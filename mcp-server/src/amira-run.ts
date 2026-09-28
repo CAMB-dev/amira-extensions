@@ -1,3 +1,4 @@
+import path from "node:path"
 import type { PackageCommandContext } from "@amira/api"
 import type { McpTool, ToolOutcome } from "./server.ts"
 
@@ -28,7 +29,10 @@ export function amiraRunTool(ctx: PackageCommandContext, defaults: RunDefaults):
           type: "string",
           description: `Model as provider/model.${defaults.model ? ` Default ${defaults.model}.` : ""}`,
         },
-        cwd: { type: "string", description: `Working directory. Default ${defaults.cwd}.` },
+        cwd: {
+          type: "string",
+          description: `Working directory; a relative path is taken from ${defaults.cwd}, the default.`,
+        },
         sessionId: { type: "string", description: "Continue this earlier amira_run session." },
       },
       required: ["prompt"],
@@ -47,7 +51,9 @@ export async function runAmira(
   const prompt = args.prompt
   if (typeof prompt !== "string" || !prompt.trim()) return { text: "prompt must be a non-empty string", isError: true }
   const model = typeof args.model === "string" && args.model ? args.model : defaults.model
-  const cwd = typeof args.cwd === "string" && args.cwd ? args.cwd : defaults.cwd
+  // Resolved once here: the child starts in it and also gets it as -C, so a relative
+  // path would otherwise be applied twice.
+  const cwd = path.resolve(defaults.cwd, typeof args.cwd === "string" && args.cwd ? args.cwd : ".")
   const session = typeof args.sessionId === "string" && args.sessionId ? args.sessionId : undefined
   if (session && !/^s_[\w-]+$/.test(session)) return { text: `not a session id: ${session}`, isError: true }
   const argv = [

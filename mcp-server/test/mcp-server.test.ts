@@ -83,6 +83,16 @@ test("a sessionId resumes that session; a failed turn is an error result", async
   expect(responses[0].result.content[0].text).toContain("rate limited")
 })
 
+test("a relative cwd is resolved once, against the default", async () => {
+  const { runs } = await session(
+    [{ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "amira_run", arguments: { prompt: "p", cwd: "sub" } } }],
+    "",
+  )
+  const sub = path.join(WORK, "sub")
+  expect(runs[0]!.options.cwd).toBe(sub)
+  expect(runs[0]!.argv.slice(3, 5)).toEqual(["-C", sub])
+})
+
 test("bad arguments and unknown subcommands", async () => {
   const bad = await session(
     [{ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "amira_run", arguments: { prompt: " " } } }],
