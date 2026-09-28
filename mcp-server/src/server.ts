@@ -38,7 +38,7 @@ interface Request {
   params?: any
 }
 
-/** Serves until the client closes stdin; calls still running then are cancelled. */
+/** Serves until the client closes stdin, then finishes the calls still running. */
 export async function serve(opts: ServerOptions): Promise<void> {
   const running = new Map<Id, AbortController>()
   const inFlight = new Set<Promise<void>>()
@@ -128,6 +128,7 @@ export async function serve(opts: ServerOptions): Promise<void> {
     }
   }
   onLine(buffer + decoder.decode())
-  for (const a of running.values()) a.abort()
+  // A client that writes its requests and closes stdin still wants the answers; each call
+  // is bounded by its own timeout, and a client that goes away can kill the server.
   await Promise.allSettled([...inFlight])
 }

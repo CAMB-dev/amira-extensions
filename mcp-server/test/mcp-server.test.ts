@@ -97,6 +97,34 @@ test("a failure before any event reports Amira's stderr message", async () => {
   )
 })
 
+test("calls still running when stdin closes are finished, not cancelled", async () => {
+  let out = ""
+  let aborted = false
+  const ctx: PackageCommandContext = {
+    apiVersion: "0.1.0",
+    argv: ["serve"],
+    cwd: "/work",
+    home: "/home",
+    amiraArgv: ["amira"],
+    runCommand: async (_a, options): Promise<RunCommandResult> => {
+      await Bun.sleep(50)
+      aborted = options.signal.aborted
+      const output = events({ type: "turn.end", data: { reason: "done" } })
+      return { output, exitCode: 0, signalCode: null, timedOut: false, aborted, settled: true, contained: true }
+    },
+    stdin: new Response(
+      `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "amira_run", arguments: { prompt: "p" } } })}\n`,
+    ).body!,
+    stdout: (s) => {
+      out += s
+    },
+    stderr: () => {},
+  }
+  expect(await command(ctx)).toBe(0)
+  expect(aborted).toBe(false)
+  expect(JSON.parse(out).result.isError).toBe(false)
+})
+
 test("a relative cwd is resolved once, against the default", async () => {
   const { runs } = await session(
     [{ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "amira_run", arguments: { prompt: "p", cwd: "sub" } } }],

@@ -24,7 +24,11 @@ In an MCP client's configuration:
 returns the final reply and the session id. Pass the session id back to continue the same
 conversation. Each call is its own `amira -p --json` process, with your settings,
 extensions and API keys; calls can run in parallel, and a cancelled call kills the whole
-process tree.
+process tree. A relative `cwd` is taken from the server's default directory.
+
+When the client closes stdin, the server stops reading and exits once the calls still
+running have answered (each is bounded by `--timeout`); only `notifications/cancelled`
+stops a call early.
 
 Options of `amira mcp serve`:
 
