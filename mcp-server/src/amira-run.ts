@@ -67,7 +67,9 @@ export async function runAmira(
     "--",
     prompt,
   ]
-  const run = await ctx.runCommand(argv, { cwd, timeoutMs: defaults.timeoutMs, signal, stdoutOnly: true })
+  // stderr is kept: startup failures (bad model, missing key, unknown session) are only
+  // reported there. In JSON mode Amira writes little else to it, and readEvents skips it.
+  const run = await ctx.runCommand(argv, { cwd, timeoutMs: defaults.timeoutMs, signal })
   const r = readEvents(run.output)
   const sessionId = r.sessionId ?? session
   if (run.timedOut || run.aborted) {
@@ -78,7 +80,7 @@ export async function runAmira(
     }
   }
   const failed = run.exitCode !== 0 || (r.reason !== undefined && r.reason !== "done")
-  const problem = r.error ?? (r.reason ? undefined : lastLines(run.output))
+  const problem = r.error ?? (lastLines(r.other) || undefined)
   const text = failed ? `Amira failed (${r.reason ?? `exit ${run.exitCode}`})${problem ? `: ${problem}` : ""}` : r.reply
   return {
     text: sessionId ? `${text}\n\n[amira session ${sessionId}]` : text,
@@ -98,17 +100,20 @@ interface Summary {
   reason?: string
   error?: string
   toolCalls: number
+  /** Lines that are not events: Amira's messages on stderr. */
+  other: string[]
 }
 
 /** The facts a caller needs from `amira -p --json` output: last reply, session, outcome. */
 export function readEvents(output: string): Summary {
-  const out: Summary = { reply: "", toolCalls: 0 }
+  const out: Summary = { reply: "", toolCalls: 0, other: [] }
   for (const line of output.split(/\r?\n/)) {
-    if (!line.startsWith("{")) continue
-    let e: { type?: string; data?: any }
+    let e: { type?: string; data?: any } | undefined
     try {
-      e = JSON.parse(line)
-    } catch {
+      e = line.startsWith("{") ? JSON.parse(line) : undefined
+    } catch {}
+    if (!e) {
+      if (line.trim()) out.other.push(line)
       continue
     }
     switch (e.type) {
@@ -140,6 +145,6 @@ export function readEvents(output: string): Summary {
   return out
 }
 
-function lastLines(output: string): string {
-  return output.trim().split(/\r?\n/).slice(-5).join("\n")
+function lastLines(lines: string[]): string {
+  return lines.slice(-5).join("\n")
 }

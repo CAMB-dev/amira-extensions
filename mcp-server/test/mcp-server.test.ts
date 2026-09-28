@@ -7,7 +7,7 @@ const WORK = path.resolve("/work")
 const events = (...lines: object[]) => lines.map((l) => JSON.stringify(l)).join("\n")
 
 /** Feeds `requests` to `amira mcp serve` and returns the parsed responses plus the child commands. */
-async function session(requests: object[], output: string, argv = ["serve", "-m", "x/y"]) {
+async function session(requests: object[], output: string, argv = ["serve", "-m", "x/y"], exitCode = 0) {
   const runs: { argv: string[]; options: RunCommandOptions }[] = []
   let out = ""
   const ctx: PackageCommandContext = {
@@ -18,7 +18,7 @@ async function session(requests: object[], output: string, argv = ["serve", "-m"
     amiraArgv: ["amira"],
     runCommand: async (a, options): Promise<RunCommandResult> => {
       runs.push({ argv: a, options })
-      return { output, exitCode: 0, signalCode: null, timedOut: false, aborted: false, settled: true, contained: true }
+      return { output, exitCode, signalCode: null, timedOut: false, aborted: false, settled: true, contained: true }
     },
     stdin: new Response(requests.map((r) => `${JSON.stringify(r)}\n`).join("")).body!,
     stdout: (s) => {
@@ -81,6 +81,20 @@ test("a sessionId resumes that session; a failed turn is an error result", async
   expect(runs[0]!.argv).toEqual(["amira", "-p", "--json", "-C", WORK, "-m", "a/b", "--resume", "s_abc", "--", "more"])
   expect(responses[0].result.isError).toBe(true)
   expect(responses[0].result.content[0].text).toContain("rate limited")
+})
+
+test("a failure before any event reports Amira's stderr message", async () => {
+  const { responses, runs } = await session(
+    [{ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "amira_run", arguments: { prompt: "p" } } }],
+    "amira: no API key for provider x\n\nRun amira --help for usage.\n",
+    ["serve", "-m", "x/y"],
+    2,
+  )
+  expect(runs[0]!.options.stdoutOnly).toBeUndefined()
+  expect(responses[0].result.isError).toBe(true)
+  expect(responses[0].result.content[0].text).toBe(
+    "Amira failed (exit 2): amira: no API key for provider x\nRun amira --help for usage.",
+  )
 })
 
 test("a relative cwd is resolved once, against the default", async () => {
