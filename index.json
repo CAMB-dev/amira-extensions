@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "extensions": [
+    {
+      "name": "mcp-server",
+      "description": "Serve Amira over MCP (stdio) so other coding agents can delegate tasks to it: amira mcp serve",
+      "version": "0.1.0",
+      "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "mcp-server" },
+      "engines": { "amira": "^0.1" },
+      "tags": ["mcp", "integration", "delegation"],
+      "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/mcp-server"
+    }
+  ]
+}
