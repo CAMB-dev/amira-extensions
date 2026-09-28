@@ -1,0 +1,10 @@
+{
+  "name": "mcp-server",
+  "version": "0.1.0",
+  "description": "Serve Amira over MCP (stdio) so other coding agents can delegate tasks to it",
+  "type": "module",
+  "amira": {
+    "engines": { "amira": "^0.1" },
+    "commands": { "mcp": "./src/command.ts" }
+  }
+}
