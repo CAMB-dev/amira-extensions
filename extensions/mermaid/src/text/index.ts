@@ -3,6 +3,7 @@
  * sequenceDiagram; every line fits the requested width (measured with Bun.stringWidth).
  */
 import { renderFlowchart } from "./flowchart/index.ts"
+import { renderSequence } from "./sequence/index.ts"
 import { meaningfulLines, strWidth, truncate } from "./util.ts"
 
 export type LineKind = "text" | "muted" | "accent" | "code"
@@ -43,6 +44,7 @@ export function renderMermaidText(source: string, width: number): DiagramLine[] 
   try {
     const type = diagramType(source)
     if (type === "flowchart") lines = renderFlowchart(source, w)?.lines
+    else if (type === "sequence") lines = renderSequence(source, w)?.lines
   } catch {
     return undefined
   }
