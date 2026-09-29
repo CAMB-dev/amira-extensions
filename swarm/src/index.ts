@@ -1,0 +1,479 @@
+import type {
+  CommandCandidate,
+  CommandContext,
+  Extension,
+  ExtensionAPI,
+  PendingNotice,
+  SessionData,
+  SpawnGroup,
+  SpawnGroupOptions,
+  ToolDefinition,
+  ToolResult,
+  UiApi,
+  UserMessage,
+} from "@amira/api"
+import { textResult } from "@amira/api"
+import { readSettings, type SwarmSettings, withOverrides } from "./limits.ts"
+import {
+  checkRoster,
+  type MemberSpec,
+  reportText,
+  Swarm,
+  type SwarmSnapshot,
+  swarmsFromRecords,
+} from "./swarm.ts"
+import { memberLine, type SwarmViewData, swarmView, timelineLine, VIEW_KIND } from "./view.ts"
+
+export { Blackboard } from "./blackboard.ts"
+export { DEFAULT_LIMITS, readSettings, type SwarmLimits, type SwarmSettings } from "./limits.ts"
+export * from "./swarm.ts"
+export { swarmView, VIEW_KIND } from "./view.ts"
+
+export const SWARM_TOOL = "swarm"
+/** The key a swarm's records go under in the session (SessionData). */
+export const DATA_KEY = "swarm"
+/** Tools a swarm member never gets: starting swarms and workflows is the main session's (D81). */
+const MEMBER_EXCLUDED = [SWARM_TOOL, "workflow"]
+
+/** Whether a user's message asks for a swarm. */
+export function asksForSwarm(text: string): boolean {
+  return /\bswarm\b|蜂群/i.test(text)
+}
+
+const notice = (text: string, display: string): UserMessage => ({
+  role: "user",
+  content: [{ type: "text", text }],
+  display: { text: display, origin: "swarm" },
+})
+
+const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
+const oneLine = (s: string) => s.replace(/\s+/g, " ").trim()
+
+interface Live {
+  swarm: Swarm
+  /** The top-level session that started it. */
+  owner: string
+}
+
+/** Where a swarm starts from: the swarm tool of the main session, or a command. */
+interface Launch {
+  goal: string
+  members: MemberSpec[]
+  limits?: Record<string, unknown>
+  toolCallId?: string
+  createGroup(opts: SpawnGroupOptions): SpawnGroup
+  expectNotice?: () => PendingNotice
+  data?: SessionData
+  ui: UiApi
+  signal?: AbortSignal
+  /** No confirmation: the user just asked for this swarm with /swarm. */
+  confirmed: boolean
+}
+
+type Params = {
+  action?: string
+  goal?: string
+  members?: MemberSpec[]
+  to?: string
+  text?: string
+  limits?: Record<string, unknown>
+}
+
+export function createSwarmExtension(): Extension {
+  return (api: ExtensionAPI) => {
+    const swarms = new Map<string, Live>()
+    let root: string | undefined
+    /** The user asked for a swarm in the message the current turn answers. */
+    let explicit = false
+    /** The user typed `/swarm <goal>`: the start that follows needs no confirmation. */
+    let requested = false
+    let lastData: SessionData | undefined
+    let seq = 0
+
+    const settings = (): SwarmSettings =>
+      readSettings(api.settings.extensions?.[DATA_KEY], (problem) =>
+        api.reportError(`swarm settings: ${problem}`),
+      )
+
+    const live = (): Live | undefined => [...swarms.values()].reverse().find((l) => l.swarm.live)
+
+    const gate = (s: SwarmSettings): string | undefined => {
+      if (s.enabled === "never") return "Swarms are turned off in settings (extensions.swarm.enabled: never)."
+      if (s.enabled === "always" || explicit || requested) return undefined
+      return "The user has not asked for a swarm, so none may be started. If long-lived agents talking to each other would help, propose a swarm (its goal and members) and let the user ask for it (by saying so, or with /swarm <goal>). Otherwise use the agent tool."
+    }
+
+    const launch = async (l: Launch): Promise<Swarm | string> => {
+      const s = settings()
+      if (live()) return `Swarm ${live()!.swarm.id} is still running; stop it first or talk to its members.`
+      const goal = typeof l.goal === "string" ? oneLine(l.goal) : ""
+      if (!goal) return '"goal" is required.'
+      const members = (l.members ?? []).map((m) => ({
+        ...m,
+        name: typeof m?.name === "string" ? m.name.trim() : (m?.name as string),
+        role: typeof m?.role === "string" ? oneLine(m.role) : (m?.role as string),
+      }))
+      const problem = checkRoster(members, s.maxMembers)
+      if (problem) return problem
+      const limits = withOverrides(s.limits, l.limits)
+      if (s.confirm && !l.confirmed) {
+        const roster = members
+          .map((m) => `  ${m.name} (${m.role}): ${clip(oneLine(m.brief), 100)}`)
+          .join("\n")
+        const ok = await l.ui.confirm(
+          `Start a swarm of ${members.length} agents?`,
+          `${goal}\n\n${roster}\n\nLimits: ${limits.maxTurnsPerMember} turns and ${limits.maxMessagesPerMember} messages per member, ${limits.maxMessages} messages in all.`,
+          l.signal ? { signal: l.signal } : {},
+        )
+        if (!ok)
+          return ok === false
+            ? "The user declined to start the swarm."
+            : "Nobody confirmed the swarm, so it did not start."
+      }
+      let group: SpawnGroup
+      try {
+        group = l.createGroup({
+          name: `swarm: ${clip(goal, 40)}`,
+          ...(limits.maxConcurrent ? { maxConcurrent: limits.maxConcurrent } : {}),
+          ...(limits.budget ? { budget: limits.budget } : {}),
+          maxTurnsPerAgent: limits.maxTurnsPerMember,
+          maxAgents: members.length * 4,
+        })
+      } catch (err) {
+        return `The swarm could not start: ${err instanceof Error ? err.message : String(err)}`
+      }
+      const id = `sw${Date.now().toString(36).slice(-5)}${++seq}`
+      const final = l.expectNotice?.()
+      const data = l.data
+      if (data) lastData = data
+      let swarm: Swarm
+      try {
+        swarm = new Swarm({
+          id,
+          goal,
+          members,
+          limits,
+          group,
+          spawn: { excludeTools: MEMBER_EXCLUDED, ...(l.toolCallId ? { toolCallId: l.toolCallId } : {}) },
+          hooks: {
+            changed: () => api.requestRender(),
+            record: (rec) => data?.append(DATA_KEY, rec),
+            toCommander: (from, text) => {
+              l.expectNotice?.()?.deliver(
+                notice(
+                  `[swarm ${id} · message from ${from}] ${text}\n\n(Answer with the swarm tool: action "message", to "${from}".)`,
+                  `✉ swarm · ${from}: ${clip(oneLine(text), 160)}`,
+                ),
+              )
+            },
+            askStuck: async (question) => {
+              const answer = await api.ui.select(question, ["Keep going", "Stop the swarm"])
+              return answer === "Keep going" ? "continue" : answer === undefined ? undefined : "stop"
+            },
+          },
+        })
+      } catch (err) {
+        group.end("the swarm could not start")
+        final?.cancel()
+        return `The swarm could not start: ${err instanceof Error ? err.message : String(err)}`
+      }
+      requested = false
+      swarms.set(id, { swarm, owner: root ?? "" })
+      void swarm.done.then((report) => {
+        api.requestRender()
+        final?.deliver(notice(reportText(report), `◆ swarm ${id} ended: ${clip(report.reason, 80)}`))
+      })
+      api.requestRender()
+      return swarm
+    }
+
+    const statusText = (s: SwarmSnapshot, tail = 20): string => {
+      const lines = [
+        `Swarm ${s.id} · ${s.state}${s.endReason ? ` (${s.endReason})` : ""} · ${s.messages} messages · ${s.tokens ?? 0} tokens`,
+        `Goal: ${s.goal}`,
+        "",
+        "Members:",
+        ...s.members.map((m) => memberLine(m).text),
+        "",
+        `Blackboard keys: ${s.board.map((e) => `${e.key} (${e.value.length} chars, by ${e.by})`).join(", ") || "none"}`,
+        "",
+        `Timeline (last ${Math.min(tail, s.timeline.length)} of ${s.timeline.length}):`,
+        ...s.timeline.slice(-tail).map((e) => clip(timelineLine(e).text, 300)),
+      ]
+      return lines.join("\n")
+    }
+
+    const tool: ToolDefinition<Params> = {
+      name: SWARM_TOOL,
+      description:
+        'Runs a swarm: long-lived sub-agents (members) that work on one goal together in the background, through a shared blackboard and messages to each other. Only start one when the user asked for a swarm; otherwise propose it. action "start" takes "goal" and "members" (2 or more, each {name, role, brief, model?}); the user confirms the start. The call returns at once: members\' messages to you and the final report (members\' results and the blackboard) come back by themselves, so end your turn instead of waiting. "message" sends "text" to member "to"; "status" shows members, blackboard keys and the latest timeline; "stop" ends the swarm.',
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["start", "message", "status", "stop"] },
+          goal: { type: "string", description: "start: what the swarm must produce." },
+          members: {
+            type: "array",
+            description: "start: the roster.",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string", description: 'A short name the others use, e.g. "writer".' },
+                role: { type: "string", description: 'A word or two, e.g. "researcher".' },
+                brief: { type: "string", description: "Its part of the work, and whom it hands results to." },
+                model: { type: "string", description: '"provider/model"; default yours.' },
+              },
+              required: ["name", "role", "brief"],
+            },
+          },
+          to: { type: "string", description: "message: the member's name." },
+          text: { type: "string", description: "message: what to tell it." },
+          limits: {
+            type: "object",
+            description:
+              "start: lower limits than the settings' (max_messages, max_messages_per_member, max_turns_per_member).",
+          },
+        },
+        required: ["action"],
+      },
+      concurrency: "serial",
+      async execute(p, ctx): Promise<ToolResult> {
+        const session = ctx.session
+        const action = p.action ?? "start"
+        if (action === "start") {
+          if (!session?.createGroup || session.depth > 0) {
+            return textResult("A swarm can only be started from the main session.", true)
+          }
+          const refused = gate(settings())
+          if (refused) return textResult(refused, true)
+          const r = await launch({
+            goal: p.goal ?? "",
+            members: p.members ?? [],
+            ...(p.limits ? { limits: p.limits } : {}),
+            toolCallId: ctx.toolCallId,
+            createGroup: (o) => session.createGroup!(o),
+            ...(session.expectNotice ? { expectNotice: () => session.expectNotice!() } : {}),
+            ...(session.data ? { data: session.data } : {}),
+            ui: api.ui,
+            signal: ctx.signal,
+            confirmed: requested,
+          })
+          if (typeof r === "string") return textResult(r, true)
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Started swarm ${r.id} with ${r.names().join(", ")}. It runs in the background: members' messages to you and its final report come back by themselves. End your turn now; use action "status" to look in, "message" to talk to a member, "stop" to end it.`,
+              },
+            ],
+            details: { swarm: r.id, members: r.names() },
+          }
+        }
+        const l = live()
+        if (action === "status") {
+          const s = l?.swarm.snapshot() ?? pastSwarms(session?.data).at(-1)
+          return s ? textResult(statusText(s)) : textResult("No swarm has run in this session.", true)
+        }
+        if (!l) return textResult("No swarm is running.", true)
+        if (action === "message") {
+          const problem = l.swarm.tell("commander", p.to ?? "", p.text ?? "")
+          return problem ? textResult(problem, true) : textResult(`Sent to ${p.to}.`)
+        }
+        if (action === "stop") {
+          void l.swarm.stop("stopped by the commander")
+          return textResult(`Stopping swarm ${l.swarm.id}; its report follows.`)
+        }
+        return textResult(`Unknown action "${action}": use start, message, status or stop.`, true)
+      },
+    }
+
+    const pastSwarms = (data: SessionData | undefined): SwarmSnapshot[] => {
+      try {
+        return swarmsFromRecords((data ?? lastData)?.read(DATA_KEY) ?? [])
+      } catch {
+        return []
+      }
+    }
+
+    /** A swarm by id (or the newest one): live, or read back from the session. */
+    const find = (ctx: CommandContext, id?: string): SwarmViewData | undefined => {
+      const l = id ? swarms.get(id) : (live() ?? [...swarms.values()].at(-1))
+      if (l) {
+        const s = l.swarm
+        return {
+          snapshot: () => s.snapshot(),
+          control: {
+            tell: (to, text) => s.tell("user", to, text),
+            pause: (name) => s.pause(name),
+            resume: (name) => s.resume(name),
+            stopMember: (name) => s.stopMember(name),
+            stop: () => void s.stop(),
+          },
+        }
+      }
+      const past = pastSwarms(ctx.session.data)
+      const snap = id ? past.find((s) => s.id === id) : past.at(-1)
+      return snap ? { snapshot: () => snap } : undefined
+    }
+
+    const tellFromUser = (ctx: CommandContext, name: string, text: string) => {
+      const l = live()
+      if (!l) throw new Error("no swarm is running")
+      const problem = l.swarm.tell("user", name, text)
+      if (problem) throw new Error(problem)
+      const m = l.swarm.member(name)
+      ctx.print(`✉ you → ${m?.name ?? name}${m?.status === "paused" ? " (held until it is resumed)" : ""}`)
+    }
+
+    api.registerCommand({
+      name: "swarm",
+      description: "Ask for a swarm, or watch, message, pause and stop the running one",
+      args: {
+        hint: "<goal> | view [id] | list | msg <name> <text> | pause [name] | resume [name] | stop [name]",
+        complete: (): CommandCandidate[] => {
+          const names = live()?.swarm.names() ?? []
+          return [
+            { value: "view", description: "the live timeline and members" },
+            { value: "list", description: "swarms of this session" },
+            { value: "stop", description: "stop the swarm (or one member)" },
+            { value: "pause", description: "hold a member's messages (or the whole swarm's)" },
+            { value: "resume", description: "deliver what was held" },
+            ...names.map((n) => ({ value: `msg ${n} `, description: `message ${n}` })),
+          ]
+        },
+      },
+      async run(text, ctx) {
+        const [first = "", ...rest] = text.split(/\s+/)
+        const name = rest[0]
+        const l = live()
+        switch (first) {
+          case "":
+          case "list": {
+            const all = [
+              ...pastSwarms(ctx.session.data).filter((s) => !swarms.has(s.id)),
+              ...[...swarms.values()].map((x) => x.swarm.snapshot()),
+            ]
+            if (!all.length) {
+              ctx.print("No swarm has run in this session. /swarm <goal> asks for one.")
+              return
+            }
+            ctx.print(
+              all
+                .map(
+                  (s) =>
+                    `${s.id} · ${s.state} · ${s.members.map((m) => m.name).join(", ")} · ${clip(s.goal, 60)}`,
+                )
+                .join("\n"),
+            )
+            return
+          }
+          case "view": {
+            const data = find(ctx, name)
+            if (!data)
+              throw new Error(name ? `no swarm ${name} in this session` : "no swarm has run in this session")
+            if (!ctx.openView) {
+              ctx.print(statusText(data.snapshot()!))
+              return
+            }
+            ctx.openView({ kind: VIEW_KIND, data })
+            return
+          }
+          case "stop": {
+            if (!l) throw new Error("no swarm is running")
+            if (name) {
+              const problem = l.swarm.stopMember(name)
+              if (problem) throw new Error(problem)
+              ctx.print(`Stopping ${name}.`)
+              return
+            }
+            void l.swarm.stop("stopped by the user")
+            ctx.print(`Stopping swarm ${l.swarm.id}.`)
+            return
+          }
+          case "pause":
+          case "resume": {
+            if (!l) throw new Error("no swarm is running")
+            const problem = first === "pause" ? l.swarm.pause(name) : l.swarm.resume(name)
+            if (problem) throw new Error(problem)
+            ctx.print(`${first === "pause" ? "Paused" : "Resumed"} ${name ?? `swarm ${l.swarm.id}`}.`)
+            return
+          }
+          case "msg": {
+            if (!name || rest.length < 2) throw new Error("usage: /swarm msg <name> <text>")
+            tellFromUser(ctx, name, text.slice(text.indexOf(name) + name.length).trim())
+            return
+          }
+        }
+        // Anything else is a goal: the model designs the roster and starts it.
+        if (settings().enabled === "never")
+          throw new Error("swarms are turned off in settings (extensions.swarm.enabled)")
+        requested = true
+        explicit = true
+        await ctx.session.send(
+          `Use a swarm (the swarm tool) for this task: ${text}\n\nPick 2 to 4 members with distinct roles and clear briefs (who writes what to the blackboard, and who hands results to whom), then start it.`,
+          { display: { text: `/swarm ${text}` } },
+        )
+      },
+    })
+
+    api.registerInputHandler({
+      name: "swarm",
+      claims(text) {
+        const l = live()
+        const m = /^@([A-Za-z][\w-]*)[\s:,]+\S/.exec(text)
+        return !!(l && m && l.swarm.member(m[1]!))
+      },
+      run(text, ctx) {
+        const m = /^@([A-Za-z][\w-]*)[\s:,]+([\s\S]+)$/.exec(text)!
+        tellFromUser(ctx, m[1]!, m[2]!)
+      },
+    })
+
+    api.registerView(swarmView)
+    api.registerTool(tool)
+    api.registerStatusItem({
+      id: "swarm",
+      align: "right",
+      tone: "accent",
+      text() {
+        const l = live()
+        if (!l) return undefined
+        const s = l.swarm.snapshot()
+        const working = s.members.filter((m) => m.status === "working").length
+        return `swarm ${working}/${s.members.length} working${s.state === "paused" ? " · paused" : ""}`
+      },
+    })
+
+    api.on("session.start", (e) => {
+      if (e.parentSessionId !== undefined) return
+      if (root && root !== e.sessionId) {
+        // Another conversation took over (/clear, /resume): its swarms have nobody to report to.
+        for (const l of swarms.values())
+          if (l.owner !== e.sessionId) void l.swarm.stop("its session was closed")
+      }
+      root = e.sessionId
+      explicit = false
+      requested = false
+    })
+    api.on("session.end", () => {
+      for (const l of swarms.values()) void l.swarm.stop("the session ended")
+    })
+    api.on("turn.start", (e) => {
+      if (e.parentSessionId !== undefined || (root && e.sessionId !== root)) return
+      const prompt = e.data.prompt
+      // A notice (a swarm's or a sub-agent's report) is not the user asking.
+      if (prompt.display?.origin) return
+      const text = prompt.content.map((b) => (b.type === "text" ? b.text : "")).join("")
+      explicit = requested || asksForSwarm(text) || asksForSwarm(prompt.display?.text ?? "")
+    })
+    api.on("turn.steer", (e) => {
+      if (e.parentSessionId !== undefined || (root && e.sessionId !== root) || e.data.state !== "queued")
+        return
+      const m = e.data.message
+      const text = m.content.map((b) => (b.type === "text" ? b.text : "")).join("")
+      if (!m.display?.origin && asksForSwarm(text)) explicit = true
+    })
+  }
+}
+
+export default createSwarmExtension()
