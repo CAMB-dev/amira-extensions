@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
 import path from "node:path"
 import { compileScript } from "../src/compile.ts"
-import { describeEstimate, estimate, parseMeta } from "../src/meta.ts"
+import { estimate, parseMeta, sizeLine, workspaceLine } from "../src/meta.ts"
 
 test("meta is read as a plain literal: comments, quotes, trailing commas", () => {
   const meta = parseMeta(`// a workflow
@@ -41,11 +41,17 @@ test("the estimate counts agent() calls, and says dynamic for loops, maps and pi
     // agent("in a comment") is not counted, nor "agent(" in a string
     return await agent("three " + x + y)`
   expect(estimate(fixed)).toEqual({ calls: 3, dynamic: false })
-  expect(describeEstimate(estimate(fixed))).toBe("3 agents")
+  expect(sizeLine(estimate(fixed))).toBe("3")
   const loop = `export const meta = { name: "a", description: "d", phases: [] }
     return await parallel(args.map((f) => () => agent(f)))`
   expect(estimate(loop)).toEqual({ calls: 1, dynamic: true })
-  expect(describeEstimate(estimate(loop))).toMatch(/^dynamic/)
+  expect(sizeLine(estimate(loop))).toBe("1 or more (some run in loops)")
+  // Whether the run changes the user's files directly or through worktrees merged back.
+  expect(workspaceLine(loop)).toContain("can change your files")
+  expect(workspaceLine(`${loop}
+agent("x", { isolation: "worktree" })`)).toContain("their own git worktrees")
+  expect(workspaceLine(`${loop}
+// agent("x", { isolation: "worktree" })`)).not.toContain("worktrees")
   expect(
     estimate(`export const meta = { name: "a", description: "d", phases: [] }\nreturn workflow("x")`).dynamic,
   ).toBe(true)

@@ -226,8 +226,17 @@ export function estimate(source: string): Estimate {
   return { calls, dynamic }
 }
 
-/** "3 agents", "dynamic (4 agent() calls in loops or pipelines)". */
-export function describeEstimate(e: Estimate): string {
-  if (!e.dynamic) return `${e.calls} agent${e.calls === 1 ? "" : "s"}`
-  return `dynamic (${e.calls} agent() call${e.calls === 1 ? "" : "s"} in the script, some in loops, maps or pipelines)`
+/** How many agents a run starts, in plain words: "4", "4 or more (some run in loops)". */
+export function sizeLine(e: Estimate): string {
+  if (!e.dynamic) return `${e.calls}`
+  if (!e.calls) return "as many as its input needs"
+  return `${e.calls} or more (some run in loops)`
+}
+
+/** Whether a run changes the user's files directly, or through worktrees merged back. */
+export function workspaceLine(source: string): string {
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:])\/\/[^\n]*/g, "$1")
+  return /isolation\s*:\s*["'`]worktree["'`]/.test(code)
+    ? "some agents work in their own git worktrees, merged into your working tree when they finish; the others work in it directly and can change your files."
+    : "its agents work in your working tree and can change your files."
 }
