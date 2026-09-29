@@ -1,6 +1,6 @@
 {
   "name": "workflow",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Dynamic workflows: TypeScript scripts that orchestrate many sub-agents, with a journal to resume them",
   "type": "module",
   "scripts": {
