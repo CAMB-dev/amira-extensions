@@ -27,6 +27,10 @@ export function encodeMessage(message: RpcMessage): string {
  */
 export class MessageReader {
   #buffer: Buffer = Buffer.alloc(0)
+  /** Chunks after #buffer, joined only once a whole message may be there (#need bytes). */
+  #chunks: Buffer[] = []
+  #length = 0
+  #need = 0
 
   constructor(
     private readonly onMessage: (message: RpcMessage) => void,
@@ -35,8 +39,20 @@ export class MessageReader {
   ) {}
 
   push(chunk: string): void {
-    this.#buffer = Buffer.concat([this.#buffer, Buffer.from(chunk, "utf8")])
+    const bytes = Buffer.from(chunk, "utf8")
+    this.#chunks.push(bytes)
+    this.#length += bytes.length
+    // A long message arrives in many chunks: copy them together once, not once per chunk.
+    if (this.#length < this.#need) return
+    this.#buffer = Buffer.concat([this.#buffer, ...this.#chunks], this.#length)
+    this.#chunks = []
+    this.#need = 0
+    this.#parse()
+  }
+
+  #parse(): void {
     for (;;) {
+      this.#length = this.#buffer.length
       const end = this.#buffer.indexOf(HEADER_END)
       if (end < 0) {
         if (this.#buffer.length > MAX_HEADER) this.#drop()
@@ -52,7 +68,10 @@ export class MessageReader {
       }
       const start = end + HEADER_END.length
       const length = Number(match[1])
-      if (this.#buffer.length < start + length) return
+      if (this.#buffer.length < start + length) {
+        this.#need = start + length
+        return
+      }
       const body = this.#buffer.subarray(start, start + length).toString("utf8")
       this.#buffer = this.#buffer.subarray(start + length)
       let message: unknown
@@ -69,5 +88,6 @@ export class MessageReader {
   #drop() {
     this.onNoise(this.#buffer.toString("utf8"))
     this.#buffer = Buffer.alloc(0)
+    this.#length = 0
   }
 }

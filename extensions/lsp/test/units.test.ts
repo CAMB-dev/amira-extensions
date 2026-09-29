@@ -62,6 +62,20 @@ test("messages are framed by UTF-8 byte length, even when a character is split a
   expect(noise).toEqual(["some log line"])
 })
 
+test("a message of several MB in small chunks is read whole, and the next one after it", () => {
+  const got: RpcMessage[] = []
+  const reader = new MessageReader((m) => got.push(m))
+  const big = "é".repeat(2_000_000)
+  const wire = encodeMessage({ method: "big", params: { big } }) + encodeMessage({ id: 7, result: null })
+  const started = performance.now()
+  for (let i = 0; i < wire.length; i += 4096) reader.push(wire.slice(i, i + 4096))
+  // Joining the buffer once per chunk (the old way) took seconds here.
+  expect(performance.now() - started).toBeLessThan(2000)
+  expect(got).toHaveLength(2)
+  expect((got[0]!.params as { big: string }).big).toBe(big)
+  expect(got[1]).toMatchObject({ id: 7 })
+})
+
 test("settings: defaults, a server of the user's own, and problems reported instead of failing", () => {
   const d = readSettings(undefined)
   expect(d).toMatchObject({
