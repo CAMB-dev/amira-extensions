@@ -81,6 +81,8 @@ export interface Change {
 export class DisabledError extends Error {}
 
 const MAX_CHANGED = 50
+/** Scratch file names, unique in the process (stores of one repository share its directory). */
+let tmpCount = 0
 const GITLINK = "160000"
 
 /**
@@ -96,7 +98,6 @@ export class CheckpointStore {
   #next = new Map<string, number>()
   /** The latest checkpoint per session, once known. */
   #last = new Map<string, Checkpoint | null>()
-  #tmp = 0
   /** Checkpoints per session, once known, so pruning lists them only when there are too many. */
   #count = new Map<string, number>()
   /** The ignore files as the last scan saw them; our index is checked for ignored files when they change. */
@@ -115,7 +116,7 @@ export class CheckpointStore {
   }
 
   #scratchFile(name: string): string {
-    return path.join(this.repo.scratch, `${process.pid}-${++this.#tmp}-${name}`)
+    return path.join(this.repo.scratch, `${process.pid}-${++tmpCount}-${name}`)
   }
 
   /** Writes the work tree to the object store and returns its tree, without a checkpoint. */
@@ -134,7 +135,7 @@ export class CheckpointStore {
         stdoutOnly: true,
         ...sig,
         ...(mode === "shadow"
-          ? { env: { GIT_INDEX_FILE: path.join(this.repo.scratch, "empty.index") } }
+          ? { env: { GIT_INDEX_FILE: this.repo.noIndex } }
           : {}),
       }),
     )

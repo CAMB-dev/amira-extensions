@@ -1,5 +1,5 @@
 import { expect, setDefaultTimeout, test } from "bun:test"
-import { existsSync, renameSync, rmSync, utimesSync, writeFileSync } from "node:fs"
+import { existsSync, readFileSync, renameSync, rmSync, utimesSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import { openRepo, type Repo } from "../src/git.ts"
 import { CheckpointStore, collapse, DisabledError, REF_PREFIX, type StoreLimits } from "../src/store.ts"
@@ -256,14 +256,61 @@ test("a lock left behind by a git that was stopped does not block later checkpoi
   const dir = await repo()
   const { store, repo: r } = await storeFor(dir)
   await store.create("s_1", { kind: "turn", turn: 1 })
+  // This process's index: its commands run one at a time, so a lock found is left over, however new.
   const lock = `${r.index}.lock`
   writeFileSync(lock, "")
-  const old = new Date(Date.now() - 60_000)
-  utimesSync(lock, old, old)
   write(dir, "a.txt", "two\n")
   const second = (await store.create("s_1", { kind: "turn", turn: 2 })).checkpoint!
   expect(second.meta.changed).toEqual(["a.txt"])
   expect(existsSync(lock)).toBe(false)
+})
+
+/** The pid of a process that has ended. */
+async function deadPid(): Promise<number> {
+  const p = Bun.spawn(["git", "--version"], { stdout: "ignore" })
+  await p.exited
+  return p.pid
+}
+
+test("each process snapshots with an index of its own; another's lock is left alone, a dead one's files go", async () => {
+  const dir = await repo()
+  const { store, repo: r } = await storeFor(dir)
+  expect(path.basename(r.index)).toBe(`${process.pid}-index`)
+  await store.create("s_1", { kind: "turn", turn: 1 })
+
+  const live = Bun.spawn(["git", "cat-file", "--batch"], { stdin: "pipe", stdout: "ignore" })
+  const dead = await deadPid()
+  try {
+    const liveLock = path.join(r.scratch, `${live.pid}-index.lock`)
+    const deadFiles = [`${dead}-index`, `${dead}-index.lock`, `${dead}-3-restore.index`].map((f) =>
+      path.join(r.scratch, f),
+    )
+    writeFileSync(liveLock, "")
+    for (const f of deadFiles.slice(1)) writeFileSync(f, "")
+    // A process that is running holds its lock, however old.
+    const old = new Date(Date.now() - 600_000)
+    utimesSync(liveLock, old, old)
+    const blocked = await r.git.exec(["add", "-A"], { env: { GIT_INDEX_FILE: path.join(r.scratch, `${live.pid}-index`) } })
+    expect(blocked.ok).toBe(false)
+    expect(existsSync(liveLock)).toBe(true)
+    // A lock of a process that has ended is removed, and the command goes on.
+    const unblocked = await r.git.exec(["add", "-A"], { env: { GIT_INDEX_FILE: deadFiles[0]! } })
+    expect(unblocked.ok).toBe(true)
+    // Opening the repository again removes what ended processes left.
+    writeFileSync(deadFiles[1]!, "")
+    await storeFor(dir)
+    for (const f of deadFiles) expect(existsSync(f)).toBe(false)
+    expect(existsSync(liveLock)).toBe(true)
+  } finally {
+    live.kill()
+    await live.exited
+  }
+
+  // A new process starts from the index the last one left, so its first snapshot is quick.
+  const bytes = readFileSync(r.index)
+  renameSync(r.index, path.join(r.scratch, "index"))
+  const again = await storeFor(dir)
+  expect(readFileSync(again.repo.index)).toEqual(bytes)
 })
 
 test("git variables of a git that started Amira, and the repository's hooks, do not apply", async () => {

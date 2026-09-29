@@ -1,5 +1,14 @@
 import { createHash } from "node:crypto"
-import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs"
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs"
 import path from "node:path"
 import type { RunCommandOptions, RunCommandResult } from "@amira/api"
 
@@ -88,11 +97,21 @@ export class Git {
     this.#own = path.resolve(dir).toLowerCase()
   }
 
-  /** A lock of ours: on an index of ours or on a checkpoint ref, never one of the user's. */
-  #ownsLock(lock: string): boolean {
+  /**
+   * Whether a lock git could not take was left by a git that is gone. Only locks of ours count:
+   * on an index file of a process (`<pid>-...` in our directory) that is no longer running, or
+   * of this process, whose git commands on its own files run one at a time (each has exited
+   * before the next starts, so a lock found then was left by one that was stopped); and on a
+   * checkpoint ref, which update-ref holds for a moment only, when it is old. Never one of the
+   * user's, nor another live process's.
+   */
+  #isStale(lock: string): boolean {
     const p = path.resolve(lock).toLowerCase()
-    if (this.#own && p.startsWith(this.#own + path.sep)) return true
-    return /[\\/]refs[\\/]amira[\\/]checkpoints[\\/]/.test(p)
+    if (this.#own && p.startsWith(this.#own + path.sep)) {
+      const owner = lockOwner(p)
+      return owner !== undefined && (owner === process.pid || !alive(owner))
+    }
+    return /[\\/]refs[\\/]amira[\\/]checkpoints[\\/]/.test(p) && ageMs(lock) > STALE_LOCK_MS
   }
 
   async exec(args: string[], opts: ExecOptions = {}): Promise<GitResult> {
@@ -114,9 +133,9 @@ export class Git {
       const lock = !result.ok && /Unable to create '([^']+\.lock)'/.exec(r.output)?.[1]
       if (lock && attempt < 8 && !opts.signal?.aborted) {
         // A git stopped in the middle (Amira exited, a snapshot timed out) leaves its lock
-        // behind; one that old is nobody's. A live one goes away in a moment.
-        if (this.#ownsLock(lock) && ageMs(lock) > STALE_LOCK_MS) rmSync(lock, { force: true })
-        else await Bun.sleep(100 + attempt * 100)
+        // behind. A live one goes away in a moment; one that cannot be removed (Windows: still
+        // open) counts as live.
+        if (!(this.#isStale(lock) && removed(lock))) await Bun.sleep(100 + attempt * 100)
         continue
       }
       return result
@@ -131,8 +150,35 @@ export class Git {
   }
 }
 
-/** A lock file older than this is left over from a git that was stopped. */
+/** A lock on a checkpoint ref older than this is left over from a git that was stopped. */
 export const STALE_LOCK_MS = 15_000
+
+/** Whether a process is running (EPERM: it is, but not ours to signal). */
+export function alive(pid: number): boolean {
+  if (pid === process.pid) return true
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM"
+  }
+}
+
+/** The process a file of ours belongs to: `<pid>-index`, `<pid>-3-restore.index.lock`... */
+export function lockOwner(file: string): number | undefined {
+  const m = /^(\d+)-/.exec(path.basename(file))
+  return m ? Number(m[1]) : undefined
+}
+
+/** Removes a file; false when it could not be (it is still open, say). */
+function removed(file: string): boolean {
+  try {
+    rmSync(file, { force: true })
+    return true
+  } catch {
+    return false
+  }
+}
 
 function ageMs(file: string): number {
   try {
@@ -168,8 +214,10 @@ export interface Repo {
   root: string
   /** The repository's own git directory (per worktree), or the shadow repository. */
   gitDir: string
-  /** Our own index, never the user's. */
+  /** This process's own index, never the user's nor another process's. */
   index: string
+  /** An index file that never exists: an empty index, for reading only. */
+  noIndex: string
   /** Scratch files: pathspec lists, temporary indexes. */
   scratch: string
   /** The user's index (git mode only). */
@@ -283,10 +331,10 @@ export async function openRepo(
     ...(process.platform === "win32" ? ["-c", "core.longpaths=true"] : []),
   ]
   git.setGlobal(global)
-  // An empty index file name gives an empty index: its tree is the empty tree, now stored.
-  const empty = await git.exec(["write-tree"], { env: { GIT_INDEX_FILE: path.join(scratch, "empty.index") } })
+  // The empty tree, stored (hashed from an empty file: no index, so no lock to wait on).
+  const empty = await git.exec(["hash-object", "-t", "tree", "-w", noAttributes], { stdoutOnly: true })
   const emptyTree = objectId(empty.output)
-  if (!empty.ok || !emptyTree) return { disabled: `git write-tree failed: ${firstLines(empty.output)}` }
+  if (!empty.ok || !emptyTree) return { disabled: `git hash-object failed: ${firstLines(empty.output)}` }
   // Attributes read from an empty tree: no eol conversion or filters, so snapshots hold the
   // files byte for byte and restores write them back the same way.
   if (raw) git.setGlobal([...global, `--attr-source=${emptyTree}`])
@@ -294,11 +342,65 @@ export async function openRepo(
     mode,
     root,
     gitDir,
-    index: path.join(scratch, "index"),
+    index: ownIndex(scratch),
+    noIndex: path.join(scratch, "none.index"),
     scratch,
     ...(userIndex ? { userIndex } : {}),
     emptyTree,
     raw,
     git,
   }
+}
+
+/** The index the last process to exit left, for the next one to start from. */
+const SHARED_INDEX = "index"
+const leaveAtExit = new Set<string>()
+
+/**
+ * This process's own index, `<pid>-index`: every Amira in the repository has its own, so none
+ * waits on (or breaks) another's lock. It starts as a copy of the newest index another process
+ * left, so the first snapshot does not hash every file again, and at exit it is left for the
+ * next one. Files of processes that are no longer running are removed.
+ */
+function ownIndex(scratch: string): string {
+  const own = path.join(scratch, `${process.pid}-index`)
+  let names: string[] = []
+  try {
+    names = readdirSync(scratch)
+  } catch {}
+  const seeds: { file: string; live: boolean; mtime: number }[] = []
+  const dead: string[] = []
+  for (const name of names) {
+    const file = path.join(scratch, name)
+    const owner = lockOwner(name)
+    const live = owner === undefined || alive(owner)
+    if (name === SHARED_INDEX || (owner !== undefined && owner !== process.pid && name === `${owner}-index`)) {
+      try {
+        seeds.push({ file, live: name !== SHARED_INDEX && live, mtime: statSync(file).mtimeMs })
+      } catch {}
+    }
+    if (!live) dead.push(file)
+  }
+  if (!existsSync(own)) {
+    // Rather an index nobody is writing to; then the newest.
+    seeds.sort((a, b) => Number(a.live) - Number(b.live) || b.mtime - a.mtime)
+    for (const seed of seeds) {
+      try {
+        copyFileSync(seed.file, own)
+        break
+      } catch {}
+    }
+  }
+  for (const file of dead) removed(file)
+  if (!leaveAtExit.has(own)) {
+    leaveAtExit.add(own)
+    process.once("exit", () => {
+      try {
+        renameSync(own, path.join(scratch, SHARED_INDEX))
+      } catch {
+        removed(own)
+      }
+    })
+  }
+  return own
 }

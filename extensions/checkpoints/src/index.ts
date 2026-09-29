@@ -1,4 +1,3 @@
-import { existsSync, rmSync, statSync } from "node:fs"
 import path from "node:path"
 import type {
   CommandCandidate,
@@ -30,14 +29,6 @@ interface PendingTurn {
 }
 
 const DAY = 24 * 3600_000
-
-/** A lock git left behind when a snapshot was cut short (our operations never overlap). */
-function clearStaleLock(index: string, olderThanMs: number) {
-  const lock = `${index}.lock`
-  try {
-    if (existsSync(lock) && Date.now() - statSync(lock).mtimeMs > olderThanMs) rmSync(lock, { force: true })
-  } catch {}
-}
 
 export function createCheckpointsExtension(options: CheckpointsOptions = {}) {
   return (api: ExtensionAPI): void => {
@@ -136,8 +127,8 @@ export function createCheckpointsExtension(options: CheckpointsOptions = {}) {
       reportOnce(
         `checkpoints: a snapshot took longer than ${settings.timeoutMs} ms, so a turn went on without its checkpoint`,
       )
-      // Git was stopped in the middle; its lock on our index would stop the next snapshot.
-      void done.then(() => getStore()).then((st) => st && clearStaleLock(st.repo.index, 0))
+      // Git was stopped in the middle; the lock it left on this process's index is removed by
+      // the next command that needs the index.
     }
 
     /** Starts the turn's checkpoint once; the turn's tool calls wait for it. */
