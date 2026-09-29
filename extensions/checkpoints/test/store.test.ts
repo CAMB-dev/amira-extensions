@@ -436,3 +436,17 @@ test("files a restore could not write are reported, with the safety checkpoint",
   expect(r.safety.meta.kind).toBe("restore")
   expect(tree(dir)["a.txt"]).toBe(Buffer.from("a1\n").toString("hex"))
 })
+test("files the user tracks although ignored (git add -f) are in checkpoints", async () => {
+  const dir = await repo({ "a.txt": "a\n", ".gitignore": "*.cfg\n" })
+  write(dir, "local.cfg", "tracked anyway\n")
+  write(dir, "other.cfg", "ignored\n")
+  await git(dir, "add", "-f", "local.cfg")
+  await git(dir, "commit", "-q", "-m", "cfg")
+  const { store } = await storeFor(dir)
+  const first = (await store.create("s_1", { kind: "turn", turn: 1 })).checkpoint!
+  expect(await listTree(dir, first.commit)).toEqual([".gitignore", "a.txt", "local.cfg"])
+  write(dir, "local.cfg", "changed\n")
+  const r = await store.restore("s_1", first)
+  expect(r.restored.map((c) => c.path)).toEqual(["local.cfg"])
+  expect(tree(dir)["local.cfg"]).toBe(Buffer.from("tracked anyway\n").toString("hex"))
+})

@@ -150,7 +150,7 @@ export class CheckpointStore {
     return this.#locked(() => this.#scan(signal, opts.timeoutMs))
   }
 
-  /** 	imeoutMs: for each git command, instead of the usual one (the first scan hashes every file). */
+  /** `timeoutMs`: for each git command, instead of the usual one (the first scan hashes every file). */
   async #scan(signal?: AbortSignal, timeoutMs?: number): Promise<Scan> {
     const { git, root, mode } = this.repo
     const ours = { GIT_INDEX_FILE: this.repo.index }
@@ -264,10 +264,39 @@ export class CheckpointStore {
     } finally {
       if (list) rmSync(list, { force: true })
     }
+    if (mode === "git") await this.#addTrackedIgnored(sig)
     const tree = (await git.must(["write-tree"], { env: ours, stdoutOnly: true, ...sig })).trim()
     if (!/^[0-9a-f]{40,64}$/.test(tree)) throw new Error(`git write-tree gave no tree: ${firstLines(tree)}`)
     this.#rules = rules
     return { tree, skipped }
+  }
+
+  /**
+   * Files the user tracks although .gitignore ignores them (added with `git add -f`): `git add
+   * -A` leaves them out of our index, so they are added by name.
+   */
+  async #addTrackedIgnored(sig: { signal?: AbortSignal; timeoutMs?: number }) {
+    const { git, root } = this.repo
+    const names = zsplit(
+      await git.must(["ls-files", "-z", "--cached", "--ignored", "--exclude-standard"], {
+        stdoutOnly: true,
+        ...sig,
+      }),
+    ).filter((p) => lexists(path.join(root, p)))
+    if (!names.length) return
+    const list = this.#scratchFile("tracked-ignored")
+    writeFileSync(list, `${[...new Set(names)].join("\0")}\0`)
+    try {
+      const r = await git.exec(
+        ["add", "-f", "--ignore-errors", `--pathspec-from-file=${list}`, "--pathspec-file-nul"],
+        { env: { GIT_INDEX_FILE: this.repo.index, GIT_LITERAL_PATHSPECS: "1" }, ...sig },
+      )
+      if (!r.ok && !/unable to index file|Permission denied|could not open/i.test(r.output)) {
+        throw gitError("add", r)
+      }
+    } finally {
+      rmSync(list, { force: true })
+    }
   }
 
   /**
