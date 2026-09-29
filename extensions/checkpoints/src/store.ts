@@ -289,9 +289,19 @@ export class CheckpointStore {
     } finally {
       rmSync(msgFile, { force: true })
     }
-    const n = await this.#nextNumber(session)
-    const ref = `${REF_PREFIX}${session}/${n}`
-    await git.must(["update-ref", "--no-deref", ref, commit], sig)
+    // Only a ref that does not exist yet is written (the zero id as its old value): another
+    // process may have numbered one of this session's (a resumed session) since we counted.
+    const zero = "0".repeat(commit.length)
+    let n = await this.#nextNumber(session)
+    let ref = `${REF_PREFIX}${session}/${n}`
+    for (let attempt = 0; ; attempt++) {
+      const r = await git.exec(["update-ref", "--no-deref", ref, commit, zero], sig)
+      if (r.ok) break
+      if (attempt >= 5 || signal?.aborted) throw new Error(`git update-ref failed: ${firstLines(r.output) || `exit ${r.code}`}`)
+      const all = await this.#list(session)
+      n = Math.max(n, all.at(-1)?.n ?? 0) + 1
+      ref = `${REF_PREFIX}${session}/${n}`
+    }
     this.#next.set(session, n + 1)
     const count = this.#count.get(session)
     if (count !== undefined) this.#count.set(session, count + 1)

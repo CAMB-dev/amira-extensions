@@ -342,3 +342,21 @@ test("git variables of a git that started Amira, and the repository's hooks, do 
   expect(await git(dir, "for-each-ref", "--format=%(refname)", "refs/amira/")).toBe(`${REF_PREFIX}s_1/1\n`)
   expect(existsSync(marker)).toBe(false)
 })
+
+test("a checkpoint number another process took meanwhile is not overwritten", async () => {
+  const dir = await repo()
+  const a = await storeFor(dir)
+  const b = await storeFor(dir)
+  const one = (await a.store.create("s_1", { kind: "turn", turn: 1, prompt: "a" })).checkpoint!
+  write(dir, "a.txt", "two\n")
+  const two = (await b.store.create("s_1", { kind: "turn", turn: 2, prompt: "b" })).checkpoint!
+  write(dir, "a.txt", "three\n")
+  // a still counts #2 as the next; b has taken it.
+  const three = (await a.store.create("s_1", { kind: "turn", turn: 3, prompt: "a again" })).checkpoint!
+  expect([one.n, two.n, three.n]).toEqual([1, 2, 3])
+  expect((await a.store.list("s_1")).map((c) => [c.n, c.meta.prompt])).toEqual([
+    [1, "a"],
+    [2, "b"],
+    [3, "a again"],
+  ])
+})
