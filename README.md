@@ -19,6 +19,7 @@ moves every installed one to its newest commit, and `--project` installs into
 | [notify](extensions/notify/README.md) | Notifications when a long turn ends, a question waits or background agents finish: desktop (Windows, macOS, Linux) or webhooks (Telegram, Discord, WeCom, JSON) | `amira ext install notify` |
 | [share](extensions/share/README.md) | `/export` the session as Markdown or self-contained HTML, secrets redacted; `/commit`, `/pr` and `/review` git helpers | `amira ext install share` |
 | [browser](extensions/browser/README.md) | `browser_*` tools: the model opens pages (your dev server) in an installed Chrome or Edge, takes screenshots, clicks, types and reads the console | `amira ext install browser` |
+| [images](extensions/images/README.md) | Images in replies drawn in the terminal (Sixel, kitty, iTerm2): local files, and http(s) URLs with web_fetch's private-network protection | `amira ext install images` |
 
 <details>
 <summary>The index, writing a package, and adding one here</summary>

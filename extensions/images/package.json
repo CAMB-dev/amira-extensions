@@ -1,0 +1,27 @@
+{
+  "name": "images",
+  "version": "0.1.0",
+  "description": "Images in replies drawn in the terminal (Sixel, kitty, iTerm2): local files and http(s) URLs, decoded and encoded off the main thread",
+  "type": "module",
+  "scripts": {
+    "link-amira": "bun scripts/link-amira.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "fast-png": "^8.0.0",
+    "jpeg-js": "^0.4.4",
+    "omggif": "^1.0.10"
+  },
+  "amira": {
+    "engines": {
+      "amira": "^0.1.3"
+    },
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "@types/omggif": "^1.0.5"
+  }
+}
