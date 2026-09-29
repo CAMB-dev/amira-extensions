@@ -160,6 +160,7 @@ export function cleanLabel(raw: string): string {
   }
   s = s.replace(/<br\s*\/?>/gi, "\n")
   s = s.replace(/<\/?[a-zA-Z][^>]*>/g, "")
+  s = s.replace(/\bfa[bsrl]?:fa-[\w-]+\s*/g, "")
   s = s.replace(/#(\d+);/g, (_, n: string) => String.fromCodePoint(Number(n)))
   const named: Record<string, string> = { quot: '"', amp: "&", lt: "<", gt: ">", nbsp: " ", apos: "'" }
   s = s.replace(/[&#](quot|amp|lt|gt|nbsp|apos);/g, (_, n: string) => named[n] ?? "")
