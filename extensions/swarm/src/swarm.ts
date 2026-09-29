@@ -306,6 +306,26 @@ export class Swarm {
     return undefined
   }
 
+  /**
+   * Sends `text` from the user to every member that can still get messages (running, idle, or
+   * paused: a paused one gets it on resume). Like a direct message from the user it counts as
+   * progress and not against the limits; the timeline and the records keep it once, as a
+   * message to "all". Returns how many members it went to, or the problem.
+   */
+  tellAll(text: string): number | string {
+    if (!this.live) return `The swarm has ${this.#state === "ended" ? "ended" : "is ending"}.`
+    const body = oneLine(text) ? text.trim() : ""
+    if (!body) return "The message is empty."
+    const to = [...this.#members.values()].filter((m) => m.child.state !== "ended" && !m.stopping)
+    if (!to.length) return "No member can get messages any more: every one has ended or is stopping."
+    this.#progress()
+    this.#record({ type: "message", swarm: this.id, from: "user", to: "all", text: body, at: Date.now() })
+    this.#log({ kind: "message", from: "user", to: "all", text: body })
+    for (const m of to)
+      this.#hand(m, `[message from the user, to every member] ${body}`, `✉ user → all: ${body}`)
+    return to.length
+  }
+
   /** Holds the messages of one member (or, without a name, of every member) until resumed. */
   pause(name?: string): string | undefined {
     if (!this.live) return "The swarm is not running."
@@ -506,10 +526,15 @@ export class Swarm {
     this.#record({ type: "message", swarm: this.id, from, to: m.spec.name, text, at })
     this.#log({ kind: "message", from, to: m.spec.name, text })
     const who = from === "user" ? "the user" : from === "commander" ? "the commander" : from
+    this.#hand(m, `[message from ${who}] ${text}`, `✉ ${from}: ${text}`)
+  }
+
+  /** Hands a message to a member, or holds it while the member (or the swarm) is paused. */
+  #hand(m: Member, text: string, display: string) {
     const msg: UserMessage = {
       role: "user",
-      content: [{ type: "text", text: `[message from ${who}] ${text}` }],
-      display: { text: `✉ ${from}: ${clip(oneLine(text), 200)}`, origin: "swarm" },
+      content: [{ type: "text", text }],
+      display: { text: clip(oneLine(display), 200), origin: "swarm" },
     }
     if (m.paused || this.#state === "paused") m.held.push(msg)
     else this.#send$(m, msg)

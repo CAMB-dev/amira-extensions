@@ -9,6 +9,8 @@ export interface SwarmViewData {
   /** Absent for a swarm read back from the session, which only shows. */
   control?: {
     tell(to: string, text: string): string | undefined
+    /** A message to every member: how many it went to, or the problem. */
+    tellAll?(text: string): number | string
     pause(name?: string): string | undefined
     resume(name?: string): string | undefined
     stopMember(name: string): string | undefined
@@ -115,9 +117,13 @@ export const swarmView: ViewDefinition<SwarmViewData> = {
       key: "m",
       label: "message",
       run(data, view) {
-        void act(data, view, "Message a member (name: text)", (c, answer) => {
+        void act(data, view, "Message a member (name: text; all: every member)", (c, answer) => {
           const m = /^@?([A-Za-z][\w-]*)\s*[:,]?\s+([\s\S]+)$/.exec(answer)
           if (!m) return 'Write it as "name: text".'
+          if (m[1]!.toLowerCase() === "all" && c.tellAll) {
+            const sent = c.tellAll(m[2]!)
+            return typeof sent === "string" ? sent : `Sent to all (${sent} member${sent === 1 ? "" : "s"}).`
+          }
           return c.tell(m[1]!, m[2]!) ?? `Sent to ${m[1]}.`
         })
       },
