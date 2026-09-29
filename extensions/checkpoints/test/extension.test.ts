@@ -12,9 +12,9 @@ import {
 } from "@amira/api"
 import { Agent, EventBus, ExtensionHost, InterceptorRegistry, ToolRegistry } from "@amira/core"
 import { promptIndex } from "../src/format.ts"
-import { createCheckpointsExtension, parseRewindArgs, readSettings } from "../src/index.ts"
+import { type CheckpointsOptions, createCheckpointsExtension, parseRewindArgs, readSettings } from "../src/index.ts"
 import type { Checkpoint } from "../src/store.ts"
-import { git, repo, tmp, write } from "./helpers.ts"
+import { git, repo, run, tmp, write } from "./helpers.ts"
 
 setDefaultTimeout(60_000)
 
@@ -56,7 +56,7 @@ function model(req: ModelRequest) {
   return { text: i ? "done" : "ok" }
 }
 
-async function setup(settings: Record<string, unknown> = {}) {
+async function setup(settings: Record<string, unknown> = {}, options: CheckpointsOptions = {}) {
   const dir = await repo({ "a.txt": "v1\n", ".gitignore": "*.log\n" })
   const mock = createMockDialect()
   for (let i = 0; i < 100; i++) mock.push(model)
@@ -91,7 +91,7 @@ async function setup(settings: Record<string, unknown> = {}) {
   bus.subscribe((e) => void (e.type === "extension.error" && errors.push(e.data.error)), {
     types: ["extension.error"],
   })
-  expect(await host.load(createCheckpointsExtension(), "pkg:checkpoints")).toBe(true)
+  expect(await host.load(createCheckpointsExtension(options), "pkg:checkpoints")).toBe(true)
   const agent = new Agent({
     ai,
     model: ai.model("mock/m"),
@@ -380,4 +380,28 @@ test("a checkpoint's prompt is found by its text when the message object is not 
   // A turn cut off earlier is not matched to a later message of the same text.
   const cut = [u("more"), a]
   expect(promptIndex(cut, list[3]!, list, none)).toBeUndefined()
+})
+
+test("/rewind says which files it could not restore, and still how to go back", async () => {
+  let dir = ""
+  const t = await setup(
+    {},
+    {
+      // Like Windows with b.txt open elsewhere.
+      run: async (argv, o) => {
+        const r = await run(argv, o)
+        if (!argv.includes("restore")) return r
+        write(dir, "b.txt", "b3\n")
+        return { ...r, exitCode: 255, output: "error: unable to unlink old 'b.txt': Permission denied" }
+      },
+    },
+  )
+  dir = t.dir
+  await t.turn("write b.txt b1")
+  await t.turn("write a.txt v2; write b.txt b2")
+  const out = await t.command("rewind", "2 --yes")
+  expect(out).toContain("Restored 1 file from checkpoint #2: a.txt")
+  expect(out).toContain("Could not restore 1 file (open in another program?): b.txt (git: error: unable to unlink old 'b.txt'")
+  expect(out).toContain("The files as they were are checkpoint #3; /rewind 3 goes back to them.")
+  expect(t.read("a.txt")).toBe("v1\n")
 })

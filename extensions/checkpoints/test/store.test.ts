@@ -360,3 +360,79 @@ test("a checkpoint number another process took meanwhile is not overwritten", as
     [3, "a again"],
   ])
 })
+test("a restore keeps an ignored file it replaces in the safety checkpoint, and leaves one too large alone", async () => {
+  const dir = await repo({ "a.txt": "a\n" })
+  write(dir, "cache.tmp", "from the checkpoint\n")
+  write(dir, "big.tmp", "small then\n")
+  const { store } = await storeFor(dir, { maxFileBytes: 1000 })
+  const first = (await store.create("s_1", { kind: "turn", turn: 1 })).checkpoint!
+  expect(await listTree(dir, first.commit)).toEqual(["a.txt", "big.tmp", "cache.tmp"])
+  // Both become ignored, so later snapshots leave them out; the user's versions are on disk only.
+  write(dir, ".gitignore", "*.tmp\n")
+  write(dir, "cache.tmp", "the user's own\n")
+  write(dir, "big.tmp", "x".repeat(2000))
+
+  const r = await store.restore("s_1", first)
+  expect(r.kept).toEqual(["cache.tmp"])
+  expect(r.left).toEqual(["big.tmp"])
+  expect(r.restored.map((c) => `${c.status} ${c.path}`).sort()).toEqual(["A cache.tmp", "D .gitignore"])
+  expect(await git(dir, "show", `${r.safety.commit}:cache.tmp`)).toBe("the user's own\n")
+  expect(tree(dir)["cache.tmp"]).toBe(Buffer.from("from the checkpoint\n").toString("hex"))
+  expect(tree(dir)["big.tmp"]).toBe(Buffer.from("x".repeat(2000)).toString("hex"))
+  // Going back to the safety checkpoint brings the user's version back.
+  await store.restore("s_1", r.safety)
+  expect(tree(dir)["cache.tmp"]).toBe(Buffer.from("the user's own\n").toString("hex"))
+  // The ignored file was not added to later snapshots.
+  write(dir, "a.txt", "changed\n")
+  const later = (await store.create("s_1", { kind: "turn", turn: 2 })).checkpoint!
+  expect(await listTree(dir, later.commit)).toEqual([".gitignore", "a.txt"])
+})
+
+test("a restore of a file where a directory of ignored files now is keeps them first", async () => {
+  const dir = await repo({ "a.txt": "a\n", ".gitignore": "*.o\n" })
+  write(dir, "out", "a file then\n")
+  const { store } = await storeFor(dir, { maxUntrackedFiles: 3 })
+  const first = (await store.create("s_1", { kind: "turn", turn: 1 })).checkpoint!
+  rmSync(path.join(dir, "out"))
+  write(dir, "out/one.o", "1\n")
+  write(dir, "out/two.o", "2\n")
+  write(dir, "gen/x.o", "x\n")
+  const r = await store.restore("s_1", first)
+  expect(r.kept).toEqual(["out"])
+  expect(r.left).toEqual([])
+  expect(tree(dir)["out"]).toBe(Buffer.from("a file then\n").toString("hex"))
+  expect(await listTree(dir, r.safety.commit)).toEqual([".gitignore", "a.txt", "out/one.o", "out/two.o"])
+  await store.restore("s_1", r.safety)
+  expect(tree(dir)["out/one.o"]).toBe(Buffer.from("1\n").toString("hex"))
+  expect(tree(dir)["out/two.o"]).toBe(Buffer.from("2\n").toString("hex"))
+
+  // Beyond maxUntrackedFiles the directory is left as it is.
+  for (let i = 0; i < 4; i++) write(dir, `out/more${i}.o`, `${i}\n`)
+  const again = await store.restore("s_1", first)
+  expect(again.left).toEqual(["out"])
+  expect(again.restored).toEqual([])
+  expect(tree(dir)["out/more3.o"]).toBe(Buffer.from("3\n").toString("hex"))
+})
+
+test("files a restore could not write are reported, with the safety checkpoint", async () => {
+  const dir = await repo({ "a.txt": "a1\n", "b.txt": "b1\n" })
+  // Like Windows with b.txt open elsewhere: git restore writes the rest and fails.
+  const stubborn: typeof run = async (argv, o) => {
+    const r = await run(argv, o)
+    if (!argv.includes("restore")) return r
+    write(dir, "b.txt", "b2\n")
+    return { ...r, exitCode: 255, output: "error: unable to unlink old 'b.txt': Permission denied" }
+  }
+  const r0 = await openRepo(stubborn, { cwd: dir, home: tmp("home"), shadow: true, timeoutMs: 60_000 })
+  if ("disabled" in r0) throw new Error(r0.disabled)
+  const store = new CheckpointStore(r0)
+  const first = (await store.create("s_1", { kind: "turn", turn: 1 })).checkpoint!
+  write(dir, "a.txt", "a2\n")
+  write(dir, "b.txt", "b2\n")
+  const r = await store.restore("s_1", first)
+  expect(r.failed).toEqual(["b.txt"])
+  expect(r.restored.map((c) => c.path)).toEqual(["a.txt"])
+  expect(r.error).toContain("unable to unlink")
+  expect(r.safety.meta.kind).toBe("restore")
+  expect(tree(dir)["a.txt"]).toBe(Buffer.from("a1\n").toString("hex"))
+})

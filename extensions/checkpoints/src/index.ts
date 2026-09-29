@@ -448,16 +448,33 @@ export function createCheckpointsExtension(options: CheckpointsOptions = {}) {
       }
 
       const out: string[] = []
+      let warn = false
       if (changes.length) {
-        const { safety, restored } = await s.restore(session, target, {
+        const r = await s.restore(session, target, {
           ...(paths ? { paths } : {}),
           ...(turn !== undefined ? { turn } : {}),
           keep: settings.keep + 1,
         })
-        const names = restored.map((c) => c.path)
+        const names = (list: string[]) => clip(list.join(", "), 300)
+        if (r.restored.length || !(r.failed.length || r.left.length)) {
+          out.push(
+            `Restored ${files(r.restored.length)} from checkpoint #${target.n}: ${names(r.restored.map((c) => c.path))}`,
+          )
+        }
+        if (r.failed.length) {
+          warn = true
+          out.push(
+            `Could not restore ${files(r.failed.length)} (open in another program?): ${names(r.failed)}${r.error ? ` (git: ${clip(r.error, 200)})` : ""}`,
+          )
+        }
+        if (r.left.length) {
+          warn = true
+          out.push(
+            `Left as they are: ${names(r.left)}. What is there now is in no checkpoint (ignored or too large), and too large to keep before replacing it.`,
+          )
+        }
         out.push(
-          `Restored ${files(restored.length)} from checkpoint #${target.n}: ${clip(names.join(", "), 300)}`,
-          `The files as they were are checkpoint #${safety.n}; /rewind ${safety.n} goes back to them.`,
+          `The files as they were are checkpoint #${r.safety.n}${r.kept.length ? ` (with ${names(r.kept)}, which no checkpoint held before)` : ""}; /rewind ${r.safety.n} goes back to them.`,
         )
       }
       if (choice === bothLabel && index !== undefined) {
@@ -474,7 +491,7 @@ export function createCheckpointsExtension(options: CheckpointsOptions = {}) {
           out.push(`The conversation was not rewound: ${err instanceof Error ? err.message : String(err)}`)
         }
       }
-      ctx.print(out.join("\n"))
+      ctx.print(out.join("\n"), warn ? "warning" : undefined)
     }
   }
 }

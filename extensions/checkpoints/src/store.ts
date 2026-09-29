@@ -1,4 +1,4 @@
-import { lstatSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { copyFileSync, type Dirent, lstatSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import { firstLines, type Repo, zsplit } from "./git.ts"
 
@@ -75,6 +75,32 @@ export interface Change {
   status: string
   oldMode: string
   newMode: string
+}
+
+/** What a restore did. */
+export interface RestoreResult {
+  /** The checkpoint of the files as they were before. */
+  safety: Checkpoint
+  /** What was written (or removed) as the checkpoint has it. */
+  restored: Change[]
+  /**
+   * Paths left as they are: the restore would have replaced something no snapshot holds (an
+   * ignored or too large file, a directory), too large to add to the safety checkpoint.
+   */
+  left: string[]
+  /** Such paths that were added to the safety checkpoint, so the restore could replace them. */
+  kept: string[]
+  /** Paths git could not write (e.g. a file open in another program). */
+  failed: string[]
+  /** Git's message when some could not be written. */
+  error?: string
+}
+
+/** Something on disk that no snapshot holds, which a restore would replace. */
+interface Risk {
+  /** The file, or the directory, the restore would replace. */
+  path: string
+  files: { path: string; size: number }[]
 }
 
 /** Checkpoints are off here, for a reason worth telling the user once. */
@@ -383,34 +409,129 @@ export class CheckpointStore {
 
   /**
    * Restores checkpoint `target` to the work tree, only under `paths` when given. Takes a
-   * checkpoint of the current state first (returned as `safety`), so nothing is lost.
-   * Submodules are left as they are.
+   * checkpoint of the current state first (returned as `safety`), so nothing is lost: what the
+   * restore would replace that no snapshot holds (an ignored or too large file where the
+   * checkpoint has one, a directory where it has a file) is added to it, or, beyond the
+   * limits, left as it is (`left`). Submodules are left as they are. Once the safety
+   * checkpoint is taken this does not throw: what could not be written is in `failed`.
    */
   restore(
     session: string,
     target: Checkpoint,
     opts: { paths?: string[]; turn?: number; keep?: number } = {},
-  ): Promise<{ safety: Checkpoint; restored: Change[] }> {
+  ): Promise<RestoreResult> {
     return this.#locked(async () => {
       const scan = await this.#scan()
+      const changes = (await this.#changes(scan.tree, target.tree, opts.paths ?? [])).filter(
+        (c) => c.oldMode !== GITLINK && c.newMode !== GITLINK,
+      )
+      const risk = this.#unsnapshotted(changes)
+      const { keep, left } = this.#fit(risk)
+      const leftOut = (p: string) => left.some((l) => p === l || p.startsWith(`${l}/`))
+      const restored = changes.filter((c) => c.status !== "A" || !leftOut(c.path))
+      const tree = keep.length ? await this.#withForced(keep.map((r) => r.path)) : scan.tree
       const prev = await this.#latest(session)
-      const safety = await this.#commit(session, scan.tree, prev, {
+      const safety = await this.#commit(session, tree, prev, {
         kind: "restore",
         note: `before restoring #${target.n}${opts.paths?.length ? ` (${opts.paths.join(", ")})` : ""}`,
         ...(opts.turn !== undefined ? { turn: opts.turn } : {}),
       })
-      const restored = (await this.#changes(scan.tree, target.tree, opts.paths ?? [])).filter(
-        (c) => c.oldMode !== GITLINK && c.newMode !== GITLINK,
-      )
-      if (restored.length) await this.#write(target, scan.tree, restored)
+      const out: RestoreResult = { safety, restored, left, kept: keep.map((r) => r.path), failed: [] }
+      try {
+        const error = restored.length ? await this.#write(target, scan.tree, restored) : undefined
+        if (error) {
+          out.error = error
+          out.failed = await this.#differing(target, restored)
+          out.restored = restored.filter((c) => !out.failed.includes(c.path))
+        }
+      } catch (err) {
+        out.error = err instanceof Error ? err.message : String(err)
+        out.failed = restored.map((c) => c.path)
+        out.restored = []
+      }
       // The safety checkpoint itself is never pruned right away: it is the newest.
-      if (opts.keep) await this.#prune(session, opts.keep)
-      return { safety, restored }
+      if (opts.keep) await this.#prune(session, opts.keep).catch(() => 0)
+      return out
     })
   }
 
-  /** Writes `changes` from `target` into the work tree; `current` is the tree it has now. */
-  async #write(target: Checkpoint, current: string, changes: Change[]) {
+  /**
+   * What a restore of `changes` would replace that is on disk but in no snapshot: where the
+   * checkpoint has a path the current snapshot lacks (status A), whatever is there now (a file
+   * left out as ignored or too large, a directory), or a file where it needs a directory.
+   */
+  #unsnapshotted(changes: Change[]): Risk[] {
+    const { root } = this.repo
+    const deleted = new Set(changes.filter((c) => c.status === "D").map((c) => c.path))
+    const found = new Map<string, Risk>()
+    for (const c of changes) {
+      if (c.status !== "A") continue
+      const parts = c.path.split("/")
+      for (let i = 1; i <= parts.length; i++) {
+        const rel = parts.slice(0, i).join("/")
+        if (found.has(rel)) break
+        let st: ReturnType<typeof lstatSync>
+        try {
+          st = lstatSync(path.join(root, rel))
+        } catch {
+          break
+        }
+        if (i < parts.length && st.isDirectory()) continue
+        // A file in the current snapshot is in the diff as deleted: it is safe.
+        if (deleted.has(rel)) break
+        const files = st.isDirectory()
+          ? walk(root, rel, this.limits.maxUntrackedFiles + 1).filter((f) => !deleted.has(f.path))
+          : [{ path: rel, size: st.size }]
+        if (files.length) found.set(rel, { path: rel, files })
+        break
+      }
+    }
+    return [...found.values()]
+  }
+
+  /** Which of `risk` fit in the limits for untracked files, and which are to be left alone. */
+  #fit(risk: Risk[]): { keep: Risk[]; left: string[] } {
+    const keep: Risk[] = []
+    const left: string[] = []
+    let count = 0
+    let bytes = 0
+    for (const r of risk) {
+      const size = r.files.reduce((s, f) => s + f.size, 0)
+      const fits =
+        r.files.every((f) => f.size <= this.limits.maxFileBytes) &&
+        count + r.files.length <= this.limits.maxUntrackedFiles &&
+        bytes + size <= this.limits.maxUntrackedBytes
+      if (fits) {
+        keep.push(r)
+        count += r.files.length
+        bytes += size
+      } else left.push(r.path)
+    }
+    return { keep, left }
+  }
+
+  /** The tree of our index with `paths` added even when ignored, without changing our index. */
+  async #withForced(paths: string[]): Promise<string> {
+    const { git } = this.repo
+    const index = this.#scratchFile("forced.index")
+    const list = this.#scratchFile("forced")
+    try {
+      copyFileSync(this.repo.index, index)
+      writeFileSync(list, `${paths.join("\0")}\0`)
+      const env = { GIT_INDEX_FILE: index, GIT_LITERAL_PATHSPECS: "1" }
+      await git.must(["add", "-f", `--pathspec-from-file=${list}`, "--pathspec-file-nul"], { env })
+      return (await git.must(["write-tree"], { env, stdoutOnly: true })).trim()
+    } finally {
+      rmSync(index, { force: true })
+      rmSync(list, { force: true })
+    }
+  }
+
+  /**
+   * Writes `changes` from `target` into the work tree; `current` is the tree it has now.
+   * Returns git's message when it could not write some of them (a file open elsewhere).
+   */
+  async #write(target: Checkpoint, current: string, changes: Change[]): Promise<string | undefined> {
     const { git } = this.repo
     const index = this.#scratchFile("restore.index")
     const list = this.#scratchFile("restore")
@@ -419,7 +540,7 @@ export class CheckpointStore {
       // and the source does not have. Its index is a throwaway copy of the current state.
       await git.must(["read-tree", current], { env: { GIT_INDEX_FILE: index } })
       writeFileSync(list, `${changes.map((c) => c.path).join("\0")}\0`)
-      await git.must(
+      const r = await git.exec(
         [
           "restore",
           `--source=${target.commit}`,
@@ -430,10 +551,44 @@ export class CheckpointStore {
         ],
         { env: { GIT_INDEX_FILE: index, GIT_LITERAL_PATHSPECS: "1" } },
       )
+      return r.ok ? undefined : firstLines(r.output) || `git restore failed: exit ${r.code}`
     } finally {
       rmSync(index, { force: true })
       rmSync(list, { force: true })
     }
+  }
+
+  /** Which of `changes` the work tree does not have as `target` has them. */
+  async #differing(target: Checkpoint, changes: Change[]): Promise<string[]> {
+    const { git, root } = this.repo
+    const failed = new Set<string>()
+    // A path the checkpoint has that is not on disk was not written; the rest are compared.
+    const check: string[] = []
+    for (const c of changes) {
+      if (c.status === "A" && !lexists(path.join(root, c.path))) failed.add(c.path)
+      else check.push(c.path)
+    }
+    if (check.length) {
+      const index = this.#scratchFile("check.index")
+      const list = this.#scratchFile("check")
+      try {
+        // A copy of our index (the state before the restore), updated for these paths only,
+        // ignored or not: its tree against the checkpoint's.
+        copyFileSync(this.repo.index, index)
+        writeFileSync(list, `${check.join("\0")}\0`)
+        const env = { GIT_INDEX_FILE: index, GIT_LITERAL_PATHSPECS: "1" }
+        await git.must(["add", "-f", "-A", `--pathspec-from-file=${list}`, "--pathspec-file-nul"], { env })
+        const tree = (await git.must(["write-tree"], { env, stdoutOnly: true })).trim()
+        const wanted = new Set(check)
+        for (const p of await this.#names(tree, target.tree, [])) if (wanted.has(p)) failed.add(p)
+      } catch {
+        for (const p of check) failed.add(p)
+      } finally {
+        rmSync(index, { force: true })
+        rmSync(list, { force: true })
+      }
+    }
+    return changes.map((c) => c.path).filter((p) => failed.has(p))
   }
 
   /** Keeps the newest `keep` checkpoints of a session. */
@@ -463,6 +618,43 @@ export class CheckpointStore {
       }
       return old.length
     })
+  }
+}
+
+/** The files under directory `rel` (repository-relative), at most `limit` of them. */
+function walk(root: string, rel: string, limit: number): { path: string; size: number }[] {
+  const out: { path: string; size: number }[] = []
+  const visit = (dir: string) => {
+    let entries: Dirent[]
+    try {
+      entries = readdirSync(path.join(root, dir), { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const e of entries) {
+      if (out.length >= limit) return
+      const p = `${dir}/${e.name}`
+      if (e.isDirectory()) visit(p)
+      else {
+        let size = 0
+        try {
+          size = lstatSync(path.join(root, p)).size
+        } catch {}
+        out.push({ path: p, size })
+      }
+    }
+  }
+  visit(rel)
+  return out
+}
+
+/** Whether something (a broken symlink too) is at `file`. */
+function lexists(file: string): boolean {
+  try {
+    lstatSync(file)
+    return true
+  } catch {
+    return false
   }
 }
 
