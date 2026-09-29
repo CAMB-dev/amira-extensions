@@ -21,9 +21,9 @@ export interface SwarmViewData {
 }
 
 const STATUS_MARK: Record<MemberView["status"], string> = {
-  queued: "○",
+  queued: "◌",
   working: "●",
-  idle: "◌",
+  idle: "○",
   paused: "‖",
   ended: "✓",
 }
@@ -33,7 +33,7 @@ const oneLine = (s: string) => s.replace(/\s+/g, " ").trim()
 
 function elapsed(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000))
-  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`
 }
 
 export function timelineLine(e: TimelineEntry): ViewLine {
@@ -43,14 +43,14 @@ export function timelineLine(e: TimelineEntry): ViewLine {
       return {
         kind: e.from === "user" ? "accent" : "text",
         // The user reads this view: their own messages are "you → …".
-        text: `${t} ✉ ${e.from === "user" ? "you" : e.from} → ${e.to}: ${oneLine(e.text)}`,
+        text: `${t} ✉️ ${e.from === "user" ? "you" : e.from} → ${e.to}: ${oneLine(e.text)}`,
       }
     case "board":
       return { kind: "success", text: `${t} ✎ ${e.from} wrote ${e.key}: ${oneLine(e.text)}` }
     case "finish":
       return { kind: "success", text: `${t} ✓ ${e.from} finished: ${oneLine(e.text)}` }
     case "end":
-      return { kind: "warning", text: `${t} ■ ended: ${e.text}` }
+      return { kind: "warning", text: `${t} ⊘ ended: ${e.text}` }
     default:
       return { kind: "muted", text: `${t} · ${e.text}` }
   }
@@ -160,14 +160,34 @@ export const swarmView: ViewDefinition<SwarmViewData> = {
       key: "s",
       label: "stop swarm",
       run(data, view) {
-        void act(data, view, 'Type "yes" to stop the whole swarm', (c, answer) => {
-          if (answer.toLowerCase() !== "yes") return "Not stopped."
-          c.stop()
-          return "Stopping the swarm."
+        const c = data.control
+        const s = data.snapshot()
+        if (!c || !s || s.state === "ended" || s.state === "ending") {
+          data.flash = "The swarm is not running."
+          view.requestRender()
+          return
+        }
+        // Stopping ends every member: the user says so first, as for a sub-agent or a workflow.
+        void confirmStop(view, "Stop the whole swarm?").then((yes) => {
+          if (yes) c.stop()
+          data.flash = yes ? "Stopping the swarm." : "Not stopped."
+          view.requestRender()
         })
       },
     },
   ],
+}
+
+/**
+ * Asks the user to confirm stopping, at the bottom of the view: "Stop …? y stops it · any other
+ * key keeps it running" (ViewControl.confirm, API 0.1.4). A frontend without it asks for "yes"
+ * to be typed instead.
+ */
+export async function confirmStop(view: ViewControl, question: string): Promise<boolean> {
+  if (typeof view.confirm === "function")
+    return view.confirm(question, { yes: "stops it", no: "keeps it running" })
+  const answer = await view.prompt(`${question} Type "yes" to stop it:`)
+  return answer?.toLowerCase() === "yes"
 }
 
 async function act(
