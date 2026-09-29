@@ -1,0 +1,19 @@
+{
+  "name": "mermaid",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "test": "bun test"
+  },
+  "amira": {
+    "engines": {
+      "amira": "^0.1.3"
+    },
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2"
+  }
+}
