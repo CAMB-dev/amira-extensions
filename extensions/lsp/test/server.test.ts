@@ -131,6 +131,13 @@ test("a server that answers textDocument/diagnostic is asked directly", async ()
   expect(r.fresh).toBe(true)
   expect(r.diagnostics.map((d) => d.severity)).toEqual([3, 1])
   expect(received().some((m) => m.method === "textDocument/diagnostic")).toBe(true)
+
+  // A request with a signal already aborted is not sent and does not wait out its timeout.
+  const aborted = AbortSignal.abort()
+  const started = Date.now()
+  await expect(c.request("textDocument/diagnostic", {}, 30_000, aborted)).rejects.toThrow("aborted")
+  expect(await c.diagnostics(file, { waitMs: 30_000, signal: aborted })).toMatchObject({ fresh: false })
+  expect(Date.now() - started).toBeLessThan(2000)
 })
 
 test("a silent server times out with fresh: false; a missing program fails to start", async () => {

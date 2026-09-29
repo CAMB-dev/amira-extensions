@@ -187,6 +187,7 @@ export class LspClient {
     if (this.state === "failed" || this.state === "closed" || !this.#pipe) {
       return Promise.reject(new Error(`the ${this.#opts.argv[0]} server is not running`))
     }
+    if (signal?.aborted) return Promise.reject(new Error("aborted"))
     const id = this.#nextId++
     const { promise, resolve, reject } = Promise.withResolvers<unknown>()
     const entry: Pending = { resolve, reject, timer: undefined }
