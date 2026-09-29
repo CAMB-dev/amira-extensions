@@ -22,6 +22,10 @@ test("Windows paths become file URIs with the drive's colon kept, and come back 
   expect(pathToUri("C:\\Users\\me\\my project\\a#1.ts", true)).toBe(
     "file:///C:/Users/me/my%20project/a%231.ts",
   )
+  // One URI per file, whatever case the drive letter came in.
+  expect(pathToUri("c:\\Users\\me\\a.ts", true)).toBe("file:///C:/Users/me/a.ts")
+  expect(pathToUri("c:/Users/me/./x/../a.ts", true)).toBe("file:///C:/Users/me/a.ts")
+  expect(uriKey(pathToUri("c:\\Users\\me\\a.ts", true), true)).toBe(fileKey("C:\\Users\\me\\a.ts", true))
   expect(pathToUri("\\\\server\\share\\x.ts", true)).toBe("file://server/share/x.ts")
   expect(pathToUri("/home/me/a b.ts", false)).toBe("file:///home/me/a%20b.ts")
   for (const uri of ["file:///C:/Users/me/a.ts", "file:///c%3A/Users/me/a.ts", "file:///c:/users/ME/a.ts"]) {

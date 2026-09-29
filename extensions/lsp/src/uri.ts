@@ -5,14 +5,16 @@ const WIN = process.platform === "win32"
 /**
  * A file URI for an absolute path, as the LSP spec writes them: `file:///C:/a/b.ts` on
  * Windows (UNC paths as `file://server/share/...`), `file:///a/b.ts` elsewhere. Each segment
- * is percent-encoded; a drive letter's colon is not.
+ * is percent-encoded; a drive letter's colon is not. The drive letter is always upper case,
+ * so `c:\x` and `C:\x` give a server one URI, not two documents.
  */
 export function pathToUri(p: string, win = WIN): string {
   const encode = (segments: string) => segments.split("/").map(encodeURIComponent).join("/")
   if (win) {
-    const slashed = p.replace(/\\/g, "/")
+    const slashed = path.win32.resolve(p).replace(/\\/g, "/")
     if (slashed.startsWith("//")) return `file://${encode(slashed.slice(2))}`
-    if (/^[A-Za-z]:\//.test(slashed)) return `file:///${slashed.slice(0, 3)}${encode(slashed.slice(3))}`
+    if (/^[A-Za-z]:\//.test(slashed))
+      return `file:///${slashed[0]!.toUpperCase()}:/${encode(slashed.slice(3))}`
   }
   return `file://${encode(p)}`
 }
