@@ -384,10 +384,19 @@ export class BrowserSession {
         const page = await ctx.newPage()
         page.on("dialog", (d) => void d.dismiss().catch(() => {}))
         await page.setContent(req.html, { waitUntil: "load", timeout: req.timeoutMs })
-        await page.evaluate(async () => {
+        // A rejection comes back as its message: the error itself may not be serializable.
+        const failed = await page.evaluate(async () => {
           const done = (globalThis as { amiraRenderDone?: unknown }).amiraRenderDone
-          if (done && typeof (done as Promise<unknown>).then === "function") await done
+          if (!done || typeof (done as Promise<unknown>).then !== "function") return null
+          try {
+            await done
+            return null
+          } catch (err) {
+            const message = (err as { message?: unknown } | null)?.message
+            return String(typeof message === "string" ? message : err).slice(0, 2000)
+          }
         })
+        if (failed !== null) throw new Error(`the page failed: ${failed}`)
         const png = req.selector
           ? await page.locator(req.selector).first().screenshot({ type: "png", timeout: req.timeoutMs })
           : await page.screenshot({ type: "png", fullPage: req.height === undefined, timeout: req.timeoutMs })
