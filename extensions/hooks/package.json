@@ -1,0 +1,26 @@
+{
+  "name": "hooks",
+  "version": "0.1.0",
+  "description": "Hooks: your commands on Amira's events, e.g. a formatter after each edit, a guard before risky shell commands, tests after a turn",
+  "type": "module",
+  "scripts": {
+    "link-amira": "bun scripts/link-amira.ts",
+    "test": "bun test",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "biome check .",
+    "check": "bun run typecheck && bun run lint && bun test"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.14",
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2"
+  },
+  "amira": {
+    "engines": {
+      "amira": "^0.1.1"
+    },
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}

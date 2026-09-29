@@ -27,6 +27,15 @@
       "engines": { "amira": "^0.1.1" },
       "tags": ["agents", "swarm", "multi-agent", "orchestration"],
       "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/swarm"
+    },
+    {
+      "name": "hooks",
+      "description": "Hooks: your commands on events, e.g. a formatter after each edit, a guard that blocks or asks before risky shell commands, tests after a turn",
+      "version": "0.1.0",
+      "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/hooks" },
+      "engines": { "amira": "^0.1.1" },
+      "tags": ["hooks", "formatter", "lint", "guard", "automation"],
+      "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/hooks"
     }
   ]
 }
