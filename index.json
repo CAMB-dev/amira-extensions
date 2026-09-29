@@ -36,6 +36,15 @@
       "engines": { "amira": "^0.1.2" },
       "tags": ["lsp", "diagnostics", "typescript", "python", "rust", "go", "csharp"],
       "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/lsp"
+    },
+    {
+      "name": "notify",
+      "description": "Notifications when Amira needs you: a long turn ended, a question waits, background agents finished; Windows/macOS/Linux desktop, Telegram, Discord, WeCom or any JSON webhook",
+      "version": "0.1.0",
+      "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/notify" },
+      "engines": { "amira": "^0.1.1" },
+      "tags": ["notifications", "webhook", "telegram", "discord", "wecom", "desktop"],
+      "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/notify"
     }
   ]
 }

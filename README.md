@@ -18,6 +18,7 @@ amira ext remove mcp-server
 | [workflow](extensions/workflow) | `/workflow` and a `workflow` tool: TypeScript scripts that orchestrate many sub-agents, with limits, a progress view and resume |
 | [swarm](extensions/swarm) | `/swarm <goal>`: long-lived agents that work together through a shared blackboard and messages |
 | [lsp](extensions/lsp) | Language server diagnostics: errors in the files the model just changed go back to it, plus a `diagnostics` tool and `/lsp` |
+| [notify](extensions/notify) | Notifications when a long turn ends, a question waits or background agents finish: desktop (Windows, macOS, Linux) or webhooks (Telegram, Discord, WeCom, JSON) |
 
 ## The index
 
