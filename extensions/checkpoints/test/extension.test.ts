@@ -540,3 +540,36 @@ test("attributes in .git/info/attributes, which still apply, are pointed out onc
   await t.turn("write a.txt v4")
   expect(t.errors).toEqual([expect.stringMatching(/info[\\/]attributes sets git attributes, and they apply to checkpoints too/)])
 })
+
+test("a turn's message is found again when the conversation changed while the dialog was open", async () => {
+  const t = await setup()
+  await t.turn("write a.txt v2")
+  await t.turn("write a.txt v3")
+  let expected = -1
+  const out = await t.command("rewind", "2", {
+    ui: {
+      reviewDiff: async (_title, _diff, options) => {
+        // Something is added to the conversation meanwhile (a compaction, a notice...).
+        t.agent.messages.unshift(userMessage("from before"))
+        expected = t.agent.messages.findIndex((m) => textOf(m) === "write a.txt v3")
+        return options[1]
+      },
+    },
+  })
+  expect(out).toContain("The conversation is back to before turn 2.")
+  expect(t.rewound).toEqual([expected])
+})
+
+test("a remembered message that is no longer the same object is found by its text", () => {
+  const cp: Checkpoint = {
+    session: "s",
+    n: 1,
+    ref: "",
+    commit: "",
+    tree: "",
+    meta: { v: 1, kind: "turn", ts: 1, turn: 1, turnId: "t_1", prompt: "fix it", changed: [], changedCount: -1 },
+  }
+  const messages: Message[] = [userMessage("hello"), userMessage("fix it")]
+  // The host holds a copy of the message the turn started with.
+  expect(promptIndex(messages, cp, [cp], new Map([["t_1", userMessage("fix it")]]))).toBe(1)
+})

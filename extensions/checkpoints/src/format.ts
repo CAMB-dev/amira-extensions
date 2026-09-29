@@ -59,7 +59,8 @@ export function promptIndex(
   const known = target.meta.turnId ? prompts.get(target.meta.turnId) : undefined
   if (known) {
     const i = messages.indexOf(known)
-    return i >= 0 ? i : undefined
+    if (i >= 0) return i
+    // Not that object any more (the host may hold copies): by its text then.
   }
   const turns = list.filter((c) => c.session === target.session && c.meta.kind === "turn" && c.n >= target.n)
   turns.sort((a, b) => b.n - a.n)

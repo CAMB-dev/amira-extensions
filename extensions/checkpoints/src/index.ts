@@ -567,7 +567,10 @@ export function createCheckpointsExtension(options: CheckpointsOptions = {}) {
       }
       if (choice === bothLabel && index !== undefined) {
         try {
-          await ctx.session.rewind!(index)
+          // The conversation may have changed while the dialog was open: where the turn is now.
+          const at = promptIndex(ctx.session.messages(), target, list, prompts)
+          if (at === undefined) throw new Error("its turn is no longer in the conversation")
+          await ctx.session.rewind!(at)
           if (turn !== undefined) nextTurn.set(session, turn)
           out.push(
             `The conversation is back to before turn ${turn}. Its message was: “${clip(oneLine(target.meta.prompt ?? ""), 200)}”`,
