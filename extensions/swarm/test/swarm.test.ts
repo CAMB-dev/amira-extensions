@@ -20,6 +20,7 @@ import {
   type SwarmLimits,
 } from "../src/index.ts"
 import { type MemberSpec, Swarm, type SwarmRecord, swarmsFromRecords } from "../src/swarm.ts"
+import { timelineLine } from "../src/view.ts"
 
 setDefaultTimeout(30_000)
 
@@ -1038,6 +1039,7 @@ test("@all from the input box reaches every member; the timeline keeps it once",
   const messages = past!.timeline.filter((e) => e.kind === "message")
   expect(messages).toHaveLength(1)
   expect(messages[0]).toMatchObject({ from: "user", to: "all", text: "check in" })
+  expect(timelineLine(messages[0]!).text).toMatch(/✉ you → all: check in$/)
   // Once it ended, @all goes to the model again.
   expect(host.inputs.claim("@all again")).toBeUndefined()
 })

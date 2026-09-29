@@ -42,7 +42,8 @@ export function timelineLine(e: TimelineEntry): ViewLine {
     case "message":
       return {
         kind: e.from === "user" ? "accent" : "text",
-        text: `${t} ✉ ${e.from} → ${e.to}: ${oneLine(e.text)}`,
+        // The user reads this view: their own messages are "you → …".
+        text: `${t} ✉ ${e.from === "user" ? "you" : e.from} → ${e.to}: ${oneLine(e.text)}`,
       }
     case "board":
       return { kind: "success", text: `${t} ✎ ${e.from} wrote ${e.key}: ${oneLine(e.text)}` }
