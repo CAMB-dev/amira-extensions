@@ -764,7 +764,7 @@ function memberSystemPrompt(
       "How the swarm works:",
       "- The blackboard is the swarm's shared memory. Put plans, findings, drafts and decisions there (blackboard_write) and read what the others wrote (blackboard_read) before you start and when woken. Prefer it over long messages.",
       '- send_message(to, text) reaches one member, or "commander" (who started the swarm) for questions only it can answer. Keep messages short and actionable; never send thanks, greetings or acknowledgements.',
-      '- After each turn you go idle; a message wakes you. Messages reach you as "[message from <name>] ...". Never wait for others inside a turn (no sleep commands, no re-reading the blackboard in a loop): when you need someone else's work, end your turn; their message wakes you.',
+      '- After each turn you go idle; a message wakes you. Messages reach you as "[message from <name>] ...". Never wait for others inside a turn (no sleep commands, no re-reading the blackboard in a loop): when you need the work of someone else, end your turn; their message wakes you.',
       "- When your part is done, call finish(result) with a short summary, then end your turn.",
       `- The swarm ends once every member is idle and no message is on its way. Limits: ${limits.maxMessagesPerMember} messages per member, ${limits.maxTurnsPerMember} turns per member.`,
     ].join("\n"),
