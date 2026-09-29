@@ -17,9 +17,15 @@ export interface SwarmLimits {
   maxPairExchanges: number
   /** Members working at once; the agent tree's own limit still applies. */
   maxConcurrent?: number
-  /** Tokens and cost the whole swarm may spend (cut to what the tree has left). */
+  /**
+   * Tokens and cost the whole swarm's agents may spend (cut to what the tree has left). The
+   * commander's own turns, answering members, are the main session's and not counted here.
+   */
   budget?: Budget
 }
+
+/** Tokens a swarm may spend unless the settings say otherwise: cache reads count too. */
+export const DEFAULT_BUDGET_TOKENS = 3_000_000
 
 export const DEFAULT_LIMITS: SwarmLimits = {
   maxMessagesPerMember: 30,
@@ -27,6 +33,7 @@ export const DEFAULT_LIMITS: SwarmLimits = {
   maxTurnsPerMember: 20,
   noProgressRounds: 3,
   maxPairExchanges: 8,
+  budget: { tokens: DEFAULT_BUDGET_TOKENS },
 }
 
 /** The extension's settings: `extensions.swarm` in settings.json. */

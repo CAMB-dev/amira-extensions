@@ -1,11 +1,20 @@
 import { expect, setDefaultTimeout, test } from "bun:test"
 import { createAi, createMockDialect, type MockReply, type ModelRequest } from "@amira/ai"
-import type { AnyEvent, CommandContext, Settings } from "@amira/api"
+import {
+  type AnyEvent,
+  type Budget,
+  type CommandContext,
+  defineTool,
+  type Settings,
+  type ToolDefinition,
+  textResult,
+} from "@amira/api"
 import { Agent, AgentTree, EventBus, ExtensionHost, InterceptorRegistry, ToolRegistry } from "@amira/core"
 import { Blackboard } from "../src/blackboard.ts"
 import {
   createSwarmExtension,
   DATA_KEY,
+  DEFAULT_BUDGET_TOKENS,
   DEFAULT_LIMITS,
   readSettings,
   type SwarmLimits,
@@ -54,10 +63,17 @@ function direct(
   members: MemberSpec[],
   limits: Partial<SwarmLimits> = {},
   hooks: ConstructorParameters<typeof Swarm>[0]["hooks"] = {},
+  opts: { tools?: ToolDefinition[]; maxConcurrent?: number; budget?: Budget } = {},
 ) {
   const { ai, mock } = makeAi(reply)
   const bus = new EventBus()
-  const tree = new AgentTree({ ai, sections: () => [{ name: "identity", text: "child" }] })
+  const tree = new AgentTree({
+    ai,
+    sections: () => [{ name: "identity", text: "child" }],
+    ...(opts.maxConcurrent ? { maxConcurrent: opts.maxConcurrent } : {}),
+  })
+  const tools = new ToolRegistry()
+  for (const t of opts.tools ?? []) tools.register(t, "test")
   const root = new Agent({
     ai,
     model: ai.model("mock/m"),
@@ -65,9 +81,9 @@ function direct(
     systemPrompt: "commander",
     bus,
     tree,
-    tools: new ToolRegistry(),
+    tools,
   })
-  const group = tree.createGroup(root, { name: "swarm" })
+  const group = tree.createGroup(root, { name: "swarm", ...(opts.budget ? { budget: opts.budget } : {}) })
   const records: SwarmRecord[] = []
   const swarm = new Swarm({
     id: "sw1",
@@ -116,7 +132,30 @@ async function withExtension(reply: (req: ModelRequest) => MockReply, settings: 
     tools,
     tree,
   })
-  return { root, mock, events, host, tree }
+  return { root, mock, events, host, tree, bus }
+}
+
+/** Runs `/swarm <text>` as a frontend would; returns what it printed. */
+async function command(host: ExtensionHost, root: Agent, text: string): Promise<string[]> {
+  const printed: string[] = []
+  const ctx = {
+    print: (t: string) => void printed.push(t),
+    session: { data: root.data },
+  } as unknown as CommandContext
+  await host.commands.get("swarm")!.def.run(text, ctx)
+  return printed
+}
+
+/** Answers every dialog the extensions open with `answer(title)`. */
+function answerDialogs(host: ExtensionHost, bus: EventBus, answer: (title: string) => unknown) {
+  bus.subscribe(
+    (e) => {
+      if (e.type !== "ui.request") return
+      const title = "title" in e.data ? String(e.data.title) : ""
+      setTimeout(() => host.ui.respond(e.data.requestId, answer(title)), 0)
+    },
+    { types: ["ui.request"] },
+  )
 }
 
 const roster3 = [
@@ -502,4 +541,339 @@ test("settings: bad values are reported and ignored; a start can only lower the 
   expect(s.limits.noProgressRounds).toBe(DEFAULT_LIMITS.noProgressRounds)
   expect(s.limits.budget).toEqual({ tokens: 5000 })
   expect(problems.length).toBe(3)
+  // Without settings a swarm still has a budget.
+  expect(readSettings(undefined).limits.budget).toEqual({ tokens: DEFAULT_BUDGET_TOKENS })
+})
+
+// ---- review fixes ----
+
+/** A tool that starts background work and ends at once; its result comes back as a notice. */
+function backgroundTool(ms: number): ToolDefinition {
+  return defineTool({
+    name: "research_in_background",
+    description: "starts work in the background",
+    parameters: { type: "object", properties: {} },
+    execute: async (_p, ctx) => {
+      const notice = ctx.session!.expectNotice!()
+      setTimeout(
+        () =>
+          notice.deliver({
+            role: "user",
+            content: [{ type: "text", text: "[background result] the sky is blue" }],
+            display: { text: "background result", origin: "test" },
+          }),
+        ms,
+      )
+      return textResult("Started; the result comes back by itself. End your turn.")
+    },
+  })
+}
+
+test("a member waiting for its own background work keeps the swarm alive until the result comes", async () => {
+  const { swarm } = direct(
+    (req) => {
+      const me = who(req)
+      if (me === "a" && lastText(req).includes("[background result]"))
+        return {
+          toolCalls: [write("findings", "the sky is blue"), { name: "finish", args: { result: "done" } }],
+        }
+      if (lastIsResult(req)) return { text: "waiting" }
+      if (me === "a") return { toolCalls: [{ name: "research_in_background", args: {} }] }
+      return { text: "b idle" }
+    },
+    pair,
+    {},
+    {},
+    { tools: [backgroundTool(150)] },
+  )
+  const report = await swarm.done
+  expect(report.reason).toContain("idle")
+  expect(report.board.map((e) => e.key)).toEqual(["findings"])
+  expect(report.members.find((m) => m.name === "a")).toMatchObject({
+    status: "done",
+    result: "done",
+    turns: 2,
+  })
+})
+
+test("a member that is stopping takes no more messages; nothing is lost silently", async () => {
+  let aGo = false
+  const { swarm, mock } = direct((req) => {
+    const me = who(req)
+    if (lastIsResult(req)) return { text: "ok" }
+    if (me === "b") return { text: "b working", delayMs: 150 }
+    if (me === "a" && aGo) return { toolCalls: [send("b", "findings ready")] }
+    return { text: "a idle" }
+  }, pair)
+  await until(() => swarm.member("b")!.status === "working")
+  expect(swarm.stopMember("b")).toBeUndefined()
+  expect(swarm.stopMember("b")).toBe("b is stopping already.")
+  expect(swarm.tell("user", "b", "hello")).toBe("b is stopping; it takes no more messages.")
+  aGo = true
+  expect(swarm.tell("user", "a", "tell b")).toBeUndefined()
+  const report = await swarm.done
+  expect(results(mock, "a")).toEqual(["ERR b is stopping; it cannot get messages any more."])
+  expect(report.messages).toBe(0)
+  expect(report.undelivered).toBe(0)
+  expect(report.members.find((m) => m.name === "b")).toMatchObject({
+    status: "done",
+    note: "stopped by the user",
+  })
+})
+
+test("a member whose turn fails ends with an error while the others go on", async () => {
+  const { swarm, mock } = direct((req) => {
+    const me = who(req)
+    if (me === "b") return { error: { message: "model exploded" } }
+    if (lastIsResult(req)) return { text: "ok" }
+    if (me === "a" && !lastText(req).includes("[message")) return { text: "a first", delayMs: 60 }
+    return { text: "idle" }
+  }, pair)
+  await until(() => swarm.member("b")!.status === "ended")
+  expect(swarm.state).toBe("running")
+  expect(swarm.tell("user", "a", "write it down")).toBeUndefined()
+  const report = await swarm.done
+  expect(report.members.find((m) => m.name === "b")).toMatchObject({ status: "error" })
+  expect(report.members.find((m) => m.name === "a")).toMatchObject({ status: "done", turns: 2 })
+  expect(mock.requests.some((r) => who(r) === "a" && lastText(r).includes("write it down"))).toBe(true)
+  expect(swarm.snapshot().timeline.some((e) => e.text.includes("b failed"))).toBe(true)
+})
+
+test("a swarm over its budget ends, and says why", async () => {
+  const usage = { input: 400 }
+  const { swarm } = direct(
+    (req) => {
+      const me = who(req)
+      if (lastIsResult(req)) return { text: "ok", usage }
+      if (lastText(req).includes("[message"))
+        return { toolCalls: [send(me === "a" ? "b" : "a", "more")], usage }
+      if (me === "a") return { toolCalls: [send("b", "go")], usage }
+      return { text: "idle", usage }
+    },
+    pair,
+    { maxPairExchanges: 1000, noProgressRounds: 1000 },
+    {},
+    { budget: { tokens: 3000 } },
+  )
+  const report = await swarm.done
+  expect(report.reason).toContain("ran out of budget")
+  expect(report.tokens).toBeGreaterThanOrEqual(3000)
+})
+
+test("a message to a member waiting for a place to run still keeps the swarm alive", async () => {
+  // One runs at a time, in roster order: b and c are idle by the time a writes to them, and
+  // then wait for a place while a's turn still runs.
+  const trio: MemberSpec[] = [pair[1]!, { name: "c", role: "three", brief: "answer a" }, pair[0]!]
+  const { swarm } = direct(
+    (req) => {
+      const me = who(req)
+      if (lastIsResult(req)) return { text: "ok", delayMs: 10 }
+      if (me === "a" && !lastText(req).includes("[message"))
+        return { toolCalls: [send("b", "one"), send("c", "two")], delayMs: 10 }
+      return { text: `${me} idle`, delayMs: 10 }
+    },
+    trio,
+    {},
+    {},
+    { maxConcurrent: 1 },
+  )
+  const queued: string[] = []
+  const timer = setInterval(() => {
+    for (const m of swarm.snapshot().members) if (m.status === "queued" && m.turns > 0) queued.push(m.name)
+  }, 1)
+  const report = await swarm.done
+  clearInterval(timer)
+  expect(queued.length).toBeGreaterThan(0)
+  expect(report.members.map((m) => `${m.name}:${m.turns}`)).toEqual(["b:2", "c:2", "a:1"])
+  expect(report.reason).toContain("idle")
+})
+
+test("a pause for lack of progress waits for its answer even with nothing on its way", async () => {
+  let answered = false
+  const { swarm } = direct(
+    (req) => {
+      const me = who(req)
+      if (lastIsResult(req)) return { text: "ok" }
+      if (me === "a" && !lastText(req).includes("[message")) return { toolCalls: [send("b", "ping")] }
+      if (me === "b" && lastText(req).includes("[message")) return { toolCalls: [send("a", "pong")] }
+      return { text: `${me} says nothing more` }
+    },
+    pair,
+    { noProgressRounds: 1, maxPairExchanges: 1000 },
+    {
+      askStuck: async () => {
+        // Both members go idle with nothing on its way while the user thinks.
+        await until(() =>
+          swarm.snapshot().members.every((m) => m.status !== "working" && m.status !== "queued"),
+        )
+        await Bun.sleep(60)
+        expect(swarm.state).toBe("paused")
+        answered = true
+        return "stop"
+      },
+    },
+  )
+  const report = await swarm.done
+  expect(answered).toBe(true)
+  expect(report.reason).toBe("no progress in 1 round")
+})
+
+test("the commander's replies count and are no progress: a member-commander loop stops", async () => {
+  let commanderTurns = 0
+  const { root, host, bus } = await withExtension(
+    (req) => {
+      const me = who(req)
+      const last = req.messages.at(-1)
+      if (me === "commander") {
+        if (last?.role === "toolResult") return { text: "ok" }
+        const text = textOf(last)
+        if (text.includes("ended:")) return { text: "done" }
+        const asked = /message from (\w+)\]/.exec(text)
+        if (asked) {
+          commanderTurns++
+          return {
+            toolCalls: [{ name: "swarm", args: { action: "message", to: asked[1], text: "answer" } }],
+          }
+        }
+        return { toolCalls: [{ name: "swarm", args: { action: "start", goal: "g", members: pair } }] }
+      }
+      if (lastIsResult(req)) return { text: "asked" }
+      if (me === "a") return { toolCalls: [send("commander", "a question?")] }
+      return { text: "b idle" }
+    },
+    {
+      extensions: {
+        swarm: {
+          confirm: false,
+          enabled: "always",
+          limits: { noProgressRounds: 2, maxPairExchanges: 1000 },
+        },
+      },
+    },
+  )
+  const asked: string[] = []
+  answerDialogs(host, bus, (title) => {
+    asked.push(title)
+    return "Stop the swarm"
+  })
+  await root.prompt("start")
+  const ended = () => root.messages.findLast((m) => m.role === "user" && textOf(m).includes("ended:"))
+  await until(() => ended() !== undefined)
+  expect(textOf(ended())).toContain("ended: no progress in 2 rounds")
+  expect(asked.length).toBe(1)
+  expect(commanderTurns).toBeLessThan(6)
+})
+
+test("the commander's messages are refused past the pair limit; the user's never", async () => {
+  const { swarm } = direct(
+    (req) => (lastIsResult(req) ? { text: "ok" } : { text: `${who(req)} idle`, delayMs: 30 }),
+    pair,
+    { maxPairExchanges: 2 },
+  )
+  expect(swarm.tell("commander", "a", "one")).toBeUndefined()
+  expect(swarm.tell("commander", "a", "two")).toBeUndefined()
+  expect(swarm.tell("commander", "a", "three")).toContain("have exchanged 2 messages")
+  expect(swarm.tell("user", "a", "the user may always")).toBeUndefined()
+  expect(swarm.snapshot().messages).toBe(2)
+  await swarm.stop()
+})
+
+test("/clear during a swarm stops it without waking the old conversation", async () => {
+  const { root, mock, bus, events } = await withExtension(
+    (req) => {
+      if (who(req) !== "commander") return { text: `${who(req)} working`, delayMs: 30 }
+      if (req.messages.at(-1)?.role === "toolResult") return { text: "started" }
+      return { toolCalls: [{ name: "swarm", args: { action: "start", goal: "g", members: pair } }] }
+    },
+    { extensions: { swarm: { confirm: false, enabled: "always" } } },
+  )
+  root.start("startup")
+  await root.prompt("go")
+  const before = mock.requests.filter((r) => who(r) === "commander").length
+  bus.emit(
+    "session.start",
+    { reason: "clear", cwd: process.cwd(), model: { provider: "mock", model: "big" } },
+    { sessionId: "s_after_clear" },
+  )
+  await until(() => events.filter((e) => e.type === "subagent.end").length === 2)
+  await Bun.sleep(50)
+  expect(mock.requests.filter((r) => who(r) === "commander").length).toBe(before)
+  expect(root.expectedNotices).toBe(0)
+  expect(root.messages.some((m) => m.role === "user" && m.display?.origin === "swarm")).toBe(false)
+  const [past] = swarmsFromRecords(root.data.read(DATA_KEY))
+  expect(past!.endReason).toBe("its session was closed")
+})
+
+test("/swarm <goal> lets only the turn it asked for start a swarm", async () => {
+  let turn = 0
+  const { root, host, bus } = await withExtension((req) => {
+    if (who(req) !== "commander") return { text: "member idle" }
+    const last = req.messages.at(-1)
+    if (last?.role === "toolResult" || textOf(last).includes("ended:")) return { text: "ok" }
+    turn++
+    // First it asks a question instead of starting; later it starts on its own.
+    if (turn === 1) return { text: "Which sky?" }
+    return { toolCalls: [{ name: "swarm", args: { action: "start", goal: "g", members: pair } }] }
+  }, {})
+  const dialogs: string[] = []
+  answerDialogs(host, bus, (title) => {
+    dialogs.push(title)
+    return false
+  })
+  await root.prompt({
+    role: "user",
+    content: [{ type: "text", text: "Use a swarm (the swarm tool) for this task: the sky" }],
+    display: { text: "/swarm the sky" },
+  })
+  await root.prompt("the blue one")
+  const refused = root.messages.filter((m) => m.role === "toolResult").at(-1)!
+  expect(textOf(refused)).toContain("has not asked for a swarm")
+  expect(dialogs).toEqual([])
+})
+
+test("/swarm commands and the commander's tool actions steer a running swarm", async () => {
+  let release = false
+  const { root, host, mock } = await withExtension(
+    (req) => {
+      const me = who(req)
+      if (me === "commander") {
+        const last = req.messages.at(-1)
+        if (last?.role === "toolResult") return { text: "ok" }
+        const text = textOf(last)
+        if (text.includes("ended:")) return { text: "done" }
+        if (text === "stop it") return { toolCalls: [{ name: "swarm", args: { action: "stop" } }] }
+        if (text === "tell a")
+          return {
+            toolCalls: [{ name: "swarm", args: { action: "message", to: "a", text: "from the top" } }],
+          }
+        if (text === "status") return { toolCalls: [{ name: "swarm", args: { action: "status" } }] }
+        return { toolCalls: [{ name: "swarm", args: { action: "start", goal: "g", members: pair } }] }
+      }
+      if (lastIsResult(req)) return { text: "ok" }
+      // b keeps the swarm alive until the test lets it go.
+      if (me === "b" && !release) return { text: "b busy", delayMs: 400 }
+      return { text: `${me} idle` }
+    },
+    { extensions: { swarm: { confirm: false, enabled: "always" } } },
+  )
+  await root.prompt("start")
+  expect(await command(host, root, "pause a")).toEqual(["Paused a."])
+  expect(await command(host, root, "msg a hello there")).toEqual(["✉ you → a (held until it is resumed)"])
+  await Bun.sleep(30)
+  const got = (text: string) => mock.requests.some((r) => who(r) === "a" && lastText(r).includes(text))
+  expect(got("hello there")).toBe(false)
+  expect(await command(host, root, "resume a")).toEqual(["Resumed a."])
+  await until(() => got("[message from the user] hello there"))
+  await root.prompt("tell a")
+  await until(() => got("[message from the commander] from the top"))
+  await root.prompt("status")
+  expect(textOf(root.messages.filter((m) => m.role === "toolResult").at(-1))).toContain("Members:")
+  expect((await command(host, root, "list"))[0]).toMatch(/running · a, b · g/)
+  await expect(command(host, root, "stop nobody")).rejects.toThrow('No member "nobody"')
+  await root.prompt("stop it")
+  await until(() =>
+    root.messages.some((m) => m.role === "user" && textOf(m).includes("ended: stopped by the commander")),
+  )
+  release = true
+  await expect(command(host, root, "stop")).rejects.toThrow("no swarm is running")
 })

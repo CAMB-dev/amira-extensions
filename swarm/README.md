@@ -53,22 +53,33 @@ before its next model call; messages from one sender arrive in the order they we
 - `/swarm list`: swarms of this session, including ones from before a resume.
 
 The main session can use the `swarm` tool too: `status`, `message` (to a member) and
-`stop`. Members' messages to `"commander"` reach it as notices.
+`stop`. Members' messages to `"commander"` reach it as notices. Unlike yours, the main
+session's messages count against the swarm's message limit and the exchange limit with
+that member, and are not progress.
+
+`/clear` or `/resume` while a swarm runs stops it; its report then goes nowhere (the
+conversation that started it is closed).
 
 ## When it ends
 
-- every member is idle (or ended) and no message is on its way, including messages held
-  for a paused member;
+- every member is idle (or ended) and nothing is on its way to any member: no message,
+  including messages held for a paused member, and no result of a member's own background
+  work (e.g. a sub-agent it started in the background);
 - you or the main session stop it;
 - a limit is hit: the swarm's message limit, the members' turn limits (each member ends
   after its last turn), or the budget;
 - it made no progress: after `noProgressRounds` rounds with messages but no blackboard
   change and no finished part, it pauses and asks you whether to go on (with nobody to ask,
-  as in print mode, it stops).
+  as in print mode, it stops). It waits for your answer.
 
-Messages two members exchange back and forth while neither writes to the blackboard are
-capped too (`maxPairExchanges`); past that, `send_message` tells them to write their
-results down instead.
+Messages two members (or a member and the main session) exchange back and forth while
+neither writes to the blackboard are capped too (`maxPairExchanges`); past that,
+`send_message` tells them to write their results down instead. A member that is being
+stopped takes no more messages; sending it one is refused, not dropped.
+
+Without a `budget` in the settings a swarm may spend 3,000,000 tokens (cache reads count).
+That covers the members and their own sub-agents; the main session's turns answering them
+are its own.
 
 The blackboard, the messages and the results are kept in the session file, so `/swarm view`
 and `/swarm list` still show a swarm after `amira --resume`.
@@ -91,7 +102,7 @@ In `settings.json`, under `extensions.swarm`:
         "noProgressRounds": 3,
         "maxPairExchanges": 8,
         "maxConcurrent": 3,        // members working at once (the agent tree's limit applies too)
-        "budget": { "tokens": 2000000, "costUsd": 2 } // for the whole swarm, within the tree's
+        "budget": { "tokens": 3000000, "costUsd": 2 } // for the whole swarm, within the tree's
       }
     }
   }

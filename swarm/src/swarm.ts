@@ -117,7 +117,7 @@ export interface SwarmHooks {
    * The swarm went round without progress and is paused: what to do. Undefined (nobody could
    * answer) stops it.
    */
-  askStuck?(question: string): Promise<"continue" | "stop" | undefined>
+  askStuck?(question: string, signal: AbortSignal): Promise<"continue" | "stop" | undefined>
 }
 
 export interface SwarmOptions {
@@ -150,8 +150,8 @@ interface Member {
   paused: boolean
   /** Messages held while it (or the swarm) is paused, in order. */
   held: UserMessage[]
-  /** Turns it had when a message was sent to it while idle: it has not picked that up yet. */
-  wakeAt?: number
+  /** Asked to stop (by the user, or as the swarm ends): it takes no more messages. */
+  stopping?: boolean
   result?: string
   ended?: SubagentResult
 }
@@ -205,6 +205,10 @@ export class Swarm {
   #endedAt?: number
   #resolve!: (r: SwarmReport) => void
   #checking = false
+  /** The question of a swarm paused for lack of progress, while nobody answered it. */
+  #asking: AbortController | undefined
+  /** Messages that could not be handed to their member (it was stopping or ended). */
+  #dropped = 0
 
   constructor(opts: SwarmOptions) {
     this.id = opts.id
@@ -274,18 +278,30 @@ export class Swarm {
   }
 
   /**
-   * Sends `text` to member `to` from the user or the commander: not counted against the
-   * limits, and it counts as progress. Returns the problem, or undefined once sent (or held
-   * for a paused member).
+   * Sends `text` to member `to` from the user or the commander. The user's messages are not
+   * counted against the limits and count as progress. The commander's count against the
+   * swarm's message limit and its exchange limit with that member, like a member's, and are
+   * not progress. Returns the problem, or undefined once sent (or held for a paused member).
    */
   tell(from: "user" | "commander", to: string, text: string): string | undefined {
     if (!this.live) return `The swarm has ${this.#state === "ended" ? "ended" : "is ending"}.`
     const m = this.#find(to)
     if (!m) return `No member "${to}"; the members are ${this.names().join(", ")}.`
     if (m.child.state === "ended") return `${m.spec.name} has ended.`
+    if (m.stopping) return `${m.spec.name} is stopping; it takes no more messages.`
     const body = oneLine(text) ? text.trim() : ""
     if (!body) return "The message is empty."
-    this.#progress()
+    if (from === "commander") {
+      if (this.#messages >= this.limits.maxMessages)
+        return `The swarm has sent all ${this.limits.maxMessages} messages it may send; stop it, or let it end.`
+      const pair = pairKey("commander", m.spec.name)
+      const count = this.#pairs.get(pair) ?? 0
+      if (count >= this.limits.maxPairExchanges)
+        return `You and ${m.spec.name} have exchanged ${count} messages while it wrote nothing to the blackboard. Stop the swarm, or leave it to the user.`
+      this.#pairs.set(pair, count + 1)
+      this.#messages++
+      this.#chatter++
+    } else this.#progress(m.spec.name)
     this.#deliver(from, m, body)
     return undefined
   }
@@ -314,6 +330,9 @@ export class Swarm {
     if (name === undefined) {
       if (this.#state !== "paused") return "The swarm is not paused."
       this.#state = "running"
+      // Resumed another way while the no-progress question was open: it is answered.
+      this.#asking?.abort()
+      this.#asking = undefined
       this.#progress()
       this.#log({ kind: "note", text: "resumed" })
       for (const m of this.#members.values()) this.#flush(m)
@@ -335,6 +354,10 @@ export class Swarm {
     const m = this.#find(name)
     if (!m) return `No member "${name}".`
     if (m.child.state === "ended") return `${m.spec.name} has ended already.`
+    if (m.stopping) return `${m.spec.name} is stopping already.`
+    m.stopping = true
+    // What was held for it would never reach it.
+    this.#dropped += m.held.splice(0).length
     m.child.stop(reason)
     this.#log({ kind: "note", text: `${m.spec.name}: ${reason}` })
     return undefined
@@ -445,19 +468,20 @@ export class Swarm {
     }
     if (m === sender) return "That is you."
     if (m?.child.state === "ended") return `${m.spec.name} has ended; it cannot get messages any more.`
+    if (m?.stopping) return `${m.spec.name} is stopping; it cannot get messages any more.`
     if (sender.sent >= this.limits.maxMessagesPerMember) {
       return `You have sent all ${this.limits.maxMessagesPerMember} messages a member may send. Put what is left on the blackboard, or call finish.`
     }
-    const pair = m ? pairKey(sender.spec.name, m.spec.name) : undefined
-    const count = pair ? (this.#pairs.get(pair) ?? 0) : 0
-    if (m && count >= this.limits.maxPairExchanges) {
-      return `You and ${m.spec.name} have exchanged ${count} messages while neither wrote to the blackboard. Write your findings or decision to the blackboard (or call finish) instead of messaging further.`
+    const pair = pairKey(sender.spec.name, m ? m.spec.name : "commander")
+    const count = this.#pairs.get(pair) ?? 0
+    if (count >= this.limits.maxPairExchanges) {
+      return `You and ${m ? m.spec.name : "the commander"} have exchanged ${count} messages while ${m ? "neither" : "you"} wrote to the blackboard. Write your findings or decision to the blackboard (or call finish) instead of messaging further.`
     }
     if (this.#messages >= this.limits.maxMessages) {
       void this.#end(`the members sent the ${this.limits.maxMessages} messages a swarm may send`, false)
       return "The swarm has reached its message limit and is ending. End your turn."
     }
-    if (pair) this.#pairs.set(pair, count + 1)
+    this.#pairs.set(pair, count + 1)
     sender.sent++
     this.#messages++
     this.#chatter++
@@ -492,9 +516,10 @@ export class Swarm {
   }
 
   #send$(m: Member, msg: UserMessage) {
-    const idle = m.child.state === "idle"
-    if (!m.child.send(msg)) return
-    if (idle && m.wakeAt === undefined) m.wakeAt = m.child.turns
+    if (m.child.send(msg)) return
+    // It ended (or began stopping) after the message was checked: say so, and count it.
+    this.#dropped++
+    this.#log({ kind: "note", text: `a message to ${m.spec.name} was not delivered: it has stopped` })
   }
 
   #flush(m: Member) {
@@ -584,10 +609,6 @@ export class Swarm {
     try {
       for await (const e of m.child.events) {
         if (e.type === "turn.end" && e.sessionId === m.child.id) this.#turnEnded()
-        if (e.type === "subagent.state" && e.data.childSessionId === m.child.id) {
-          if (m.wakeAt !== undefined && (e.data.state !== "idle" || m.child.turns > m.wakeAt))
-            m.wakeAt = undefined
-        }
         this.#hooks.changed?.()
         this.#check()
       }
@@ -618,40 +639,41 @@ export class Swarm {
     const question = `The swarm "${clip(this.goal, 60)}" went ${plural(this.limits.noProgressRounds, "round")} with messages but no blackboard change or finished part. Keep it going?`
     this.#log({ kind: "note", text: `paused: ${this.limits.noProgressRounds} rounds without progress` })
     const ask = this.#hooks.askStuck
+    // Until it is answered the swarm waits, even with nothing on its way (see #check).
+    const asking = new AbortController()
+    this.#asking = asking
     void (async () => {
-      const answer = ask ? await ask(question).catch(() => undefined) : undefined
-      if (this.#state !== "paused") return
+      const answer = ask ? await ask(question, asking.signal).catch(() => undefined) : undefined
+      if (this.#asking === asking) this.#asking = undefined
+      if (this.#state !== "paused" || asking.signal.aborted) return
       if (answer === "continue") this.resume()
       else void this.#end(`no progress in ${plural(this.limits.noProgressRounds, "round")}`, false)
     })()
   }
 
-  /** Whether a member has a message it has not picked up yet. */
+  /**
+   * Whether something is on its way to a member: a message held for it, one its model has not
+   * seen yet, or a notice it waits for (e.g. the result of a background sub-agent of its own).
+   */
   #inFlight(m: Member): boolean {
     if (m.child.state === "ended") return false
-    if (m.held.length) return true
-    if (m.wakeAt === undefined) return false
-    if (m.child.state !== "idle" || m.child.turns > m.wakeAt) {
-      m.wakeAt = undefined
-      return false
-    }
-    return true
+    return m.held.length > 0 || m.child.pendingNotices > 0
   }
 
   #check() {
-    if (!this.live || this.#checking) return
+    // A swarm paused for lack of progress waits for the answer.
+    if (!this.live || this.#checking || this.#asking) return
     const all = [...this.#members.values()]
     if (all.every((m) => m.child.state === "ended")) {
       void this.#end("every member ended", false)
       return
     }
-    // A paused swarm waits for its answer; its held messages keep it from ending anyway.
     if (all.every((m) => (m.child.state === "idle" || m.child.state === "ended") && !this.#inFlight(m))) {
       this.#checking = true
       // Once more after anything that is already on its way (a state event, a send).
       setTimeout(() => {
         this.#checking = false
-        if (!this.live) return
+        if (!this.live || this.#asking) return
         const quiet = all.every(
           (m) => (m.child.state === "idle" || m.child.state === "ended") && !this.#inFlight(m),
         )
@@ -664,9 +686,12 @@ export class Swarm {
     if (!this.live) return
     this.#state = "ending"
     this.#endReason = reason
+    this.#asking?.abort()
+    this.#asking = undefined
     this.#log({ kind: "note", text: `ending: ${reason}` })
-    let undelivered = 0
+    let undelivered = this.#dropped
     for (const m of this.#members.values()) {
+      m.stopping = true
       undelivered += m.held.splice(0).length
       if (now) m.child.abort(reason)
       else m.child.stop(reason)

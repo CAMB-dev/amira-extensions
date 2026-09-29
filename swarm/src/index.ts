@@ -25,7 +25,13 @@ import {
 import { memberLine, type SwarmViewData, swarmView, timelineLine, VIEW_KIND } from "./view.ts"
 
 export { Blackboard } from "./blackboard.ts"
-export { DEFAULT_LIMITS, readSettings, type SwarmLimits, type SwarmSettings } from "./limits.ts"
+export {
+  DEFAULT_BUDGET_TOKENS,
+  DEFAULT_LIMITS,
+  readSettings,
+  type SwarmLimits,
+  type SwarmSettings,
+} from "./limits.ts"
 export * from "./swarm.ts"
 export { swarmView, VIEW_KIND } from "./view.ts"
 
@@ -53,6 +59,13 @@ interface Live {
   swarm: Swarm
   /** The top-level session that started it. */
   owner: string
+  /** The report its commander expects, until it is delivered. */
+  final?: PendingNotice
+  /**
+   * Its commander's conversation was closed (/clear, /resume, the session ended): nothing is
+   * delivered to it any more, since that would run a turn nobody sees.
+   */
+  orphaned?: boolean
 }
 
 /** Where a swarm starts from: the swarm tool of the main session, or a command. */
@@ -146,6 +159,7 @@ export function createSwarmExtension(): Extension {
       const final = l.expectNotice?.()
       const data = l.data
       if (data) lastData = data
+      let entry: Live | undefined
       let swarm: Swarm
       try {
         swarm = new Swarm({
@@ -159,15 +173,16 @@ export function createSwarmExtension(): Extension {
             changed: () => api.requestRender(),
             record: (rec) => data?.append(DATA_KEY, rec),
             toCommander: (from, text) => {
+              if (entry?.orphaned) return
               l.expectNotice?.()?.deliver(
                 notice(
-                  `[swarm ${id} · message from ${from}] ${text}\n\n(Answer with the swarm tool: action "message", to "${from}".)`,
+                  `[swarm ${id} · message from ${from}] ${text}\n\n(If it needs an answer, give it with the swarm tool: action "message", to "${from}". Otherwise just end your turn.)`,
                   `✉ swarm · ${from}: ${clip(oneLine(text), 160)}`,
                 ),
               )
             },
-            askStuck: async (question) => {
-              const answer = await api.ui.select(question, ["Keep going", "Stop the swarm"])
+            askStuck: async (question, signal) => {
+              const answer = await api.ui.select(question, ["Keep going", "Stop the swarm"], { signal })
               return answer === "Keep going" ? "continue" : answer === undefined ? undefined : "stop"
             },
           },
@@ -178,9 +193,12 @@ export function createSwarmExtension(): Extension {
         return `The swarm could not start: ${err instanceof Error ? err.message : String(err)}`
       }
       requested = false
-      swarms.set(id, { swarm, owner: root ?? "" })
+      const started: Live = { swarm, owner: root ?? "", ...(final ? { final } : {}) }
+      entry = started
+      swarms.set(id, started)
       void swarm.done.then((report) => {
         api.requestRender()
+        if (started.orphaned) return
         final?.deliver(notice(reportText(report), `◆ swarm ${id} ended: ${clip(report.reason, 80)}`))
       })
       api.requestRender()
@@ -444,25 +462,37 @@ export function createSwarmExtension(): Extension {
       },
     })
 
+    /** Stops a swarm whose commander is gone, without delivering anything to it. */
+    const orphan = (l: Live, reason: string) => {
+      l.orphaned = true
+      l.final?.cancel()
+      if (l.swarm.live) void l.swarm.stop(reason)
+    }
     api.on("session.start", (e) => {
       if (e.parentSessionId !== undefined) return
       if (root && root !== e.sessionId) {
         // Another conversation took over (/clear, /resume): its swarms have nobody to report to.
-        for (const l of swarms.values())
-          if (l.owner !== e.sessionId) void l.swarm.stop("its session was closed")
+        for (const l of swarms.values()) if (l.owner !== e.sessionId) orphan(l, "its session was closed")
       }
       root = e.sessionId
       explicit = false
       requested = false
     })
-    api.on("session.end", () => {
-      for (const l of swarms.values()) void l.swarm.stop("the session ended")
+    api.on("session.end", (e) => {
+      if (e.parentSessionId !== undefined) return
+      for (const l of swarms.values()) orphan(l, "the session ended")
+    })
+    api.on("turn.end", (e) => {
+      // `/swarm <goal>` lets the start of the turn it asked for through, not a later one.
+      if (e.parentSessionId === undefined && (!root || e.sessionId === root)) requested = false
     })
     api.on("turn.start", (e) => {
       if (e.parentSessionId !== undefined || (root && e.sessionId !== root)) return
       const prompt = e.data.prompt
       // A notice (a swarm's or a sub-agent's report) is not the user asking.
       if (prompt.display?.origin) return
+      // The turn `/swarm <goal>` asked for (it may have waited behind a running one).
+      if (/^\/swarm\s+\S/.test(prompt.display?.text ?? "")) requested = true
       const text = prompt.content.map((b) => (b.type === "text" ? b.text : "")).join("")
       explicit = requested || asksForSwarm(text) || asksForSwarm(prompt.display?.text ?? "")
     })
