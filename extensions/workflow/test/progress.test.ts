@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { type AgentNode, type FlowNode, formatDuration, treeLines } from "../src/progress.ts"
+import { type AgentNode, type FlowNode, formatDuration, runStateText, treeLines } from "../src/progress.ts"
 
 const agent = (call: number, status: AgentNode["status"]): AgentNode => ({
   kind: "agent",
@@ -36,4 +36,10 @@ test("times are written as Amira writes them", () => {
   expect(formatDuration(12_000)).toBe("12s")
   expect(formatDuration(65_000)).toBe("1m 05s")
   expect(formatDuration(3_720_000)).toBe("1h 02m")
+})
+
+test("run and agent states are worded as every screen words them", () => {
+  expect(runStateText("error")).toBe("failed")
+  expect(runStateText("aborted")).toBe("stopped")
+  expect(runStateText("done")).toBe("done")
 })

@@ -20,7 +20,7 @@ import type {
 import { compileScript } from "./compile.ts"
 import { type JournalEntry, listRuns, readJournal, readRun } from "./journal.ts"
 import { describeEstimate, estimate, readMeta, type WorkflowMeta } from "./meta.ts"
-import { countsLine, formatDuration, formatTokens, totals, treeLines } from "./progress.ts"
+import { countsLine, formatDuration, formatTokens, runStateText, totals, treeLines } from "./progress.ts"
 import { loadRoles } from "./roles.ts"
 import { type ScriptWorker, WorkflowRun } from "./run.ts"
 import { findSaved, listSaved } from "./saved.ts"
@@ -495,7 +495,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       kind: VIEW_KIND,
       title(d) {
         const run = runOf(d)
-        return run ? `Workflow ${run.meta.name} · ${run.id} · ${run.status}` : "Workflow"
+        return run ? `Workflow ${run.meta.name} · ${run.id} · ${runStateText(run.status)}` : "Workflow"
       },
       header(d, o) {
         const run = runOf(d)
@@ -555,8 +555,10 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       const stored = listRuns(runsRoot()).filter((r) => !runs.has(r.id))
       if (recent.length || stored.length) {
         lines.push("Runs:")
-        for (const r of recent) lines.push(`  ${r.id} ${r.meta.name} · ${r.status} · ${countsLine(r.flow)}`)
-        for (const r of stored.slice(0, 10)) lines.push(`  ${r.id} ${r.meta.name} · ${r.status} (earlier)`)
+        for (const r of recent)
+          lines.push(`  ${r.id} ${r.meta.name} · ${runStateText(r.status)} · ${countsLine(r.flow)}`)
+        for (const r of stored.slice(0, 10))
+          lines.push(`  ${r.id} ${r.meta.name} · ${runStateText(r.status)} (earlier)`)
       }
       lines.push(
         "Also: /workflow view [id], /workflow stop [id], /workflow resume <id>, /workflow <task> to ask for a workflow.",
@@ -630,7 +632,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
               id ? `no workflow run ${id} in this session` : "no workflow has run in this session",
             )
           if (!ctx.openView) {
-            ctx.print(`${run.meta.name} ${run.id} · ${run.status} · ${countsLine(run.flow)}`)
+            ctx.print(`${run.meta.name} ${run.id} · ${runStateText(run.status)} · ${countsLine(run.flow)}`)
             return
           }
           ctx.openView({ kind: VIEW_KIND, data: { id: run.id } })

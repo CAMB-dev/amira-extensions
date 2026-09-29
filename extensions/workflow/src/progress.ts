@@ -89,6 +89,11 @@ export function formatTokens(n: number): string {
   return `${(n / 1_000_000).toFixed(1)}M`
 }
 
+/** A run's or an agent's state as Amira's screens word it: "failed" for an error. */
+export function runStateText(state: string): string {
+  return state === "error" ? "failed" : state === "aborted" ? "stopped" : state
+}
+
 /** "12s", "1m 05s", "1h 02m": as Amira's own screens write times. */
 export function formatDuration(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000))
