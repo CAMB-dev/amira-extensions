@@ -80,7 +80,7 @@ export interface TscRun {
 
 /**
  * Checks `files` with tsc: once per tsconfig.json they belong to; files outside any project
- * are checked on their own, with modern defaults.
+ * are checked on their own, with modern defaults. `timeoutMs` is for all the runs together.
  */
 export async function runTsc(
   tsc: string[],
@@ -96,6 +96,8 @@ export async function runTsc(
   }
   const byFile = new Map<string, Diagnostic[]>()
   for (const file of files) byFile.set(fileKey(file), [])
+  const deadline = Date.now() + opts.timeoutMs
+  const late = { byFile, error: `tsc took longer than ${opts.timeoutMs} ms` }
   for (const [project, members] of byProject) {
     const cwd = project ? path.dirname(project) : root
     const argv = project
@@ -114,13 +116,15 @@ export async function runTsc(
           "bundler",
           ...members,
         ]
+    const left = deadline - Date.now()
+    if (left <= 0) return late
     let result: RunCommandResult
     try {
-      result = await run(argv, { cwd, timeoutMs: opts.timeoutMs, signal: opts.signal })
+      result = await run(argv, { cwd, timeoutMs: left, signal: opts.signal })
     } catch (err) {
       return { byFile, error: `tsc failed: ${err instanceof Error ? err.message : String(err)}` }
     }
-    if (result.timedOut) return { byFile, error: `tsc took longer than ${opts.timeoutMs} ms` }
+    if (result.timedOut) return late
     if (result.aborted) return { byFile, error: "aborted" }
     const found = parseTscOutput(result.output, cwd)
     // Exit 1 or 2 with nothing parsed: tsc itself failed (bad tsconfig, crash).

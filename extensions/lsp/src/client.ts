@@ -158,7 +158,9 @@ export class LspClient {
         }
       },
     })
+    // One budget for starting and initializing, not one for each.
     const timeout = this.#opts.startupTimeoutMs
+    const deadline = Date.now() + timeout
     await withTimeout(spawned.promise, timeout, `${this.#opts.argv[0]} did not start in ${timeout} ms`)
     const root = this.#opts.root
     const init = (await this.request(
@@ -183,7 +185,7 @@ export class LspClient {
           ? { initializationOptions: this.#opts.initializationOptions }
           : {}),
       },
-      timeout,
+      Math.max(1, deadline - Date.now()),
     )) as { capabilities?: Record<string, any>; serverInfo?: { name?: string; version?: string } } | null
     this.#capabilities = init?.capabilities ?? {}
     const info = init?.serverInfo
@@ -273,26 +275,29 @@ export class LspClient {
    * A publish that names the version sent (or a later one) is the answer. One without a
    * version may be a first pass (typescript-language-server publishes syntax errors, then
    * type errors): the answer is the last one once `settleMs` passed without another.
+   * `deadline` (a Date.now() time) ends the wait earlier than `waitMs` would; asking and then
+   * waiting for a publish share the same time.
    */
   async diagnostics(
     file: string,
-    opts: { waitMs: number; settleMs?: number; signal?: AbortSignal },
+    opts: { waitMs: number; deadline?: number; settleMs?: number; signal?: AbortSignal },
   ): Promise<DiagnosticsResult> {
     const key = fileKey(file)
     const doc = this.#docs.get(key)
     if (!doc) return { diagnostics: [], fresh: false }
+    const deadline = Math.min(Date.now() + opts.waitMs, opts.deadline ?? Number.POSITIVE_INFINITY)
     if (this.pulls) {
       try {
-        return { diagnostics: await this.#pull(doc, opts.waitMs, opts.signal), fresh: true }
+        return { diagnostics: await this.#pull(doc, deadline, opts.signal), fresh: true }
       } catch {
-        // Fall back to what the server published.
+        // Fall back to what the server published, in the time left.
+        if (opts.signal?.aborted) return { diagnostics: [], fresh: false }
       }
     }
-    return this.#waitForPublish(key, doc, opts.waitMs, opts.settleMs ?? DEFAULT_SETTLE_MS, opts.signal)
+    return this.#waitForPublish(key, doc, deadline, opts.settleMs ?? DEFAULT_SETTLE_MS, opts.signal)
   }
 
-  async #pull(doc: Doc, waitMs: number, signal?: AbortSignal): Promise<Diagnostic[]> {
-    const deadline = Date.now() + waitMs
+  async #pull(doc: Doc, deadline: number, signal?: AbortSignal): Promise<Diagnostic[]> {
     for (let attempt = 0; ; attempt++) {
       try {
         const report = (await this.request(
@@ -316,7 +321,7 @@ export class LspClient {
   #waitForPublish(
     key: string,
     doc: Doc,
-    waitMs: number,
+    deadlineAt: number,
     settleMs: number,
     signal?: AbortSignal,
   ): Promise<DiagnosticsResult> {
@@ -349,7 +354,10 @@ export class LspClient {
         if (k === key) settled()
       }
       const onAbort = () => finish(false)
-      const deadline = setTimeout(() => finish(current() !== undefined), waitMs)
+      const deadline = setTimeout(
+        () => finish(current() !== undefined),
+        Math.max(0, deadlineAt - Date.now()),
+      )
       this.#listeners.add(listener)
       signal?.addEventListener("abort", onAbort, { once: true })
       if (signal?.aborted) return finish(false)

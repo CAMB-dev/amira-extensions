@@ -3,7 +3,7 @@
  * `WARN: text` or `INFO: text` is a diagnostic of that severity; a document containing
  * CRASH makes the server exit. Environment:
  *   FAKE_LSP_LOG     file to append every message it gets to, as JSON lines
- *   FAKE_LSP_PULL    "1": answer textDocument/diagnostic instead of publishing
+ *   FAKE_LSP_PULL    "1": answer textDocument/diagnostic instead of publishing; "hang": never answer it
  *   FAKE_LSP_DELAY   ms before publishing (default 20)
  *   FAKE_LSP_SILENT  "1": never publish
  *   FAKE_LSP_URIS    "vscode": publish URIs as file:///c%3A/... (lower-case drive, encoded colon)
@@ -15,7 +15,7 @@
 import { appendFileSync } from "node:fs"
 
 const env = process.env
-const pull = env.FAKE_LSP_PULL === "1"
+const pull = env.FAKE_LSP_PULL === "1" || env.FAKE_LSP_PULL === "hang"
 const delay = Number(env.FAKE_LSP_DELAY ?? 20)
 const docs = new Map<string, { text: string; version: number }>()
 
@@ -120,6 +120,7 @@ function onMessage(m: any) {
       return publishLater(uri)
     }
     case "textDocument/diagnostic": {
+      if (env.FAKE_LSP_PULL === "hang") return
       const doc = docs.get(m.params.textDocument.uri)
       return send({ id: m.id, result: { kind: "full", items: doc ? diagnosticsOf(doc.text) : [] } })
     }

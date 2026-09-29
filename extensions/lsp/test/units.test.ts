@@ -9,7 +9,8 @@ import { editedFile, lspBlock, withDiagnostics } from "../src/index.ts"
 import { encodeMessage, MessageReader, type RpcMessage } from "../src/rpc.ts"
 import { DEFAULT_SERVERS, findCommand, findRoot, languageIdFor, serverFor } from "../src/servers.ts"
 import { readSettings } from "../src/settings.ts"
-import { parseTscOutput } from "../src/tsc.ts"
+import { checkBudgetMs } from "../src/manager.ts"
+import { parseTscOutput, type RunCommand, runTsc } from "../src/tsc.ts"
 import { fileKey, pathToUri, uriKey, uriToPath } from "../src/uri.ts"
 
 const diag = (line: number, character: number, message: string, severity = 1, code?: string): Diagnostic => ({
@@ -259,6 +260,35 @@ test("tsc output is read into diagnostics by file, with continuation lines", () 
     },
   ])
   expect(out.get(fileKey(path.join(cwd, "src/b.ts")))?.[0]?.severity).toBe(2)
+})
+
+test("tsc runs for several projects share one time limit; a check's budget covers its longest path", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "lsp-tsc-"))
+  for (const p of ["a", "b"]) {
+    mkdirSync(path.join(dir, p))
+    writeFileSync(path.join(dir, p, "tsconfig.json"), "{}")
+    writeFileSync(path.join(dir, p, "x.ts"), "")
+  }
+  const limits: number[] = []
+  const run: RunCommand = async (_argv, opts) => {
+    limits.push(opts.timeoutMs)
+    const took = Math.min(opts.timeoutMs, 400)
+    await Bun.sleep(took)
+    return { output: "", exitCode: 0, signalCode: null, timedOut: took < 400, aborted: false, settled: true, contained: true }
+  }
+  const started = Date.now()
+  const r = await runTsc(["tsc"], [path.join(dir, "a", "x.ts"), path.join(dir, "b", "x.ts")], dir, run, {
+    timeoutMs: 600,
+    signal: new AbortController().signal,
+  })
+  expect(Date.now() - started).toBeLessThan(900)
+  expect(r.error).toBe("tsc took longer than 600 ms")
+  expect(limits[0]).toBe(600)
+  expect(limits[1]).toBeLessThanOrEqual(200)
+
+  const s = readSettings({ waitMs: 1000, startupTimeoutMs: 5000, tscTimeoutMs: 8000 })
+  expect(checkBudgetMs(s)).toBe(9000)
+  expect(checkBudgetMs({ ...s, tscTimeoutMs: 20_000 })).toBe(20_000)
 })
 
 test("the file an edit changed: the absolute path in its details, else its path argument", () => {

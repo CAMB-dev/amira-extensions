@@ -24,7 +24,7 @@ import {
   HEADER,
   plural,
 } from "./format.ts"
-import { type FileCheck, type ServerDescription, ServerManager } from "./manager.ts"
+import { checkBudgetMs, type FileCheck, type ServerDescription, ServerManager } from "./manager.ts"
 import { isFile, which as pathWhich, type Which } from "./servers.ts"
 import { type LspSettings, readSettings, SEVERITY, type Severity } from "./settings.ts"
 import { fileKey } from "./uri.ts"
@@ -211,7 +211,8 @@ function setUp(api: ExtensionAPI, settings: LspSettings, which: Which) {
 
   // After the last edit of a batch, check every file the batch changed and add what the
   // servers found to that call's result.
-  const timeoutMs = Math.max(settings.startupTimeoutMs + settings.waitMs * 4, settings.tscTimeoutMs) + 5000
+  // A check keeps to its budget; the margin covers syncing files and formatting the report.
+  const timeoutMs = checkBudgetMs(settings) + 5000
   api.intercept(
     "tool.call.after",
     async (v, ctx) => {

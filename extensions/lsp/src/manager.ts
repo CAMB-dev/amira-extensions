@@ -46,6 +46,18 @@ const MAX_CRASHES = 3
 /** The first check of a new server waits this many times `waitMs` (projects load first). */
 const FIRST_CHECK_FACTOR = 4
 
+/**
+ * The longest one check may take: a server started and waited for (its first check waits
+ * longest), or tsc, whichever is longer. Checks keep to it, so an interceptor given this
+ * (plus a margin) never times out on one.
+ */
+export function checkBudgetMs(
+  settings: Pick<LspSettings, "startupTimeoutMs" | "waitMs" | "tscTimeoutMs">,
+  waitMs = settings.waitMs,
+): number {
+  return Math.max(settings.startupTimeoutMs + waitMs * FIRST_CHECK_FACTOR, settings.tscTimeoutMs)
+}
+
 /** Starts language servers when files of theirs are checked, one per server and root, and keeps them. */
 export class ServerManager {
   readonly #settings: LspSettings
@@ -82,8 +94,14 @@ export class ServerManager {
       const spec = this.specFor(file)
       if (spec) bySpec.set(spec, [...(bySpec.get(spec) ?? []), file])
     }
+    // One time limit for the whole check: starting, asking and waiting (or tsc) all count.
+    const started = Date.now()
+    const limits = {
+      server: started + this.#settings.startupTimeoutMs + waitMs * FIRST_CHECK_FACTOR,
+      tsc: started + this.#settings.tscTimeoutMs,
+    }
     const parts = await Promise.all(
-      [...bySpec].map(([spec, list]) => this.#checkSpec(spec, list, cwd, signal, waitMs)),
+      [...bySpec].map(([spec, list]) => this.#checkSpec(spec, list, cwd, signal, waitMs, limits)),
     )
     return parts.flat()
   }
@@ -94,11 +112,12 @@ export class ServerManager {
     cwd: string,
     signal: AbortSignal,
     waitMs: number,
+    limits: { server: number; tsc: number },
   ): Promise<FileCheck[]> {
     const command = this.#command(spec)
     if (!command) {
       if (!spec.tscFallback) return []
-      return this.#checkWithTsc(files, cwd, signal)
+      return this.#checkWithTsc(files, cwd, signal, limits.tsc)
     }
     const byRoot = new Map<string, string[]>()
     for (const file of files) {
@@ -109,13 +128,19 @@ export class ServerManager {
       [...byRoot].map(async ([root, list]) => {
         const entry = await this.#client(spec, command, root)
         if (!entry || signal.aborted) return []
-        return this.#checkWith(entry, list, signal, waitMs)
+        return this.#checkWith(entry, list, signal, waitMs, limits.server)
       }),
     )
     return parts.flat()
   }
 
-  async #checkWith(entry: Entry, files: string[], signal: AbortSignal, waitMs: number): Promise<FileCheck[]> {
+  async #checkWith(
+    entry: Entry,
+    files: string[],
+    signal: AbortSignal,
+    waitMs: number,
+    deadline: number,
+  ): Promise<FileCheck[]> {
     const { client, spec } = entry
     const wanted = new Set(files.map((f) => fileKey(f)))
     // Files opened earlier may have changed on disk since (other tools, the user): resend them,
@@ -141,6 +166,7 @@ export class ServerManager {
       present.map((file) =>
         client.diagnostics(file, {
           waitMs: wait,
+          deadline,
           signal,
           ...(spec.settleMs !== undefined ? { settleMs: spec.settleMs } : {}),
         }),
@@ -154,14 +180,19 @@ export class ServerManager {
     }))
   }
 
-  async #checkWithTsc(files: string[], cwd: string, signal: AbortSignal): Promise<FileCheck[]> {
+  async #checkWithTsc(
+    files: string[],
+    cwd: string,
+    signal: AbortSignal,
+    deadline: number,
+  ): Promise<FileCheck[]> {
     // Declaration files and JavaScript are left to a real server.
     const ts = files.filter((f) => /\.(ts|tsx|mts|cts)$/i.test(f) && !/\.d\.[mc]?ts$/i.test(f) && isFile(f))
     if (!ts.length) return []
     const tsc = this.#findTsc(cwd)
     if (!tsc) return []
     const run = await runTsc([tsc], ts, cwd, this.#deps.runCommand, {
-      timeoutMs: this.#settings.tscTimeoutMs,
+      timeoutMs: Math.max(1, deadline - Date.now()),
       signal,
     })
     if (run.error) {

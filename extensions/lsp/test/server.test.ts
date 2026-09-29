@@ -158,6 +158,22 @@ test("a server that answers textDocument/diagnostic is asked directly", async ()
   expect(Date.now() - started).toBeLessThan(2000)
 })
 
+test("asking and then waiting for a publish share one time limit", async () => {
+  const { dir } = workspace()
+  const c = client(dir, { FAKE_LSP_PULL: "hang" })
+  await c.start()
+  expect(c.pulls).toBe(true)
+  const file = path.join(dir, "a.fk")
+  c.sync(file, "ERROR: x\n", "fake")
+  let started = Date.now()
+  expect(await c.diagnostics(file, { waitMs: 800 })).toEqual({ diagnostics: [], fresh: false })
+  // The failed request used up the time: no second full wait for a publish.
+  expect(Date.now() - started).toBeLessThan(1400)
+  started = Date.now()
+  await c.diagnostics(file, { waitMs: 30_000, deadline: Date.now() + 300 })
+  expect(Date.now() - started).toBeLessThan(1000)
+})
+
 test("a silent server times out with fresh: false; a missing program fails to start", async () => {
   const { dir } = workspace()
   const c = client(dir, { FAKE_LSP_SILENT: "1" })
