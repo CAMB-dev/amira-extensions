@@ -137,7 +137,12 @@ interface Launch {
   ui: UiApi
   signal?: AbortSignal
   createGroup(opts: SpawnGroupOptions): SpawnGroup
-  notice: PendingNotice | undefined
+  /**
+   * Takes the notice the result is delivered as. Called only once the run starts: a pending
+   * notice keeps print and RPC mode waiting, so one taken for a run that never starts would
+   * keep them waiting forever.
+   */
+  expectNotice(): PendingNotice | undefined
   /** How the result reaches the commander when there is no notice. */
   send?: (message: UserMessage) => void
 }
@@ -242,7 +247,6 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         l.signal ? { signal: l.signal } : {},
       )
       if (ok !== true) {
-        l.notice?.cancel()
         return ok === false
           ? "The user declined to start the workflow."
           : "Nobody confirmed the workflow, so it did not start."
@@ -258,7 +262,6 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
           compact: true,
         })
       } catch (err) {
-        l.notice?.cancel()
         return `The workflow could not start: ${errorText(err)}`
       }
       const id = l.resume?.id ?? `wf_${crypto.randomUUID().slice(0, 8)}`
@@ -286,16 +289,16 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         })
       } catch (err) {
         group.end("the workflow could not start")
-        l.notice?.cancel()
         return `The script cannot run: ${errorText(err)}`
       }
       runs.delete(id)
       runs.set(id, run)
       if (root) owners.set(id, root)
+      const notice = l.expectNotice()
       run.done.then(() => {
         setStatus(run)
         const message = noticeFor(run)
-        if (l.notice) l.notice.deliver(message)
+        if (notice) notice.deliver(message)
         else l.send?.(message)
       })
       run.start()
@@ -381,7 +384,6 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
           origin = saved.file
         }
         if (source === undefined) return textResult('Give "script", "name" or "resume".', true)
-        const notice = session.expectNotice?.()
         const run = await launch({
           source,
           origin,
@@ -390,7 +392,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
           ui: api.ui,
           signal: ctx.signal,
           createGroup: (o) => session.createGroup!(o),
-          notice,
+          expectNotice: () => session.expectNotice?.(),
         })
         if (typeof run === "string") return textResult(run, true)
         return textResult(
@@ -494,18 +496,17 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
 
     const commandLaunch = async (
       ctx: CommandContext,
-      l: Omit<Launch, "ui" | "createGroup" | "notice" | "send">,
+      l: Omit<Launch, "ui" | "createGroup" | "expectNotice" | "send">,
     ) => {
       const control = ctx.session
       if (!control.createGroup)
         throw new Error("workflows need an agent tree, which this frontend does not have")
-      const notice = control.expectNotice?.()
       const run = await launch({
         ...l,
         ui: ctx.ui,
         signal: ctx.signal,
         createGroup: (o) => control.createGroup!(o),
-        notice,
+        expectNotice: () => control.expectNotice?.(),
         send: (m) =>
           void ctx.session.send(messageText(m), m.display ? { display: m.display } : {}).catch(() => {}),
       })

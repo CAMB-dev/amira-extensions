@@ -57,6 +57,7 @@ function setup(
   const groups: FakeGroup[] = []
   const notices: UserMessage[] = []
   let cancelled = 0
+  let expected = 0
   const answer = opts.answer ?? ((o: { prompt: string }) => ({ text: `saw ${o.prompt.split(" ").at(-1)}` }))
   const api = {
     apiVersion: "0.1.0",
@@ -112,10 +113,13 @@ function setup(
     depth,
     maxDepth: 2,
     createGroup,
-    expectNotice: () => ({
-      deliver: (m: UserMessage) => notices.push(m),
-      cancel: () => cancelled++,
-    }),
+    expectNotice: () => {
+      expected++
+      return {
+        deliver: (m: UserMessage) => notices.push(m),
+        cancel: () => cancelled++,
+      }
+    },
   })
   const call = (params: Record<string, unknown>, depth = 0): Promise<ToolResult> =>
     tool.execute(params, {
@@ -166,6 +170,9 @@ function setup(
     sent,
     get cancelled() {
       return cancelled
+    },
+    get expected() {
+      return expected
     },
   }
 }
@@ -261,20 +268,37 @@ test("defaults: a run's group gets 30 agents and 6 at once", async () => {
   expect(t.groups[0]!.options.budget).toBeUndefined()
 })
 
-test("declining the confirmation starts nothing and cancels the expected notice", async () => {
+test("declining the confirmation starts nothing and leaves no notice pending", async () => {
   const t = setup({ settings: { enabled: "always" }, confirm: false })
   const r = await t.call({ script: SCRIPT })
   expect(t.text(r)).toMatch(/declined/)
   expect(t.groups).toHaveLength(0)
-  expect(t.cancelled).toBe(1)
+  expect(t.expected - t.cancelled).toBe(0)
 })
 
-test("a script without meta is refused before the user is asked", async () => {
+test("a script without meta, or that does not compile, is refused with no notice pending", async () => {
+  // A pending notice keeps print and RPC mode waiting for it: one taken for a run that never
+  // starts would keep them waiting forever.
   const t = setup({ settings: { enabled: "always" } })
   const r = await t.call({ script: 'return await agent("x")' })
   expect(r.isError).toBe(true)
   expect(t.text(r)).toMatch(/export const meta/)
+  const broken = await t.call({
+    script: `export const meta = { name: "b", description: "b", phases: [] }\nreturn (`,
+  })
+  expect(t.text(broken)).toMatch(/does not compile/)
   expect(t.confirms).toHaveLength(0)
+  expect(t.expected - t.cancelled).toBe(0)
+  // The same through /workflow <saved name>.
+  mkdirSync(path.join(t.cwd, ".amira", "workflows"), { recursive: true })
+  writeFileSync(path.join(t.cwd, ".amira", "workflows", "nometa.ts"), 'return await agent("x")')
+  await t.run("nometa")
+  expect(t.printed.at(-1)).toMatch(/export const meta/)
+  expect(t.expected - t.cancelled).toBe(0)
+  // A run that starts takes exactly one.
+  await t.call({ script: SCRIPT })
+  expect(t.expected).toBe(1)
+  await until(() => t.notices.length === 1)
 })
 
 test("the estimate says dynamic when agents are started in loops", async () => {
