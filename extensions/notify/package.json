@@ -1,0 +1,18 @@
+{
+  "name": "notify",
+  "version": "0.1.0",
+  "description": "Notifications when Amira needs you: a long turn ended, a question waits, background agents finished; on the desktop or through webhooks",
+  "type": "module",
+  "scripts": {
+    "link-amira": "bun scripts/link-amira.ts",
+    "test": "bun test"
+  },
+  "amira": {
+    "engines": {
+      "amira": "^0.1.1"
+    },
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}
