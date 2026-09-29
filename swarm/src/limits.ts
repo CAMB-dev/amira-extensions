@@ -39,15 +39,11 @@ export const DEFAULT_LIMITS: SwarmLimits = {
 /** The extension's settings: `extensions.swarm` in settings.json. */
 export interface SwarmSettings {
   /**
-   * When the model may start a swarm: "explicit" (the default) only after the user asked for
-   * one (said "swarm", or typed `/swarm <goal>`), "always", or "never".
+   * How a swarm starts: "ask" (the default) asks the user to confirm every start, which is the
+   * gate; "always" starts without asking; "never" starts none. Older settings read as:
+   * "explicit" is "ask", and `confirm: false` turns "ask" into "always".
    */
-  enabled: "explicit" | "always" | "never"
-  /**
-   * Ask the user before each start the model makes (default true). A start right after the
-   * user typed `/swarm <goal>` is never asked about.
-   */
-  confirm: boolean
+  enabled: "ask" | "always" | "never"
   /** Most members a swarm may have. */
   maxMembers: number
   limits: SwarmLimits
@@ -60,18 +56,19 @@ const positive = (v: unknown): number | undefined =>
 export function readSettings(raw: unknown, report: (problem: string) => void = () => {}): SwarmSettings {
   const s = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {}
   const out: SwarmSettings = {
-    enabled: "explicit",
-    confirm: true,
+    enabled: "ask",
     maxMembers: 6,
     limits: { ...DEFAULT_LIMITS },
   }
   if (s.enabled !== undefined) {
-    if (s.enabled === "explicit" || s.enabled === "always" || s.enabled === "never") out.enabled = s.enabled
-    else report('"extensions.swarm.enabled" must be "explicit", "always" or "never"')
+    if (s.enabled === "ask" || s.enabled === "always" || s.enabled === "never") out.enabled = s.enabled
+    else if (s.enabled === "explicit") out.enabled = "ask"
+    else report('"extensions.swarm.enabled" must be "ask", "always" or "never"')
   }
+  // The older `confirm` setting: false skipped the confirmation, which "always" does now.
   if (s.confirm !== undefined) {
-    if (typeof s.confirm === "boolean") out.confirm = s.confirm
-    else report('"extensions.swarm.confirm" must be true or false')
+    if (typeof s.confirm !== "boolean") report('"extensions.swarm.confirm" must be true or false')
+    else if (!s.confirm && out.enabled === "ask") out.enabled = "always"
   }
   if (s.maxMembers !== undefined) {
     const n = positive(s.maxMembers)

@@ -12,12 +12,18 @@ Needs Amira's extension API 0.1.1 or newer (persistent sub-agents, spawn groups,
 
 ## Starting one
 
-A swarm only starts when you ask for one:
+You can ask for a swarm, and the model may propose one when it clearly helps:
 
-- `/swarm <goal>`: the main session picks the members (name, role, brief) and starts it at
-  once;
-- or say "swarm" in a message ("use a swarm to ..."): the model may then call the `swarm`
-  tool, and you confirm the roster before it starts.
+- `/swarm <goal>`: the main session picks the members (name, role, brief) and starts it;
+- say "swarm" in a message ("use a swarm to ..."): the model calls the `swarm` tool;
+- or the model proposes one on its own.
+
+Every start asks you to confirm, showing whether the model proposes it or you asked for it,
+the goal, the roster (names, roles, briefs), the limits and the budget. If you decline, the
+model is told so and may not propose a swarm for the same goal again in this session unless
+you ask for one. Where nobody can confirm (print mode, an rpc client that does not answer
+dialogs), the model cannot start one: run `/swarm <goal>` in the interactive UI, or set
+`enabled` to `"always"`.
 
 Only the main session can start a swarm; members and other sub-agents cannot. The start
 returns at once. The swarm runs in the background and, when it ends, sends the main session
@@ -92,8 +98,7 @@ In `settings.json`, under `extensions.swarm`:
 {
   "extensions": {
     "swarm": {
-      "enabled": "explicit",       // "explicit" (only when you ask), "always", or "never"
-      "confirm": true,             // confirm starts the model makes (/swarm never asks)
+      "enabled": "ask",            // "ask" (default): confirm every start; "always": start without asking; "never"
       "maxMembers": 6,
       "limits": {
         "maxMessagesPerMember": 30,
@@ -111,6 +116,9 @@ In `settings.json`, under `extensions.swarm`:
 
 A start may lower the message and turn limits (`limits` of the `swarm` tool), never raise
 them.
+
+Older settings still work: `"enabled": "explicit"` reads as `"ask"`, and `"confirm": false`
+reads as `"enabled": "always"`.
 
 ## Tests
 

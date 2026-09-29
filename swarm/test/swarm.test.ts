@@ -158,6 +158,23 @@ function answerDialogs(host: ExtensionHost, bus: EventBus, answer: (title: strin
   )
 }
 
+/** Records every confirmation and answers it with `answer()` (undefined: nobody answers). */
+function confirmations(host: ExtensionHost, bus: EventBus, answer: () => boolean | undefined) {
+  const seen: { title: string; message: string }[] = []
+  bus.subscribe(
+    (e) => {
+      if (e.type !== "ui.request" || e.data.kind !== "confirm") return
+      seen.push({ title: e.data.title, message: e.data.message ?? "" })
+      const v = answer()
+      setTimeout(() => host.ui.respond(e.data.requestId, v ?? null), 0)
+    },
+    { types: ["ui.request"] },
+  )
+  return seen
+}
+
+const lastResult = (root: Agent) => textOf(root.messages.filter((m) => m.role === "toolResult").at(-1))
+
 const roster3 = [
   { name: "planner", role: "planner", brief: "Write a plan to the blackboard and tell the researcher." },
   { name: "researcher", role: "researcher", brief: "Research what the plan asks and tell the writer." },
@@ -462,27 +479,108 @@ test("the user messages a member with @name; the swarm counts it as progress, no
   expect(host.inputs.claim("@writer again")).toBeUndefined()
 })
 
-test("the model may start a swarm only when the user asked for one, and only from the main session", async () => {
+test("the model may propose a swarm: the confirmation, marked as its proposal, is the gate", async () => {
+  const { root, host, bus } = await withExtension((req) => {
+    if (who(req) !== "commander") return { text: "member idle" }
+    if (req.messages.at(-1)?.role === "toolResult" || textOf(req.messages.at(-1)).includes("ended:"))
+      return { text: "ok" }
+    return { toolCalls: [{ name: "swarm", args: { action: "start", goal: "Check the sky", members: pair } }] }
+  }, {})
+  const seen = confirmations(host, bus, () => true)
+  await root.prompt("answer this for me")
+  expect(lastResult(root)).toContain("Started swarm")
+  expect(seen).toHaveLength(1)
+  expect(seen[0]!.title).toBe("Start a swarm of 2 agents?")
+  const lines = seen[0]!.message.split("\n")
+  expect(lines[0]).toBe("The model proposes this swarm.")
+  expect(lines[1]).toBe("Goal: Check the sky")
+  expect(seen[0]!.message).toContain("  a (one): talk to b")
+  expect(seen[0]!.message).toContain("  b (two): answer a")
+  expect(seen[0]!.message).toContain("Limits: 20 turns and 30 messages per member, 150 messages in all.")
+  expect(seen[0]!.message).toContain("Budget: 3,000,000 tokens.")
+  await until(() => root.messages.some((m) => m.role === "user" && m.display?.origin === "swarm"))
+})
+
+test("a declined goal is not proposed again until the user asks; another goal may be", async () => {
+  let turn = 0
+  const goals = ["g", "g", "G  ", "another goal", "g"]
+  const { root, host, bus } = await withExtension((req) => {
+    if (who(req) !== "commander") return { text: "member idle" }
+    const last = req.messages.at(-1)
+    if (last?.role === "toolResult" || textOf(last).includes("ended:")) return { text: "ok" }
+    const goal = goals[turn++]!
+    return { toolCalls: [{ name: "swarm", args: { action: "start", goal, members: pair } }] }
+  }, {})
+  const seen = confirmations(host, bus, () => false)
+  // Asked for with /swarm: marked as the user's, and declined.
+  await root.prompt({
+    role: "user",
+    content: [{ type: "text", text: "Use a swarm (the swarm tool) for this task: g" }],
+    display: { text: "/swarm g" },
+  })
+  expect(seen.map((c) => c.message.split("\n")[0])).toEqual(["You asked for this swarm."])
+  expect(lastResult(root)).toMatch(/^The user declined the swarm, so it did not start\. Do not propose/)
+  // The model tries the same goal again, and reworded: refused without asking.
+  await root.prompt("ok, go on")
+  expect(lastResult(root)).toContain("already declined a swarm for this goal")
+  await root.prompt("go on")
+  expect(lastResult(root)).toContain("already declined a swarm for this goal")
+  expect(seen).toHaveLength(1)
+  // Another goal may be proposed.
+  await root.prompt("next")
+  expect(seen).toHaveLength(2)
+  expect(seen[1]!.message.split("\n")[0]).toBe("The model proposes this swarm.")
+  // The user asks for a swarm: the declined goal may be proposed again.
+  await root.prompt("fine, use a swarm for g")
+  expect(seen).toHaveLength(3)
+  expect(seen[2]!.message.split("\n")[0]).toBe("You asked for this swarm.")
+})
+
+test("with nobody to confirm (print mode) the tool refuses and says how to start it", async () => {
   let n = 0
-  const { root } = await withExtension(
+  const { root, host, bus } = await withExtension((req) => {
+    if (who(req) !== "commander") return { text: "member idle" }
+    if (req.messages.at(-1)?.role === "toolResult") return { text: "ok" }
+    n++
+    return { toolCalls: [{ name: "swarm", args: { action: "start", goal: "Check the sky", members: pair } }] }
+  }, {})
+  confirmations(host, bus, () => undefined)
+  await root.prompt("answer this for me")
+  const text = lastResult(root)
+  expect(text).toContain("Nobody confirmed the swarm, so it did not start")
+  expect(text).toContain("/swarm Check the sky")
+  expect(text).toContain('extensions.swarm.enabled to "always"')
+  expect(root.expectedNotices).toBe(0)
+  await root.prompt("and again")
+  expect(lastResult(root)).toContain("already declined")
+  expect(n).toBe(2)
+})
+
+test('settings: "never" refuses the tool and /swarm; "always" starts without asking', async () => {
+  const { root, host } = await withExtension(
+    (req) => {
+      if (req.messages.at(-1)?.role === "toolResult") return { text: "ok" }
+      return { toolCalls: [{ name: "swarm", args: { action: "start", goal: "g", members: pair } }] }
+    },
+    { extensions: { swarm: { enabled: "never" } } },
+  )
+  await root.prompt("use a swarm")
+  expect(lastResult(root)).toContain("turned off")
+  await expect(command(host, root, "do it")).rejects.toThrow("turned off")
+  const always = await withExtension(
     (req) => {
       if (who(req) !== "commander") return { text: "member idle" }
       if (req.messages.at(-1)?.role === "toolResult" || textOf(req.messages.at(-1)).includes("ended:"))
         return { text: "ok" }
-      n++
       return { toolCalls: [{ name: "swarm", args: { action: "start", goal: "g", members: pair } }] }
     },
-    { extensions: { swarm: { confirm: false } } },
+    { extensions: { swarm: { enabled: "always" } } },
   )
-  await root.prompt("answer this for me")
-  const refused = root.messages.filter((m) => m.role === "toolResult").at(-1)!
-  expect(refused.role === "toolResult" && refused.isError).toBe(true)
-  expect(textOf(refused)).toContain("has not asked for a swarm")
-  await root.prompt("run a swarm on it")
-  const started = root.messages.filter((m) => m.role === "toolResult").at(-1)!
-  expect(textOf(started)).toContain("Started swarm")
-  await until(() => root.messages.some((m) => m.role === "user" && m.display?.origin === "swarm"))
-  expect(n).toBe(2)
+  const seen = confirmations(always.host, always.bus, () => false)
+  await always.root.prompt("answer this")
+  expect(lastResult(always.root)).toContain("Started swarm")
+  expect(seen).toHaveLength(0)
+  await until(() => always.root.messages.some((m) => m.role === "user" && m.display?.origin === "swarm"))
 })
 
 test("no sub-agent, at any depth, is offered the swarm tool, even when it asks for it by name", async () => {
@@ -547,8 +645,8 @@ test("settings: bad values are reported and ignored; a start can only lower the 
     },
     (p) => void problems.push(p),
   )
-  expect(s.enabled).toBe("explicit")
-  expect(s.confirm).toBe(false)
+  // An unknown value is reported; the older confirm: false still skips the confirmation.
+  expect(s.enabled).toBe("always")
   expect(s.maxMembers).toBe(6)
   expect(s.limits.maxMessages).toBe(10)
   expect(s.limits.noProgressRounds).toBe(DEFAULT_LIMITS.noProgressRounds)
@@ -556,6 +654,14 @@ test("settings: bad values are reported and ignored; a start can only lower the 
   expect(problems.length).toBe(3)
   // Without settings a swarm still has a budget.
   expect(readSettings(undefined).limits.budget).toEqual({ tokens: DEFAULT_BUDGET_TOKENS })
+  expect(readSettings(undefined).enabled).toBe("ask")
+  // The older values: "explicit" is "ask"; confirm: false never overrides "never".
+  const quiet: string[] = []
+  expect(readSettings({ enabled: "explicit" }, (p) => void quiet.push(p)).enabled).toBe("ask")
+  expect(readSettings({ enabled: "explicit", confirm: false }).enabled).toBe("always")
+  expect(readSettings({ enabled: "never", confirm: false }).enabled).toBe("never")
+  expect(readSettings({ confirm: true }).enabled).toBe("ask")
+  expect(quiet).toEqual([])
 })
 
 // ---- review fixes ----
@@ -815,33 +921,6 @@ test("/clear during a swarm stops it without waking the old conversation", async
   expect(root.messages.some((m) => m.role === "user" && m.display?.origin === "swarm")).toBe(false)
   const [past] = swarmsFromRecords(root.data.read(DATA_KEY))
   expect(past!.endReason).toBe("its session was closed")
-})
-
-test("/swarm <goal> lets only the turn it asked for start a swarm", async () => {
-  let turn = 0
-  const { root, host, bus } = await withExtension((req) => {
-    if (who(req) !== "commander") return { text: "member idle" }
-    const last = req.messages.at(-1)
-    if (last?.role === "toolResult" || textOf(last).includes("ended:")) return { text: "ok" }
-    turn++
-    // First it asks a question instead of starting; later it starts on its own.
-    if (turn === 1) return { text: "Which sky?" }
-    return { toolCalls: [{ name: "swarm", args: { action: "start", goal: "g", members: pair } }] }
-  }, {})
-  const dialogs: string[] = []
-  answerDialogs(host, bus, (title) => {
-    dialogs.push(title)
-    return false
-  })
-  await root.prompt({
-    role: "user",
-    content: [{ type: "text", text: "Use a swarm (the swarm tool) for this task: the sky" }],
-    display: { text: "/swarm the sky" },
-  })
-  await root.prompt("the blue one")
-  const refused = root.messages.filter((m) => m.role === "toolResult").at(-1)!
-  expect(textOf(refused)).toContain("has not asked for a swarm")
-  expect(dialogs).toEqual([])
 })
 
 test("/swarm commands and the commander's tool actions steer a running swarm", async () => {

@@ -79,9 +79,15 @@ interface Launch {
   data?: SessionData
   ui: UiApi
   signal?: AbortSignal
-  /** No confirmation: the user just asked for this swarm with /swarm. */
-  confirmed: boolean
+  /**
+   * Who wants the swarm: "user" when the message the turn answers asks for one (or came from
+   * /swarm <goal>), else "model" (the model proposes it). Shown in the confirmation.
+   */
+  initiator: "user" | "model"
 }
+
+/** A goal as the "declined" memory compares it: case and spacing do not make it another. */
+const goalKey = (goal: string) => oneLine(goal).toLowerCase()
 
 type Params = {
   action?: string
@@ -98,8 +104,10 @@ export function createSwarmExtension(): Extension {
     let root: string | undefined
     /** The user asked for a swarm in the message the current turn answers. */
     let explicit = false
-    /** The user typed `/swarm <goal>`: the start that follows needs no confirmation. */
+    /** The user typed `/swarm <goal>`: the turn it asked for counts as asking for a swarm. */
     let requested = false
+    /** Goals the user turned down in this session: the model may not propose them again unasked. */
+    const declined = new Set<string>()
     let lastData: SessionData | undefined
     let seq = 0
 
@@ -110,17 +118,15 @@ export function createSwarmExtension(): Extension {
 
     const live = (): Live | undefined => [...swarms.values()].reverse().find((l) => l.swarm.live)
 
-    const gate = (s: SwarmSettings): string | undefined => {
-      if (s.enabled === "never") return "Swarms are turned off in settings (extensions.swarm.enabled: never)."
-      if (s.enabled === "always" || explicit || requested) return undefined
-      return "The user has not asked for a swarm, so none may be started. If long-lived agents talking to each other would help, propose a swarm (its goal and members) and let the user ask for it (by saying so, or with /swarm <goal>). Otherwise use the agent tool."
-    }
-
     const launch = async (l: Launch): Promise<Swarm | string> => {
       const s = settings()
+      if (s.enabled === "never") return "Swarms are turned off in settings (extensions.swarm.enabled: never)."
       if (live()) return `Swarm ${live()!.swarm.id} is still running; stop it first or talk to its members.`
       const goal = typeof l.goal === "string" ? oneLine(l.goal) : ""
       if (!goal) return '"goal" is required.'
+      if (l.initiator === "model" && declined.has(goalKey(goal))) {
+        return "The user already declined a swarm for this goal in this session, so it was not proposed again. Do not propose it again, reworded or with another roster; carry on without it (e.g. with the agent tool) unless the user asks for a swarm."
+      }
       const members = (l.members ?? []).map((m) => ({
         ...m,
         name: typeof m?.name === "string" ? m.name.trim() : (m?.name as string),
@@ -129,19 +135,33 @@ export function createSwarmExtension(): Extension {
       const problem = checkRoster(members, s.maxMembers)
       if (problem) return problem
       const limits = withOverrides(s.limits, l.limits)
-      if (s.confirm && !l.confirmed) {
+      if (s.enabled === "ask") {
         const roster = members
           .map((m) => `  ${m.name} (${m.role}): ${clip(oneLine(m.brief), 100)}`)
           .join("\n")
+        const budget = [
+          limits.budget?.tokens !== undefined ? `${limits.budget.tokens.toLocaleString("en-US")} tokens` : "",
+          limits.budget?.costUsd !== undefined ? `$${limits.budget.costUsd}` : "",
+        ].filter(Boolean)
         const ok = await l.ui.confirm(
           `Start a swarm of ${members.length} agents?`,
-          `${goal}\n\n${roster}\n\nLimits: ${limits.maxTurnsPerMember} turns and ${limits.maxMessagesPerMember} messages per member, ${limits.maxMessages} messages in all.`,
+          [
+            l.initiator === "user" ? "You asked for this swarm." : "The model proposes this swarm.",
+            `Goal: ${goal}`,
+            "",
+            roster,
+            "",
+            `Limits: ${limits.maxTurnsPerMember} turns and ${limits.maxMessagesPerMember} messages per member, ${limits.maxMessages} messages in all${limits.maxConcurrent ? `, ${limits.maxConcurrent} at once` : ""}.`,
+            `Budget: ${budget.join(", ") || "the session's"}.`,
+          ].join("\n"),
           l.signal ? { signal: l.signal } : {},
         )
-        if (!ok)
-          return ok === false
-            ? "The user declined to start the swarm."
-            : "Nobody confirmed the swarm, so it did not start."
+        if (ok !== true) {
+          declined.add(goalKey(goal))
+          if (ok === false)
+            return "The user declined the swarm, so it did not start. Do not propose a swarm for this goal again in this session unless the user asks for one; carry on without it (e.g. with the agent tool), or ask the user how they want to proceed."
+          return `Nobody confirmed the swarm, so it did not start: the confirmation was dismissed, or nobody can answer it here (print mode, or an rpc client that does not answer dialogs). Do not propose it again in this session unless the user asks. To start it themselves, the user can run /swarm ${clip(goal, 200)} in the interactive UI, or set extensions.swarm.enabled to "always" in settings.json to start swarms without confirming.`
+        }
       }
       let group: SpawnGroup
       try {
@@ -224,7 +244,7 @@ export function createSwarmExtension(): Extension {
     const tool: ToolDefinition<Params> = {
       name: SWARM_TOOL,
       description:
-        'Runs a swarm: long-lived sub-agents (members) that work on one goal together in the background, through a shared blackboard and messages to each other. Only start one when the user asked for a swarm; otherwise propose it. action "start" takes "goal" and "members" (2 or more, each {name, role, brief, model?}); the user confirms the start. The call returns at once: members\' messages to you and the final report (members\' results and the blackboard) come back by themselves, so end your turn instead of waiting. "message" sends "text" to member "to"; "status" shows members, blackboard keys and the latest timeline; "stop" ends the swarm.',
+        'Runs a swarm: long-lived sub-agents (members) that work on one goal together in the background, through a shared blackboard and messages to each other. Start one when it clearly helps (several agents that must keep talking to each other over a longer task); for one-off sub-tasks use the agent tool. action "start" takes "goal" and "members" (2 or more, each {name, role, brief, model?}); it proposes the swarm: the user sees the goal, roster and limits and approves or declines it. When the user declines, do not start a swarm for that goal again unless they ask. The call returns at once: members\' messages to you and the final report (members\' results and the blackboard) come back by themselves, so end your turn instead of waiting. "message" sends "text" to member "to"; "status" shows members, blackboard keys and the latest timeline; "stop" ends the swarm.',
       parameters: {
         type: "object",
         properties: {
@@ -264,8 +284,6 @@ export function createSwarmExtension(): Extension {
           if (!session?.createGroup || session.depth > 0) {
             return textResult("A swarm can only be started from the main session.", true)
           }
-          const refused = gate(settings())
-          if (refused) return textResult(refused, true)
           const r = await launch({
             goal: p.goal ?? "",
             members: p.members ?? [],
@@ -276,7 +294,7 @@ export function createSwarmExtension(): Extension {
             ...(session.data ? { data: session.data } : {}),
             ui: api.ui,
             signal: ctx.signal,
-            confirmed: requested,
+            initiator: explicit || requested ? "user" : "model",
           })
           if (typeof r === "string") return textResult(r, true)
           return {
@@ -479,6 +497,7 @@ export function createSwarmExtension(): Extension {
       root = e.sessionId
       explicit = false
       requested = false
+      declined.clear()
     })
     api.on("session.end", (e) => {
       if (e.parentSessionId !== undefined) return
