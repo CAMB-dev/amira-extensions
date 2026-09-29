@@ -353,6 +353,7 @@ export function createSwarmExtension(): Extension {
           snapshot: () => s.snapshot(),
           control: {
             tell: (to, text) => s.tell("user", to, text),
+            tellAll: (text) => s.tellAll(text),
             pause: (name) => s.pause(name),
             resume: (name) => s.resume(name),
             stopMember: (name) => s.stopMember(name),
@@ -374,11 +375,23 @@ export function createSwarmExtension(): Extension {
       ctx.print(`✉ you → ${m?.name ?? name}${m?.status === "paused" ? " (held until it is resumed)" : ""}`)
     }
 
+    /** `@all <text>` and `/swarm msg all <text>`: one message to every member. */
+    const tellAllFromUser = (ctx: CommandContext, text: string) => {
+      const l = live()
+      if (!l) throw new Error("no swarm is running")
+      const sent = l.swarm.tellAll(text)
+      if (typeof sent === "string") throw new Error(sent)
+      ctx.print(`✉ you → all (${sent} member${sent === 1 ? "" : "s"})`)
+    }
+
+    /** Whether `name` (after @ or `/swarm msg`) means every member. */
+    const isAll = (name: string) => name.toLowerCase() === "all"
+
     api.registerCommand({
       name: "swarm",
       description: "Ask for a swarm, or watch, message, pause and stop the running one",
       args: {
-        hint: "<goal> | view [id] | list | msg <name> <text> | pause [name] | resume [name] | stop [name]",
+        hint: "<goal> | view [id] | list | msg <name|all> <text> | pause [name] | resume [name] | stop [name]",
         complete: (): CommandCandidate[] => {
           const names = live()?.swarm.names() ?? []
           return [
@@ -387,6 +400,7 @@ export function createSwarmExtension(): Extension {
             { value: "stop", description: "stop the swarm (or one member)" },
             { value: "pause", description: "hold a member's messages (or the whole swarm's)" },
             { value: "resume", description: "deliver what was held" },
+            ...(names.length ? [{ value: "msg all ", description: "message every member" }] : []),
             ...names.map((n) => ({ value: `msg ${n} `, description: `message ${n}` })),
           ]
         },
@@ -448,8 +462,10 @@ export function createSwarmExtension(): Extension {
             return
           }
           case "msg": {
-            if (!name || rest.length < 2) throw new Error("usage: /swarm msg <name> <text>")
-            tellFromUser(ctx, name, text.slice(text.indexOf(name) + name.length).trim())
+            if (!name || rest.length < 2) throw new Error("usage: /swarm msg <name|all> <text>")
+            const body = text.slice(text.indexOf(name) + name.length).trim()
+            if (isAll(name)) tellAllFromUser(ctx, body)
+            else tellFromUser(ctx, name, body)
             return
           }
         }
@@ -470,11 +486,12 @@ export function createSwarmExtension(): Extension {
       claims(text) {
         const l = live()
         const m = /^@([A-Za-z][\w-]*)[\s:,]+\S/.exec(text)
-        return !!(l && m && l.swarm.member(m[1]!))
+        return !!(l && m && (isAll(m[1]!) || l.swarm.member(m[1]!)))
       },
       run(text, ctx) {
         const m = /^@([A-Za-z][\w-]*)[\s:,]+([\s\S]+)$/.exec(text)!
-        tellFromUser(ctx, m[1]!, m[2]!)
+        if (isAll(m[1]!)) tellAllFromUser(ctx, m[2]!)
+        else tellFromUser(ctx, m[1]!, m[2]!)
       },
     })
 

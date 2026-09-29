@@ -49,10 +49,14 @@ before its next model call; messages from one sender arrive in the order they we
 
 - `/swarm view` opens the live view: members with their states, the blackboard, and the
   timeline of every message, write and finish. Its keys: `m` message a member
-  (`name: text`), `p` pause or resume a member (`all` for the whole swarm), `x` stop a
-  member, `s` stop the swarm.
+  (`name: text`, or `all: text` for every member), `p` pause or resume a member (`all`
+  for the whole swarm), `x` stop a member, `s` stop the swarm.
 - `@name text` while a swarm runs sends `text` to that member instead of to the model.
   `/swarm msg <name> <text>` does the same.
+- `@all text` (or `/swarm msg all <text>`) sends `text` to every member that is still
+  running or idle; a paused member gets it when it is resumed. The timeline shows it once,
+  as `user → all`, and the line printed (`✉ you → all (3 members)`) says how many members
+  it went to.
 - `/swarm pause [name]`, `/swarm resume [name]`: hold a member's messages (or everyone's)
   and deliver them later.
 - `/swarm stop [name]`: stop one member, or the whole swarm.

@@ -998,3 +998,109 @@ test("/swarm commands and the commander's tool actions steer a running swarm", a
   release = true
   await expect(command(host, root, "stop")).rejects.toThrow("no swarm is running")
 })
+
+test("@all from the input box reaches every member; the timeline keeps it once", async () => {
+  let gate = true
+  const { root, mock, host } = await withExtension(
+    (req) => {
+      const me = who(req)
+      if (me === "commander") {
+        return req.messages.at(-1)?.role === "toolResult" || textOf(req.messages.at(-1)).includes("ended:")
+          ? { text: "ok" }
+          : { toolCalls: [{ name: "swarm", args: { action: "start", goal: "sky", members: roster3 } }] }
+      }
+      if (lastIsResult(req)) return { text: "ok" }
+      // The planner keeps the swarm alive until the user has spoken.
+      if (me === "planner" && gate) return { text: "thinking", delayMs: 40 }
+      return { text: `${me} idle` }
+    },
+    { extensions: { swarm: { confirm: false, enabled: "always" } } },
+  )
+  await root.prompt("go")
+  const printed: string[] = []
+  const ctx = { print: (t: string) => void printed.push(t) } as unknown as CommandContext
+  const handler = host.inputs.claim("@all check in")!
+  expect(handler?.name).toBe("swarm")
+  expect(host.inputs.claim("@ALL: check in")?.name).toBe("swarm")
+  // "@all" with nothing after it is no message: it goes to the model.
+  expect(host.inputs.claim("@all")).toBeUndefined()
+  await handler.run("@all check in", ctx)
+  gate = false
+  expect(printed).toEqual(["✉ you → all (3 members)"])
+  await until(() => root.messages.some((m) => m.role === "user" && m.display?.origin === "swarm"))
+  for (const name of ["planner", "researcher", "writer"]) {
+    const saw = mock.requests.filter(
+      (r) => who(r) === name && inbox(r).includes("[message from the user, to every member] check in"),
+    )
+    expect(saw.length).toBeGreaterThan(0)
+  }
+  const [past] = swarmsFromRecords(root.data.read(DATA_KEY))
+  const messages = past!.timeline.filter((e) => e.kind === "message")
+  expect(messages).toHaveLength(1)
+  expect(messages[0]).toMatchObject({ from: "user", to: "all", text: "check in" })
+  // Once it ended, @all goes to the model again.
+  expect(host.inputs.claim("@all again")).toBeUndefined()
+})
+
+test("/swarm msg all reaches every member; a paused one gets it on resume", async () => {
+  let release = false
+  const { root, host, mock } = await withExtension(
+    (req) => {
+      const me = who(req)
+      if (me === "commander") {
+        const last = req.messages.at(-1)
+        if (last?.role === "toolResult") return { text: "ok" }
+        if (textOf(last).includes("ended:")) return { text: "done" }
+        if (textOf(last) === "stop it") return { toolCalls: [{ name: "swarm", args: { action: "stop" } }] }
+        return { toolCalls: [{ name: "swarm", args: { action: "start", goal: "g", members: pair } }] }
+      }
+      if (lastIsResult(req)) return { text: "ok" }
+      // b keeps the swarm alive until the test lets it go.
+      if (me === "b" && !release) return { text: "b busy", delayMs: 100 }
+      return { text: `${me} idle` }
+    },
+    { extensions: { swarm: { confirm: false, enabled: "always" } } },
+  )
+  await root.prompt("start")
+  const complete = host.commands.get("swarm")!.def.args!.complete!
+  expect((await complete("", {} as never)).map((c) => c.value)).toContain("msg all ")
+  expect(await command(host, root, "pause a")).toEqual(["Paused a."])
+  expect(await command(host, root, "msg all hello everyone")).toEqual(["✉ you → all (2 members)"])
+  const got = (name: string) =>
+    mock.requests.some((r) => who(r) === name && lastText(r).includes("to every member] hello everyone"))
+  await until(() => got("b"))
+  expect(got("a")).toBe(false)
+  expect(await command(host, root, "resume a")).toEqual(["Resumed a."])
+  await until(() => got("a"))
+  const snap = swarmsFromRecords(root.data.read(DATA_KEY))[0]!
+  expect(snap.timeline.filter((e) => e.kind === "message").map((e) => `${e.from}>${e.to}`)).toEqual([
+    "user>all",
+  ])
+  // Empty text is refused, and a bare "msg all" is a usage error.
+  await expect(command(host, root, "msg all   ")).rejects.toThrow("The message is empty.")
+  await expect(command(host, root, "msg all")).rejects.toThrow("usage: /swarm msg <name|all> <text>")
+  await root.prompt("stop it")
+  await until(() => root.messages.some((m) => m.role === "user" && textOf(m).includes("ended:")))
+  release = true
+  await expect(command(host, root, "msg all hi")).rejects.toThrow("no swarm is running")
+})
+
+test("a message to all goes to the members that can still get it, and says when none can", async () => {
+  const { swarm, records } = direct((req) => {
+    if (lastIsResult(req)) return { text: "ok" }
+    return { text: `${who(req)} busy`, delayMs: 200 }
+  }, pair)
+  expect(swarm.tellAll("   ")).toBe("The message is empty.")
+  await until(() => swarm.snapshot().members.every((m) => m.status === "working"))
+  expect(swarm.stopMember("a")).toBeUndefined()
+  expect(swarm.tellAll("only b")).toBe(1)
+  expect(swarm.stopMember("b")).toBeUndefined()
+  expect(swarm.tellAll("nobody")).toBe(
+    "No member can get messages any more: every one has ended or is stopping.",
+  )
+  await swarm.done
+  expect(swarm.tellAll("late")).toBe("The swarm has ended.")
+  expect(records.filter((r) => r.type === "message")).toMatchObject([
+    { from: "user", to: "all", text: "only b" },
+  ])
+})
