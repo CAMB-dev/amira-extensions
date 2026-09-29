@@ -288,3 +288,18 @@ test("settings: bad fields are reported and fall back to defaults", () => {
   expect(s).toEqual({ ...DEFAULT_SETTINGS, exportDir: "exp", maxDiffChars: 5000 })
   expect(problems).toHaveLength(4)
 })
+
+test("a stored sub-agent without its call id is linked to the call whose result names it", () => {
+  const { toolCallId: _, ...stored } = sub
+  const msgs = messages.map((m) =>
+    m.role === "toolResult" && m.toolCallId === "c2"
+      ? {
+          ...m,
+          isError: false,
+          content: [{ type: "text" as const, text: "Started in the background: s_child1 (explorer)" }],
+        }
+      : m,
+  )
+  const t = buildTranscript({ ...source, messages: msgs, subagents: [stored] }, createRedactor({}))
+  expect(renderMarkdown(t)).toContain("Sub-agent: [Explore api](#subagent-s_child1)")
+})

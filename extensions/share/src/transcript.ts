@@ -94,6 +94,37 @@ export function buildTranscript(src: TranscriptSource, redact: Redactor, now = D
     if (!models.includes(ref)) models.push(ref)
     addUsage(usage, m.usage)
   }
+  const entries = entriesOf(src.messages, redact, byCall)
+  const subagents: SubagentSection[] = src.subagents.map((s) => ({
+    id: s.id,
+    title: redact(s.title),
+    role: s.role,
+    status: s.status,
+    depth: s.depth,
+    task: redact(s.task),
+    ...(s.model ? { model: `${s.model.provider}/${s.model.model}` } : {}),
+    usage: s.usage,
+    ...(s.durationMs !== undefined ? { durationMs: s.durationMs } : {}),
+    ...(s.error ? { error: redact(s.error) } : {}),
+    entries: entriesOf(src.subagentMessages(s.id) ?? [], redact, byCall),
+  }))
+  // Sub-agents of earlier runs do not know the call that started them: link them to the call
+  // whose result names them (the agent tool's result gives the ids it started).
+  const unlinked = src.subagents.filter((s) => !s.toolCallId)
+  if (unlinked.length) {
+    const calls = [entries, ...subagents.map((s) => s.entries)].flatMap((list) =>
+      list.flatMap((e) =>
+        e.kind === "assistant" ? e.parts.flatMap((p) => (p.kind === "tool" ? [p.call] : [])) : [],
+      ),
+    )
+    for (const s of unlinked) {
+      const call = calls.find(
+        (c) => c.result && new RegExp(`\\b${s.id.replace(/[^\w-]/g, "")}\\b`).test(c.result.text),
+      )
+      if (call && !call.subagents.some((x) => x.id === s.id))
+        call.subagents.push({ id: s.id, title: redact(s.title) })
+    }
+  }
   return {
     sessionId: src.sessionId,
     cwd: redact(src.cwd),
@@ -101,20 +132,8 @@ export function buildTranscript(src: TranscriptSource, redact: Redactor, now = D
     exportedAt: now,
     models,
     usage,
-    entries: entriesOf(src.messages, redact, byCall),
-    subagents: src.subagents.map((s) => ({
-      id: s.id,
-      title: redact(s.title),
-      role: s.role,
-      status: s.status,
-      depth: s.depth,
-      task: redact(s.task),
-      ...(s.model ? { model: `${s.model.provider}/${s.model.model}` } : {}),
-      usage: s.usage,
-      ...(s.durationMs !== undefined ? { durationMs: s.durationMs } : {}),
-      ...(s.error ? { error: redact(s.error) } : {}),
-      entries: entriesOf(src.subagentMessages(s.id) ?? [], redact, byCall),
-    })),
+    entries,
+    subagents,
   }
 }
 
