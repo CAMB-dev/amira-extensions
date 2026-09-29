@@ -41,10 +41,23 @@ html,body{margin:0;background:#fff}
 window.amiraRenderDone = (async () => {
   const m = globalThis.mermaid || (globalThis.__esbuild_esm_mermaid_nm && globalThis.__esbuild_esm_mermaid_nm.mermaid.default)
   m.initialize({ startOnLoad: false, securityLevel: "strict", theme: ${jsString(theme)}, htmlLabels: false, flowchart: { htmlLabels: false } })
-  const { svg } = await m.render("amira-diagram", ${jsString(source)})
+  let svg
+  try {
+    svg = (await m.render("amira-diagram", ${jsString(source)})).svg
+  } catch (err) {
+    throw new Error(${jsString(DIAGRAM_ERROR)} + (err && err.message ? err.message : String(err)))
+  }
   document.getElementById("diagram").innerHTML = svg
 })()
 </script></body></html>`
+}
+
+/** How the page says mermaid could not draw the diagram (the diagram's fault, not the browser's). */
+const DIAGRAM_ERROR = "mermaid could not draw the diagram: "
+
+/** Whether a failed render was mermaid refusing the diagram, rather than the browser or the page failing. */
+export function isDiagramError(message: string): boolean {
+  return message.includes(DIAGRAM_ERROR)
 }
 
 /** Renders HTML to a PNG: the browser extension's service. */
@@ -56,8 +69,8 @@ const KEPT = 64
 /**
  * Diagrams rendered to PNGs through the browser extension, each once per source and theme
  * (by their hash): the same diagram in another reply, a redraw at another width, or the
- * transcript drawn again costs nothing. A failure is kept too, so a diagram mermaid cannot
- * draw is not tried again and again.
+ * transcript drawn again costs nothing. A diagram mermaid cannot draw is kept as such too, so
+ * it is not tried again and again.
  */
 export class DiagramImages {
   private cache = new Map<string, Promise<Uint8Array>>()
@@ -81,6 +94,12 @@ export class DiagramImages {
       timeoutMs: 20_000,
     })
     this.cache.set(key, png)
+    // Only mermaid refusing the diagram is kept: a browser that failed to start, or was slow,
+    // gets another chance next time.
+    png.catch((err) => {
+      if (!isDiagramError(err instanceof Error ? err.message : String(err)) && this.cache.get(key) === png)
+        this.cache.delete(key)
+    })
     for (const k of this.cache.keys()) {
       if (this.cache.size <= KEPT) break
       this.cache.delete(k)

@@ -80,10 +80,37 @@ test("renders are cached by the diagram's hash; a failed image falls back, and a
     "mermaid: rendering a diagram to an image failed: Chrome did not start within 30s",
   ])
   // Mermaid failing on the diagram is the diagram's problem: code, and nothing reported.
-  const syntax = setup({ browser: true, fail: "the page failed: Parsing failed" })
+  const syntax = setup({
+    browser: true,
+    fail: "the page failed: mermaid could not draw the diagram: Parsing failed",
+  })
+  expect(await syntax.render(PIE, true)).toBeUndefined()
   expect(await syntax.render(PIE, true)).toBeUndefined()
   expect(syntax.errors).toEqual([])
+  // ...and it is not tried again; a browser that failed is.
+  expect(syntax.renders).toHaveLength(1)
+  await bad.render(PIE, true)
+  expect(bad.renders).toHaveLength(3)
   expect(new DiagramImages().key(PIE, "default")).not.toBe(new DiagramImages().key(PIE, "dark"))
+})
+
+test("the browser is looked up only for a picture; a huge diagram is not laid out as text", () => {
+  let lookups = 0
+  const api = {
+    settings: {},
+    useService: () => {
+      lookups++
+      return undefined
+    },
+    reportError: () => {},
+  } as unknown as ExtensionAPI
+  const r = mermaidRenderer(api)
+  r.render(node(FLOW), { width: 60, images: true, maxImageRows: 20 })
+  expect(lookups).toBe(0)
+  r.render(node(PIE), { width: 60, images: true, maxImageRows: 20 })
+  expect(lookups).toBe(1)
+  const huge = `flowchart TD\n${Array.from({ length: 3000 }, (_, i) => `  n${i} --> n${i + 1}`).join("\n")}`
+  expect(r.render(node(huge), { width: 60, images: false, maxImageRows: 20 })).toBeUndefined()
 })
 
 test("the page: mermaid bundled inline, the source as a safe literal, strict security, no network", () => {

@@ -7,7 +7,7 @@ import {
   type MarkdownRenderResult,
   type Settings,
 } from "@amira/api"
-import { DiagramImages, type MermaidTheme, type RenderHtml } from "./image.ts"
+import { DiagramImages, isDiagramError, type MermaidTheme, type RenderHtml } from "./image.ts"
 import { type DiagramLine, diagramType, renderMermaidText } from "./text/index.ts"
 
 export { DiagramImages, diagramPage, MERMAID_VERSION } from "./image.ts"
@@ -39,6 +39,8 @@ export function readSettings(settings: Readonly<Settings> | undefined): MermaidS
 
 /** Types there is a text layout for. */
 const TEXT_TYPES = new Set(["flowchart", "sequence"])
+/** The largest source laid out as text (it runs on the UI thread). */
+const MAX_TEXT_SOURCE = 20_000
 
 export interface MermaidOptions {
   settings?: MermaidSettings
@@ -77,8 +79,8 @@ export function mermaidRenderer(api: ExtensionAPI, opts: MermaidOptions = {}): M
       return { image: { data: await images.render(source, settings.theme, render) } }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      // A diagram mermaid cannot parse is the model's; the browser failing is worth saying once.
-      if (!/the page failed/.test(message) && !reported) {
+      // A diagram mermaid cannot draw is the model's; anything else is worth saying once.
+      if (!isDiagramError(message) && !reported) {
         reported = true
         api.reportError(`mermaid: rendering a diagram to an image failed: ${message}`)
       }
@@ -94,10 +96,11 @@ export function mermaidRenderer(api: ExtensionAPI, opts: MermaidOptions = {}): M
       if (node.type !== "code") return undefined
       const type = diagramType(node.code)
       if (!type) return undefined
-      const textual = TEXT_TYPES.has(type)
-      const render = settings.mode !== "text" && ctx.images ? renderHtml() : undefined
-      const wantPicture = render && (settings.mode === "image" || !textual)
-      if (wantPicture) {
+      // Laid out on the UI thread: a diagram past this size stays code rather than stall it.
+      const textual = TEXT_TYPES.has(type) && node.code.length <= MAX_TEXT_SOURCE
+      const wantsPicture = settings.mode === "image" || !TEXT_TYPES.has(type)
+      const render = wantsPicture && settings.mode !== "text" && ctx.images ? renderHtml() : undefined
+      if (render) {
         return picture(node.code, render).then((r) => r ?? (textual ? text(node.code, ctx.width) : undefined))
       }
       return textual ? text(node.code, ctx.width) : undefined
