@@ -14,9 +14,9 @@ amira ext remove mcp-server
 
 | Extension | What it does |
 |---|---|
-| [mcp-server](mcp-server) | `amira mcp serve`: Amira as an MCP server, so Claude Code, Codex, Gemini CLI and others can hand it tasks |
-| [workflow](workflow) | `/workflow` and a `workflow` tool: TypeScript scripts that orchestrate many sub-agents, with limits, a progress view and resume |
-| [swarm](swarm) | `/swarm <goal>`: long-lived agents that work together through a shared blackboard and messages |
+| [mcp-server](extensions/mcp-server) | `amira mcp serve`: Amira as an MCP server, so Claude Code, Codex, Gemini CLI and others can hand it tasks |
+| [workflow](extensions/workflow) | `/workflow` and a `workflow` tool: TypeScript scripts that orchestrate many sub-agents, with limits, a progress view and resume |
+| [swarm](extensions/swarm) | `/swarm <goal>`: long-lived agents that work together through a shared blackboard and messages |
 
 ## The index
 
@@ -87,5 +87,5 @@ project package replaces a user package of the same name.
 
 ## Adding an extension here
 
-One directory per extension, plus an entry in `index.json`. Keep extensions small, load
+One directory per extension under `extensions/`, plus an entry in `index.json`. Keep extensions small, load
 nothing expensive at startup, and start processes only through `runCommand`.
