@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test"
-import { existsSync, readdirSync, readFileSync } from "node:fs"
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import type { CommandContext, Message, StoredSession, SubagentInfo } from "@amira/api"
 import { completeExport, parseExportArgs, runExport } from "../src/export.ts"
@@ -197,14 +197,21 @@ test("export arguments: format, path and --session in any order; completions", (
   expect(() => parseExportArgs("--bogus")).toThrow(/unknown option/)
   const session = { sessions: () => [{ id: "s_old", updatedAt: 1, firstUserText: "hello", messageCount: 2 }] }
   const ctx = { session } as unknown as CommandContext
-  expect(completeExport("", ctx).map((c) => c.value)).toEqual(["md", "html", "--session "])
+  expect(completeExport("", ctx).map((c) => c.value)).toEqual(["md", "html", "--session ", "--force"])
   expect(completeExport("html --session ", ctx).map((c) => c.value)).toEqual(["html --session s_old"])
 })
 
-function exportContext(cwd: string, opts: { stored?: StoredSession } = {}) {
+function exportContext(cwd: string, opts: { stored?: StoredSession; confirm?: boolean } = {}) {
   const printed: string[] = []
+  const asked: string[] = []
   const ctx = {
     cwd,
+    ui: {
+      confirm: async (title: string) => {
+        asked.push(title)
+        return opts.confirm
+      },
+    },
     signal: new AbortController().signal,
     print: (t: string) => void printed.push(t),
     session: {
@@ -217,7 +224,7 @@ function exportContext(cwd: string, opts: { stored?: StoredSession } = {}) {
         : {}),
     },
   } as unknown as CommandContext
-  return { ctx, printed }
+  return { ctx, printed, asked }
 }
 
 test("/export writes the current session under .amira/exports, git-ignored, and says where", async () => {
@@ -302,4 +309,109 @@ test("a stored sub-agent without its call id is linked to the call whose result 
   )
   const t = buildTranscript({ ...source, messages: msgs, subagents: [stored] }, createRedactor({}))
   expect(renderMarkdown(t)).toContain("Sub-agent: [Explore api](#subagent-s_child1)")
+})
+
+test("the redactor: more key shapes and short passwords go; words that only look like keys stay", () => {
+  const redact = createRedactor({
+    GIT_AUTHOR_NAME: "Christopher",
+    AUTH_MODE: "production",
+    SIGNING_KEY: "k3y-f0r-s1gning",
+  })
+  const secrets = [
+    `PRIVATE_KEY=0x${"ab12".repeat(16)}`,
+    "SERVICE_KEY=Zq81kfLr0cX2mB7t",
+    // Put together here, so the file holds no key-shaped string of its own.
+    `STRIPE=${["sk", "live", "0000fake0000fake0000"].join("_")}`,
+    '"password": "Summer2024!"',
+    `token ${"ya29"}.fake0fake0fake0fake0fake`,
+    `AccountName=me;${"Account"}Key=fake0fake0fake==;EndpointSuffix=core`,
+    `Authorization: Basic ${Buffer.from("admin:hunter22").toString("base64")}`,
+    "signed with k3y-f0r-s1gning",
+  ]
+  for (const s of secrets) expect(redact(s)).toContain(REDACTED)
+  expect(redact('"password": "Summer2024!"')).not.toContain("Summer2024")
+  const prose = [
+    "Christopher deployed to production",
+    "Basic configuration/settings are in the README",
+    "the sk-spinner-wave-animation class",
+    "password: string",
+  ].join("\n")
+  expect(redact(prose)).toBe(prose)
+})
+
+test("the redactor stays fast on long runs of hyphenated words", () => {
+  const started = performance.now()
+  createRedactor({})("ab-".repeat(40_000))
+  expect(performance.now() - started).toBeLessThan(500)
+})
+
+test("Markdown export: a reply cut off inside a code block, or holding </details>, cannot swallow what follows", () => {
+  const cut: Message[] = [
+    { role: "user", content: [{ type: "text", text: "go" }] },
+    {
+      role: "assistant",
+      model,
+      usage,
+      content: [
+        { type: "thinking", text: "hmm </details> <details>" },
+        { type: "text", text: "Here:\n\n```ts\nconst a = 1\n" },
+      ],
+      stopReason: "aborted",
+    },
+    { role: "user", content: [{ type: "text", text: "and then" }] },
+  ]
+  const render = (msgs: Message[]) =>
+    renderMarkdown(buildTranscript({ ...source, messages: msgs, subagents: [] }, createRedactor({})))
+  const md = render(cut)
+  expect(md).toContain("```ts\nconst a = 1\n```")
+  expect(md).toContain("hmm &lt;/details> &lt;details>")
+  // Outside the code block again: the next message is a heading.
+  expect(md).toContain("### User\n\nand then")
+  // Inside code, tags stay as written.
+  const inCode: Message = {
+    role: "assistant",
+    model,
+    usage,
+    content: [{ type: "text", text: "```\n</details>\n```" }],
+  }
+  expect(render([cut[0]!, inCode])).toContain("```\n</details>\n```")
+})
+
+test("HTML export: protocol-relative and UNC links are not links", () => {
+  const html = markdownToHtml("[a](//evil.example/x) [b](\\\\host\\share) [c](./ok.md)")
+  expect(html).not.toContain('href="//')
+  expect(html).not.toContain('href="\\\\')
+  expect(html).toContain('<a href="./ok.md"')
+})
+
+test("/export to an existing file asks first; --force replaces it; a path without an extension gets one", async () => {
+  const cwd = tempDir()
+  const settings = { settings: DEFAULT_SETTINGS, redact: createRedactor({}) }
+  const target = path.join(cwd, "README.md")
+  writeFileSync(target, "mine\n")
+  // Nobody can answer (print mode): refused, with how to force it.
+  const nobody = exportContext(cwd)
+  await runExport("README.md", nobody.ctx, settings)
+  expect(readFileSync(target, "utf8")).toBe("mine\n")
+  expect(nobody.asked).toEqual(["Replace README.md?"])
+  expect(nobody.printed.at(-1)).toBe("Not exported: README.md exists. Add --force to replace it.")
+  // The user says no.
+  const no = exportContext(cwd, { confirm: false })
+  await runExport("README.md", no.ctx, settings)
+  expect(readFileSync(target, "utf8")).toBe("mine\n")
+  expect(no.printed.at(-1)).toBe("Not exported: README.md exists.")
+  // Yes, or --force without asking.
+  const yes = exportContext(cwd, { confirm: true })
+  await runExport("README.md", yes.ctx, settings)
+  expect(readFileSync(target, "utf8")).toContain("# Amira session s_root")
+  const forced = exportContext(cwd)
+  writeFileSync(target, "mine\n")
+  await runExport("README.md --force", forced.ctx, settings)
+  expect(forced.asked).toEqual([])
+  expect(readFileSync(target, "utf8")).toContain("# Amira session s_root")
+  await runExport("html notes", forced.ctx, settings)
+  expect(readFileSync(path.join(cwd, "notes.html"), "utf8")).toStartWith("<!doctype html>")
+  // A format that does not match the extension is written, with a warning.
+  await runExport("md page.html", forced.ctx, settings)
+  expect(forced.printed.some((p) => p.includes("Writing Markdown to a .html file."))).toBe(true)
 })

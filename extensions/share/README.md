@@ -11,20 +11,22 @@ Session export and git helpers for Amira:
 amira ext install share
 ```
 
-Needs Amira's extension API 0.1.1 or newer. `/export --session <id>` also needs a host
-that can read stored sessions (`SessionControl.readSession`); without it, only the current
-session can be exported.
+Needs Amira's extension API 0.1.2 (for `SessionControl.readSession`, which `/export` uses to
+read the whole conversation and `/export --session <id>` to read a stored one).
 
 ## /export
 
 ```
-/export [md|html] [path] [--session <id>]
+/export [md|html] [path] [--session <id>] [--force]
 ```
 
 - With no path, the file goes to `.amira/exports/<session>-<date>-<time>.<md|html>` in the
   project. When that directory is created, it gets a `.gitignore` of `*`, so exports are not
   committed by accident. A path ending in `/`, or naming a directory, gets the same file name
-  inside it. A path ending in `.html` or `.md` sets the format.
+  inside it. A path ending in `.html` or `.md` sets the format; a path without an extension
+  gets the format's.
+- A file that exists already is replaced only once you confirm (`--force`: without asking;
+  where nobody can answer, as in print mode, it is left alone).
 - Without `md` or `html` (and no telling extension), the format is `exportFormat` (default
   Markdown).
 - `--session <id>` exports a stored session of this project (the ids `/resume` lists)
@@ -43,16 +45,18 @@ Both formats have the whole conversation, including anything a compaction later 
 The HTML file needs nothing else: styles and a few lines of script (expand or collapse
 everything) are inline, images are embedded, and it follows the system's light or dark mode.
 Everything the session said is escaped: no text from the session becomes markup, and links
-keep only `http(s)`, `mailto` and relative targets. Markdown exports name images instead of
+keep only `http(s)`, `mailto` and relative targets (not `//host/…`, which opens as a network
+path from a local file). Markdown exports name images instead of
 embedding them.
 
 **Secrets.** Before anything is written, text that looks like a key or token is replaced
 with `[REDACTED]`: keys by their usual shapes (`sk-…`, `ghp_…`, `github_pat_…`, AWS, Google,
-Slack, Hugging Face, npm, Telegram bot tokens, JWTs, private key blocks, webhook URLs),
-`Bearer …` headers, passwords in URLs, `api_key = …` / `"token": "…"` assignments with
-generated-looking values, and the values of this process's environment variables whose names
-say KEY, TOKEN, SECRET, PASSWORD and the like (and of every provider's `apiKeyEnv`), wherever
-they appear. It is a filter, not a guarantee: read an export before you share it.
+Slack, Stripe, Hugging Face, npm, Telegram bot tokens, Google OAuth tokens, Azure storage keys,
+JWTs, private key blocks, webhook URLs), `Bearer …` and `Basic …` headers, passwords in URLs,
+`api_key = …` / `"token": "…"` / `PRIVATE_KEY=…` assignments with generated-looking values,
+password assignments of 8 characters or more, and the values of this process's environment
+variables whose names have a KEY, TOKEN, SECRET, PASSWORD, CREDENTIALS or AUTH part (when
+the value looks generated) and of every provider's `apiKeyEnv`, wherever they appear. It is a filter, not a guarantee: read an export before you share it.
 
 ## /commit
 
@@ -102,8 +106,8 @@ from the settings, else `origin`'s default branch, else `main` or `master`.
 
 A reviewer sub-agent reviews the branch's changes against the base (chosen as for `/pr`).
 When the branch has no commits of its own, it reviews the uncommitted changes instead. It
-gets the commits and the diff, may read the code around them (read, grep, glob and read-only
-shell commands, as far as the session has those tools), and hands back findings, which are
+gets the commits and the diff, may read the code around them (read, grep and glob only, as far as the
+session has those tools: no shell, since the diff may come from someone else), and hands back findings, which are
 printed most severe first: severity, `file:line`, the problem, and how it goes wrong. It
 runs on `reviewModel`, else `agents.reviewer.model`, else the session's model.
 

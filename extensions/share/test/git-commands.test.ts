@@ -214,6 +214,29 @@ test("/pr with gh pushes a branch without upstream and creates the PR after conf
   expect(create[create.indexOf("--head") + 1]).toBe("feat/b")
 })
 
+test("/pr: a branch tracking a differently named remote branch pushes there and names it as the head", async () => {
+  const cwd = branchRepo()
+  const remote = path.join(path.dirname(cwd), "remote.git")
+  git(path.dirname(cwd), "init", "-q", "--bare", remote)
+  git(cwd, "remote", "add", "origin", remote)
+  git(cwd, "push", "-q", "origin", "main", "HEAD~1:refs/heads/me/b")
+  git(cwd, "branch", "-q", "--set-upstream-to", "origin/me/b")
+  const calls: string[][] = []
+  const h = await harness({
+    cwd,
+    reply: prReply,
+    run: fakeGh(true, calls),
+    dialogs: { select: ["Push and create PR"] },
+  })
+  const out = await h.run("/pr main")
+  expect(h.asked[0]!.title).toMatch(/1 commit is not pushed; it will be pushed to origin/)
+  expect(out).toContain("Created https://github.com/o/r/pull/7")
+  expect(git(remote, "rev-parse", "me/b")).toBe(git(cwd, "rev-parse", "HEAD"))
+  expect(() => git(remote, "rev-parse", "--verify", "-q", "refs/heads/feat/b")).toThrow()
+  const create = calls.find((c) => c[1] === "pr")!
+  expect(create[create.indexOf("--head") + 1]).toBe("me/b")
+})
+
 test("/pr: Cancel creates nothing; on the base branch it refuses", async () => {
   const cwd = branchRepo()
   const calls: string[][] = []

@@ -265,7 +265,9 @@ function inline(text: string): string {
     const url = href.replace(/&amp;/g, "&")
     if (
       !/^(https?:|mailto:|#|\.{0,2}\/|[\w-]+(\.[\w-]+)*(\/|$))/i.test(url) ||
-      /^(javascript|data|vbscript):/i.test(url)
+      /^(javascript|data|vbscript):/i.test(url) ||
+      // Protocol-relative: opened from a file, //host/x is a UNC path on Windows.
+      /^[\\/]{2}/.test(url)
     )
       return `${label} (${href})`
     return `<a href="${esc(url)}" rel="noopener noreferrer">${label}</a>`

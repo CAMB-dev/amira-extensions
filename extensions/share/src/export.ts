@@ -13,6 +13,8 @@ export interface ExportArgs {
   format?: ExportFormat
   path?: string
   session?: string
+  /** Replace an existing file without asking. */
+  force?: boolean
 }
 
 /** Splits on spaces, keeping "quoted parts" (with spaces) together. */
@@ -22,7 +24,7 @@ export function splitArgs(args: string): string[] {
   return out
 }
 
-/** `[md|html] [path] [--session <id>]`, in any order. */
+/** `[md|html] [path] [--session <id>] [--force]`, in any order. */
 export function parseExportArgs(args: string): ExportArgs {
   const out: ExportArgs = {}
   const words = splitArgs(args)
@@ -33,6 +35,7 @@ export function parseExportArgs(args: string): ExportArgs {
       if (!id) throw new Error("--session needs a session id (see /resume)")
       out.session = id
     } else if (w.startsWith("--session=")) out.session = w.slice("--session=".length)
+    else if (w === "--force" || w === "-f") out.force = true
     else if ((w === "md" || w === "html" || w === "markdown") && out.format === undefined)
       out.format = w === "html" ? "html" : "md"
     else if (w.startsWith("-") && w.length > 1) throw new Error(`unknown option ${w}`)
@@ -76,7 +79,24 @@ export async function runExport(
   if (a.path) {
     const target = path.resolve(ctx.cwd, a.path)
     const isDir = /[\\/]$/.test(a.path) || (existsSync(target) && statSync(target).isDirectory())
-    file = isDir ? path.join(target, name) : target
+    // A path without an extension gets the format's.
+    file = isDir ? path.join(target, name) : path.extname(target) ? target : `${target}.${format}`
+    if (!isDir && existsSync(file) && !a.force) {
+      const shownFile = path.relative(ctx.cwd, file) || file
+      const yes = await ctx.ui.confirm(`Replace ${shownFile}?`, "It exists; the export would overwrite it.", {
+        signal: ctx.signal,
+      })
+      if (yes !== true) {
+        ctx.print(
+          `Not exported: ${shownFile} exists.${yes === undefined ? " Add --force to replace it." : ""}`,
+          "warning",
+        )
+        return
+      }
+    }
+    const implied = formatOf(file)
+    if (implied && implied !== format)
+      ctx.print(`Writing ${format === "html" ? "HTML" : "Markdown"} to a .${implied} file.`, "warning")
   } else {
     const dir = path.resolve(ctx.cwd, deps.settings.exportDir)
     madeDefaultDir = !existsSync(dir)
@@ -157,5 +177,7 @@ export function completeExport(
   }
   if (!before.includes("--session"))
     out.push({ value: `${head}--session `, description: "export a stored session" })
+  if (!before.includes("--force"))
+    out.push({ value: `${head}--force`, description: "replace an existing file without asking" })
   return out
 }

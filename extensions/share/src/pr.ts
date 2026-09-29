@@ -179,7 +179,9 @@ export async function runPr(
     if (!push.remote)
       throw new Error("the branch has no upstream and the repository has no remote to push to")
     ctx.print(`Pushing ${changes.branch} to ${push.remote}…`)
-    const pushed = await git.exec(["push", "--set-upstream", push.remote, changes.branch], {
+    // To the upstream branch when there is one: its name may differ from the local one.
+    const refspec = push.head && push.head !== changes.branch ? `HEAD:${push.head}` : changes.branch
+    const pushed = await git.exec(["push", "--set-upstream", push.remote, refspec], {
       timeoutMs: 5 * 60_000,
     })
     if (!pushed.ok) {
@@ -202,7 +204,7 @@ export async function runPr(
       "--base",
       baseName,
       "--head",
-      changes.branch,
+      push.head ?? changes.branch,
     ]
     if (opts.draft) argv.push("--draft")
     const r = await deps.run(argv, { cwd: root, signal: ctx.signal, timeoutMs: 2 * 60_000 })
@@ -221,7 +223,7 @@ export async function runPr(
 async function pushState(
   git: Git,
   branch: string,
-): Promise<{ needed: boolean; why?: string; remote?: string }> {
+): Promise<{ needed: boolean; why?: string; remote?: string; head?: string }> {
   const upstream = await git.exec(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], {
     stdoutOnly: true,
   })
@@ -231,6 +233,9 @@ async function pushState(
     return { needed: true, why: `${branch} has no upstream`, ...(fallback ? { remote: fallback } : {}) }
   }
   const remote = remotes.find((r) => upstream.output.startsWith(`${r}/`)) ?? fallback
+  // The branch on the remote, e.g. user/fix for a local fix tracking origin/user/fix.
+  const head =
+    remote && upstream.output.startsWith(`${remote}/`) ? upstream.output.slice(remote.length + 1) : branch
   const ahead = await git.exec(["rev-list", "--count", "@{u}..HEAD"], { stdoutOnly: true })
   const n = ahead.ok ? Number(ahead.output) : 0
   if (n > 0)
@@ -238,8 +243,9 @@ async function pushState(
       needed: true,
       why: `${n} commit${n === 1 ? " is" : "s are"} not pushed`,
       ...(remote ? { remote } : {}),
+      head,
     }
-  return { needed: false }
+  return { needed: false, head }
 }
 
 async function editDraft(ctx: CommandContext, d: PrDraft, submit: string): Promise<PrDraft | undefined> {

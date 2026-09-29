@@ -44,7 +44,7 @@ function renderEntries(out: string[], entries: Entry[], level: number): void {
       if (e.display) out.push(`> ${escapeInline(e.display)}`, "")
       if (e.note) out.push(`*${escapeInline(e.note)}*`, "")
       if (e.display) out.push(details("Full message", fence(e.text)))
-      else out.push(e.text, "")
+      else out.push(contained(e.text), "")
       for (const img of e.images) out.push(imageLine(img), "")
       continue
     }
@@ -64,11 +64,11 @@ function renderEntries(out: string[], entries: Entry[], level: number): void {
 
 function renderPart(out: string[], p: Part): void {
   if (p.kind === "text") {
-    out.push(p.text, "")
+    out.push(contained(p.text), "")
     return
   }
   if (p.kind === "thinking") {
-    out.push(details("Thinking", p.text))
+    out.push(details("Thinking", contained(p.text)))
     return
   }
   out.push(details(toolSummary(p.call), toolBody(p.call)))
@@ -114,6 +114,31 @@ function imageLine(img: ImagePart): string {
 /** A collapsed block; the blank lines let Markdown inside it render. */
 function details(summary: string, body: string): string {
   return `<details>\n<summary>${summary}</summary>\n\n${body.trim()}\n\n</details>\n`
+}
+
+/**
+ * Free text (a reply, thinking, a user message) as Markdown that cannot swallow what follows
+ * it: a code fence left open (a reply cut off mid-block) is closed, and `<details>` and
+ * `<summary>` tags outside code are escaped so they cannot close the export's own blocks.
+ */
+export function contained(text: string): string {
+  const lines = text.split("\n")
+  let open: { ch: string; len: number } | undefined
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(lines[i]!)
+    if (open) {
+      if (m && m[1]![0] === open.ch && m[1]!.length >= open.len && !m[2]!.trim()) open = undefined
+      continue
+    }
+    // A backtick fence's info string cannot contain a backtick; such a line is not a fence.
+    if (m && !(m[1]![0] === "`" && m[2]!.includes("`"))) {
+      open = { ch: m[1]![0]!, len: m[1]!.length }
+      continue
+    }
+    lines[i] = lines[i]!.replace(/<(\/?(?:details|summary))(?=[\s>/])/gi, "&lt;$1")
+  }
+  const out = lines.join("\n")
+  return open ? `${out.replace(/\n+$/, "")}\n${open.ch.repeat(open.len)}` : out
 }
 
 /** A fenced code block whose fence is longer than any run of backticks inside. */
