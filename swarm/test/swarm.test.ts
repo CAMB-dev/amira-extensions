@@ -536,6 +536,35 @@ test("a declined goal is not proposed again until the user asks; another goal ma
   expect(seen[2]!.message.split("\n")[0]).toBe("You asked for this swarm.")
 })
 
+test("a decline uses up the user's ask; a new session forgets what was declined", async () => {
+  const goals = ["Check the sky", "check the sky.", "Check the sky"]
+  let turn = 0
+  const { root, host, bus } = await withExtension((req) => {
+    if (who(req) !== "commander") return { text: "member idle" }
+    const last = req.messages.at(-1)
+    if (last?.role === "toolResult" && turn === 1) {
+      // Same turn, right after the decline: the model tries again, with a full stop added.
+      turn++
+      return { toolCalls: [{ name: "swarm", args: { action: "start", goal: goals[1], members: pair } }] }
+    }
+    if (last?.role === "toolResult" || textOf(last).includes("ended:")) return { text: "ok" }
+    const goal = goals[turn === 0 ? 0 : 2]!
+    turn = turn === 0 ? 1 : 3
+    return { toolCalls: [{ name: "swarm", args: { action: "start", goal, members: pair } }] }
+  }, {})
+  const seen = confirmations(host, bus, () => false)
+  await root.prompt("use a swarm to check the sky")
+  expect(seen).toHaveLength(1)
+  expect(lastResult(root)).toContain("already declined a swarm for this goal")
+  bus.emit(
+    "session.start",
+    { reason: "clear", cwd: process.cwd(), model: { provider: "mock", model: "big" } },
+    { sessionId: root.sessionId },
+  )
+  await root.prompt("hello again")
+  expect(seen).toHaveLength(2)
+})
+
 test("with nobody to confirm (print mode) the tool refuses and says how to start it", async () => {
   let n = 0
   const { root, host, bus } = await withExtension((req) => {

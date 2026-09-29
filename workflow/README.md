@@ -22,6 +22,10 @@ Where nobody can confirm (print mode, an rpc client that does not answer dialogs
 cannot start one: run it yourself with `/workflow <name>` in the interactive UI, or set
 `enabled` to `"always"`.
 
+Since 0.1.1, `"always"` starts workflows without the confirmation (before, it only let the
+model start one unasked, and every start was still confirmed). The earlier default
+`"explicit"` reads as `"ask"`.
+
 | Command | |
 |---|---|
 | `/workflow` | Saved workflows and this session's runs |

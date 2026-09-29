@@ -154,6 +154,8 @@ interface Launch {
    * workflow, else "model" (the model proposes it). Shown in the confirmation.
    */
   initiator: "user" | "model"
+  /** Started by the user's own /workflow command: messages go to the user, not the model. */
+  command?: boolean
   /** Resuming this run: its id and journal. */
   resume?: { id: string; dir: string; previous: JournalEntry[]; resumes: number }
   ui: UiApi
@@ -276,16 +278,16 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
 
     /** Asks the user, then starts the run in the background. Returns the run, or why it did not start. */
     const launch = async (l: Launch): Promise<WorkflowRun | string> => {
+      const s = settings()
+      const mode = s.enabled ?? "ask"
+      if (mode === "never")
+        return "Workflows are turned off in settings (extensions.workflow.enabled: never)."
       let meta: WorkflowMeta
       try {
         meta = compileScript(l.source).meta
       } catch (err) {
         return `The script cannot run: ${errorText(err)}`
       }
-      const s = settings()
-      const mode = s.enabled ?? "ask"
-      if (mode === "never")
-        return "Workflows are turned off in settings (extensions.workflow.enabled: never)."
       const keys = declineKeys(meta, l.source)
       if (l.initiator === "model" && keys.some((k) => declined.has(k))) {
         return `The user already declined the workflow "${meta.name}" in this session, so it was not proposed again. Do not propose it again, renamed or reworded; carry on without it (e.g. with the agent tool) unless the user asks for a workflow.`
@@ -298,11 +300,19 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         )
         if (ok !== true) {
           for (const k of keys) declined.add(k)
+          // The user's ask is used up: asking again is what lets this workflow be proposed again.
+          explicit = false
+          if (l.command) {
+            return ok === false
+              ? `Workflow "${meta.name}" not started.`
+              : `Nobody confirmed the workflow "${meta.name}", so it did not start (nobody can answer dialogs here). Set extensions.workflow.enabled to "always" in settings.json to start workflows without confirming.`
+          }
           if (ok === false) {
             return `The user declined the workflow "${meta.name}", so it did not start. Do not propose it again in this session unless the user asks for it; carry on without it (e.g. with the agent tool), or ask the user how they want to proceed.`
           }
-          const how =
-            l.origin === "inline" || l.origin === "resume"
+          const how = l.resume
+            ? `run /workflow resume ${l.resume.id}`
+            : l.origin === "inline"
               ? `save the script as .amira/workflows/${meta.name}.ts and run /workflow ${meta.name}`
               : `run /workflow ${meta.name}`
           return `Nobody confirmed the workflow "${meta.name}", so it did not start: the confirmation was dismissed, or nobody can answer it here (print mode, or an rpc client that does not answer dialogs). Do not propose it again in this session unless the user asks. To start it themselves, the user can ${how} in the interactive UI, or set extensions.workflow.enabled to "always" in settings.json to start workflows without confirming.`
@@ -546,7 +556,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
 
     const commandLaunch = async (
       ctx: CommandContext,
-      l: Omit<Launch, "ui" | "createGroup" | "expectNotice" | "send" | "initiator">,
+      l: Omit<Launch, "ui" | "createGroup" | "expectNotice" | "send" | "initiator" | "command">,
     ) => {
       const control = ctx.session
       if (!control.createGroup)
@@ -554,6 +564,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       const run = await launch({
         ...l,
         initiator: "user",
+        command: true,
         ui: ctx.ui,
         signal: ctx.signal,
         createGroup: (o) => control.createGroup!(o),
@@ -637,6 +648,8 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
           return
         }
         // Not a saved workflow: a task the user wants done with one.
+        if (settings().enabled === "never")
+          throw new Error("workflows are turned off in settings (extensions.workflow.enabled: never)")
         explicit = true
         await ctx.session.send(`Use a workflow (the workflow tool) for this task: ${text}`, {
           display: { text: `/workflow ${text}` },

@@ -374,6 +374,44 @@ test("a declined workflow is not proposed again, by name or by script, until the
   await until(() => t.notices.length === 2)
 })
 
+test("a user's ask is used up by a decline: the same workflow again in that turn is refused", async () => {
+  const t = setup({ confirm: false })
+  t.say("use a workflow to review the packages")
+  await t.call({ script: SCRIPT })
+  expect(t.confirms[0]!.message!.split("\n")[0]).toBe("You asked for this workflow.")
+  const again = await t.call({ script: SCRIPT })
+  expect(t.text(again)).toMatch(/already declined/)
+  expect(t.confirms).toHaveLength(1)
+})
+
+test("with nobody to confirm, a resume is started again with /workflow resume", async () => {
+  const t = setup()
+  const r = await t.call({ script: SCRIPT })
+  const id = /run (wf_\w+)/.exec(t.text(r))![1]!
+  await until(() => t.notices.length === 1)
+  t.answerConfirm(undefined)
+  expect(t.text(await t.call({ resume: id }))).toContain(
+    `the user can run /workflow resume ${id} in the interactive UI`,
+  )
+})
+
+test("the user's own /workflow gets messages meant for the user, and never refuses before compiling", async () => {
+  const t = setup({ confirm: false })
+  mkdirSync(path.join(t.cwd, ".amira", "workflows"), { recursive: true })
+  writeFileSync(path.join(t.cwd, ".amira", "workflows", "fanout.ts"), SCRIPT)
+  await t.run("fanout")
+  expect(t.printed.at(-1)).toBe('Workflow "fanout" not started.')
+  t.answerConfirm(undefined)
+  await t.run("fanout")
+  expect(t.printed.at(-1)).toMatch(
+    /^Nobody confirmed the workflow "fanout", so it did not start \(nobody can answer dialogs here\)\. Set extensions\.workflow\.enabled to "always"/,
+  )
+  const never = setup({ settings: { enabled: "never" } })
+  expect(never.text(await never.call({ script: "no meta here" }))).toMatch(/turned off/)
+  await expect(never.run("review the packages")).rejects.toThrow(/turned off/)
+  expect(never.sent).toEqual([])
+})
+
 test("a new session forgets what was declined", async () => {
   const t = setup({ confirm: false })
   await t.call({ script: SCRIPT })

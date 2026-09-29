@@ -87,7 +87,10 @@ interface Launch {
 }
 
 /** A goal as the "declined" memory compares it: case and spacing do not make it another. */
-const goalKey = (goal: string) => oneLine(goal).toLowerCase()
+const goalKey = (goal: string) =>
+  oneLine(goal)
+    .toLowerCase()
+    .replace(/[\s.!?。！？]+$/u, "")
 
 type Params = {
   action?: string
@@ -158,9 +161,17 @@ export function createSwarmExtension(): Extension {
         )
         if (ok !== true) {
           declined.add(goalKey(goal))
+          // The user's ask is used up: asking again is what lets this goal be proposed again.
+          explicit = false
+          requested = false
           if (ok === false)
             return "The user declined the swarm, so it did not start. Do not propose a swarm for this goal again in this session unless the user asks for one; carry on without it (e.g. with the agent tool), or ask the user how they want to proceed."
-          return `Nobody confirmed the swarm, so it did not start: the confirmation was dismissed, or nobody can answer it here (print mode, or an rpc client that does not answer dialogs). Do not propose it again in this session unless the user asks. To start it themselves, the user can run /swarm ${clip(goal, 200)} in the interactive UI, or set extensions.swarm.enabled to "always" in settings.json to start swarms without confirming.`
+          // After /swarm <goal> the user already did the first; only the setting is left to suggest.
+          const how =
+            l.initiator === "user"
+              ? `The user can set extensions.swarm.enabled to "always" in settings.json to start swarms without confirming.`
+              : `To start it themselves, the user can run /swarm ${clip(goal, 200)} in the interactive UI, or set extensions.swarm.enabled to "always" in settings.json to start swarms without confirming.`
+          return `Nobody confirmed the swarm, so it did not start: the confirmation was dismissed, or nobody can answer it here (print mode, or an rpc client that does not answer dialogs). Do not propose it again in this session unless the user asks. ${how}`
         }
       }
       let group: SpawnGroup

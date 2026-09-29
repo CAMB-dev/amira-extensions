@@ -118,7 +118,8 @@ A start may lower the message and turn limits (`limits` of the `swarm` tool), ne
 them.
 
 Older settings still work: `"enabled": "explicit"` reads as `"ask"`, and `"confirm": false`
-reads as `"enabled": "always"`.
+reads as `"enabled": "always"`. Since 0.1.1, `"always"` starts swarms without the confirmation
+(before, `"always"` with the default `"confirm": true` still asked).
 
 ## Tests
 
