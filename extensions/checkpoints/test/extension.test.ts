@@ -12,7 +12,13 @@ import {
 } from "@amira/api"
 import { Agent, EventBus, ExtensionHost, InterceptorRegistry, ToolRegistry } from "@amira/core"
 import { promptIndex } from "../src/format.ts"
-import { type CheckpointsOptions, createCheckpointsExtension, parseRewindArgs, readSettings } from "../src/index.ts"
+import type { Run } from "../src/git.ts"
+import {
+  type CheckpointsOptions,
+  createCheckpointsExtension,
+  parseRewindArgs,
+  readSettings,
+} from "../src/index.ts"
 import type { Checkpoint } from "../src/store.ts"
 import { git, repo, run, tmp, write } from "./helpers.ts"
 
@@ -56,11 +62,7 @@ function model(req: ModelRequest) {
   return { text: i ? "done" : "ok" }
 }
 
-async function setup(
-  settings: Record<string, unknown> = {},
-  options: CheckpointsOptions = {},
-  at?: string,
-) {
+async function setup(settings: Record<string, unknown> = {}, options: CheckpointsOptions = {}, at?: string) {
   const dir = at ?? (await repo({ "a.txt": "v1\n", ".gitignore": "*.log\n" }))
   const mock = createMockDialect()
   for (let i = 0; i < 100; i++) mock.push(model)
@@ -405,7 +407,9 @@ test("/rewind says which files it could not restore, and still how to go back", 
   await t.turn("write a.txt v2; write b.txt b2")
   const out = await t.command("rewind", "2 --yes")
   expect(out).toContain("Restored 1 file from checkpoint #2: a.txt")
-  expect(out).toContain("Could not restore 1 file (open in another program?): b.txt (git: error: unable to unlink old 'b.txt'")
+  expect(out).toContain(
+    "Could not restore 1 file (open in another program?): b.txt (git: error: unable to unlink old 'b.txt'",
+  )
   expect(out).toContain("The files as they were are checkpoint #3; /rewind 3 goes back to them.")
   expect(t.read("a.txt")).toBe("v1\n")
 })
@@ -434,16 +438,26 @@ test("checkpoints turned off for a reason stay off: later turns do not scan agai
   expect(await t.command("checkpoints", "")).toContain("Checkpoints are off here:")
 })
 
-/** A runner whose `git add` takes `slowMs` while `slow()` says so, honoring timeouts as runCommand does. */
-function slowAdds(slow: () => boolean, slowMs: number, seen: number[] = []): CheckpointsOptions["run"] {
+/**
+ * A runner whose `git add` would take `slowMs` while `slow()` says so: with less time than that
+ * it ends as timed out right away, as runCommand's would once its time is up.
+ */
+function slowAdds(slow: () => boolean, slowMs: number, seen: number[] = []): Run {
   return async (argv, o) => {
     if (argv.includes("add") && slow()) {
       seen.push(o.timeoutMs)
       if (o.timeoutMs < slowMs) {
-        await Bun.sleep(o.timeoutMs)
-        return { output: "", exitCode: null, signalCode: null, timedOut: true, aborted: false, settled: true, contained: true }
+        return {
+          output: "",
+          exitCode: null,
+          signalCode: null,
+          timedOut: true,
+          aborted: false,
+          settled: true,
+          contained: true,
+        }
       }
-      await Bun.sleep(slowMs)
+      await Bun.sleep(200)
     }
     return run(argv, o)
   }
@@ -452,26 +466,34 @@ function slowAdds(slow: () => boolean, slowMs: number, seen: number[] = []): Che
 test("the first scan gets much longer than timeoutMs, so a slow first hash still ends in checkpoints", async () => {
   let first = true
   const seen: number[] = []
-  const t = await setup({ timeoutMs: 1000 }, { run: slowAdds(() => first, 1500, seen) })
-  // The warm-up scan started with the session; wait for it.
-  await Bun.sleep(2500)
-  first = false
-  expect(seen[0]).toBeGreaterThanOrEqual(30 * 60_000)
+  // The first add hashes every file: two minutes, more than timeoutMs.
+  const slow = slowAdds(() => first, 120_000, seen)
+  const t = await setup(
+    { timeoutMs: 10_000 },
+    {
+      run: async (argv, o) => {
+        const r = await slow(argv, o)
+        if (argv.includes("add")) first = false
+        return r
+      },
+    },
+  )
+  // The turn's snapshot waits behind the warm-up scan.
   await t.turn("write a.txt v2")
+  expect(seen[0]).toBeGreaterThanOrEqual(30 * 60_000)
   expect((await t.refs()).length).toBe(1)
   expect(t.errors).toEqual([])
 })
 
 test("after three snapshots in a row run out of time, checkpoints are off for the session", async () => {
   let slow = false
-  const t = await setup({ timeoutMs: 1000 }, { run: slowAdds(() => slow, 1500) })
-  await Bun.sleep(3000)
+  const t = await setup({ timeoutMs: 10_000 }, { run: slowAdds(() => slow, 120_000) })
   await t.turn("write a.txt v2")
   expect((await t.refs()).length).toBe(1)
   slow = true
   for (let i = 3; i <= 5; i++) await t.turn(`write a.txt v${i}`)
   expect((await t.refs()).length).toBe(1)
-  expect(t.errors.at(-1)).toContain("3 snapshots in a row took longer than timeoutMs (1000 ms)")
+  expect(t.errors.at(-1)).toContain("3 snapshots in a row took longer than timeoutMs (10000 ms)")
   slow = false
   await t.turn("write a.txt v6")
   expect((await t.refs()).length).toBe(1)
@@ -516,10 +538,18 @@ test("/rewind waits for background sub-agents, a persistent one only while it wo
   )
   await t.bus.flush()
   expect(await failure(t.command("rewind", "1 --yes"))).toContain("3 sub-agents are still running")
-  t.bus.emit("subagent.end", { childSessionId: "s_grandchild", status: "done", usage, durationMs: 1 } as never, {
-    sessionId: "s_bg",
-  })
-  t.bus.emit("subagent.end", { childSessionId: "s_bg", status: "done", usage, durationMs: 1 } as never, parent)
+  t.bus.emit(
+    "subagent.end",
+    { childSessionId: "s_grandchild", status: "done", usage, durationMs: 1 } as never,
+    {
+      sessionId: "s_bg",
+    },
+  )
+  t.bus.emit(
+    "subagent.end",
+    { childSessionId: "s_bg", status: "done", usage, durationMs: 1 } as never,
+    parent,
+  )
   await t.bus.flush()
   expect(await failure(t.command("rewind", "1 --yes"))).toContain("a sub-agent is still running")
   t.bus.emit("subagent.state", { childSessionId: "s_helper", state: "idle", turns: 1 }, parent)
@@ -538,7 +568,9 @@ test("attributes in .git/info/attributes, which still apply, are pointed out onc
   const t = await setup({}, {}, dir)
   await t.turn("write a.txt v3")
   await t.turn("write a.txt v4")
-  expect(t.errors).toEqual([expect.stringMatching(/info[\\/]attributes sets git attributes, and they apply to checkpoints too/)])
+  expect(t.errors).toEqual([
+    expect.stringMatching(/info[\\/]attributes sets git attributes, and they apply to checkpoints too/),
+  ])
 })
 
 test("a turn's message is found again when the conversation changed while the dialog was open", async () => {
@@ -567,7 +599,16 @@ test("a remembered message that is no longer the same object is found by its tex
     ref: "",
     commit: "",
     tree: "",
-    meta: { v: 1, kind: "turn", ts: 1, turn: 1, turnId: "t_1", prompt: "fix it", changed: [], changedCount: -1 },
+    meta: {
+      v: 1,
+      kind: "turn",
+      ts: 1,
+      turn: 1,
+      turnId: "t_1",
+      prompt: "fix it",
+      changed: [],
+      changedCount: -1,
+    },
   }
   const messages: Message[] = [userMessage("hello"), userMessage("fix it")]
   // The host holds a copy of the message the turn started with.

@@ -63,7 +63,9 @@ const INHERITED = [
 const INHERITED_PATTERN = /^GIT_CONFIG_(KEY|VALUE)_\d+$/i
 
 /** The environment git runs in: the process's, minus what would point it elsewhere. */
-export function gitEnv(base: Record<string, string | undefined> = process.env): Record<string, string | undefined> {
+export function gitEnv(
+  base: Record<string, string | undefined> = process.env,
+): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = { ...base, ...IDENTITY }
   const drop = new Set(INHERITED)
   // Windows environment names are case-insensitive.
@@ -364,9 +366,12 @@ export async function openRepo(
   // files byte for byte and restores write them back the same way.
   if (raw) git.setGlobal([...global, `--attr-source=${emptyTree}`])
   // $GIT_DIR/info/attributes applies whatever the attribute source is.
-  const infoAttributes = await git.exec(["rev-parse", "--path-format=absolute", "--git-path", "info/attributes"], {
-    stdoutOnly: true,
-  })
+  const infoAttributes = await git.exec(
+    ["rev-parse", "--path-format=absolute", "--git-path", "info/attributes"],
+    {
+      stdoutOnly: true,
+    },
+  )
   const attributesFile =
     infoAttributes.ok && infoAttributes.output.trim()
       ? path.normalize(infoAttributes.output.trim())
@@ -419,7 +424,10 @@ function ownIndex(scratch: string): string {
     const file = path.join(scratch, name)
     const owner = lockOwner(name)
     const live = owner === undefined || alive(owner)
-    if (name === SHARED_INDEX || (owner !== undefined && owner !== process.pid && name === `${owner}-index`)) {
+    if (
+      name === SHARED_INDEX ||
+      (owner !== undefined && owner !== process.pid && name === `${owner}-index`)
+    ) {
       try {
         seeds.push({ file, live: name !== SHARED_INDEX && live, mtime: statSync(file).mtimeMs })
       } catch {}

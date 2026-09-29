@@ -290,7 +290,9 @@ test("each process snapshots with an index of its own; another's lock is left al
     // A process that is running holds its lock, however old.
     const old = new Date(Date.now() - 600_000)
     utimesSync(liveLock, old, old)
-    const blocked = await r.git.exec(["add", "-A"], { env: { GIT_INDEX_FILE: path.join(r.scratch, `${live.pid}-index`) } })
+    const blocked = await r.git.exec(["add", "-A"], {
+      env: { GIT_INDEX_FILE: path.join(r.scratch, `${live.pid}-index`) },
+    })
     expect(blocked.ok).toBe(false)
     expect(existsSync(liveLock)).toBe(true)
     // A lock of a process that has ended is removed, and the command goes on.
@@ -400,7 +402,7 @@ test("a restore of a file where a directory of ignored files now is keeps them f
   const r = await store.restore("s_1", first)
   expect(r.kept).toEqual(["out"])
   expect(r.left).toEqual([])
-  expect(tree(dir)["out"]).toBe(Buffer.from("a file then\n").toString("hex"))
+  expect(tree(dir).out).toBe(Buffer.from("a file then\n").toString("hex"))
   expect(await listTree(dir, r.safety.commit)).toEqual([".gitignore", "a.txt", "out/one.o", "out/two.o"])
   await store.restore("s_1", r.safety)
   expect(tree(dir)["out/one.o"]).toBe(Buffer.from("1\n").toString("hex"))

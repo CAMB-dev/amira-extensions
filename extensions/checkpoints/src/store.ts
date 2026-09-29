@@ -161,9 +161,7 @@ export class CheckpointStore {
       await git.must(["ls-files", "-z", "-t", "--cached", "--others", "--exclude-standard"], {
         stdoutOnly: true,
         ...sig,
-        ...(mode === "shadow"
-          ? { env: { GIT_INDEX_FILE: this.repo.noIndex } }
-          : {}),
+        ...(mode === "shadow" ? { env: { GIT_INDEX_FILE: this.repo.noIndex } } : {}),
       }),
     )
     const tracked = new Set<string>()
@@ -353,7 +351,8 @@ export class CheckpointStore {
     for (let attempt = 0; ; attempt++) {
       const r = await git.exec(["update-ref", "--no-deref", ref, commit, zero], sig)
       if (r.ok) break
-      if (attempt >= 5 || signal?.aborted) throw new Error(`git update-ref failed: ${firstLines(r.output) || `exit ${r.code}`}`)
+      if (attempt >= 5 || signal?.aborted)
+        throw new Error(`git update-ref failed: ${firstLines(r.output) || `exit ${r.code}`}`)
       const all = await this.#list(session)
       n = Math.max(n, all.at(-1)?.n ?? 0) + 1
       ref = `${REF_PREFIX}${session}/${n}`
