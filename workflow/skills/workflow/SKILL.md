@@ -1,6 +1,6 @@
 ---
 name: workflow
-description: How to write workflow scripts for the workflow tool (fan-out and verify, pipelines, loop until nothing new), with the script API. Load it before writing a workflow: when the user asks for one, or when a workflow clearly helps and you are about to propose one.
+description: How to write workflow scripts for the workflow tool (fan-out and verify, pipelines, loop until nothing new), with the script API. Load it before writing a workflow, whether the user asked for one or you are about to propose one because it clearly helps.
 ---
 
 # Writing workflow scripts
