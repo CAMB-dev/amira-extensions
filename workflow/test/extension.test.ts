@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test"
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import type {
@@ -40,6 +40,8 @@ function setup(
     settings?: Record<string, unknown>
     confirm?: boolean | undefined
     answer?: (o: { prompt: string }) => Answer | Promise<Answer>
+    /** false: the session has no file yet (runs go to ~/.amira/workflow-runs). */
+    sessionFile?: false
   } = {},
 ) {
   const root = mkdtempSync(path.join(tmpdir(), "wf-ext-"))
@@ -99,7 +101,10 @@ function setup(
     for (const h of handlers.get(type) ?? []) h({ sessionId: "s_root", ...e })
   }
   emit("session.start", {
-    data: { reason: "startup", sessionFile: path.join(home, "sessions", "s_root.jsonl") },
+    data: {
+      reason: "startup",
+      ...(opts.sessionFile === false ? {} : { sessionFile: path.join(home, "sessions", "s_root.jsonl") }),
+    },
   })
   const say = (text: string) =>
     emit("turn.start", { data: { prompt: { role: "user", content: [{ type: "text", text }] } } })
@@ -379,6 +384,37 @@ test("resume by id replays the journal: no agent runs again", async () => {
   await until(() => t.notices.length === 2)
   expect(t.groups[1]!.spawned).toHaveLength(0)
   expect(JSON.stringify(t.notices[1]!.content)).toContain("saw tui")
+})
+
+test("a run resumed twice, from a run kept before the session had a file, keeps every attempt's results", async () => {
+  let failing = "look at core"
+  const t = setup({
+    settings: { enabled: "always" },
+    sessionFile: false,
+    answer: (o) => (o.prompt === failing ? { error: "provider down" } : { text: `saw ${o.prompt}` }),
+  })
+  const sequential = `export const meta = { name: "seq", description: "one after another", phases: [] }
+    const out = []
+    for (const p of ["api", "core", "tui"]) out.push(await agent("look at " + p))
+    return out`
+  const r = await t.call({ script: sequential })
+  const id = /run (wf_\w+)/.exec(t.text(r))![1]!
+  await until(() => t.notices.length === 1)
+  expect(existsSync(path.join(t.home, "workflow-runs", id, "journal.jsonl"))).toBe(true)
+  // The session gets its file; runs from now on go next to it.
+  t.emit("session.start", {
+    data: { reason: "startup", sessionFile: path.join(t.home, "sessions", "s_root.jsonl") },
+  })
+  failing = "look at tui"
+  await t.call({ resume: id })
+  await until(() => t.notices.length === 2)
+  expect(t.groups[1]!.spawned.map((o) => o.prompt)).toEqual(["look at core", "look at tui"])
+  failing = ""
+  await t.call({ resume: id })
+  await until(() => t.notices.length === 3)
+  // api (first attempt) and core (second) replay: only tui runs again.
+  expect(t.groups[2]!.spawned.map((o) => o.prompt)).toEqual(["look at tui"])
+  expect(JSON.stringify(t.notices[2]!.content)).toContain("saw look at api")
 })
 
 test("settings are checked: bad fields are reported once and left at their defaults", () => {

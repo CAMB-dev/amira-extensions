@@ -133,7 +133,7 @@ interface Launch {
   origin: string
   args: unknown
   /** Resuming this run: its id and journal. */
-  resume?: { id: string; previous: JournalEntry[]; resumes: number }
+  resume?: { id: string; dir: string; previous: JournalEntry[]; resumes: number }
   ui: UiApi
   signal?: AbortSignal
   createGroup(opts: SpawnGroupOptions): SpawnGroup
@@ -269,7 +269,8 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       try {
         run = new WorkflowRun({
           id,
-          dir: path.join(runsRoot(), id),
+          // A resumed run stays where it was, so its journal keeps every attempt's results.
+          dir: l.resume?.dir ?? path.join(runsRoot(), id),
           source: l.source,
           origin: l.origin,
           args: l.args,
@@ -315,7 +316,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
     /** A run to resume: its stored script and journal. */
     const resumable = (
       id: string,
-    ): { source: string; args: unknown; previous: JournalEntry[]; resumes: number } | string => {
+    ): { dir: string; source: string; args: unknown; previous: JournalEntry[]; resumes: number } | string => {
       const live = runs.get(id)
       if (live?.status === "running") return `Run ${id} is still running.`
       const dir = [path.join(runsRoot(), id), path.join(api.home, "workflow-runs", id)].find((d) =>
@@ -324,6 +325,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       const stored = dir ? readRun(dir) : undefined
       if (!dir || !stored) return `No workflow run ${id} was found.`
       return {
+        dir,
         source: stored.script,
         args: stored.record.args,
         previous: readJournal(dir),
@@ -367,7 +369,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         if (p.resume) {
           const r = resumable(p.resume)
           if (typeof r === "string") return textResult(r, true)
-          resume = { id: p.resume, previous: r.previous, resumes: r.resumes }
+          resume = { id: p.resume, dir: r.dir, previous: r.previous, resumes: r.resumes }
           source ??= p.name ? undefined : r.source
           args ??= r.args
         }
@@ -572,7 +574,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
             source: r.source,
             origin: "resume",
             args: newer ?? r.args,
-            resume: { id, previous: r.previous, resumes: r.resumes },
+            resume: { id, dir: r.dir, previous: r.previous, resumes: r.resumes },
           })
           return
         }
