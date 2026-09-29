@@ -265,3 +265,33 @@ test("a lock left behind by a git that was stopped does not block later checkpoi
   expect(second.meta.changed).toEqual(["a.txt"])
   expect(existsSync(lock)).toBe(false)
 })
+
+test("git variables of a git that started Amira, and the repository's hooks, do not apply", async () => {
+  const dir = await repo()
+  // A reference-transaction hook that leaves a mark each time a ref changes.
+  const marker = path.join(dir, ".git", "hook-ran")
+  write(dir, ".git/hooks/reference-transaction", `#!/bin/sh\necho ran >> "${marker.replaceAll("\\", "/")}"\n`)
+  await git(dir, "update-ref", "refs/heads/probe", "HEAD")
+  expect(existsSync(marker)).toBe(true)
+  rmSync(marker)
+
+  const vars = {
+    GIT_NAMESPACE: "elsewhere",
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "core.bare",
+    GIT_CONFIG_VALUE_0: "true",
+    GIT_CONFIG_PARAMETERS: "'core.bare'='true'",
+    GIT_COMMON_DIR: path.join(dir, "nowhere"),
+  }
+  const { store } = await storeFor(dir)
+  Object.assign(process.env, vars)
+  let cp: Awaited<ReturnType<typeof store.create>>
+  try {
+    cp = await store.create("s_1", { kind: "turn", turn: 1 })
+  } finally {
+    for (const k of Object.keys(vars)) delete process.env[k]
+  }
+  expect(cp.checkpoint!.ref).toBe(`${REF_PREFIX}s_1/1`)
+  expect(await git(dir, "for-each-ref", "--format=%(refname)", "refs/amira/")).toBe(`${REF_PREFIX}s_1/1\n`)
+  expect(existsSync(marker)).toBe(false)
+})

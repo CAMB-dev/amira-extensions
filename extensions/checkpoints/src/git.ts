@@ -31,7 +31,30 @@ const INHERITED = [
   "GIT_ICASE_PATHSPECS",
   "GIT_ATTR_SOURCE",
   "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_COMMON_DIR",
+  "GIT_NAMESPACE",
+  "GIT_PREFIX",
+  "GIT_SHALLOW_FILE",
+  "GIT_QUARANTINE_PATH",
+  // Configuration given on the command line of a git that started Amira (git -c, a hook).
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_CONFIG_COUNT",
 ]
+
+/** GIT_CONFIG_KEY_<n> and GIT_CONFIG_VALUE_<n>, which go with GIT_CONFIG_COUNT. */
+const INHERITED_PATTERN = /^GIT_CONFIG_(KEY|VALUE)_\d+$/i
+
+/** The environment git runs in: the process's, minus what would point it elsewhere. */
+export function gitEnv(base: Record<string, string | undefined> = process.env): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = { ...base, ...IDENTITY }
+  const drop = new Set(INHERITED)
+  // Windows environment names are case-insensitive.
+  for (const k of Object.keys(env)) {
+    if (drop.has(k.toUpperCase()) || INHERITED_PATTERN.test(k)) delete env[k]
+  }
+  return env
+}
 
 const IDENTITY = {
   GIT_AUTHOR_NAME: "Amira checkpoints",
@@ -73,8 +96,7 @@ export class Git {
   }
 
   async exec(args: string[], opts: ExecOptions = {}): Promise<GitResult> {
-    const env: Record<string, string | undefined> = { ...process.env, ...IDENTITY }
-    for (const k of INHERITED) delete env[k]
+    const env = gitEnv()
     Object.assign(env, opts.env)
     // Another Amira (or the user's git) may hold the index lock for a moment.
     for (let attempt = 0; ; attempt++) {
@@ -237,6 +259,9 @@ export async function openRepo(
   mkdirSync(scratch, { recursive: true })
   const noAttributes = path.join(scratch, "no-attributes")
   if (!existsSync(noAttributes)) writeFileSync(noAttributes, "")
+  // No hooks run for our commands (update-ref runs reference-transaction hooks).
+  const noHooks = path.join(scratch, "no-hooks")
+  mkdirSync(noHooks, { recursive: true })
   const git = new Git(run, root, opts.timeoutMs)
   git.setOwnDir(scratch)
   const global = [
@@ -252,7 +277,10 @@ export async function openRepo(
     "-c",
     `core.attributesFile=${noAttributes}`,
     "-c",
+    `core.hooksPath=${noHooks}`,
+    "-c",
     "gc.auto=0",
+    ...(process.platform === "win32" ? ["-c", "core.longpaths=true"] : []),
   ]
   git.setGlobal(global)
   // An empty index file name gives an empty index: its tree is the empty tree, now stored.
