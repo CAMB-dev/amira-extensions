@@ -236,7 +236,10 @@ class ChainParser {
     const finish = (style: LineStyle, headTo: Head, label: string): Link => {
       this.ws()
       if (s[this.i] === "|") {
-        const end = s.indexOf("|", this.i + 1)
+        let from = this.i + 1
+        while (s[from] === " ") from++
+        const close = s[from] === '"' ? s.indexOf('"', from + 1) : -1
+        const end = s.indexOf("|", close >= 0 ? close + 1 : this.i + 1)
         if (end >= 0) {
           label = s.slice(this.i + 1, end)
           this.i = end + 1
