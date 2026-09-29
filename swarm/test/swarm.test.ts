@@ -485,6 +485,19 @@ test("the model may start a swarm only when the user asked for one, and only fro
   expect(n).toBe(2)
 })
 
+test("no sub-agent, at any depth, is offered the swarm tool, even when it asks for it by name", async () => {
+  const offered: string[][] = []
+  const { root, tree } = await withExtension(
+    (req) => {
+      offered.push(req.tools.map((t) => t.name))
+      return { text: "done" }
+    },
+    { extensions: { swarm: { confirm: false } } },
+  )
+  await tree.spawn(root, { prompt: "p", tools: ["swarm"] }).result()
+  expect(offered.at(-1)).not.toContain("swarm")
+  expect(root.tools.specs().map((t) => t.name)).toContain("swarm")
+})
 test("a roster that does not fit is refused", async () => {
   const { root } = await withExtension(
     (req) => {

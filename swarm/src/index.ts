@@ -255,6 +255,8 @@ export function createSwarmExtension(): Extension {
         required: ["action"],
       },
       concurrency: "serial",
+      // Only the user's own session starts swarms (D81): no sub-agent is offered this tool.
+      mainOnly: true,
       async execute(p, ctx): Promise<ToolResult> {
         const session = ctx.session
         const action = p.action ?? "start"
