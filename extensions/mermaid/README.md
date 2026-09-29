@@ -18,19 +18,20 @@ committed once, in order; the full-screen transcript draws it again at a new wid
 ## As text
 
 ```
-     ┌─────────────────────┐
-     │ User sends a prompt │
-     └──────────┬──────────┘
-                │
-                ▼
-           ╱──────────╲
-          < Tool call? >
-           ╲───┬──────╱
-               │  ▲
-               │  │
-               │  └───────────┐
-        ┌──────┴───────┐      │
-       yes            no      │
+            ┌─────────────────────┐
+            │ User sends a prompt │
+            └──────────┬──────────┘
+                       │
+                       ▼
+                  ╱──────────╲
+                 < Tool call? >
+                  ╲───┬──────╱
+                      │  ▲
+                      │  │
+               ┌──────┤  └─┐
+              yes     no   │
+               │      │    │
+        ┌──────┘      └┐   └──┐
         ▼              ▼      │
  ┌──────────────┐  ╭───────╮  │
  │ Run the tool │  ( Reply )  │
@@ -41,6 +42,30 @@ committed once, in order; the full-screen transcript draws it again at a new wid
 ┌──────────────┴───────┐
 │ Feed the result back │
 └──────────────────────┘
+```
+
+```
+  ○
+ ╶┼╴    ┌───────┐    ┌───────┐
+ ╱ ╲    │ Amira │    │ Model │
+User    └───┬───┘    └───┬───┘
+  │         │            │
+  │ prompt  │            │
+  ├────────▶│            │
+  │         │ messages   │
+  │         ├───────────▶│
+  │       ┌─ loop [until no tool calls] ─┐
+  │       │ │ tool call  │               │
+  │       │ │◀┄┄┄┄┄┄┄┄┄┄┄┤               │
+  │       │ ├──┐ run it  │               │
+  │       │ │◀─┘         │               │
+  │       └─┼────────────┼───────────────┘
+  │         │   reply    │
+  │         │◀┄┄┄┄┄┄┄┄┄┄┄┤
+  │      ┌────────────────┐
+  │      │    streamed    │
+  │      └────────────────┘
+  │         │            │
 ```
 
 - **Flowcharts** (`flowchart` / `graph`, TD, TB, BT, LR, RL): all node shapes (`[ ]`, `( )`,
