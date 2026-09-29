@@ -167,6 +167,9 @@ test("a checkpoint is taken before each turn, and /rewind brings the files back"
   expect(out).toContain("/rewind 3 goes back to them")
   expect(t.read("a.txt")).toBe("v1\n")
   expect(t.read("b.txt")).toBeUndefined()
+  expect(await t.command("checkpoints", "")).toMatch(
+    /#1 {2}\d\d:\d\d {2}turn 1 · “write a.txt v2” · no changes since/,
+  )
   // The conversation was left alone.
   expect(t.rewound).toEqual([])
   // And back again.

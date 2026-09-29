@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto"
-import { existsSync, mkdirSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import type { RunCommandOptions, RunCommandResult } from "@amira/api"
 
@@ -75,8 +75,12 @@ export class Git {
       const result = { ok: r.exitCode === 0 && !r.timedOut && !r.aborted, output: r.output, code: r.exitCode }
       if (r.timedOut) result.output = `timed out after ${this.#timeoutMs} ms`
       if (r.aborted) result.output = "aborted"
-      if (!result.ok && /index\.lock/.test(r.output) && attempt < 8 && !opts.signal?.aborted) {
-        await Bun.sleep(100 + attempt * 100)
+      const lock = !result.ok && /Unable to create '([^']+\.lock)'/.exec(r.output)?.[1]
+      if (lock && attempt < 8 && !opts.signal?.aborted) {
+        // A git stopped in the middle (Amira exited, a snapshot timed out) leaves its lock
+        // behind; one that old is nobody's. A live one goes away in a moment.
+        if (ageMs(lock) > STALE_LOCK_MS) rmSync(lock, { force: true })
+        else await Bun.sleep(100 + attempt * 100)
         continue
       }
       return result
@@ -88,6 +92,17 @@ export class Git {
     const r = await this.exec(args, opts)
     if (!r.ok) throw new Error(`git ${args[0]} failed: ${firstLines(r.output) || `exit ${r.code}`}`)
     return r.output
+  }
+}
+
+/** A lock file older than this is left over from a git that was stopped. */
+export const STALE_LOCK_MS = 15_000
+
+function ageMs(file: string): number {
+  try {
+    return Date.now() - statSync(file).mtimeMs
+  } catch {
+    return 0
   }
 }
 

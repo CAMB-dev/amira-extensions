@@ -7,18 +7,7 @@ import type {
   InterceptContext,
   UserMessage,
 } from "@amira/api"
-import {
-  changedSince,
-  clip,
-  clipDiff,
-  files,
-  oneLine,
-  promptIndex,
-  promptOf,
-  row,
-  time,
-  what,
-} from "./format.ts"
+import { clip, clipDiff, files, oneLine, promptIndex, promptOf, row, time, what } from "./format.ts"
 import { openRepo, type Run } from "./git.ts"
 import { type CheckpointSettings, readSettings } from "./settings.ts"
 import { type Checkpoint, CheckpointStore, DisabledError, type Skipped } from "./store.ts"
@@ -156,7 +145,6 @@ export function createCheckpointsExtension(options: CheckpointsOptions = {}) {
       turn.snapshot ??= bounded(async (sig) => {
         const s = await getStore()
         if (!s) return
-        clearStaleLock(s.repo.index, settings.timeoutMs * 2)
         const n = await numberFor(s, session)
         turnOf.set(turn.turnId, n)
         prompts.set(turn.turnId, turn.prompt)
@@ -206,7 +194,6 @@ export function createCheckpointsExtension(options: CheckpointsOptions = {}) {
         void getStore()
           .then(async (s) => {
             if (!s) return
-            clearStaleLock(s.repo.index, settings.timeoutMs * 2)
             await s.scan()
             await s.pruneOlder(settings.maxAgeDays * DAY)
           })
@@ -269,15 +256,21 @@ export function createCheckpointsExtension(options: CheckpointsOptions = {}) {
       return s
     }
 
+    /** Rows of a list, newest first, each with how many files differ from it now. */
     const listLines = async (s: CheckpointStore, list: Checkpoint[]) => {
-      const newest = list.at(-1)
-      let since: string[] = []
-      if (newest) {
-        const now = await s.scan()
-        since = newest.tree === now.tree ? [] : (await s.changes(newest.tree, now.tree)).map((c) => c.path)
+      const now = (await s.scan()).tree
+      const newestFirst = [...list].reverse()
+      const counts = new Map<string, number>()
+      // Diffs of trees touch no index: several run at once.
+      const trees = [...new Set(newestFirst.map((c) => c.tree))]
+      for (let i = 0; i < trees.length; i += 8) {
+        await Promise.all(
+          trees.slice(i, i + 8).map(async (t) => {
+            counts.set(t, t === now ? 0 : (await s.changes(t, now)).length)
+          }),
+        )
       }
-      const counts = changedSince(list, since)
-      return [...list].reverse().map((c) => row(c, counts.get(c.n)))
+      return newestFirst.map((c) => row(c, counts.get(c.tree)))
     }
 
     api.registerCommand({

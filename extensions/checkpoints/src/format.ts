@@ -29,39 +29,17 @@ export function what(c: Checkpoint, width = 60): string {
   const m = c.meta
   if (m.kind === "tool") return clip(`before ${m.tool ?? "a tool call"}`, width)
   if (m.kind === "restore") return clip(m.note ?? "before a restore", width)
-  const who = m.notice ? "notice" : "turn"
-  return clip(`${who} ${m.turn ?? "?"} · “${m.prompt ?? ""}”`, width)
+  const head = `${m.notice ? "notice" : "turn"} ${m.turn ?? "?"} · `
+  return `${head}“${clip(m.prompt ?? "", Math.max(8, width - head.length - 2))}”`
 }
 
-export function files(n: number, capped = false): string {
-  return `${n}${capped ? "+" : ""} file${n === 1 && !capped ? "" : "s"}`
+export function files(n: number): string {
+  return `${n} file${n === 1 ? "" : "s"}`
 }
 
-/**
- * Files changed after each checkpoint, newest first: the union of what each later one saw
- * change (they record the first few), plus what changed since the newest one.
- */
-export function changedSince(
-  list: Checkpoint[],
-  sinceNewest: string[],
-): Map<number, { n: number; capped: boolean }> {
-  const out = new Map<number, { n: number; capped: boolean }>()
-  const seen = new Set(sinceNewest)
-  let capped = false
-  for (let i = list.length - 1; i >= 0; i--) {
-    const c = list[i]!
-    out.set(c.n, { n: seen.size, capped })
-    for (const p of c.meta.changed) seen.add(p)
-    if (c.meta.changedCount > c.meta.changed.length) capped = true
-  }
-  return out
-}
-
-/** One row of a list, e.g. `#12  14:02  turn 5 · “fix the parser”  · 3 files changed since`. */
-export function row(c: Checkpoint, since: { n: number; capped: boolean } | undefined, width = 60): string {
-  const tail = since
-    ? ` · ${since.n || since.capped ? `${files(since.n, since.capped)} changed since` : "no changes since"}`
-    : ""
+/** One row of a list, e.g. `#12  14:02  turn 5 · “fix the parser” · 3 files changed since`. */
+export function row(c: Checkpoint, since: number | undefined, width = 60): string {
+  const tail = since === undefined ? "" : ` · ${since ? `${files(since)} changed since` : "no changes since"}`
   return `#${c.n}  ${time(c.meta.ts)}  ${what(c, width)}${tail}`
 }
 

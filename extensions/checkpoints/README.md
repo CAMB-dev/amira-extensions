@@ -26,6 +26,10 @@ Files are stored as they are on disk: line endings (CRLF or LF), binary files, f
 spaces or non-ASCII characters. Attributes such as `text=auto` or `core.autocrlf` do not
 apply, so restoring writes back exactly what was there.
 
+In print mode (`amira -p`) Amira exits when the turn ends, so a turn that calls no tool may
+end before its checkpoint is written. Nothing is lost by that: such a turn changed no files,
+and the next turn's checkpoint holds them.
+
 Turns of sub-agents take no checkpoints of their own; what they change is in the next turn's
 checkpoint of the main session.
 
