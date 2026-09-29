@@ -19,6 +19,7 @@ amira ext remove mcp-server
 | [swarm](extensions/swarm) | `/swarm <goal>`: long-lived agents that work together through a shared blackboard and messages |
 | [lsp](extensions/lsp) | Language server diagnostics: errors in the files the model just changed go back to it, plus a `diagnostics` tool and `/lsp` |
 | [notify](extensions/notify) | Notifications when a long turn ends, a question waits or background agents finish: desktop (Windows, macOS, Linux) or webhooks (Telegram, Discord, WeCom, JSON) |
+| [todo](extensions/todo) | `todo_write` and `todo_read`: the model's todo list for multi-step work, shown live above the activity line |
 
 ## The index
 
