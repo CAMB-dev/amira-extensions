@@ -142,9 +142,11 @@ export function createSwarmExtension(): Extension {
         const roster = members
           .map((m) => `  ${m.name} (${m.role}): ${clip(oneLine(m.brief), 100)}`)
           .join("\n")
+        // The swarm's own budget, else the session's: what stops it spending more.
+        const cap = limits.budget ?? api.settings.budget
         const budget = [
-          limits.budget?.tokens !== undefined ? `${limits.budget.tokens.toLocaleString("en-US")} tokens` : "",
-          limits.budget?.costUsd !== undefined ? `$${limits.budget.costUsd}` : "",
+          cap?.tokens !== undefined ? `${cap.tokens.toLocaleString("en-US")} tokens` : "",
+          cap?.costUsd !== undefined ? `$${cap.costUsd}` : "",
         ].filter(Boolean)
         const ok = await l.ui.confirm(
           `Start a swarm of ${members.length} agents?`,
@@ -154,8 +156,9 @@ export function createSwarmExtension(): Extension {
             "",
             roster,
             "",
-            `Limits: ${limits.maxTurnsPerMember} turns and ${limits.maxMessagesPerMember} messages per member, ${limits.maxMessages} messages in all${limits.maxConcurrent ? `, ${limits.maxConcurrent} at once` : ""}.`,
-            `Budget: ${budget.join(", ") || "the session's"}.`,
+            `Agents: ${members.length}${limits.maxConcurrent ? `, ${limits.maxConcurrent} at a time` : ", all at once"}; each works up to ${limits.maxTurnsPerMember} turns and sends up to ${limits.maxMessagesPerMember} messages (${limits.maxMessages} in all).`,
+            `Cost: ${budget.length ? `stops at ${budget.join(" or ")}` : "no cost cap"}.`,
+            "Files: the members work in your working tree and can change your files.",
           ].join("\n"),
           l.signal ? { signal: l.signal } : {},
         )
@@ -164,6 +167,12 @@ export function createSwarmExtension(): Extension {
           // The user's ask is used up: asking again is what lets this goal be proposed again.
           explicit = false
           requested = false
+          // The user said no to the model's proposal: tell them how to start it after all.
+          if (l.initiator === "model") {
+            api.notify(
+              `Swarm not started; it will not be proposed again for this goal in this session. To start it yourself, run /swarm ${clip(goal, 200)}.`,
+            )
+          }
           if (ok === false)
             return "The user declined the swarm, so it did not start. Do not propose a swarm for this goal again in this session unless the user asks for one; carry on without it (e.g. with the agent tool), or ask the user how they want to proceed."
           // After /swarm <goal> the user already did the first; only the setting is left to suggest.

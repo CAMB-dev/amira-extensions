@@ -56,6 +56,8 @@ function setup(
   const handlers = new Map<string, Handler[]>()
   const confirms: { title: string; message: string | undefined }[] = []
   const errors: string[] = []
+  /** What the extension told the user (api.notify). */
+  const told: string[] = []
   const groups: FakeGroup[] = []
   const notices: UserMessage[] = []
   let cancelled = 0
@@ -84,6 +86,7 @@ function setup(
     registerSkill: () => () => {},
     requestRender: () => {},
     reportError: (e: string) => errors.push(e),
+    notify: (t: string) => told.push(t),
     runCommand: async () => ({ output: "", exitCode: 1 }),
     ui: {
       confirm: async (title: string, message?: string) => {
@@ -169,6 +172,7 @@ function setup(
     text,
     confirms,
     errors,
+    told,
     groups,
     notices,
     printed,
@@ -212,7 +216,7 @@ test("the model may propose a workflow: the confirmation, marked as the model's 
   expect(t.confirms).toHaveLength(1)
   expect(t.confirms[0]!.title).toBe('Start workflow "fanout"?')
   expect(t.confirms[0]!.message!.split("\n")[0]).toBe("The model proposes this workflow.")
-  expect(t.confirms[0]!.message).toContain("Estimate: 4 agents")
+  expect(t.confirms[0]!.message).toContain("Agents: 4, at most 30, 6 at a time.")
   await until(() => t.notices.length === 1, "the notice")
 })
 
@@ -225,8 +229,9 @@ test("a user message asking for a workflow marks the confirmation as asked for",
   expect(t.confirms[0]!.message!.split("\n")[0]).toBe("You asked for this workflow.")
   expect(t.confirms[0]!.message).toContain("Three looks and a check")
   expect(t.confirms[0]!.message).toContain("Phases: Explore → Verify")
-  expect(t.confirms[0]!.message).toContain("Estimate: 4 agents")
-  expect(t.confirms[0]!.message).toContain("Limits: at most 30 agents, 6 at once")
+  expect(t.confirms[0]!.message).toContain("Agents: 4, at most 30, 6 at a time.")
+  expect(t.confirms[0]!.message).toContain("Cost: no cost cap.")
+  expect(t.confirms[0]!.message).toContain("Files: its agents work in your working tree and can change your files.")
   // The result comes back as a notice with a short display line.
   await until(() => t.notices.length === 1, "the notice")
   const notice = t.notices[0]!
@@ -294,7 +299,8 @@ test("a notice turn does not count as the user asking or not asking", async () =
 test('settings: "always" starts without asking, "never" refuses even when asked; limits come from settings', async () => {
   const limits = setup({ settings: { maxAgents: 12, maxConcurrent: 3, budget: { tokens: 50000 } } })
   await limits.call({ script: SCRIPT })
-  expect(limits.confirms[0]!.message).toContain("Limits: at most 12 agents, 3 at once, 50k tokens")
+  expect(limits.confirms[0]!.message).toContain("Agents: 4, at most 12, 3 at a time.")
+  expect(limits.confirms[0]!.message).toContain("Cost: stops at 50k tokens.")
   await until(() => limits.notices.length === 1)
   const always = setup({
     settings: { enabled: "always", maxAgents: 12, maxConcurrent: 3, budget: { tokens: 50000 } },
@@ -341,6 +347,10 @@ test("declining the confirmation starts nothing and leaves no notice pending", a
   )
   expect(t.groups).toHaveLength(0)
   expect(t.expected - t.cancelled).toBe(0)
+  // The user is told how to start it after all.
+  expect(t.told).toEqual([
+    'Workflow "fanout" not started; it will not be proposed again in this session. To start it yourself, save the script as .amira/workflows/fanout.ts and run /workflow fanout.',
+  ])
 })
 
 test("a declined workflow is not proposed again, by name or by script, until the user asks", async () => {
@@ -478,7 +488,7 @@ test("the estimate says dynamic when agents are started in loops", async () => {
   const dynamic = `export const meta = { name: "loop", description: "loops", phases: [] }
     return await parallel(args.map((x) => () => agent(x)))`
   await t.call({ script: dynamic, args: ["a"] })
-  expect(t.confirms[0]!.message).toMatch(/Estimate: dynamic/)
+  expect(t.confirms[0]!.message).toContain("Agents: 1 or more (some run in loops)")
 })
 
 test("progress: the group's status line follows the phases and counts, and the view shows the tree", async () => {

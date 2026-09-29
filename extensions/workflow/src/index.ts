@@ -18,7 +18,7 @@ import type {
 } from "@amira/api"
 import { compileScript } from "./compile.ts"
 import { type JournalEntry, listRuns, readJournal, readRun } from "./journal.ts"
-import { describeEstimate, estimate, readMeta, type WorkflowMeta } from "./meta.ts"
+import { estimate, readMeta, sizeLine, type WorkflowMeta, workspaceLine } from "./meta.ts"
 import { countsLine, formatDuration, formatTokens, totals, treeLines } from "./progress.ts"
 import { loadRoles } from "./roles.ts"
 import { type ScriptWorker, WorkflowRun } from "./run.ts"
@@ -256,18 +256,21 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       resume?: Launch["resume"],
     ) => {
       const s = settings()
-      const limits = [
-        `at most ${s.maxAgents ?? DEFAULT_MAX_AGENTS} agents`,
-        `${s.maxConcurrent ?? DEFAULT_MAX_CONCURRENT} at once`,
-        s.budget?.tokens !== undefined ? `${formatTokens(s.budget.tokens)} tokens` : "",
-        s.budget?.costUsd !== undefined ? `$${s.budget.costUsd}` : "",
+      const max = s.maxAgents ?? DEFAULT_MAX_AGENTS
+      const concurrent = s.maxConcurrent ?? DEFAULT_MAX_CONCURRENT
+      // The workflow's own budget, else the session's: what stops it spending more.
+      const budget = s.budget ?? api.settings.budget
+      const cap = [
+        budget?.tokens !== undefined ? `${formatTokens(budget.tokens)} tokens` : "",
+        budget?.costUsd !== undefined ? `$${budget.costUsd}` : "",
       ].filter(Boolean)
       return [
         initiator === "user" ? "You asked for this workflow." : "The model proposes this workflow.",
         meta.description,
         `Phases: ${phasesLine(meta)}`,
-        `Estimate: ${describeEstimate(estimate(source))}`,
-        `Limits: ${limits.join(", ")}`,
+        `Agents: ${sizeLine(estimate(source))}, at most ${max}, ${concurrent} at a time.`,
+        `Cost: ${cap.length ? `stops at ${cap.join(" or ")}` : "no cost cap"}.`,
+        `Files: ${workspaceLine(source)}`,
         ...(resume
           ? [
               `Resumes run ${resume.id}: ${resume.previous.length} journaled results are reused where the script is unchanged.`,
@@ -307,14 +310,18 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
               ? `Workflow "${meta.name}" not started.`
               : `Nobody confirmed the workflow "${meta.name}", so it did not start (nobody can answer dialogs here). Set extensions.workflow.enabled to "always" in settings.json to start workflows without confirming.`
           }
-          if (ok === false) {
-            return `The user declined the workflow "${meta.name}", so it did not start. Do not propose it again in this session unless the user asks for it; carry on without it (e.g. with the agent tool), or ask the user how they want to proceed.`
-          }
           const how = l.resume
             ? `run /workflow resume ${l.resume.id}`
             : l.origin === "inline"
               ? `save the script as .amira/workflows/${meta.name}.ts and run /workflow ${meta.name}`
               : `run /workflow ${meta.name}`
+          // The user said no to the model's proposal: tell them how to start it after all.
+          api.notify(
+            `Workflow "${meta.name}" not started; it will not be proposed again in this session. To start it yourself, ${how}.`,
+          )
+          if (ok === false) {
+            return `The user declined the workflow "${meta.name}", so it did not start. Do not propose it again in this session unless the user asks for it; carry on without it (e.g. with the agent tool), or ask the user how they want to proceed.`
+          }
           return `Nobody confirmed the workflow "${meta.name}", so it did not start: the confirmation was dismissed, or nobody can answer it here (print mode, or an rpc client that does not answer dialogs). Do not propose it again in this session unless the user asks. To start it themselves, the user can ${how} in the interactive UI, or set extensions.workflow.enabled to "always" in settings.json to start workflows without confirming.`
         }
       }

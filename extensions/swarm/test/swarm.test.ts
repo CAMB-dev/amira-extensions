@@ -497,8 +497,11 @@ test("the model may propose a swarm: the confirmation, marked as its proposal, i
   expect(lines[1]).toBe("Goal: Check the sky")
   expect(seen[0]!.message).toContain("  a (one): talk to b")
   expect(seen[0]!.message).toContain("  b (two): answer a")
-  expect(seen[0]!.message).toContain("Limits: 20 turns and 30 messages per member, 150 messages in all.")
-  expect(seen[0]!.message).toContain("Budget: 3,000,000 tokens.")
+  expect(seen[0]!.message).toContain(
+    "Agents: 2, all at once; each works up to 20 turns and sends up to 30 messages (150 in all).",
+  )
+  expect(seen[0]!.message).toContain("Cost: stops at 3,000,000 tokens.")
+  expect(seen[0]!.message).toContain("Files: the members work in your working tree and can change your files.")
   await until(() => root.messages.some((m) => m.role === "user" && m.display?.origin === "swarm"))
 })
 
@@ -513,6 +516,10 @@ test("a declined goal is not proposed again until the user asks; another goal ma
     return { toolCalls: [{ name: "swarm", args: { action: "start", goal, members: pair } }] }
   }, {})
   const seen = confirmations(host, bus, () => false)
+  const told: string[] = []
+  bus.subscribe((e) => {
+    if (e.type === "extension.notice") told.push(e.data.text)
+  })
   // Asked for with /swarm: marked as the user's, and declined.
   await root.prompt({
     role: "user",
@@ -531,6 +538,11 @@ test("a declined goal is not proposed again until the user asks; another goal ma
   await root.prompt("next")
   expect(seen).toHaveLength(2)
   expect(seen[1]!.message.split("\n")[0]).toBe("The model proposes this swarm.")
+  // Declining the model's proposal tells the user how to start it themselves.
+  await bus.flush()
+  expect(told).toEqual([
+    "Swarm not started; it will not be proposed again for this goal in this session. To start it yourself, run /swarm another goal.",
+  ])
   // The user asks for a swarm: the declined goal may be proposed again.
   await root.prompt("fine, use a swarm for g")
   expect(seen).toHaveLength(3)
