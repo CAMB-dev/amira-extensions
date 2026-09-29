@@ -17,6 +17,7 @@ amira ext remove mcp-server
 | [mcp-server](mcp-server) | `amira mcp serve`: Amira as an MCP server, so Claude Code, Codex, Gemini CLI and others can hand it tasks |
 | [workflow](workflow) | `/workflow` and a `workflow` tool: TypeScript scripts that orchestrate many sub-agents, with limits, a progress view and resume |
 | [swarm](swarm) | `/swarm <goal>`: long-lived agents that work together through a shared blackboard and messages |
+| [todo](extensions/todo) | `todo_write` and `todo_read`: the model's todo list for multi-step work, shown live above the activity line |
 
 ## The index
 

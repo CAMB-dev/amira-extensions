@@ -27,6 +27,15 @@
       "engines": { "amira": "^0.1.1" },
       "tags": ["agents", "swarm", "multi-agent", "orchestration"],
       "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/swarm"
+    },
+    {
+      "name": "todo",
+      "description": "A todo list the model keeps for multi-step work (todo_write, todo_read), shown live above the activity line and kept with the session",
+      "version": "0.1.0",
+      "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/todo" },
+      "engines": { "amira": "^0.1.2" },
+      "tags": ["todo", "plan", "tasks", "progress"],
+      "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/todo"
     }
   ]
 }
