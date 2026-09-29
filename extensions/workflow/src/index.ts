@@ -13,6 +13,7 @@ import type {
   ToolResult,
   UiApi,
   UserMessage,
+  ViewControl,
   ViewDefinition,
   ViewLine,
 } from "@amira/api"
@@ -33,6 +34,18 @@ export { WorkflowRun } from "./run.ts"
 
 export const WORKFLOW_TOOL = "workflow"
 export const VIEW_KIND = "workflow"
+
+/**
+ * Asks the user to confirm stopping, at the bottom of the view: "Stop …? y stops it · any other
+ * key keeps it running" (ViewControl.confirm, API 0.1.4). A frontend without it asks for "yes"
+ * to be typed instead.
+ */
+export async function confirmStop(view: ViewControl, question: string): Promise<boolean> {
+  if (typeof view.confirm === "function")
+    return view.confirm(question, { yes: "stops it", no: "keeps it running" })
+  const answer = await view.prompt(`${question} Type "yes" to stop it:`)
+  return answer?.toLowerCase() === "yes"
+}
 
 /** settings.json `extensions.workflow` (D81). */
 export interface WorkflowSettings {
@@ -242,8 +255,9 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       return {
         role: "user",
         content: [{ type: "text", text: `${head}\n\n${body}` }],
+        // Shaped like a sub-agent's end line: how it ended as ✓ ✗ ⊘, which the frontend colors.
         display: {
-          text: `◆ workflow ${run.meta.name} ${ended} · ${t.agents} agents · ${took} · ${formatTokens(t.tokens)} tok`,
+          text: `◆ workflow ${run.meta.name} ${run.status === "done" ? "✓" : run.status === "stopped" ? "⊘" : "✗"} ${t.agents} agent${t.agents === 1 ? "" : "s"} · ${took} · ${formatTokens(t.tokens)} tok${t.failed ? ` · ${t.failed} failed` : ""}`,
           origin: "workflow",
         },
       }
@@ -513,8 +527,13 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
           key: "x",
           label: "stop",
           run(d, v) {
-            runOf(d)?.stop()
-            v.requestRender()
+            const run = runOf(d)
+            if (!run) return
+            // Stopping ends every agent of the run: the user says so first, as for a sub-agent.
+            void confirmStop(v, `Stop the workflow run ${run.meta.name}?`).then((yes) => {
+              if (yes) run.stop()
+              v.requestRender()
+            })
           },
         },
       ],

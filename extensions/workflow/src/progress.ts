@@ -89,13 +89,14 @@ export function formatTokens(n: number): string {
   return `${(n / 1_000_000).toFixed(1)}M`
 }
 
+/** "12s", "1m 05s", "1h 02m": as Amira's own screens write times. */
 export function formatDuration(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000))
   if (s < 60) return `${s}s`
   const m = Math.floor(s / 60)
   return m < 60
-    ? `${m}m${String(s % 60).padStart(2, "0")}s`
-    : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`
+    ? `${m}m ${String(s % 60).padStart(2, "0")}s`
+    : `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`
 }
 
 function cost(c: number | undefined): string {
@@ -107,7 +108,7 @@ const MARK: Record<AgentStatus, string> = {
   working: "●",
   done: "✓",
   error: "✗",
-  aborted: "■",
+  aborted: "⊘",
   cached: "↺",
 }
 
@@ -131,16 +132,34 @@ export function countsLine(flow: FlowNode): string {
   return `${parts.join(" · ")} · ${formatTokens(t.tokens)} tok${cost(t.cost)}`
 }
 
-function phaseState(flow: FlowNode, p: PhaseNode): "pending" | "current" | "done" {
+/**
+ * How a phase stands: not reached yet, going on, or over, and then whether all its agents did
+ * their work: one that failed makes it failed, one stopped (and none failed) stopped.
+ */
+function phaseState(flow: FlowNode, p: PhaseNode): "pending" | "current" | "done" | "failed" | "stopped" {
   if (flow.current === p.title && flow.state === "running") return "current"
   const agents = p.items.flatMap((i) => (i.kind === "agent" ? [i] : agentsOf(i)))
   if (agents.some((a) => a.status === "working" || a.status === "queued")) return "current"
   if (!agents.length && !p.items.length) {
     const i = flow.phases.indexOf(p)
     const later = flow.phases.slice(i + 1).some((q) => q.items.length || q.title === flow.current)
-    return later || flow.state !== "running" ? "done" : "pending"
+    if (later || flow.state === "done") return "done"
+    // A run that failed never got past the phase it failed in, nor to the ones after it.
+    if (flow.state === "error") return flow.current === p.title ? "failed" : "pending"
+    return "pending"
   }
+  if (agents.some((a) => a.status === "error")) return "failed"
+  if (agents.some((a) => a.status === "aborted")) return "stopped"
   return "done"
+}
+
+/** A phase's mark and line kind, in the marks every screen uses: ● ✓ ✗ ⊘, and ◌ not reached yet. */
+const PHASE: Record<ReturnType<typeof phaseState>, { mark: string; kind: ViewLine["kind"] }> = {
+  current: { mark: "●", kind: "accent" },
+  done: { mark: "✓", kind: "text" },
+  failed: { mark: "✗", kind: "error" },
+  stopped: { mark: "⊘", kind: "warning" },
+  pending: { mark: "◌", kind: "muted" },
 }
 
 /** The progress tree: phases, and under them agents (and nested workflows) with status, tokens and cost. */
@@ -149,9 +168,7 @@ export function treeLines(flow: FlowNode, now: number, prefix = ""): ViewLine[] 
   const phases = flow.phases.filter((p) => p.title !== "" || p.items.length)
   for (const [pi, p] of phases.entries()) {
     const lastPhase = pi === phases.length - 1
-    const state = phaseState(flow, p)
-    const mark = state === "current" ? "●" : state === "done" ? "✓" : "○"
-    const kind: ViewLine["kind"] = state === "current" ? "accent" : state === "done" ? "text" : "muted"
+    const { mark, kind } = PHASE[phaseState(flow, p)]
     const branch = lastPhase ? "└ " : "├ "
     const inner = prefix + (lastPhase ? "  " : "│ ")
     if (p.title) out.push({ kind, text: `${prefix}${branch}${mark} ${p.title}` })
