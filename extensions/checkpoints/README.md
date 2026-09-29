@@ -12,15 +12,19 @@ Needs git (2.40 or newer to keep line endings byte for byte, see below).
 ## What a checkpoint is
 
 Before the first model call of every turn, the extension snapshots the working tree: tracked
-files with their changes, and untracked files too, except what `.gitignore` ignores. Each
-snapshot is a commit under a private ref, `refs/amira/checkpoints/<session>/<n>`, written
+files with their changes (also ones you track although `.gitignore` ignores them), and
+untracked files too, except what `.gitignore` ignores. Each snapshot is a commit under a
+private ref, `refs/amira/checkpoints/<session>/<n>`, written
 with an index of the extension's own. Your branch, your index (what you staged), your stash
 and your commits are never touched: nothing appears in `git status`, `git log` or
 `git stash list`.
 
 The snapshot runs while the model writes its answer; the turn's first tool call waits for
 it, so no edit can happen before it is taken. After `timeoutMs` (30 s) the turn goes
-on without it, and you are told once.
+on without it, and you are told once. The first snapshot hashes every file, so it is taken
+when the session starts and gets much longer (at least 30 minutes); later ones only look at
+what changed. When three snapshots in a row run out of time, checkpoints are off for the rest
+of the session (raise `timeoutMs`, or add large directories to `.gitignore`).
 
 Files are stored as they are on disk: line endings (CRLF or LF), binary files, file names with
 spaces or non-ASCII characters. Attributes such as `text=auto` or `core.autocrlf` do not
@@ -54,7 +58,14 @@ checkpoint of the main session.
 
 Every restore first takes a checkpoint of the files as they are (it is listed as
 "before restoring #n"), so a rewind can itself be undone: `/rewind <that number>`.
-A rewind waits until the running turn has ended.
+When the restore would replace something no snapshot holds (an ignored or too large file
+where the checkpoint has a file of that name, or a directory where it has a file), that is
+added to this checkpoint first; when it is beyond the limits below, it is left as it is, and
+`/rewind` says so. Files git could not write (on Windows, a file open in another program) are
+listed, and the rest is restored.
+
+A rewind waits until the running turn has ended, and until the session's sub-agents running
+in the background have too.
 
 ## Outside a git repository
 
@@ -114,7 +125,15 @@ In `settings.json`, under `extensions.checkpoints`:
 - Submodules are recorded but not restored.
 - With git older than 2.40, line endings follow your git settings when snapshotting and
   restoring (git cannot be told to ignore attributes before that).
-- The extension's index and scratch files live in `.git/amira-checkpoints/`.
+- Attributes set in `.git/info/attributes` apply to snapshots and restores whatever the git
+  version (git reads that file in any case); you are told once when it sets any.
+- Git hooks do not run for the extension's git commands, and git settings passed down from
+  a git that started Amira (`git -c`, `GIT_CONFIG_*`, `GIT_NAMESPACE`...) do not apply.
+- The extension's index and scratch files live in `.git/amira-checkpoints/`: each Amira
+  process has an index of its own there (`<pid>-index`), started from the one the last
+  process left, so sessions running side by side never wait on each other's locks.
+- When checkpoints are turned off for a reason (too many files outside a repository, too
+  slow), they stay off until Amira starts again.
 
 ## Tests
 
