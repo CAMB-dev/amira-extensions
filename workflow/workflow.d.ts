@@ -76,7 +76,7 @@ declare function workflow(name: string, args?: unknown): Promise<any>
 /** What the run was started with: a JSON value, or null. */
 declare const args: any
 
-/** The run's token budget (settings workflow.budget.tokens); Infinity without one. */
+/** The run's token budget (settings extensions.workflow.budget.tokens); Infinity without one. */
 declare const budget: {
   readonly total: number
   /** Tokens the run's agents have used so far. */

@@ -33,7 +33,7 @@ export { WorkflowRun } from "./run.ts"
 export const WORKFLOW_TOOL = "workflow"
 export const VIEW_KIND = "workflow"
 
-/** settings.json `workflow` (D81). */
+/** settings.json `extensions.workflow` (D81). */
 export interface WorkflowSettings {
   /**
    * When the model may start a workflow: "explicit" (default) only when the user asked for one
@@ -57,19 +57,19 @@ const positive = (v: unknown): number | undefined =>
   typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined
 
 /**
- * The `workflow` section of settings.json, checked: a field that does not fit is reported and
+ * The `extensions.workflow` section of settings.json, checked: a field that does not fit is reported and
  * left at its default.
  */
 export function readSettings(raw: unknown, report: (error: string) => void = () => {}): WorkflowSettings {
   if (raw === undefined) return {}
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    report("settings: workflow must be an object; using the defaults")
+    report("settings: extensions.workflow must be an object; using the defaults")
     return {}
   }
   const r = raw as Record<string, unknown>
   const out: WorkflowSettings = {}
   const bad = (field: string, want: string) =>
-    report(`settings: workflow.${field} must be ${want}; using the default`)
+    report(`settings: extensions.workflow.${field} must be ${want}; using the default`)
   if (r.enabled !== undefined) {
     if (r.enabled === "explicit" || r.enabled === "always" || r.enabled === "never") out.enabled = r.enabled
     else bad("enabled", '"explicit", "always" or "never"')
@@ -165,7 +165,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
   return (api: ExtensionAPI) => {
     const reported = new Set<string>()
     const settings = (): WorkflowSettings =>
-      readSettings(api.settings.workflow, (error) => {
+      readSettings(api.settings.extensions?.workflow, (error) => {
         if (reported.has(error)) return
         reported.add(error)
         api.reportError(error)
@@ -349,7 +349,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
 
     const gate = (): string | undefined => {
       const mode = settings().enabled ?? "explicit"
-      if (mode === "never") return "Workflows are turned off in settings (workflow.enabled: never)."
+      if (mode === "never") return "Workflows are turned off in settings (extensions.workflow.enabled: never)."
       if (mode === "always" || explicit) return undefined
       return "The user has not asked for a workflow, so none may be started. If a workflow would help (many agents fanning out, verifying each other, or a long pipeline), propose it: describe the plan and its rough size, and let the user ask for it (e.g. by saying so, or with /workflow). Otherwise use the agent tool."
     }

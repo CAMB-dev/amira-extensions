@@ -68,11 +68,23 @@ changed result run again too, since they may depend on it.
 ```jsonc
 // settings.json
 {
-  "workflow": {
-    "enabled": "explicit",   // "explicit" (default): only when you ask; "always"; "never"
-    "maxAgents": 30,         // agents a run may start in all
-    "maxConcurrent": 6,      // agents of a run working at once (the tree's own limit still applies)
-    "budget": { "tokens": 2000000, "costUsd": 5 }   // optional; spent, the run's agents are stopped and no more start
+  "extensions": {
+    "workflow": {
+      "enabled": "explicit",   // "explicit" (default): only when you ask; "always"; "never"
+      "maxAgents": 30,         // agents a run may start in all
+      "maxConcurrent": 6,      // agents of a run working at once (the tree's own limit still applies)
+      "budget": { "tokens": 2000000, "costUsd": 5 }   // optional; spent, the run's agents are stopped and no more start
+    }
   }
 }
+```
+
+## Tests
+
+The tests run workflows on a real agent tree with a scripted model, so they need Amira's
+packages:
+
+```sh
+bun run link-amira <path to an Amira checkout>   # after `bun install` there
+bun test
 ```

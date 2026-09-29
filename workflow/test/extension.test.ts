@@ -65,7 +65,7 @@ function setup(
     apiVersion: "0.1.0",
     cwd,
     home,
-    settings: { workflow: opts.settings },
+    settings: { extensions: { workflow: opts.settings } },
     registerTool: (t: ToolDefinition) => {
       tool = t
       return () => {}
@@ -459,9 +459,9 @@ test("settings are checked: bad fields are reported once and left at their defau
     maxConcurrent: 2,
   })
   expect(errors).toEqual([
-    'settings: workflow.enabled must be "explicit", "always" or "never"; using the default',
-    "settings: workflow.maxAgents must be a positive number; using the default",
-    "settings: workflow.budget must be { tokens?, costUsd? } with positive numbers; using the default",
+    'settings: extensions.workflow.enabled must be "explicit", "always" or "never"; using the default',
+    "settings: extensions.workflow.maxAgents must be a positive number; using the default",
+    "settings: extensions.workflow.budget must be { tokens?, costUsd? } with positive numbers; using the default",
   ])
   expect(readSettings(undefined)).toEqual({})
 })

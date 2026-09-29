@@ -15,7 +15,7 @@
       "description": "Dynamic workflows: TypeScript scripts that orchestrate many sub-agents in the background, with limits, a progress view and resume",
       "version": "0.1.0",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "workflow" },
-      "engines": { "amira": "^0.1" },
+      "engines": { "amira": "^0.1.1" },
       "tags": ["workflow", "orchestration", "sub-agents", "automation"],
       "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/workflow"
     },
