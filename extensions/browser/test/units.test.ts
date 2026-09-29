@@ -95,7 +95,7 @@ test("requests: localhost is always fine, the private network only when allowed"
     "ws://[::1]:24678/",
     "https://public.example/",
     "http://loop.example/",
-    "https://unknown.example/",
+    "http://[::ffff:127.0.0.1]:3000/",
     "data:text/plain,hi",
   ])
     expect(await strict.checkRequest(ok)).toBeUndefined()
@@ -107,6 +107,8 @@ test("requests: localhost is always fine, the private network only when allowed"
     "http://mixed.example/",
     "file:///etc/passwd",
     "chrome://settings/",
+    // Fails closed when the name cannot be checked.
+    "https://unknown.example/",
   ])
     expect(await strict.checkRequest(bad)).toBeString()
   const open = new UrlPolicy({ allowFileUrls: true, allowPrivateNetwork: true, resolve })
@@ -117,6 +119,8 @@ test("requests: localhost is always fine, the private network only when allowed"
 test("loopback addresses", () => {
   expect(isLoopback("127.0.0.1")).toBe(true)
   expect(isLoopback("127.5.6.7")).toBe(true)
+  expect(isLoopback("::ffff:7f00:1")).toBe(true)
+  expect(isLoopback("::ffff:a00:1")).toBe(false)
   expect(isLoopback("[::1]")).toBe(true)
   expect(isLoopback("::ffff:127.0.0.1")).toBe(true)
   expect(isLoopback("10.0.0.1")).toBe(false)

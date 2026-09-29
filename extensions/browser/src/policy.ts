@@ -21,8 +21,11 @@ export function isLoopback(ip: string): boolean {
   const a = bare(ip)
   if (isIP(a) === 4) return a.startsWith("127.")
   if (a === "::1" || a === "0:0:0:0:0:0:0:1") return true
-  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(a)
-  return !!mapped && (mapped[1] as string).startsWith("127.")
+  const dotted = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(a)
+  if (dotted) return (dotted[1] as string).startsWith("127.")
+  // URLs spell a mapped address in hex: [::ffff:127.0.0.1] becomes [::ffff:7f00:1].
+  const hex = /^::ffff:([0-9a-f]{1,4}):[0-9a-f]{1,4}$/.exec(a)
+  return !!hex && Number.parseInt(hex[1] as string, 16) >> 8 === 127
 }
 
 const isLocalhostName = (host: string) => host === "localhost" || host.endsWith(".localhost")
@@ -95,16 +98,17 @@ export class UrlPolicy {
     if (isIP(host)) return isLoopback(host) || !isPrivateAddress(host) ? undefined : this.refuse(host)
     const hit = this.cache.get(host)
     if (hit && Date.now() - hit.at < 60_000) return hit.refusal
-    let refusal: string | undefined
+    let addresses: string[]
     try {
-      const addresses = await this.resolve(host)
-      // Every address must be fine: a name may answer with a public and a private one.
-      const bad = addresses.find((a) => !isLoopback(a) && isPrivateAddress(a))
-      refusal = bad ? this.refuse(host, bad) : undefined
-    } catch {
-      // Unresolvable: the browser will fail to load it on its own.
-      refusal = undefined
+      addresses = await this.resolve(host)
+    } catch (err) {
+      // Fail closed, uncached: the browser's own lookup might succeed where this one did not.
+      const why = err instanceof Error ? err.message : String(err)
+      return `${host} could not be resolved to check that it is not a private-network address (${why})`
     }
+    // Every address must be fine: a name may answer with a public and a private one.
+    const bad = addresses.find((a) => !isLoopback(a) && isPrivateAddress(a))
+    const refusal = bad ? this.refuse(host, bad) : undefined
     this.cache.set(host, { at: Date.now(), refusal })
     return refusal
   }
