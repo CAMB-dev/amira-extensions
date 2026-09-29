@@ -63,6 +63,8 @@ interface Seg {
   row: number
   /** Index of the edge this segment belongs to. */
   edge: number
+  /** Canvas net: segments that share a channel group (fan-out / fan-in) join, others cross. */
+  net: number
 }
 
 interface Port {
@@ -288,6 +290,7 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions, width = Infinit
         vPort: undefined,
         row: 0,
         edge: ei,
+        net: 0,
       }
       prev.down.push(seg)
       next.up.push(seg)
@@ -702,6 +705,7 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions, width = Infinit
 
   // ---- channels per gap ------------------------------------------------------------------------
   const gapChannels: number[] = []
+  let nets = 0
   const mkGroup = (segs: Seg[]): Group => {
     const src = segs.map((s) => portX(s.uPort!))
     const tgt = segs.map((s) => portX(s.vPort!))
@@ -786,7 +790,13 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions, width = Infinit
     // A short stub leaves each box before the first turn.
     const channels = usedRows === 0 ? minCh : Math.max(minCh, usedRows + 1)
     const offset = usedRows === 0 ? 0 : vertical ? channels - usedRows : Math.ceil((channels - usedRows) / 2)
-    for (const gr of groups) for (const s of gr.segs) s.row = gr.row + offset
+    for (const gr of groups) {
+      const net = ++nets
+      for (const s of gr.segs) {
+        s.row = gr.row + offset
+        s.net = net
+      }
+    }
     gapChannels.push(channels)
   }
 
@@ -933,7 +943,7 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions, width = Infinit
           a === b
             ? [pt(m1, a), pt(m2, b)]
             : [pt(m1, a), pt(gapCh[g]! + s.row, a), pt(gapCh[g]! + s.row, b), pt(m2, b)]
-        cv.path(pts, s.style)
+        cv.path(pts, s.style, s.net)
       }
   }
   // Dummies and labels: the edge runs straight through their layer.
@@ -942,7 +952,7 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions, width = Infinit
       const s = it.up[0] ?? it.down[0]
       if (!s) continue
       const c = it.x + co(it)
-      cv.path([pt(layerStart[it.layer]!, c), pt(layerStart[it.layer]! + lsz[it.layer]! - 1, c)], s.style)
+      cv.path([pt(layerStart[it.layer]!, c), pt(layerStart[it.layer]! + lsz[it.layer]! - 1, c)], s.style, ++nets)
     }
 
   for (const it of nodeItems) {

@@ -12,6 +12,8 @@ export const LEFT = 8
 
 export type Style = "solid" | "dotted" | "thick"
 
+const SIMPLE = /^[\x20-\x7e─-◿]*$/
+
 const SOLID = [" ", "│", "─", "└", "│", "│", "┌", "├", "─", "┘", "─", "┴", "┐", "┤", "┬", "┼"]
 const THICK = [" ", "┃", "━", "┗", "┃", "┃", "┏", "┣", "━", "┛", "━", "┻", "┓", "┫", "┳", "╋"]
 
@@ -22,10 +24,20 @@ interface Cell {
   solid: number
   dotted: number
   thick: number
+  /**
+   * Which lines ("nets") put bits here: the first net and its bits, a second net and its bits,
+   * and whether more nets did. Lines of the same net join; a straight line of one net crossing
+   * a straight line of another is a crossing, not a junction.
+   */
+  net1: number
+  bits1: number
+  net2: number
+  bits2: number
+  many: boolean
 }
 
 function emptyCell(): Cell {
-  return { ch: null, cont: false, solid: 0, dotted: 0, thick: 0 }
+  return { ch: null, cont: false, solid: 0, dotted: 0, thick: 0, net1: 0, bits1: 0, net2: 0, bits2: 0, many: false }
 }
 
 export class Canvas {
@@ -84,13 +96,17 @@ export class Canvas {
     c.ch = null
     c.cont = false
     c.solid = c.dotted = c.thick = 0
+    c.net1 = c.bits1 = c.net2 = c.bits2 = 0
+    c.many = false
   }
 
   /** Writes text starting at (x, y); it replaces whatever was there. */
   text(x: number, y: number, s: string): void {
     let cx = x
-    for (const g of graphemes(s)) {
-      const w = strWidth(g)
+    // ASCII and box drawing / geometric shapes are one column per code unit: no segmenting.
+    const simple = SIMPLE.test(s)
+    for (const g of simple ? s : graphemes(s)) {
+      const w = simple ? 1 : strWidth(g)
       if (w === 0) continue
       if (cx >= 0 && y >= 0) {
         this.clearAt(cx, y)
@@ -106,30 +122,42 @@ export class Canvas {
     }
   }
 
-  /** Adds connection bits to a cell (a text character there is replaced by the line). */
-  bits(x: number, y: number, mask: number, style: Style): void {
+  /**
+   * Adds connection bits to a cell (a text character there is replaced by the line). `net`
+   * (> 0) names the line they belong to; 0 means "joins everything".
+   */
+  bits(x: number, y: number, mask: number, style: Style, net = 0): void {
     const c = this.cell(x, y)
     if (!c) return
     if (c.ch !== null || c.cont) this.clearAt(x, y)
+    if (net > 0) {
+      if (c.net1 === 0 || c.net1 === net) {
+        c.net1 = net
+        c.bits1 |= mask
+      } else if (c.net2 === 0 || c.net2 === net) {
+        c.net2 = net
+        c.bits2 |= mask
+      } else c.many = true
+    } else c.many = true
     if (style === "solid") c.solid |= mask
     else if (style === "dotted") c.dotted |= mask
     else c.thick |= mask
   }
 
-  /** Connects two orthogonally adjacent-or-aligned cells with a straight line. */
-  line(x1: number, y1: number, x2: number, y2: number, style: Style): void {
+  /** Connects two orthogonally aligned cells with a straight line. */
+  line(x1: number, y1: number, x2: number, y2: number, style: Style, net = 0): void {
     if (x1 === x2 && y1 === y2) return
     if (x1 === x2) {
       const step = y2 > y1 ? 1 : -1
       for (let y = y1; y !== y2; y += step) {
-        this.bits(x1, y, step > 0 ? DOWN : UP, style)
-        this.bits(x1, y + step, step > 0 ? UP : DOWN, style)
+        this.bits(x1, y, step > 0 ? DOWN : UP, style, net)
+        this.bits(x1, y + step, step > 0 ? UP : DOWN, style, net)
       }
     } else if (y1 === y2) {
       const step = x2 > x1 ? 1 : -1
       for (let x = x1; x !== x2; x += step) {
-        this.bits(x, y1, step > 0 ? RIGHT : LEFT, style)
-        this.bits(x + step, y1, step > 0 ? LEFT : RIGHT, style)
+        this.bits(x, y1, step > 0 ? RIGHT : LEFT, style, net)
+        this.bits(x + step, y1, step > 0 ? LEFT : RIGHT, style, net)
       }
     } else {
       throw new Error("canvas: diagonal line")
@@ -137,17 +165,25 @@ export class Canvas {
   }
 
   /** Draws a polyline through orthogonal points. */
-  path(points: ReadonlyArray<readonly [number, number]>, style: Style): void {
+  path(points: ReadonlyArray<readonly [number, number]>, style: Style, net = 0): void {
     for (let i = 1; i < points.length; i++) {
       const [ax, ay] = points[i - 1]!
       const [bx, by] = points[i]!
-      this.line(ax, ay, bx, by, style)
+      this.line(ax, ay, bx, by, style, net)
     }
   }
 
   private glyph(c: Cell): string {
     const all = c.solid | c.dotted | c.thick
     if (all === 0) return " "
+    // Two unrelated lines crossing: keep the vertical one whole (a hop), no junction.
+    const ud = UP | DOWN
+    const lr = LEFT | RIGHT
+    if (!c.many && c.net2 && ((c.bits1 === ud && c.bits2 === lr) || (c.bits1 === lr && c.bits2 === ud))) {
+      if (c.thick & ud && !(c.solid & ud)) return "┃"
+      if (c.dotted & ud && !(c.solid & ud) && !(c.thick & ud)) return "┆"
+      return "│"
+    }
     if (c.thick === all && !c.solid && !c.dotted) return THICK[all]!
     if (c.dotted === all && !c.solid && !c.thick) {
       if (all === UP || all === DOWN || all === (UP | DOWN)) return "┆"
