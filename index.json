@@ -18,6 +18,15 @@
       "engines": { "amira": "^0.1" },
       "tags": ["workflow", "orchestration", "sub-agents", "automation"],
       "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/workflow"
+    },
+    {
+      "name": "swarm",
+      "description": "Swarm mode: long-lived sub-agents that work on one goal together through a shared blackboard and direct messages: /swarm <goal>",
+      "version": "0.1.0",
+      "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "swarm" },
+      "engines": { "amira": "^0.1.1" },
+      "tags": ["agents", "swarm", "multi-agent", "orchestration"],
+      "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/swarm"
     }
   ]
 }
