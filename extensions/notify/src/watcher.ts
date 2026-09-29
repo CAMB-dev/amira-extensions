@@ -8,6 +8,8 @@ export interface WatcherOptions {
   notify: (n: Notification) => void
   /** The notifications' title, e.g. "Amira · my-project". */
   title: string
+  /** Whether the user's terminal has focus; undefined while unknown. */
+  focused?: () => boolean | undefined
   setTimer?: (fn: () => void, ms: number) => unknown
   clearTimer?: (timer: unknown) => void
 }
@@ -31,6 +33,8 @@ interface Child {
   parent: string
   title: string
   groupId?: string
+  /** The parent's tool call that started it, when a tool did. */
+  toolCallId?: string
 }
 
 /**
@@ -52,6 +56,8 @@ export class Watcher {
   #lastText = new Map<string, string>()
   /** Background work that finished while its session was in a turn, told when the turn ends. */
   #finishedDuringTurn = new Map<string, string[]>()
+  /** Tool calls of top-level sessions still running: a sub-agent ending inside one ran in the foreground. */
+  #openCalls = new Set<string>()
   /** Open dialogs waiting for their delay to pass. */
   #dialogs = new Map<string, unknown>()
   /** Background completions gathered for one notification. */
@@ -99,11 +105,18 @@ export class Watcher {
       case "turn.end":
         this.#turnEnded(e.sessionId, e.ts, e.data.reason, e.data.error)
         return
+      case "tool.execute.start":
+        if (this.#topLevel(e.sessionId, e.parentSessionId)) this.#openCalls.add(e.data.toolCallId)
+        return
+      case "tool.execute.end":
+        this.#openCalls.delete(e.data.toolCallId)
+        return
       case "subagent.start":
         this.#children.set(e.data.childSessionId, {
           parent: e.sessionId,
           title: e.data.title || e.data.role || "sub-agent",
           ...(e.data.groupId ? { groupId: e.data.groupId } : {}),
+          ...(e.data.toolCallId ? { toolCallId: e.data.toolCallId } : {}),
         })
         return
       case "subagent.end": {
@@ -111,6 +124,8 @@ export class Watcher {
         // Members of a group are told about with their group; stopped ones by whoever stopped them.
         if (!child || child.groupId || e.data.status === "aborted") return
         if (!this.#topLevel(child.parent)) return
+        // Ending while the call that started it still runs: it ran in the foreground, part of the turn.
+        if (child.toolCallId && this.#openCalls.has(child.toolCallId)) return
         const what =
           e.data.status === "error"
             ? `◆ ${child.title} failed${e.data.error ? `: ${clip(oneLine(e.data.error), 120)}` : ""}`
@@ -139,7 +154,11 @@ export class Watcher {
             : "Waiting for your answer"
           this.#opts.notify({ kind: "dialog", title: this.#opts.title, body })
         }
-        this.#dialogs.set(requestId, this.#set(fire, s.dialogDelaySeconds * 1000))
+        // Where the terminal never said whether it has focus (many report only changes), a
+        // question the user may be looking at waits as long as a long turn before it notifies.
+        const unknown = s.when === "unfocused" && this.#opts.focused?.() === undefined
+        const delay = unknown ? Math.max(s.dialogDelaySeconds, s.longTurnSeconds) : s.dialogDelaySeconds
+        this.#dialogs.set(requestId, this.#set(fire, delay * 1000))
         return
       }
       case "ui.resolved": {

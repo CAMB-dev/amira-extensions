@@ -135,6 +135,7 @@ test('"always" notifies while focused too; preview off keeps the reply out', asy
 
 test("a question left open notifies after the delay; one answered first does not", async () => {
   const s = await setup({ desktop: false })
+  await s.emit("ui.focus", { focused: false }, { sessionId: "host" })
   await s.emit(
     "ui.request",
     { kind: "confirm", title: "Run rm -rf build?", requestId: "r1" },
@@ -153,6 +154,53 @@ test("a question left open notifies after the delay; one answered first does not
   s.t.advance(2_000)
   await s.settle()
   expect(s.bodies()).toEqual(["Waiting for your answer: Which model?"])
+})
+
+test("focus unknown (the terminal reports only changes): a question waits as long as a long turn", async () => {
+  const s = await setup({ desktop: false, longTurnSeconds: 20 })
+  await s.emit("ui.request", { kind: "confirm", title: "Go?", requestId: "r1" }, { sessionId: "host" })
+  s.t.advance(19_000)
+  await s.settle()
+  expect(s.bodies()).toEqual([])
+  s.t.advance(1_000)
+  await s.settle()
+  expect(s.bodies()).toEqual(["Waiting for your answer: Go?"])
+})
+
+test("a sub-agent that ends inside the call that started it ran in the foreground: not background work", async () => {
+  const s = await setup({ desktop: false })
+  const at = s.t.now()
+  await s.emit("turn.start", { prompt }, { at })
+  await s.emit("tool.execute.start", { toolCallId: "call_1", name: "agent", args: {} })
+  await s.emit("subagent.start", {
+    childSessionId: "f1",
+    title: "Foreground one",
+    toolCallId: "call_1",
+    prompt: "p",
+    model: { provider: "mock", model: "m" },
+    depth: 1,
+    cwd: "/w",
+    context: "fresh",
+    queued: false,
+  })
+  await s.emit("subagent.end", {
+    childSessionId: "f1",
+    toolCallId: "call_1",
+    status: "done",
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as never,
+    durationMs: 5_000,
+  })
+  await s.emit("tool.execute.end", {
+    toolCallId: "call_1",
+    name: "agent",
+    result: { content: [] } as never,
+    durationMs: 5_000,
+  })
+  s.t.advance(8_000)
+  await s.emit("turn.end", { reason: "done", steps: 2 }, { at: at + 8_000 })
+  s.t.advance(5_000)
+  await s.settle()
+  expect(s.bodies()).toEqual([])
 })
 
 test("background sub-agents: told when the main session is idle, batched; with the turn when it is busy", async () => {

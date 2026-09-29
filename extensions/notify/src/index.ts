@@ -42,6 +42,8 @@ const WATCHED: (keyof EventMap)[] = [
   "group.end",
   "ui.request",
   "ui.resolved",
+  "tool.execute.start",
+  "tool.execute.end",
 ]
 
 const whenText = (s: NotifySettings) =>
@@ -90,6 +92,7 @@ export function createNotifyExtension(deps: NotifyDeps = {}): Extension {
     const watcher = new Watcher({
       settings: () => settings,
       title,
+      focused: () => focused,
       notify: (n) => {
         if (on) void notifier.notify(n)
       },

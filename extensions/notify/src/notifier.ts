@@ -42,7 +42,8 @@ export class Notifier {
   #heldTimer: unknown
   /** Failures reported so far, by channel, so a broken webhook does not report every time. */
   #reported = new Map<string, string>()
-  readonly #abort = new AbortController()
+  /** Sends are never cut short by the notifier; each channel has its own timeout. */
+  readonly #signal = new AbortController().signal
 
   constructor(opts: NotifierOptions) {
     this.#opts = opts
@@ -86,12 +87,14 @@ export class Notifier {
     return this.#dispatch(n, this.#opts.channels(), false)
   }
 
-  /** Stops sending: held notifications are dropped and sends under way are aborted. */
+  /**
+   * Stops sending: held notifications are dropped. Sends under way are left to finish (the
+   * last notification of a print run goes out as the session ends).
+   */
   dispose(): void {
     this.#held = undefined
     if (this.#heldTimer !== undefined) (this.#opts.clearTimer ?? clearTimeout)(this.#heldTimer as never)
     this.#heldTimer = undefined
-    this.#abort.abort()
   }
 
   #scheduleHeld(ms: number) {
@@ -112,7 +115,7 @@ export class Notifier {
   }
 
   async #dispatch(n: Notification, channels: Channel[], reportFailures = true): Promise<SendResult[]> {
-    const signal = this.#abort.signal
+    const signal = this.#signal
     return Promise.all(
       channels.map(async (c): Promise<SendResult> => {
         try {

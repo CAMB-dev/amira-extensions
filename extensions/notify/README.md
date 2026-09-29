@@ -23,7 +23,10 @@ it, focus counts as unknown and it notifies as if you were away.
 By default (`"when": "unfocused"`) nothing is sent while the terminal has focus. The TUI
 tells focus from the terminal's focus reports (Windows Terminal, VS Code, iTerm2, kitty,
 WezTerm, most others); where the terminal never reports it, as in print mode, it notifies
-as if you were away (the thresholds still apply). `"when": "always"` notifies either way.
+as if you were away, except that a question then waits `longTurnSeconds` before it notifies
+(many terminals report focus only once it changes, so right after starting it is unknown).
+`"when": "always"` notifies either way. Sub-agents that run in the foreground, inside the
+call that started them, are part of their turn and not told about on their own.
 
 ## Channels
 
