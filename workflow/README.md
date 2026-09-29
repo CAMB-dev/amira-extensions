@@ -10,10 +10,17 @@ amira ext install workflow
 
 ## Starting a workflow
 
-The model may start a workflow only when you asked for one: say so in your message ("use a
-workflow to ..."), or run `/workflow <task>`. Otherwise it proposes one and lets you decide.
-Every start asks you to confirm, showing the script's name, description, phases, estimated
-number of agents and limits.
+The model may propose a workflow when one clearly helps, and you can ask for one yourself:
+say so in your message ("use a workflow to ..."), or run `/workflow <task>` or
+`/workflow <name>`. Every start asks you to confirm, showing whether the model proposes it or
+you asked for it, and the script's name, description, phases, estimated number of agents
+(or "dynamic") and limits. If you decline, the model is told so and may not propose the same
+workflow (by name, or the same script renamed) again in this session unless you ask for it;
+a different workflow may still be proposed.
+
+Where nobody can confirm (print mode, an rpc client that does not answer dialogs), the model
+cannot start one: run it yourself with `/workflow <name>` in the interactive UI, or set
+`enabled` to `"always"`.
 
 | Command | |
 |---|---|
@@ -70,7 +77,7 @@ changed result run again too, since they may depend on it.
 {
   "extensions": {
     "workflow": {
-      "enabled": "explicit",   // "explicit" (default): only when you ask; "always"; "never"
+      "enabled": "ask",        // "ask" (default): confirm every start; "always": start without asking; "never"
       "maxAgents": 30,         // agents a run may start in all
       "maxConcurrent": 6,      // agents of a run working at once (the tree's own limit still applies)
       "budget": { "tokens": 2000000, "costUsd": 5 }   // optional; spent, the run's agents are stopped and no more start

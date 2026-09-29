@@ -1,15 +1,18 @@
 ---
 name: workflow
-description: How to write workflow scripts for the workflow tool (fan-out and verify, pipelines, loop until nothing new), with the script API. Load it before writing a workflow, and only when the user asked for one.
+description: How to write workflow scripts for the workflow tool (fan-out and verify, pipelines, loop until nothing new), with the script API. Load it before writing a workflow: when the user asks for one, or when a workflow clearly helps and you are about to propose one.
 ---
 
 # Writing workflow scripts
 
 A workflow is a TypeScript script that orchestrates many sub-agents deterministically. The
 `workflow` tool runs it in the background and sends you its return value as a message when it
-ends. Use one only when the user asked for a workflow (or ran `/workflow`); otherwise propose
-it in a sentence (what it would do, roughly how many agents) and let the user decide. The user
-confirms every start and sees the script's name, description, phases and estimated size.
+ends. Reach for one when it clearly helps: many agents fanning out, agents checking each
+other's work, or a long pipeline; for one or two sub-agents use the agent tool. Calling the tool
+proposes the workflow: the user sees its name, description, phases and estimated size, and
+approves or declines it, so write a `meta.description` that says plainly what the run does.
+If the user declines, carry on without it and do not call the tool again for the same workflow
+(renamed or reworded) unless they ask for it; the tool refuses such a repeat.
 
 ## Shape
 

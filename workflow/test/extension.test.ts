@@ -60,6 +60,7 @@ function setup(
   const notices: UserMessage[] = []
   let cancelled = 0
   let expected = 0
+  let confirmAnswer: boolean | undefined = "confirm" in opts ? opts.confirm : true
   const answer = opts.answer ?? ((o: { prompt: string }) => ({ text: `saw ${o.prompt.split(" ").at(-1)}` }))
   const api = {
     apiVersion: "0.1.0",
@@ -87,7 +88,7 @@ function setup(
     ui: {
       confirm: async (title: string, message?: string) => {
         confirms.push({ title, message })
-        return "confirm" in opts ? opts.confirm : true
+        return confirmAnswer
       },
     },
     on: (type: string, h: Handler) => {
@@ -173,6 +174,10 @@ function setup(
     printed,
     opened,
     sent,
+    /** What the user answers the next confirmations with. */
+    answerConfirm(v: boolean | undefined) {
+      confirmAnswer = v
+    },
     get cancelled() {
       return cancelled
     },
@@ -199,22 +204,25 @@ test("the tool is main-session only and refuses sub-agents that reach it anyway"
   expect(t.confirms).toHaveLength(0)
 })
 
-test("without the user asking, the tool refuses and tells the model to propose a workflow", async () => {
+test("the model may propose a workflow: the confirmation, marked as the model's proposal, is the gate", async () => {
   const t = setup()
-  t.say("fix the flaky test")
+  t.say("sweep this small repo for bugs with several agents")
   const r = await t.call({ script: SCRIPT })
-  expect(r.isError).toBe(true)
-  expect(t.text(r)).toMatch(/has not asked for a workflow.*propose it/s)
-  expect(t.confirms).toHaveLength(0)
-  expect(t.groups).toHaveLength(0)
+  expect(t.text(r)).toMatch(/Started workflow run wf_\w+ \(fanout\) in the background/)
+  expect(t.confirms).toHaveLength(1)
+  expect(t.confirms[0]!.title).toBe('Start workflow "fanout"?')
+  expect(t.confirms[0]!.message!.split("\n")[0]).toBe("The model proposes this workflow.")
+  expect(t.confirms[0]!.message).toContain("Estimate: 4 agents")
+  await until(() => t.notices.length === 1, "the notice")
 })
 
-test("a user message asking for a workflow lets the model start one, after the user confirms", async () => {
+test("a user message asking for a workflow marks the confirmation as asked for", async () => {
   const t = setup()
   t.say("Use a workflow to review the three packages")
   const r = await t.call({ script: SCRIPT })
   expect(t.text(r)).toMatch(/Started workflow run wf_\w+ \(fanout\) in the background/)
   expect(t.confirms[0]!.title).toBe('Start workflow "fanout"?')
+  expect(t.confirms[0]!.message!.split("\n")[0]).toBe("You asked for this workflow.")
   expect(t.confirms[0]!.message).toContain("Three looks and a check")
   expect(t.confirms[0]!.message).toContain("Phases: Explore → Verify")
   expect(t.confirms[0]!.message).toContain("Estimate: 4 agents")
@@ -227,9 +235,11 @@ test("a user message asking for a workflow lets the model start one, after the u
   expect(body).toContain('"saw tui"')
   expect(notice.display?.origin).toBe("workflow")
   expect(notice.display?.text).toMatch(/^◆ workflow fanout finished · 4 agents · \d+s · 400 tok$/)
-  // The next user message that does not ask shuts the gate again.
+  // The next user message that does not ask makes the next start the model's proposal again.
   t.say("thanks")
-  expect((await t.call({ script: SCRIPT })).isError).toBe(true)
+  expect((await t.call({ script: SCRIPT })).isError).toBeUndefined()
+  expect(t.confirms[1]!.message!.split("\n")[0]).toBe("The model proposes this workflow.")
+  await until(() => t.notices.length === 2)
 })
 
 test("asking for a workflow takes asking, not just the word", async () => {
@@ -256,12 +266,12 @@ test("asking for a workflow takes asking, not just the word", async () => {
   ]) {
     expect(`${no}: ${asksForWorkflow(no)}`).toBe(`${no}: false`)
   }
-  // Mentioning one without asking keeps the tool shut.
+  // Mentioning one without asking leaves the start the model's proposal.
   const t = setup()
   t.say("fix the failing GitHub Actions workflow")
-  const r = await t.call({ script: SCRIPT })
-  expect(t.text(r)).toMatch(/has not asked for a workflow/)
-  expect(t.confirms).toHaveLength(0)
+  await t.call({ script: SCRIPT })
+  expect(t.confirms[0]!.message!.split("\n")[0]).toBe("The model proposes this workflow.")
+  await until(() => t.notices.length === 1)
 })
 
 test("a notice turn does not count as the user asking or not asking", async () => {
@@ -277,15 +287,22 @@ test("a notice turn does not count as the user asking or not asking", async () =
     },
   })
   expect((await t.call({ script: SCRIPT })).isError).toBeUndefined()
+  expect(t.confirms[0]!.message!.split("\n")[0]).toBe("You asked for this workflow.")
+  await until(() => t.notices.length === 1)
 })
 
-test('settings: "always" skips the ask, "never" refuses even when asked; limits come from settings', async () => {
+test('settings: "always" starts without asking, "never" refuses even when asked; limits come from settings', async () => {
+  const limits = setup({ settings: { maxAgents: 12, maxConcurrent: 3, budget: { tokens: 50000 } } })
+  await limits.call({ script: SCRIPT })
+  expect(limits.confirms[0]!.message).toContain("Limits: at most 12 agents, 3 at once, 50k tokens")
+  await until(() => limits.notices.length === 1)
   const always = setup({
     settings: { enabled: "always", maxAgents: 12, maxConcurrent: 3, budget: { tokens: 50000 } },
+    confirm: false,
   })
   always.say("do the thing")
   expect((await always.call({ script: SCRIPT })).isError).toBeUndefined()
-  expect(always.confirms[0]!.message).toContain("Limits: at most 12 agents, 3 at once, 50k tokens")
+  expect(always.confirms).toHaveLength(0)
   expect(always.groups[0]!.options).toEqual({
     name: "workflow fanout",
     maxAgents: 12,
@@ -295,7 +312,17 @@ test('settings: "always" skips the ask, "never" refuses even when asked; limits 
   })
   const never = setup({ settings: { enabled: "never" } })
   never.say("use a workflow")
-  expect(never.text(await never.call({ script: SCRIPT }))).toMatch(/turned off/)
+  const refused = await never.call({ script: SCRIPT })
+  expect(refused.isError).toBe(true)
+  expect(never.text(refused)).toMatch(/turned off/)
+  // /workflow <name> too.
+  mkdirSync(path.join(never.cwd, ".amira", "workflows"), { recursive: true })
+  writeFileSync(path.join(never.cwd, ".amira", "workflows", "fanout.ts"), SCRIPT)
+  await never.run("fanout")
+  expect(never.printed.at(-1)).toMatch(/turned off/)
+  expect(never.confirms).toHaveLength(0)
+  expect(never.groups).toHaveLength(0)
+  expect(never.expected).toBe(0)
 })
 
 test("defaults: a run's group gets 30 agents and 6 at once", async () => {
@@ -306,11 +333,81 @@ test("defaults: a run's group gets 30 agents and 6 at once", async () => {
 })
 
 test("declining the confirmation starts nothing and leaves no notice pending", async () => {
-  const t = setup({ settings: { enabled: "always" }, confirm: false })
+  const t = setup({ confirm: false })
   const r = await t.call({ script: SCRIPT })
-  expect(t.text(r)).toMatch(/declined/)
+  expect(r.isError).toBe(true)
+  expect(t.text(r)).toMatch(
+    /The user declined the workflow "fanout", so it did not start\. Do not propose it again/,
+  )
   expect(t.groups).toHaveLength(0)
   expect(t.expected - t.cancelled).toBe(0)
+})
+
+test("a declined workflow is not proposed again, by name or by script, until the user asks", async () => {
+  const t = setup({ confirm: false })
+  t.say("find the bugs")
+  await t.call({ script: SCRIPT })
+  expect(t.confirms).toHaveLength(1)
+  t.answerConfirm(true)
+  // The same name with another script, and the same script under another name: refused unasked.
+  const edited = `${SCRIPT}\n// tweaked`
+  const renamed = SCRIPT.replace('name: "fanout"', 'name: "fanout2"')
+  for (const script of [edited, renamed]) {
+    const again = await t.call({ script })
+    expect(again.isError).toBe(true)
+    expect(t.text(again)).toMatch(/already declined the workflow "fanout2?" in this session/)
+  }
+  expect(t.confirms).toHaveLength(1)
+  // A later message that does not ask for one keeps it refused.
+  t.say("ok, go on")
+  expect((await t.call({ script: SCRIPT })).isError).toBe(true)
+  expect(t.confirms).toHaveLength(1)
+  // A different workflow may still be proposed.
+  const other = SCRIPT.replace('name: "fanout"', 'name: "other"').replace("look at api", "look at cli")
+  expect(t.text(await t.call({ script: other }))).toMatch(/Started workflow run/)
+  expect(t.confirms).toHaveLength(2)
+  // Once the user asks for a workflow, the declined one may be proposed again.
+  t.say("fine, use a workflow for it after all")
+  expect(t.text(await t.call({ script: SCRIPT }))).toMatch(/Started workflow run/)
+  expect(t.confirms).toHaveLength(3)
+  expect(t.confirms[2]!.message!.split("\n")[0]).toBe("You asked for this workflow.")
+  await until(() => t.notices.length === 2)
+})
+
+test("a new session forgets what was declined", async () => {
+  const t = setup({ confirm: false })
+  await t.call({ script: SCRIPT })
+  t.emit("session.start", { sessionId: "s_other", data: { reason: "new" } })
+  t.answerConfirm(true)
+  expect(t.text(await t.call({ script: SCRIPT }))).toMatch(/Started workflow run/)
+  expect(t.confirms).toHaveLength(2)
+  await until(() => t.notices.length === 1)
+})
+
+test("with nobody to confirm (print mode, rpc without dialogs) the tool refuses and says how to start it", async () => {
+  const t = setup({ confirm: undefined })
+  const r = await t.call({ script: SCRIPT })
+  expect(r.isError).toBe(true)
+  expect(t.text(r)).toMatch(/Nobody confirmed the workflow "fanout", so it did not start/)
+  expect(t.text(r)).toContain("save the script as .amira/workflows/fanout.ts and run /workflow fanout")
+  expect(t.text(r)).toContain('extensions.workflow.enabled to "always"')
+  expect(t.groups).toHaveLength(0)
+  expect(t.expected - t.cancelled).toBe(0)
+  // A saved workflow is started by name; it is not proposed again unasked either.
+  mkdirSync(path.join(t.cwd, ".amira", "workflows"), { recursive: true })
+  writeFileSync(
+    path.join(t.cwd, ".amira", "workflows", "echo.ts"),
+    `export const meta = { name: "echo", description: "echoes", phases: [] }\nreturn await agent("x")`,
+  )
+  expect(t.text(await t.call({ name: "echo" }))).toMatch(/can run \/workflow echo in the interactive UI/)
+  expect(t.text(await t.call({ name: "echo" }))).toMatch(/already declined/)
+})
+
+test('the setting "explicit" (the earlier default) reads as "ask"', () => {
+  const errors: string[] = []
+  expect(readSettings({ enabled: "explicit" }, (e) => errors.push(e))).toEqual({ enabled: "ask" })
+  expect(readSettings({ enabled: "ask" })).toEqual({ enabled: "ask" })
+  expect(errors).toEqual([])
 })
 
 test("a script without meta, or that does not compile, is refused with no notice pending", async () => {
@@ -339,7 +436,7 @@ test("a script without meta, or that does not compile, is refused with no notice
 })
 
 test("the estimate says dynamic when agents are started in loops", async () => {
-  const t = setup({ settings: { enabled: "always" } })
+  const t = setup()
   const dynamic = `export const meta = { name: "loop", description: "loops", phases: [] }
     return await parallel(args.map((x) => () => agent(x)))`
   await t.call({ script: dynamic, args: ["a"] })
@@ -374,6 +471,7 @@ test("/workflow <name> runs a saved workflow with args, and marks the start as a
   )
   await t.run('echo {"word":"hi"}')
   expect(t.printed.at(-1)).toMatch(/Started workflow run wf_\w+ \(echo\)/)
+  expect(t.confirms[0]!.message!.split("\n")[0]).toBe("You asked for this workflow.")
   await until(() => t.notices.length === 1)
   expect(t.notices[0]!.content[0]).toMatchObject({ type: "text" })
   expect(JSON.stringify(t.notices[0]!.content)).toContain("saw hi")
@@ -382,11 +480,13 @@ test("/workflow <name> runs a saved workflow with args, and marks the start as a
   expect(t.printed.at(-1)).toContain("echo (project) - echoes")
 })
 
-test("/workflow <task> asks the model to use a workflow, which the gate then allows", async () => {
+test("/workflow <task> asks the model to use a workflow, marked as asked for", async () => {
   const t = setup()
   await t.run("review the three packages")
   expect(t.sent).toEqual(["Use a workflow (the workflow tool) for this task: review the three packages"])
   expect((await t.call({ script: SCRIPT })).isError).toBeUndefined()
+  expect(t.confirms[0]!.message!.split("\n")[0]).toBe("You asked for this workflow.")
+  await until(() => t.notices.length === 1)
 })
 
 test("/workflow view opens the progress view; /workflow stop stops a run", async () => {
@@ -404,7 +504,7 @@ test("/workflow view opens the progress view; /workflow stop stops a run", async
 })
 
 test("resume by id replays the journal: no agent runs again", async () => {
-  const t = setup({ settings: { enabled: "always" } })
+  const t = setup()
   const r = await t.call({ script: SCRIPT })
   const id = /run (wf_\w+)/.exec(t.text(r))![1]!
   await until(() => t.notices.length === 1)
@@ -459,7 +559,7 @@ test("settings are checked: bad fields are reported once and left at their defau
     maxConcurrent: 2,
   })
   expect(errors).toEqual([
-    'settings: extensions.workflow.enabled must be "explicit", "always" or "never"; using the default',
+    'settings: extensions.workflow.enabled must be "ask", "always" or "never"; using the default',
     "settings: extensions.workflow.maxAgents must be a positive number; using the default",
     "settings: extensions.workflow.budget must be { tokens?, costUsd? } with positive numbers; using the default",
   ])

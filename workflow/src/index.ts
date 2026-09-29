@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { existsSync, readFileSync } from "node:fs"
 import path from "node:path"
 import type {
@@ -17,7 +18,7 @@ import type {
 } from "@amira/api"
 import { compileScript } from "./compile.ts"
 import { type JournalEntry, listRuns, readJournal, readRun } from "./journal.ts"
-import { describeEstimate, estimate, type WorkflowMeta } from "./meta.ts"
+import { describeEstimate, estimate, readMeta, type WorkflowMeta } from "./meta.ts"
 import { countsLine, formatDuration, formatTokens, totals, treeLines } from "./progress.ts"
 import { loadRoles } from "./roles.ts"
 import { type ScriptWorker, WorkflowRun } from "./run.ts"
@@ -36,12 +37,11 @@ export const VIEW_KIND = "workflow"
 /** settings.json `extensions.workflow` (D81). */
 export interface WorkflowSettings {
   /**
-   * When the model may start a workflow: "explicit" (default) only when the user asked for one
-   * (their message asks to use one, see asksForWorkflow, or they used /workflow); "always";
-   * "never".
-   * Every start is still confirmed by the user.
+   * How a workflow starts: "ask" (default) asks the user to confirm every start, which is the
+   * gate; "always" starts without asking; "never" starts none. ("explicit", the setting's
+   * earlier default, reads as "ask".)
    */
-  enabled?: "explicit" | "always" | "never"
+  enabled?: "ask" | "always" | "never"
   /** Agents a run may start in all. Default 30. */
   maxAgents?: number
   /** Agents of a run working at once. Default 6. */
@@ -71,8 +71,9 @@ export function readSettings(raw: unknown, report: (error: string) => void = () 
   const bad = (field: string, want: string) =>
     report(`settings: extensions.workflow.${field} must be ${want}; using the default`)
   if (r.enabled !== undefined) {
-    if (r.enabled === "explicit" || r.enabled === "always" || r.enabled === "never") out.enabled = r.enabled
-    else bad("enabled", '"explicit", "always" or "never"')
+    if (r.enabled === "ask" || r.enabled === "always" || r.enabled === "never") out.enabled = r.enabled
+    else if (r.enabled === "explicit") out.enabled = "ask"
+    else bad("enabled", '"ask", "always" or "never"')
   }
   for (const key of ["maxAgents", "maxConcurrent"] as const) {
     if (r[key] === undefined) continue
@@ -103,7 +104,9 @@ export function readSettings(raw: unknown, report: (error: string) => void = () 
 /**
  * "use a workflow", "run this as a workflow", "with a workflow", "via workflows": a verb or
  * preposition of using one, then the word. The bare word is not enough: "fix the failing
- * GitHub Actions workflow" or "our git workflow" do not ask for one.
+ * GitHub Actions workflow" or "our git workflow" do not ask for one. It no longer gates
+ * anything: it tells the confirmation who wants the run, and lets a declined workflow be
+ * proposed again.
  */
 const ASK_EN =
   /\b(?:use|using|run|start|launch|kick off|spin up|do|try|with|via|through|as)\s+(?:(?:it|this|that|these|them|everything|the task|the work)\s+(?:as|with|via|through|using|in)\s+)?(?:(?:a|an|one|another|new|dynamic|multi-agent|small|big|quick)\s+)*workflows?\b/i
@@ -146,6 +149,11 @@ interface Launch {
   source: string
   origin: string
   args: unknown
+  /**
+   * Who wants the run: "user" when they ran /workflow or their latest message asks for a
+   * workflow, else "model" (the model proposes it). Shown in the confirmation.
+   */
+  initiator: "user" | "model"
   /** Resuming this run: its id and journal. */
   resume?: { id: string; dir: string; previous: JournalEntry[]; resumes: number }
   ui: UiApi
@@ -177,6 +185,19 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
     let sessionFile: string | undefined
     /** The user's last message asked for a workflow (or /workflow was used). */
     let explicit = false
+    /**
+     * Workflows the user turned down in this session, by `name:<meta.name>` and
+     * `hash:<hash of the script after its meta>` (so a renamed copy is the same workflow): the
+     * model may not propose them again unless the user asks.
+     */
+    const declined = new Set<string>()
+    const declineKeys = (meta: WorkflowMeta, source: string) => {
+      let body = source
+      try {
+        body = source.slice(readMeta(source).end)
+      } catch {}
+      return [`name:${meta.name}`, `hash:${createHash("sha256").update(body.trim()).digest("hex")}`]
+    }
 
     const git: RunGit =
       opts.git ??
@@ -226,7 +247,12 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       }
     }
 
-    const confirmText = (meta: WorkflowMeta, source: string, resume?: Launch["resume"]) => {
+    const confirmText = (
+      meta: WorkflowMeta,
+      source: string,
+      initiator: Launch["initiator"],
+      resume?: Launch["resume"],
+    ) => {
       const s = settings()
       const limits = [
         `at most ${s.maxAgents ?? DEFAULT_MAX_AGENTS} agents`,
@@ -235,6 +261,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         s.budget?.costUsd !== undefined ? `$${s.budget.costUsd}` : "",
       ].filter(Boolean)
       return [
+        initiator === "user" ? "You asked for this workflow." : "The model proposes this workflow.",
         meta.description,
         `Phases: ${phasesLine(meta)}`,
         `Estimate: ${describeEstimate(estimate(source))}`,
@@ -255,17 +282,32 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       } catch (err) {
         return `The script cannot run: ${errorText(err)}`
       }
-      const ok = await l.ui.confirm(
-        `${l.resume ? "Resume" : "Start"} workflow "${meta.name}"?`,
-        confirmText(meta, l.source, l.resume),
-        l.signal ? { signal: l.signal } : {},
-      )
-      if (ok !== true) {
-        return ok === false
-          ? "The user declined to start the workflow."
-          : "Nobody confirmed the workflow, so it did not start."
-      }
       const s = settings()
+      const mode = s.enabled ?? "ask"
+      if (mode === "never")
+        return "Workflows are turned off in settings (extensions.workflow.enabled: never)."
+      const keys = declineKeys(meta, l.source)
+      if (l.initiator === "model" && keys.some((k) => declined.has(k))) {
+        return `The user already declined the workflow "${meta.name}" in this session, so it was not proposed again. Do not propose it again, renamed or reworded; carry on without it (e.g. with the agent tool) unless the user asks for a workflow.`
+      }
+      if (mode === "ask") {
+        const ok = await l.ui.confirm(
+          `${l.resume ? "Resume" : "Start"} workflow "${meta.name}"?`,
+          confirmText(meta, l.source, l.initiator, l.resume),
+          l.signal ? { signal: l.signal } : {},
+        )
+        if (ok !== true) {
+          for (const k of keys) declined.add(k)
+          if (ok === false) {
+            return `The user declined the workflow "${meta.name}", so it did not start. Do not propose it again in this session unless the user asks for it; carry on without it (e.g. with the agent tool), or ask the user how they want to proceed.`
+          }
+          const how =
+            l.origin === "inline" || l.origin === "resume"
+              ? `save the script as .amira/workflows/${meta.name}.ts and run /workflow ${meta.name}`
+              : `run /workflow ${meta.name}`
+          return `Nobody confirmed the workflow "${meta.name}", so it did not start: the confirmation was dismissed, or nobody can answer it here (print mode, or an rpc client that does not answer dialogs). Do not propose it again in this session unless the user asks. To start it themselves, the user can ${how} in the interactive UI, or set extensions.workflow.enabled to "always" in settings.json to start workflows without confirming.`
+        }
+      }
       let group: SpawnGroup
       try {
         group = l.createGroup({
@@ -347,18 +389,11 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       }
     }
 
-    const gate = (): string | undefined => {
-      const mode = settings().enabled ?? "explicit"
-      if (mode === "never") return "Workflows are turned off in settings (extensions.workflow.enabled: never)."
-      if (mode === "always" || explicit) return undefined
-      return "The user has not asked for a workflow, so none may be started. If a workflow would help (many agents fanning out, verifying each other, or a long pipeline), propose it: describe the plan and its rough size, and let the user ask for it (e.g. by saying so, or with /workflow). Otherwise use the agent tool."
-    }
-
     type Params = { script?: string; name?: string; args?: unknown; resume?: string }
     const tool: ToolDefinition<Params> = {
       name: WORKFLOW_TOOL,
       mainOnly: true,
-      description: `Runs a workflow: a TypeScript script that orchestrates many sub-agents (fan-out, verification, pipelines) deterministically, in the background. Only use it when the user asked for a workflow; otherwise propose one. Load the "workflow" skill first for how to write scripts. The script runs in a sandbox with only agent(prompt, {label, phase, schema, role, model, isolation}), parallel(thunks), pipeline(items, ...stages), phase(title), log(msg), args, budget and workflow(name, args); it starts with \`export const meta = { name, description, phases }\` and its top level ends with \`return result\`. The user confirms every start. The call returns at once with the run's id; the script's return value comes back to you by itself as a message when the run ends: end your turn instead of waiting. Give "script" (the source), or "name" (a saved workflow from .amira/workflows or ~/.amira/workflows), and "args" for the script. "resume" with a run id reruns that run (with "script" or "name" to use an edited script), replaying unchanged agent calls from its journal.`,
+      description: `Runs a workflow: a TypeScript script that orchestrates many sub-agents (fan-out, verification, pipelines) deterministically, in the background. Use it when a workflow clearly helps (many agents fanning out, checking each other's work, or a long pipeline); for one or two sub-agents use the agent tool. Calling it proposes the workflow: the user sees its name, description, phases and estimated size and approves or declines it. When the user declines one, do not call it again for the same workflow unless they ask. Load the "workflow" skill first for how to write scripts. The script runs in a sandbox with only agent(prompt, {label, phase, schema, role, model, isolation}), parallel(thunks), pipeline(items, ...stages), phase(title), log(msg), args, budget and workflow(name, args); it starts with \`export const meta = { name, description, phases }\` and its top level ends with \`return result\`. The call returns at once with the run's id; the script's return value comes back to you by itself as a message when the run ends: end your turn instead of waiting. Give "script" (the source), or "name" (a saved workflow from .amira/workflows or ~/.amira/workflows), and "args" for the script. "resume" with a run id reruns that run (with "script" or "name" to use an edited script), replaying unchanged agent calls from its journal.`,
       parameters: {
         type: "object",
         properties: {
@@ -374,8 +409,6 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         if (!session?.createGroup || session.depth > 0) {
           return textResult("Workflows can only be started from the main session.", true)
         }
-        const refused = gate()
-        if (refused) return textResult(refused, true)
         let source = p.script
         let origin = "inline"
         let args = p.args
@@ -404,6 +437,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
           source,
           origin,
           args,
+          initiator: explicit ? "user" : "model",
           ...(resume ? { resume } : {}),
           ui: api.ui,
           signal: ctx.signal,
@@ -512,13 +546,14 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
 
     const commandLaunch = async (
       ctx: CommandContext,
-      l: Omit<Launch, "ui" | "createGroup" | "expectNotice" | "send">,
+      l: Omit<Launch, "ui" | "createGroup" | "expectNotice" | "send" | "initiator">,
     ) => {
       const control = ctx.session
       if (!control.createGroup)
         throw new Error("workflows need an agent tree, which this frontend does not have")
       const run = await launch({
         ...l,
+        initiator: "user",
         ui: ctx.ui,
         signal: ctx.signal,
         createGroup: (o) => control.createGroup!(o),
@@ -635,6 +670,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       root = e.sessionId
       if (e.data.sessionFile) sessionFile = e.data.sessionFile
       explicit = false
+      declined.clear()
     })
     api.on("session.end", () => {
       for (const r of runs.values()) r.stop("the session ended")
