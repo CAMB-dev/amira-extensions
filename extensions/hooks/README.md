@@ -7,8 +7,8 @@ risky shell commands, tests after a turn, something at the start and end of a se
 amira ext install hooks
 ```
 
-Needs an Amira whose extension API has an after-tool interceptor (`tool.call.after` or
-`tool.result.after`), `notify`, `onExit` and `runCommand`'s `stdin` (newer than 0.1.1).
+Needs Amira's extension API 0.1.2 (the `tool.call.after` interceptor, `notify`, `onExit` and
+`runCommand`'s `stdin`).
 
 ## Where hooks live
 

@@ -29,16 +29,7 @@ export const MAX_RUNS = 50
 export const NOTICE_LINES = 5
 /** Interceptors wait for the user's answer and for hooks, which have timeouts of their own. */
 const INTERCEPT_TIMEOUT_MS = 24 * 60 * 60_000
-/**
- * Where after-edit hooks run: tool.call.after, or tool.result.after, the same point under the
- * name another API change gave it (it also passes `cwd`, and rejected calls with `rejected`).
- * Whichever this Amira has runs them, and only once per call if it has both.
- */
-const AFTER_TOOL_POINTS = ["tool.call.after", "tool.result.after"]
-type AfterToolValue = InterceptorMap["tool.call.after"] & {
-  readonly cwd?: string
-  readonly rejected?: string
-}
+type AfterToolValue = InterceptorMap["tool.call.after"]
 /** Tools whose successful calls count as edits for onlyAfterEdits. */
 const EDIT_TOOLS = ["edit", "write"]
 
@@ -64,7 +55,7 @@ const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…`
 
 export function createHooksExtension(deps: HooksDeps = {}): Extension {
   return (api: ExtensionAPI) => {
-    // tool.call.after, notify, onExit and runCommand's stdin came after API 0.1.1.
+    // tool.call.after, notify, onExit and runCommand's stdin came with API 0.1.2.
     if (typeof api.notify !== "function" || typeof api.onExit !== "function")
       throw new Error("the hooks extension needs a newer Amira (extension API with notify and onExit)")
     const cwd = api.cwd
@@ -339,21 +330,16 @@ export function createHooksExtension(deps: HooksDeps = {}): Extension {
 
     // ---- after edit: formatters and linters on the changed file ----
 
-    /** Calls whose after-edit hooks started, until the call ends (see AFTER_TOOL_POINTS). */
-    const afterStarted = new Set<string>()
     const afterTool = async (
       call: AfterToolValue,
       ctx: InterceptContext,
     ): Promise<Intercept<AfterToolValue>> => {
-      const key = `${ctx.sessionId}:${call.toolCallId}`
-      if (afterStarted.has(key)) return pass
-      afterStarted.add(key)
       if (call.result.isError || call.rejected) return pass
       if (EDIT_TOOLS.includes(call.name)) edited = true
       const hooks = (await active("afterEdit")).filter((h) => toolMatches(h.tools, call.name))
       if (!hooks.length) return pass
       // Relative paths are the calling session's (a sub-agent may work in a worktree).
-      const file = editedFile(call.args, call.result.details, typeof call.cwd === "string" ? call.cwd : cwd)
+      const file = editedFile(call.args, call.result.details, call.cwd)
       if (!file) return pass
       const target = relPath(file)
       const feedback: TextBlock[] = []
@@ -384,14 +370,12 @@ export function createHooksExtension(deps: HooksDeps = {}): Extension {
         value: { ...call, result: { ...call.result, content: [...call.result.content, ...feedback] } },
       }
     }
-    for (const point of AFTER_TOOL_POINTS) {
-      api.intercept(point as "tool.call.after", afterTool, { timeoutMs: INTERCEPT_TIMEOUT_MS })
-    }
+    // Default priority: before handlers that read the file (the lsp extension's diagnostics).
+    api.intercept("tool.call.after", afterTool, { timeoutMs: INTERCEPT_TIMEOUT_MS })
 
     // The call's own line comes first, then what its hooks did.
     api.on("tool.execute.end", (e) => {
       const key = `${e.sessionId}:${e.data.toolCallId}`
-      afterStarted.delete(key)
       const held = heldNotices.get(key)
       if (!held) return
       heldNotices.delete(key)

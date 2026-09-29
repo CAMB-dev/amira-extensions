@@ -457,7 +457,7 @@ test("before tool: a guard command that cannot start blocks the call", async () 
   )
 })
 
-test("after edit: under both names of the after-tool point the hooks run once; rejected calls are skipped", async () => {
+test("after edit: tool.call.after runs the hooks; rejected calls are skipped", async () => {
   const { interceptors, cwd, command } = await setup([], {
     user: { afterEdit: [{ name: "fmt", command: "echo formatted" }] },
   })
@@ -473,10 +473,9 @@ test("after edit: under both names of the after-tool point the hooks run once; r
       details: { path: path.join(cwd, "a.ts") },
     },
   }
-  await interceptors.run("tool.result.after" as "tool.call.after", value, ctx)
   await interceptors.run("tool.call.after", value, ctx)
-  const rejected = { ...value, toolCallId: "c10", rejected: "blocked" }
-  await interceptors.run("tool.result.after" as "tool.call.after", rejected, ctx)
+  const rejected = { ...value, toolCallId: "c10", rejected: "blocked" as const }
+  await interceptors.run("tool.call.after", rejected, ctx)
   const runs = (await command("")).split("\n").filter((l) => l.includes("after edit · fmt"))
   expect(runs).toHaveLength(1)
 })
