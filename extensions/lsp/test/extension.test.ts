@@ -171,7 +171,7 @@ test("errors in files a batch of writes changed come back once, with the last wr
   })
   const listing = await command("")
   expect(listing).toContain("fake")
-  expect(listing).toContain("ready")
+  expect(listing).toContain("fake        running · fake-lsp 1.0 · . · 2 files open")
   expect(listing).toContain("b.fk: 1 error")
 })
 
@@ -247,4 +247,18 @@ test("settings problems are reported, and enabled: false registers nothing", asy
   expect(
     events.filter((e) => e.type === "extension.error").map((e) => (e.data as { error: string }).error),
   ).toEqual(["lsp: extensions.lsp.maxItems must be a number of at least 1"])
+})
+
+test("a deleted file's old problems leave the status bar", async () => {
+  const { dir, agent, host } = await setup([
+    () => ({ toolCalls: [{ id: "w1", name: "write", args: { path: "a.fk", content: "ERROR: e\n" } }] }),
+    () => ({ text: "ok" }),
+    () => ({ toolCalls: [{ id: "d1", name: "diagnostics", args: { path: "a.fk" } }] }),
+    () => ({ text: "ok" }),
+  ])
+  await agent.prompt("go")
+  expect(host.status.snapshot().find((s) => s.id === "lsp")?.text).toBe("lsp 1 error")
+  rmSync(path.join(dir, "a.fk"))
+  await agent.prompt("again")
+  expect(host.status.snapshot().find((s) => s.id === "lsp")?.text).toBe("lsp ✓")
 })

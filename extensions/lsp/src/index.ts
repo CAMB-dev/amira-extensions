@@ -197,7 +197,10 @@ function setUp(api: ExtensionAPI, settings: LspSettings, which: Which) {
     checking++
     api.requestRender()
     try {
-      return await manager.check(files, cwd, signal, waitMs)
+      const checks = await manager.check(files, cwd, signal, waitMs)
+      // Files that are gone take their old problems with them.
+      for (const file of files) if (!isFile(file)) known.delete(fileKey(file))
+      return checks
     } finally {
       checking--
       api.requestRender()
@@ -261,7 +264,10 @@ function setUp(api: ExtensionAPI, settings: LspSettings, which: Which) {
       if (typeof params.path !== "string" || !params.path) return textResult("path is required", true)
       const file = path.resolve(ctx.cwd, params.path)
       const shown = displayPath(file, ctx.cwd)
-      if (!isFile(file)) return textResult(`${shown} is not a file`, true)
+      if (!isFile(file)) {
+        if (known.delete(fileKey(file))) api.requestRender()
+        return textResult(`${shown} is not a file`, true)
+      }
       const spec = manager.specFor(file)
       if (!spec) {
         return textResult(
@@ -337,14 +343,22 @@ export function describe(
   for (const s of servers) {
     const head = `  ${s.id.padEnd(width)}  `
     const pad = " ".repeat(head.length)
+    const program = (argv0: string) => path.basename(argv0).replace(/\.(exe|cmd|bat)$/i, "")
     if (s.running.length) {
       for (const [i, r] of s.running.entries()) {
-        const info = r.serverInfo ? ` (${r.serverInfo})` : ""
-        lines.push(`${i ? pad : head}${r.state} · ${r.root}${info} · ${plural(r.files, "file")} open`)
+        const state = r.state === "ready" ? "running" : r.state
+        const root = path.relative(cwd, r.root) === "" ? "." : displayPath(r.root, cwd)
+        const name = r.serverInfo ?? program(r.program)
+        lines.push(`${i ? pad : head}${state} · ${name} · ${root} · ${plural(r.files, "file")} open`)
       }
-    } else if (s.command)
-      lines.push(`${head}ready: ${s.command.join(" ")} (starts with the first ${s.extensions[0]} edit)`)
-    else if (s.fallback) lines.push(`${head}no server installed; checks with ${s.fallback}`)
+    } else if (s.command) {
+      lines.push(
+        `${head}installed: ${program(s.command[0] ?? "")} (starts with the first ${s.extensions[0]} file)`,
+      )
+    } else if (s.fallback)
+      lines.push(
+        `${head}no server installed; falls back to ${s.fallback} (the project's tsc, else one on PATH)`,
+      )
     else lines.push(`${head}not installed`)
     for (const f of s.failed) lines.push(`${pad}failed: ${f}`)
   }

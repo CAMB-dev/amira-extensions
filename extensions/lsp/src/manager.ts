@@ -260,6 +260,7 @@ export class ServerManager {
         running: running.map((e) => ({
           root: e.root,
           state: e.client.state,
+          program: e.client.argv[0] ?? "",
           files: e.client.openFiles().length,
           ...(e.client.serverInfo ? { serverInfo: e.client.serverInfo } : {}),
         })),
@@ -299,7 +300,7 @@ export interface ServerDescription {
   /** The command it starts with; undefined when it is not installed. */
   command: string[] | undefined
   fallback: string | undefined
-  running: { root: string; state: string; files: number; serverInfo?: string }[]
+  running: { root: string; state: string; program: string; files: number; serverInfo?: string }[]
   failed: string[]
 }
 
