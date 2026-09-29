@@ -5,6 +5,7 @@ import type {
   Extension,
   ExtensionAPI,
   Intercept,
+  InterceptContext,
   InterceptorMap,
   NoticeLevel,
   TextBlock,
@@ -28,6 +29,16 @@ export const MAX_RUNS = 50
 export const NOTICE_LINES = 5
 /** Interceptors wait for the user's answer and for hooks, which have timeouts of their own. */
 const INTERCEPT_TIMEOUT_MS = 24 * 60 * 60_000
+/**
+ * Where after-edit hooks run: tool.call.after, or tool.result.after, the same point under the
+ * name another API change gave it (it also passes `cwd`, and rejected calls with `rejected`).
+ * Whichever this Amira has runs them, and only once per call if it has both.
+ */
+const AFTER_TOOL_POINTS = ["tool.call.after", "tool.result.after"]
+type AfterToolValue = InterceptorMap["tool.call.after"] & {
+  readonly cwd?: string
+  readonly rejected?: string
+}
 /** Tools whose successful calls count as edits for onlyAfterEdits. */
 const EDIT_TOOLS = ["edit", "write"]
 
@@ -65,6 +76,10 @@ export function createHooksExtension(deps: HooksDeps = {}): Extension {
     /** The project's hooks changed since the user trusted them. */
     let changed = false
     let asking: Promise<boolean> | undefined
+    /** Closes the open trust question when the hooks are read again (it was about the old ones). */
+    let askAbort: AbortController | undefined
+    /** Counts reads of the hook files, so an answer about older hooks is not applied to newer ones. */
+    let generation = 0
     let off = false
     let seq = 0
     const runs: HookRun[] = []
@@ -97,7 +112,10 @@ export function createHooksExtension(deps: HooksDeps = {}): Extension {
         trustStatus = state === "trusted" ? "trusted" : "pending"
         changed = state === "changed"
       }
+      generation++
       asking = undefined
+      askAbort?.abort()
+      askAbort = undefined
     }
     load()
 
@@ -105,13 +123,19 @@ export function createHooksExtension(deps: HooksDeps = {}): Extension {
     const projectFiles = () =>
       loaded.files.project.map((f) => path.relative(cwd, f).replaceAll("\\", "/")).join(", ")
 
-    /** Asks the user once whether the project's hooks may run; resolves whether they may. */
-    const ensureTrust = (signal?: AbortSignal): Promise<boolean> => {
+    /**
+     * Asks the user once whether the project's hooks may run; resolves whether they may. The
+     * question is not tied to the turn that first needed it: an interrupt leaves it open.
+     */
+    const ensureTrust = (): Promise<boolean> => {
       if (trustStatus === "none" || trustStatus === "trusted")
         return Promise.resolve(trustStatus === "trusted")
       if (trustStatus !== "pending") return Promise.resolve(false)
       asking ??= (async () => {
         const hash = loaded.projectHash!
+        const gen = generation
+        const abort = new AbortController()
+        askAbort = abort
         const list = projectHooks()
           .map(
             (h) =>
@@ -122,8 +146,11 @@ export function createHooksExtension(deps: HooksDeps = {}): Extension {
         const answer = await api.ui.confirm(
           changed ? "This project's hooks changed. Run them?" : "Run this project's hooks?",
           `${files} ${changed ? "now asks" : "asks"} Amira to run commands on your machine, with your permissions:\n${list}\n\nYes remembers these hooks for this project; when they change you are asked again.`,
-          signal ? { signal } : {},
+          { signal: abort.signal },
         )
+        // The hooks were read again meanwhile (/hooks reload, trust, untrust): this answer was
+        // about the hooks as they were, so it counts for nothing; ask about the current ones.
+        if (gen !== generation) return ensureTrust()
         if (answer !== true) {
           trustStatus = answer === false ? "declined" : "unanswered"
           api.notify(
@@ -148,12 +175,13 @@ export function createHooksExtension(deps: HooksDeps = {}): Extension {
     }
 
     /** The hooks for an event that may run now: the user's, and the project's once trusted. */
-    const active = async (event: HookEvent, signal?: AbortSignal): Promise<Hook[]> => {
+    const active = async (event: HookEvent): Promise<Hook[]> => {
       if (off || !loaded.options.enabled) return []
-      const hooks = loaded.hooks.filter((h) => h.event === event)
-      if (!hooks.some((h) => h.origin === "project")) return hooks
-      const trusted = await ensureTrust(signal)
-      return trusted ? hooks : hooks.filter((h) => h.origin === "user")
+      const of = () => loaded.hooks.filter((h) => h.event === event)
+      if (!of().some((h) => h.origin === "project")) return of()
+      const trusted = await ensureTrust()
+      // Read after the answer: the files may have been read again while it was open.
+      return trusted ? of() : of().filter((h) => h.origin === "user")
     }
 
     const remember = (run: HookRun) => {
@@ -257,9 +285,7 @@ export function createHooksExtension(deps: HooksDeps = {}): Extension {
     api.intercept(
       "tool.call.before",
       async (call, ctx) => {
-        const hooks = (await active("beforeTool", ctx.signal)).filter((h) =>
-          callMatches(h, call.name, call.args),
-        )
+        const hooks = (await active("beforeTool")).filter((h) => callMatches(h, call.name, call.args))
         for (const hook of hooks) {
           if (hook.action === "block") {
             ruleHit(hook, call.name, "blocked", false)
@@ -284,6 +310,13 @@ export function createHooksExtension(deps: HooksDeps = {}): Extension {
             target: call.name,
             signal: ctx.signal,
           })
+          // A guard that could not even start (no shell, a bad cwd) must not wave calls through.
+          if (r.error && !ctx.signal.aborted) {
+            return {
+              action: "block",
+              reason: `the hook "${hook.name}" could not run (${r.error}), so the call was not made; /hooks off turns hooks off`,
+            }
+          }
           const decision = decisionOf(r)
           if (decision.decision === "block") {
             return {
@@ -306,50 +339,59 @@ export function createHooksExtension(deps: HooksDeps = {}): Extension {
 
     // ---- after edit: formatters and linters on the changed file ----
 
-    api.intercept(
-      "tool.call.after",
-      async (call, ctx) => {
-        if (call.result.isError) return pass
-        if (EDIT_TOOLS.includes(call.name)) edited = true
-        const hooks = (await active("afterEdit", ctx.signal)).filter((h) => toolMatches(h.tools, call.name))
-        if (!hooks.length) return pass
-        const file = editedFile(call.args, call.result.details, cwd)
-        if (!file) return pass
-        const target = relPath(file)
-        const feedback: TextBlock[] = []
-        for (const hook of hooks.filter((h) => fileMatches(h.files, file, cwd))) {
-          if (ctx.signal.aborted) break
-          const r = await run(hook, {
-            vars: { AMIRA_TOOL: call.name, AMIRA_TOOL_CALL_ID: call.toolCallId, AMIRA_FILE: file },
-            input: { sessionId: ctx.sessionId, tool: call.name, toolCallId: call.toolCallId, file },
-            target,
-            signal: ctx.signal,
+    /** Calls whose after-edit hooks started, until the call ends (see AFTER_TOOL_POINTS). */
+    const afterStarted = new Set<string>()
+    const afterTool = async (
+      call: AfterToolValue,
+      ctx: InterceptContext,
+    ): Promise<Intercept<AfterToolValue>> => {
+      const key = `${ctx.sessionId}:${call.toolCallId}`
+      if (afterStarted.has(key)) return pass
+      afterStarted.add(key)
+      if (call.result.isError || call.rejected) return pass
+      if (EDIT_TOOLS.includes(call.name)) edited = true
+      const hooks = (await active("afterEdit")).filter((h) => toolMatches(h.tools, call.name))
+      if (!hooks.length) return pass
+      // Relative paths are the calling session's (a sub-agent may work in a worktree).
+      const file = editedFile(call.args, call.result.details, typeof call.cwd === "string" ? call.cwd : cwd)
+      if (!file) return pass
+      const target = relPath(file)
+      const feedback: TextBlock[] = []
+      for (const hook of hooks.filter((h) => fileMatches(h.files, file, cwd))) {
+        if (ctx.signal.aborted) break
+        const r = await run(hook, {
+          vars: { AMIRA_TOOL: call.name, AMIRA_TOOL_CALL_ID: call.toolCallId, AMIRA_FILE: file },
+          input: { sessionId: ctx.sessionId, tool: call.name, toolCallId: call.toolCallId, file },
+          target,
+          signal: ctx.signal,
+        })
+        const send = hook.feedback === "always" || (hook.feedback === "onError" && !r.ok)
+        if (send) {
+          feedback.push({
+            type: "text",
+            text: `[hook "${hook.name}" after ${call.name === "write" ? "writing" : "editing"} ${target}: ${outcome(r)}]\n${r.output || "(no output)"}`,
           })
-          const send = hook.feedback === "always" || (hook.feedback === "onError" && !r.ok)
-          if (send) {
-            feedback.push({
-              type: "text",
-              text: `[hook "${hook.name}" after ${call.name === "write" ? "writing" : "editing"} ${target}: ${outcome(r)}]\n${r.output || "(no output)"}`,
-            })
-          }
-          const n = noticeOf(r, send && !r.ok ? " · sent to the model" : "")
-          if (n) {
-            const key = `${ctx.sessionId}:${call.toolCallId}`
-            heldNotices.set(key, [...(heldNotices.get(key) ?? []), n])
-          }
         }
-        if (!feedback.length) return pass
-        return {
-          action: "modify",
-          value: { ...call, result: { ...call.result, content: [...call.result.content, ...feedback] } },
+        const n = noticeOf(r, send && !r.ok ? " · sent to the model" : "")
+        if (n) {
+          const key = `${ctx.sessionId}:${call.toolCallId}`
+          heldNotices.set(key, [...(heldNotices.get(key) ?? []), n])
         }
-      },
-      { timeoutMs: INTERCEPT_TIMEOUT_MS },
-    )
+      }
+      if (!feedback.length) return pass
+      return {
+        action: "modify",
+        value: { ...call, result: { ...call.result, content: [...call.result.content, ...feedback] } },
+      }
+    }
+    for (const point of AFTER_TOOL_POINTS) {
+      api.intercept(point as "tool.call.after", afterTool, { timeoutMs: INTERCEPT_TIMEOUT_MS })
+    }
 
     // The call's own line comes first, then what its hooks did.
     api.on("tool.execute.end", (e) => {
       const key = `${e.sessionId}:${e.data.toolCallId}`
+      afterStarted.delete(key)
       const held = heldNotices.get(key)
       if (!held) return
       heldNotices.delete(key)

@@ -7,8 +7,8 @@ risky shell commands, tests after a turn, something at the start and end of a se
 amira ext install hooks
 ```
 
-Needs an Amira whose extension API has `tool.call.after`, `notify`, `onExit` and
-`runCommand`'s `stdin` (newer than 0.1.1).
+Needs an Amira whose extension API has an after-tool interceptor (`tool.call.after` or
+`tool.result.after`), `notify`, `onExit` and `runCommand`'s `stdin` (newer than 0.1.1).
 
 ## Where hooks live
 
@@ -20,7 +20,8 @@ Needs an Amira whose extension API has `tool.call.after`, `notify`, `onExit` and
 A project's hooks never run silently. The first time a session starts in the project, Amira
 shows its hooks and asks whether they may run. Yes is remembered (in
 `~/.amira/hooks-trust.json`) for these hooks exactly: when the project changes them, for
-example after a pull, you are asked again. No keeps them off for the session. With nobody to
+example after a pull, you are asked again (also when they change while the question is open
+and you run `/hooks reload`). No keeps them off for the session. With nobody to
 ask (print mode, rpc without a UI) they do not run, and a warning says so. `/hooks trust`
 allows them, `/hooks untrust` stops them. Your own hooks always run.
 
@@ -63,8 +64,10 @@ allows them, `/hooks untrust` stops them. Your own hooks always run.
 
 Every hook may set:
 
-- `command`: a command line, run by `bash` (Git Bash on Windows, as the bash tool uses; with
-  PowerShell as the fallback) or by PowerShell with `"shell": "powershell"`;
+- `command`: a command line, run by `bash` (Git Bash on Windows, as the bash tool uses; set
+  `AMIRA_BASH` to pick one) or by PowerShell with `"shell": "powershell"`. A bash hook on a
+  Windows machine without Git Bash does not run (it is never handed to PowerShell, whose
+  syntax differs);
 - `name`: shown in notices and `/hooks`; by default the program's name;
 - `timeoutMs`: default 60000 (`extensions.hooks.timeoutMs` changes the default), at most 30
   minutes. A hook that runs longer is killed with everything it started;
@@ -106,7 +109,8 @@ names to regular expressions, all of which must match (`"*"` matches the argumen
 - or runs a `command`: exit code 2 refuses the call, with the command's output as the reason;
   exit code 0 lets it through, unless the output is a JSON object such as
   `{"decision": "block" | "ask" | "allow", "reason": "..."}`. A command that fails otherwise or
-  times out lets the call through and shows a warning.
+  times out lets the call through and shows a warning; one that cannot start at all (no
+  shell, a missing `cwd`) refuses the call, so a broken guard never waves calls through.
 
 ### After turn
 

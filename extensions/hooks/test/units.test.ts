@@ -12,6 +12,7 @@ import {
   loadHooks,
   parseHooks,
   runHook,
+  type ShellLaunch,
   shellLaunch,
   toolMatches,
   trust,
@@ -228,7 +229,7 @@ test("shells: Git Bash on Windows from git on PATH, PowerShell without it, bash 
             ? "C:\\ps\\powershell.exe"
             : null,
   }
-  const bash = shellLaunch("bash", "echo hi", win)
+  const bash = shellLaunch("bash", "echo hi", win) as ShellLaunch
   expect(bash.argv).toEqual(["C:\\Git\\usr\\bin\\bash.exe", "-c", "echo hi"])
   expect(bash.env.Path?.startsWith("C:\\Git\\mingw64\\bin;C:\\Git\\usr\\bin;")).toBe(true)
   expect(bash.env.MSYSTEM).toBe("MINGW64")
@@ -238,8 +239,8 @@ test("shells: Git Bash on Windows from git on PATH, PowerShell without it, bash 
     which: (n: string) => (n === "git" ? null : n === "powershell" ? "C:\\ps\\powershell.exe" : null),
     exists: (p: string) => p.includes("System32"),
   })
-  expect(wsl.label).toBe("powershell (Git Bash not found)")
-  const ps = shellLaunch("powershell", "Write-Output 'a \"b\"'", win)
+  expect(wsl).toEqual({ error: expect.stringContaining("Git Bash was not found") })
+  const ps = shellLaunch("powershell", "Write-Output 'a \"b\"'", win) as ShellLaunch
   expect(ps.argv.slice(0, -1)).toEqual([
     "C:\\ps\\powershell.exe",
     "-NoLogo",
@@ -254,7 +255,7 @@ test("shells: Git Bash on Windows from git on PATH, PowerShell without it, bash 
     platform: "linux",
     exists: (p) => p === "/bin/bash",
     which: () => null,
-  })
+  }) as ShellLaunch
   expect(posix.argv).toEqual(["/bin/bash", "-c", "ls"])
 })
 

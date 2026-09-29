@@ -93,12 +93,12 @@ export async function setup(steps: MockStep[], o: SetupOptions = {}) {
     }),
     "test",
   )
-  const asked: { title: string; message: string }[] = []
+  const asked: { title: string; message: string; requestId: string }[] = []
   bus.subscribe((e) => {
     if (e.type !== "ui.request" || e.data.kind !== "confirm") return
     const title = e.data.title
     const message = e.data.message ?? ""
-    asked.push({ title, message })
+    asked.push({ title, message, requestId: e.data.requestId })
     const answer = o.confirm?.(title, message)
     if (answer === null) return
     if (answer === undefined) host.ui.cancel(e.data.requestId)
@@ -134,7 +134,7 @@ export async function setup(steps: MockStep[], o: SetupOptions = {}) {
     await host.commands.get("hooks")!.def.run(args, ctx)
     return printed.join("\n")
   }
-  return { agent, mock, bus, events, host, home, cwd, ran, asked, notices, errors, command }
+  return { agent, mock, bus, events, host, interceptors, home, cwd, ran, asked, notices, errors, command }
 }
 
 /** The text blocks of the tool results the model was sent in request `i`. */

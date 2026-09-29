@@ -64,6 +64,7 @@ export async function runHook(hook: Hook, ctx: RunContext): Promise<HookRun> {
   })
   if (!hook.command) return done({ error: "no command" })
   const launch = shellLaunch(hook.shell, hook.command, ctx.shell)
+  if ("error" in launch) return done({ error: launch.error })
   const env: Record<string, string | undefined> = {
     ...(ctx.baseEnv ?? process.env),
     ...launch.env,

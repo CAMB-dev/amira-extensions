@@ -421,3 +421,62 @@ test("exit waits for after-turn hooks still running, as in print mode", async ()
   await host.runExitHandlers(15_000)
   expect(readFileSync(path.join(cwd, "after.txt"), "utf8").trim()).toBe("ok")
 })
+
+test("project hooks: an answer to a question about hooks read again since does not count", async () => {
+  const { agent, host, asked, cwd, command, events, bus } = await setup([], {
+    project: projectHooks,
+    confirm: () => null,
+  })
+  agent.start("startup")
+  await until(() => asked.length === 1)
+  writeJson(path.join(cwd, ".amira", "hooks.json"), {
+    afterEdit: [{ name: "swapped", command: "echo other" }],
+  })
+  await command("reload")
+  // The open question was about the old hooks: it is closed, and the new ones are asked about.
+  await until(() => asked.length === 2)
+  await bus.flush()
+  const first = asked[0]!.requestId
+  expect(events.some((e) => e.type === "ui.resolved" && e.data.requestId === first && e.data.cancelled)).toBe(
+    true,
+  )
+  expect(asked[1]!.message).toContain("swapped: echo other")
+  host.ui.respond(asked[1]!.requestId, true)
+  await until(() => existsSync(trustFile(process.env.AMIRA_HOME!)))
+  expect(await command("")).toContain("trusted")
+})
+
+test("before tool: a guard command that cannot start blocks the call", async () => {
+  const { agent, mock, ran } = await setup([bashCall("ls"), { text: "ok" }], {
+    user: { beforeTool: [{ name: "guard", tools: ["bash"], command: "exit 0", cwd: "no/such/dir" }] },
+  })
+  await agent.prompt("go")
+  expect(ran).toEqual([])
+  expect(toolResultTexts(mock, 1)[0]).toMatch(
+    /^Tool call blocked: the hook "guard" could not run \(.+\), so the call was not made/,
+  )
+})
+
+test("after edit: under both names of the after-tool point the hooks run once; rejected calls are skipped", async () => {
+  const { interceptors, cwd, command } = await setup([], {
+    user: { afterEdit: [{ name: "fmt", command: "echo formatted" }] },
+  })
+  const ctx = { sessionId: "s1", signal: new AbortController().signal }
+  const value = {
+    toolCallId: "c9",
+    name: "edit",
+    args: { path: "a.ts" },
+    cwd,
+    pending: [],
+    result: {
+      content: [{ type: "text" as const, text: "edited" }],
+      details: { path: path.join(cwd, "a.ts") },
+    },
+  }
+  await interceptors.run("tool.result.after" as "tool.call.after", value, ctx)
+  await interceptors.run("tool.call.after", value, ctx)
+  const rejected = { ...value, toolCallId: "c10", rejected: "blocked" }
+  await interceptors.run("tool.result.after" as "tool.call.after", rejected, ctx)
+  const runs = (await command("")).split("\n").filter((l) => l.includes("after edit · fmt"))
+  expect(runs).toHaveLength(1)
+})

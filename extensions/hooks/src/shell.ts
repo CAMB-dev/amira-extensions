@@ -10,8 +10,13 @@ export interface ShellLaunch {
   argv: string[]
   /** Added to the hook's environment, e.g. Git Bash's PATH. */
   env: Record<string, string>
-  /** What actually runs it, for /hooks: "bash", "powershell (Git Bash not found)". */
+  /** What runs it: "bash", "sh" or "powershell". */
   label: string
+}
+
+/** No shell for the command: bash was asked for, and Windows has no Git Bash. */
+export interface ShellMissing {
+  error: string
 }
 
 export interface ShellDeps {
@@ -23,10 +28,15 @@ export interface ShellDeps {
 }
 
 /**
- * Starts `command` in the shell the bash tool uses: Git Bash on Windows (PowerShell when it is
- * missing), bash (or sh) elsewhere; or PowerShell when asked. Nothing is spawned to find them.
+ * Starts `command` in the shell the bash tool uses: Git Bash on Windows, bash (or sh)
+ * elsewhere; or PowerShell when asked. A bash command line is never handed to PowerShell, whose
+ * syntax differs: without Git Bash it is an error. Nothing is spawned to find them.
  */
-export function shellLaunch(kind: ShellKind, command: string, deps: ShellDeps = {}): ShellLaunch {
+export function shellLaunch(
+  kind: ShellKind,
+  command: string,
+  deps: ShellDeps = {},
+): ShellLaunch | ShellMissing {
   const platform = deps.platform ?? process.platform
   const exists = deps.exists ?? existsSync
   const which = deps.which ?? ((name: string) => Bun.which(name))
@@ -39,7 +49,10 @@ export function shellLaunch(kind: ShellKind, command: string, deps: ShellDeps = 
     if (found) {
       return { argv: [found.bash, "-c", command], env: gitBashEnv(found.root, deps.env), label: "bash" }
     }
-    return { ...powershell(command, platform, which), label: "powershell (Git Bash not found)" }
+    return {
+      error:
+        'Git Bash was not found; install Git for Windows, set AMIRA_BASH, or give the hook "shell": "powershell"',
+    }
   }
   return { ...powershell(command, platform, which), label: "powershell" }
 }
