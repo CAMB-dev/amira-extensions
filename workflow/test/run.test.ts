@@ -85,19 +85,28 @@ test("a fan-out and verify script runs its agents and returns its value", async 
   expect(group.endReason).toBe("the workflow finished")
 })
 
-for (const [what, code] of [
+for (const [what, code, expected] of [
   ["Date.now()", "Date.now()"],
   ["new Date()", "new Date()"],
   ["Math.random()", "Math.random()"],
   ["the real Date through a date's constructor", "new (new Date(0).constructor)()"],
   ["the Function constructor", '(function () {}).constructor("return 1")()'],
   ["the AsyncFunction constructor", '(async () => {}).constructor("return 1")'],
-] as const) {
+  // Date's prototype is Function.prototype: it has no now() and is no constructor.
+  ["the real Date through Date's prototype chain", "Object.getPrototypeOf(Date).now()", /is not a function/],
+  [
+    "a real Date built through Date's prototype chain",
+    "new (Object.getPrototypeOf(Date))()",
+    /not a constructor/,
+  ],
+  ["Intl formatting the current time", "new Intl.DateTimeFormat().format()"],
+  ["Intl formatting the current time in parts", "Intl.DateTimeFormat().formatToParts()"],
+] as [string, string, RegExp?][]) {
   test(`the sandbox refuses ${what}`, async () => {
     const { run } = start({ source: `${META}${code}\nreturn "reached"` })
     await run.done
     expect(run.status).toBe("error")
-    expect(run.error).toMatch(/not available/)
+    expect(run.error).toMatch(expected ?? /not available/)
   })
 }
 
@@ -119,6 +128,61 @@ test("files, processes, the network and modules are out of reach", async () => {
   await run.done
   expect(run.error).toBeUndefined()
   expect(run.result).toEqual(Array(15).fill("undefined"))
+})
+
+test("no alias of the global object is reachable, so neither is anything on it", async () => {
+  const { run } = start({
+    source: `${META}
+      const probes = {
+        global: () => typeof global, window: () => typeof window, globalThis: () => typeof globalThis,
+        self: () => typeof self, Bun: () => typeof Bun, Temporal: () => typeof Temporal,
+        ShadowRealm: () => typeof ShadowRealm, queueMicrotask: () => typeof queueMicrotask,
+        EventTarget: () => typeof EventTarget, constructor: () => typeof constructor,
+        __proto__: () => typeof __proto__, performance: () => typeof performance,
+        sloppyThis: () => typeof (function () { return this })(),
+        viaFunction: () => typeof Function,
+      }
+      const out = {}
+      for (const [k, f] of Object.entries(probes)) {
+        try { out[k] = f() } catch (e) { out[k] = "threw " + e.name }
+      }
+      return out`,
+  })
+  await run.done
+  expect(run.error).toBeUndefined()
+  const out = run.result as Record<string, string>
+  for (const [k, v] of Object.entries(out)) expect(`${k}: ${v}`).toBe(`${k}: undefined`)
+})
+
+test("the plain builtins stay, Date.UTC and Date.parse included; console goes to the log", async () => {
+  const { run } = start({
+    source: `${META}
+      console.log("hello", { a: 1 })
+      console.warn("careful")
+      return [JSON.stringify([1]), Math.max(1, 2), [3, 1].sort().join(), new Map([[1, 2]]).size,
+        Date.parse("2020-01-01T00:00:00Z"), Date.UTC(2020, 0, 1), new Date(0) instanceof Date,
+        Object.getPrototypeOf(Date) === Object.getPrototypeOf(Object), typeof Date.now,
+        new Intl.DateTimeFormat("en", { timeZone: "UTC", year: "numeric" }).format(new Date(0)),
+        new URL("https://x.test/a?b=1").searchParams.get("b"), new TextEncoder().encode("é").length]`,
+  })
+  await run.done
+  expect(run.error).toBeUndefined()
+  expect(run.result).toEqual([
+    "[1]",
+    2,
+    "1,3",
+    1,
+    1577836800000,
+    1577836800000,
+    true,
+    true,
+    "function",
+    "1970",
+    "1",
+    2,
+  ])
+  expect(run.logs).toContainEqual({ level: "info", text: 'hello {"a":1}' })
+  expect(run.logs).toContainEqual({ level: "warning", text: "careful" })
 })
 
 test("imports are refused before anything runs", () => {

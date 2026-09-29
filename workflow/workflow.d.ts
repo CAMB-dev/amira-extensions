@@ -6,9 +6,11 @@
  *
  *   /// <reference path="./workflow.d.ts" />
  *
- * Scripts cannot import anything, and have no files, processes, network, timers or modules.
- * `Date.now()`, `new Date()` and `Math.random()` throw: a run must take the same path when it
- * is resumed, so pass anything variable in through `args`.
+ * Scripts cannot import anything, and have no files, processes, network, timers or modules:
+ * besides this API they see only plain language builtins (Object, Array, JSON, Math, Map,
+ * Promise, Intl, ...), and `console` writes to the run's log. `Date.now()`, `new Date()`,
+ * `Math.random()` and formatting the current time throw: a run must take the same path when
+ * it is resumed, so pass anything variable in through `args`.
  */
 
 /** Options of one agent() call. Every field is part of the call's journal key. */

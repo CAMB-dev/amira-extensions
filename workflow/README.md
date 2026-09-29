@@ -41,11 +41,13 @@ return await agent(`Check these summaries against the code:\n${looks.join("\n\n"
 ```
 
 Scripts see only `agent`, `parallel`, `pipeline`, `phase`, `log`, `workflow`, `args` and
-`budget` ([`workflow.d.ts`](workflow.d.ts) has the types). They run in a Worker without
-imports, files, processes, network or timers, and `Date.now()`, `new Date()` and
-`Math.random()` throw, so a resumed run takes the same path. This keeps honest scripts
-deterministic; it is not a security boundary, since scripts are run only with your
-confirmation.
+`budget` ([`workflow.d.ts`](workflow.d.ts) has the types), plus plain language builtins
+(`Object`, `Array`, `JSON`, `Math`, `Map`, `Promise`, `Intl`, ...); `console` writes to the
+run's log. They run in a Worker where every other global, the global object itself
+included, is out of reach: no imports, files, processes, network or timers. `Date.now()`,
+`new Date()`, `Math.random()` and formatting the current time throw, so a resumed run takes
+the same path. The agents a script starts have the tools their role gives them; the
+sandbox only limits the script.
 
 Save scripts as `.amira/workflows/<name>.ts` in a project or `~/.amira/workflows/<name>.ts`
 for yourself. A script can run a saved one with `workflow(name, args)`, one level deep; it

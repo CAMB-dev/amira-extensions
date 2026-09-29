@@ -1,99 +1,136 @@
 /**
  * The Worker a workflow script runs in. The script sees only the workflow API (agent,
- * parallel, pipeline, phase, log, args, budget, workflow) as the parameters of the function
- * it is compiled into; the globals that reach files, processes, the network or modules are
- * removed or shadowed, and the sources of nondeterminism (the clock, Math.random) throw, so a
- * resumed run takes the same path as the first one. This keeps honest scripts deterministic;
- * it is not a security boundary (D26: extensions and their scripts are trusted).
+ * parallel, pipeline, phase, log, args, budget, workflow) and an allowlist of plain language
+ * builtins (ALLOWED): every other global name, including every alias of the global object
+ * (globalThis, self, global) and host objects such as Bun, is shadowed by a parameter of the
+ * function the script is compiled into, and deleted where the runtime lets it be. So the
+ * script has no files, processes, network, timers or modules. The sources of nondeterminism
+ * (the clock, Math.random) throw, so a resumed run takes the same path as the first one.
  */
 import type { HostMessage, WorkerMessage } from "./protocol.ts"
 
-declare const self: {
+// Captured before anything is locked, and out of the script's reach (it cannot see this module).
+const host = globalThis as unknown as {
   postMessage(message: WorkerMessage): void
   onmessage: ((e: { data: HostMessage }) => void) | null
 }
-
-// Captured before anything is locked, and out of the script's reach (it cannot see this module).
 const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor as new (
   ...args: string[]
 ) => (...values: unknown[]) => Promise<unknown>
-const post = (m: WorkerMessage) => self.postMessage(m)
+const hostPost = host.postMessage.bind(host)
+const post = (m: WorkerMessage) => hostPost(m)
 
-/** Globals a script must not reach; shadowed by parameters as well, for the ones that cannot be deleted. */
-const SHADOWED = [
-  "Bun",
-  "process",
-  "require",
-  "module",
-  "exports",
-  "fetch",
-  "WebSocket",
-  "Worker",
-  "XMLHttpRequest",
-  "EventSource",
-  "navigator",
-  "Buffer",
-  "crypto",
-  "performance",
-  "setTimeout",
-  "setInterval",
-  "setImmediate",
-  "clearTimeout",
-  "clearInterval",
-  "queueMicrotask",
-  // eval cannot be a parameter name in strict code; it is deleted instead (REMOVED).
-  "Function",
-  "globalThis",
-  "self",
+/**
+ * The only globals a script can name: plain, deterministic language builtins. Everything else
+ * on the global object (and its prototype chain) is out of its reach.
+ */
+const ALLOWED = new Set([
+  "undefined",
+  "NaN",
+  "Infinity",
+  "isNaN",
+  "isFinite",
+  "parseInt",
+  "parseFloat",
+  "escape",
+  "unescape",
+  "decodeURI",
+  "decodeURIComponent",
+  "encodeURI",
+  "encodeURIComponent",
+  "atob",
+  "btoa",
+  "structuredClone",
+  "Object",
+  "Array",
+  "Boolean",
+  "Number",
+  "BigInt",
+  "String",
+  "Symbol",
+  "Date",
+  "Promise",
+  "RegExp",
+  "Map",
+  "Set",
+  "WeakMap",
+  "WeakSet",
+  "Proxy",
+  "Reflect",
+  "JSON",
+  "Math",
+  "Intl",
+  "Iterator",
+  "Error",
+  "EvalError",
+  "RangeError",
+  "ReferenceError",
+  "SyntaxError",
+  "TypeError",
+  "URIError",
+  "AggregateError",
+  "SuppressedError",
+  "DisposableStack",
+  "AsyncDisposableStack",
+  "ArrayBuffer",
+  "DataView",
+  "Int8Array",
+  "Uint8Array",
+  "Uint8ClampedArray",
+  "Int16Array",
+  "Uint16Array",
+  "Int32Array",
+  "Uint32Array",
+  "Float16Array",
+  "Float32Array",
+  "Float64Array",
+  "BigInt64Array",
+  "BigUint64Array",
+  "TextEncoder",
+  "TextDecoder",
+  "URL",
+  "URLSearchParams",
+])
+
+/** Not allowed, but kept on the global object: the worker's own messaging needs them. */
+const KEPT = new Set([
   "postMessage",
   "onmessage",
+  "onerror",
   "addEventListener",
-  "importScripts",
-  "Request",
-  "Response",
-  "Headers",
-  "Blob",
-  "File",
-  "FormData",
-  "URL",
-  "BroadcastChannel",
-  "MessageChannel",
-  "SharedArrayBuffer",
-  "Atomics",
-  "WebAssembly",
-  "Deno",
-  "HTMLRewriter",
-]
+  "removeEventListener",
+  "dispatchEvent",
+])
 
-/** Of those, the ones deleted outright; the worker's own messaging and the builtins it needs stay. */
-const REMOVED = [
-  "process",
-  "require",
-  "module",
-  "exports",
-  "fetch",
-  "WebSocket",
-  "Worker",
-  "XMLHttpRequest",
-  "EventSource",
-  "navigator",
-  "Buffer",
-  "crypto",
-  "performance",
-  "setTimeout",
-  "setInterval",
-  "setImmediate",
-  "clearTimeout",
-  "clearInterval",
+/** Names that cannot be parameters of strict code; they are deleted instead (eval) or harmless. */
+const NOT_PARAMS = new Set([
   "eval",
-  "importScripts",
-  "BroadcastChannel",
-  "MessageChannel",
-  "SharedArrayBuffer",
-  "Atomics",
-  "WebAssembly",
-  "HTMLRewriter",
-]
+  "arguments",
+  "await",
+  "yield",
+  "let",
+  "static",
+  "implements",
+  "interface",
+  "package",
+  "private",
+  "protected",
+  "public",
+  "enum",
+])
+
+/** Every name the global object answers to (its own properties and its prototype chain's). */
+function globalNames(): string[] {
+  const names = new Set<string>()
+  for (let o: object | null = globalThis; o; o = Object.getPrototypeOf(o)) {
+    for (const n of Object.getOwnPropertyNames(o)) names.add(n)
+  }
+  // Names some runtimes give the global object or module scope, present or not.
+  for (const n of ["global", "globalThis", "self", "window", "require", "module", "exports", "Deno"]) {
+    names.add(n)
+  }
+  return [...names]
+}
 
 class DeterminismError extends Error {
   override name = "DeterminismError"
@@ -103,35 +140,74 @@ function forbid(what: string, why = "workflow scripts must be deterministic so a
   throw new DeterminismError(`${what} is not available: ${why}. Pass values in through args instead.`)
 }
 
+/** The global names a script's function shadows with parameters: all but the allowed ones. */
+let shadowed: string[] = []
+
 function lockDown() {
   const RealDate = Date
-  // new Date(value) and Date.UTC/parse stay; the current time does not.
-  const SafeDate = function (this: unknown, ...a: unknown[]) {
+  // new Date(value) and Date.UTC/parse stay; the current time does not. SafeDate is not
+  // chained to the real Date (Object.getPrototypeOf(Date) would hand it out): it is a plain
+  // function with UTC and parse copied over.
+  const SafeDate = function SafeDate(this: unknown, ...a: unknown[]) {
     if (!new.target) forbid("Date()")
     if (a.length === 0) forbid("new Date()")
     return Reflect.construct(RealDate, a, new.target)
   } as unknown as DateConstructor
-  Object.setPrototypeOf(SafeDate, RealDate)
-  Object.defineProperty(SafeDate, "prototype", { value: RealDate.prototype })
+  Object.defineProperty(SafeDate, "length", { value: RealDate.length })
+  Object.defineProperty(SafeDate, "name", { value: "Date" })
+  Object.defineProperty(SafeDate, "prototype", { value: RealDate.prototype, writable: false })
   // `new (new Date(0).constructor)()` would reach the real one.
-  Object.defineProperty(RealDate.prototype, "constructor", { value: SafeDate })
-  Object.defineProperty(SafeDate, "now", { value: () => forbid("Date.now()") })
+  Object.defineProperty(RealDate.prototype, "constructor", {
+    value: SafeDate,
+    writable: false,
+    configurable: false,
+  })
+  for (const key of ["UTC", "parse"] as const) {
+    Object.defineProperty(SafeDate, key, { value: RealDate[key].bind(RealDate), writable: false })
+  }
+  Object.defineProperty(SafeDate, "now", { value: () => forbid("Date.now()"), writable: false })
   ;(globalThis as Record<string, unknown>).Date = SafeDate
   Object.defineProperty(Math, "random", {
     value: () => forbid("Math.random()"),
     writable: false,
     configurable: false,
   })
-  for (const name of REMOVED) {
+  // Intl formats the current time when it is given no date.
+  const dtf = Intl.DateTimeFormat.prototype
+  const formatGetter = Object.getOwnPropertyDescriptor(dtf, "format")?.get
+  if (formatGetter) {
+    Object.defineProperty(dtf, "format", {
+      get(this: Intl.DateTimeFormat) {
+        const format = formatGetter.call(this) as (d?: unknown) => string
+        return (d?: unknown) => (d === undefined ? forbid("Formatting the current time") : format(d))
+      },
+      configurable: false,
+    })
+  }
+  const formatToParts = dtf.formatToParts
+  Object.defineProperty(dtf, "formatToParts", {
+    value(this: Intl.DateTimeFormat, d?: unknown) {
+      if (d === undefined) forbid("Formatting the current time")
+      return formatToParts.call(this, d as Date)
+    },
+    writable: false,
+    configurable: false,
+  })
+  // Everything not allowed is shadowed; what the runtime lets go of is deleted too.
+  const names = globalNames().filter((n) => !ALLOWED.has(n))
+  shadowed = names.filter((n) => /^[A-Za-z_$][\w$]*$/.test(n) && !NOT_PARAMS.has(n))
+  const g = globalThis as Record<string, unknown>
+  for (const name of names) {
+    if (KEPT.has(name) || !Object.hasOwn(g, name)) continue
     try {
-      delete (globalThis as Record<string, unknown>)[name]
+      delete g[name]
     } catch {}
   }
   // `(function () {}).constructor("...")` would compile code with the real globals.
   const blocked = () =>
     forbid("Compiling code at run time", "workflow scripts cannot create functions from strings")
   for (const proto of [
-    Function.prototype,
+    Object.getPrototypeOf(() => {}),
     Object.getPrototypeOf(async () => {}),
     Object.getPrototypeOf(function* () {}),
     Object.getPrototypeOf(async function* () {}),
@@ -279,18 +355,23 @@ function makeApi(args: unknown, nest: string | undefined) {
           ),
         )
       }
-  return { agent, parallel, pipeline, phase, log, args, budget, workflow }
+  const warn = (...parts: unknown[]) => {
+    post({ t: "log", msg: parts.map(text).join(" "), level: "warning", ...(nest ? { nest } : {}) })
+  }
+  // console would write over the terminal; in a script it goes to the run's log.
+  const scriptConsole = Object.freeze({ log, info: log, debug: log, warn, error: warn })
+  return { agent, parallel, pipeline, phase, log, args, budget, workflow, console: scriptConsole }
 }
 
 function runScript(code: string, args: unknown, nest?: string): Promise<unknown> {
   const api = makeApi(args, nest)
   const names = Object.keys(api)
-  const shadow = SHADOWED.filter((n) => !names.includes(n))
+  const shadow = shadowed.filter((n) => !names.includes(n))
   const fn = new AsyncFunction(...names, ...shadow, `"use strict";\n${code}`)
   return fn(...names.map((n) => api[n as keyof typeof api]), ...shadow.map(() => undefined))
 }
 
-self.onmessage = (e) => {
+host.onmessage = (e) => {
   const m = e.data
   switch (m.t) {
     case "run": {
