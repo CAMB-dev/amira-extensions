@@ -71,28 +71,9 @@ function tokens(text: string): Token[] {
   return out
 }
 
-/** Breaks one over-long word into chunks of at most `max` columns. */
-function breakWord(word: string, max: number): string[] {
-  const out: string[] = []
-  let cur = ""
-  let w = 0
-  for (const g of graphemes(word)) {
-    const gw = strWidth(g)
-    if (w + gw > max && cur) {
-      out.push(cur)
-      cur = ""
-      w = 0
-    }
-    cur += g
-    w += gw
-  }
-  if (cur) out.push(cur)
-  return out
-}
-
 /**
  * Word-wraps one paragraph (no newlines). Line i fits `widthOf(i)` columns (a lone wide
- * character may still exceed a width of 1).
+ * character may still exceed a width of 1). Linear in the length of the text.
  */
 function wrapWith(text: string, widthOf: (line: number) => number): string[] {
   const toks = tokens(text)
@@ -112,14 +93,22 @@ function wrapWith(text: string, widthOf: (line: number) => number): string[] {
     if (line) lines.push(line)
     line = ""
     lw = 0
-    let rest = t.text
-    while (strWidth(rest) > cap()) {
-      const [head, ...tail] = breakWord(rest, cap())
-      lines.push(head!)
-      rest = tail.join("")
+    if (tw <= cap()) {
+      line = t.text
+      lw = tw
+      continue
     }
-    line = rest
-    lw = strWidth(rest)
+    // A word longer than a line: cut it grapheme by grapheme.
+    for (const g of graphemes(t.text)) {
+      const gw = strWidth(g)
+      if (lw + gw > cap() && line) {
+        lines.push(line)
+        line = ""
+        lw = 0
+      }
+      line += g
+      lw += gw
+    }
   }
   if (line || lines.length === 0) lines.push(line)
   return lines
@@ -161,7 +150,10 @@ export function cleanLabel(raw: string): string {
   s = s.replace(/<br\s*\/?>/gi, "\n")
   s = s.replace(/<\/?[a-zA-Z][^>]*>/g, "")
   s = s.replace(/\bfa[bsrl]?:fa-[\w-]+\s*/g, "")
-  s = s.replace(/#(\d+);/g, (_, n: string) => String.fromCodePoint(Number(n)))
+  s = s.replace(/#(\d+);/g, (_, n: string) => {
+    const cp = Number(n)
+    return cp <= 0x10ffff ? stripControls(String.fromCodePoint(cp)) : ""
+  })
   const named: Record<string, string> = { quot: '"', amp: "&", lt: "<", gt: ">", nbsp: " ", apos: "'" }
   s = s.replace(/[&#](quot|amp|lt|gt|nbsp|apos);/g, (_, n: string) => named[n] ?? "")
   return s
@@ -170,9 +162,17 @@ export function cleanLabel(raw: string): string {
     .join("\n")
 }
 
+/** Terminal escape sequences and control characters (other than tab and newline). */
+const CONTROL = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-_]?|[\x00-\x08\x0b-\x1f\x7f-\x9f]/g
+
+/** Removes escape sequences and control characters; tabs become spaces. */
+export function stripControls(s: string): string {
+  return s.replace(CONTROL, "").replace(/\t/g, " ")
+}
+
 /** Source lines with front matter, directives and %% comments removed. */
 export function meaningfulLines(source: string): string[] {
-  const lines = source.replace(/\r\n?/g, "\n").split("\n")
+  const lines = stripControls(source.replace(/\r\n?/g, "\n")).split("\n")
   let i = 0
   while (i < lines.length && lines[i]!.trim() === "") i++
   if (i < lines.length && lines[i]!.trim() === "---") {
