@@ -33,8 +33,11 @@ export function compactSequence(seq: Sequence, width: number): string[] {
         emit(prefix, `note ${where} ${who}`, flat(e.text))
       } else {
         e.sections.forEach((s, i) => {
-          emit(prefix + (i ? "├ " : "┌ "), s.kw, "")
-          if (s.label) out[out.length - 1] = truncate(`${out[out.length - 1]!} ${flat(s.label)}`, width)
+          const head = s.label ? `${s.kw} ${flat(s.label)}` : s.kw
+          const pw = strWidth(prefix)
+          wrapHanging(head, width - pw - 2, width - pw - 4).forEach((l, k) =>
+            out.push(truncate(prefix + (k ? "│   " : i ? "├ " : "┌ ") + l, width)),
+          )
           walk(s.events, prefix + "│ ")
         })
         out.push(truncate(prefix + "└", width))
