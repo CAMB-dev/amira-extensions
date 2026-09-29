@@ -8,7 +8,7 @@ web app you are working on, on its dev server.
 amira ext install browser
 ```
 
-Needs Amira's extension API with `isPrivateAddress` (0.1.1 plus that addition), and a
+Needs Amira's extension API 0.1.2 (for `isPrivateAddress`), and a
 Chromium-based browser. No browser is downloaded: the extension uses one that is installed,
 looked for in this order:
 

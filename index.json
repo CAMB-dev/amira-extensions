@@ -42,7 +42,7 @@
       "description": "Notifications when Amira needs you: a long turn ended, a question waits, background agents finished; Windows/macOS/Linux desktop, Telegram, Discord, WeCom or any JSON webhook",
       "version": "0.1.0",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/notify" },
-      "engines": { "amira": "^0.1.1" },
+      "engines": { "amira": "^0.1.2" },
       "tags": ["notifications", "webhook", "telegram", "discord", "wecom", "desktop"],
       "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/notify"
     },
@@ -78,7 +78,7 @@
       "description": "Browser tools: the model opens pages (e.g. your dev server) in an installed Chrome or Edge, headless, and takes screenshots, clicks, types, evaluates and reads the console",
       "version": "0.1.0",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/browser" },
-      "engines": { "amira": "^0.1.1" },
+      "engines": { "amira": "^0.1.2" },
       "tags": ["browser", "playwright", "screenshot", "web", "testing"],
       "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/browser"
     }

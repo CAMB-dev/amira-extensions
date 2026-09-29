@@ -9,7 +9,7 @@
   },
   "amira": {
     "engines": {
-      "amira": "^0.1.1"
+      "amira": "^0.1.2"
     },
     "extensions": [
       "./src/index.ts"

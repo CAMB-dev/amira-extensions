@@ -8,9 +8,9 @@ desktop, through a chat webhook (Telegram, Discord, WeCom), or both.
 amira ext install notify
 ```
 
-Works with Amira's extension API 0.1.1. With a newer Amira that reports terminal focus
-(the `ui.focus` event), it notifies only while the terminal is in the background; without
-it, focus counts as unknown and it notifies as if you were away.
+Needs Amira's extension API 0.1.2, whose `ui.focus` event says whether the terminal has focus:
+it notifies only while the terminal is in the background. Where a frontend does not report
+focus, it counts as unknown and notifies as if you were away.
 
 ## When it notifies
 
