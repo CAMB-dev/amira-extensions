@@ -199,6 +199,30 @@ test("a failed edit adds no file, but still reports for the batch; the severity 
   expect(mock.requests).toHaveLength(2)
 })
 
+test("files of a batch cut short by an abort are not reported with the next turn's edit", async () => {
+  const { agent, bus } = await setup([
+    () => ({
+      toolCalls: [
+        { id: "w1", name: "write", args: { path: "a.fk", content: "ERROR: from the aborted turn\n" } },
+        { id: "w2", name: "write", args: { path: "b.fk", content: "fine\n", delayMs: 1500 } },
+      ],
+    }),
+    () => ({ toolCalls: [{ id: "w3", name: "write", args: { path: "c.fk", content: "fine\n" } }] }),
+    (req) => {
+      expect(textOf(results(req).at(-1))).toBe("Wrote c.fk")
+      return { text: "ok" }
+    },
+  ])
+  // Abort once the first write is done, while the second still runs.
+  const off = bus.subscribe((e) => {
+    if (e.type === "tool.execute.end" && e.data.toolCallId === "w1") agent.abort()
+  })
+  expect(await agent.prompt("go")).toMatchObject({ reason: "aborted" })
+  off()
+  await bus.flush()
+  expect(await agent.prompt("again")).toMatchObject({ reason: "done" })
+})
+
 test("the check runs after other tool.call.after handlers, so it sees what a formatter wrote", async () => {
   const { mock, agent, host } = await setup([
     () => ({ toolCalls: [{ id: "w1", name: "write", args: { path: "a.fk", content: "ERROR: unformatted\n" } }] }),

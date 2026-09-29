@@ -331,7 +331,13 @@ function setUp(api: ExtensionAPI, settings: LspSettings, which: Which) {
     },
   })
 
+  // A batch cut short (aborted, or a call that never got to tool.call.after) leaves files in
+  // `touched`: they are dropped with the turn, not reported with the next one's first edit.
+  api.on("turn.end", (e) => void touched.delete(e.sessionId))
+  api.on("subagent.end", (e) => void touched.delete(e.data.childSessionId))
+
   api.on("session.end", () => {
+    touched.clear()
     void manager.stopAll()
   })
 }
