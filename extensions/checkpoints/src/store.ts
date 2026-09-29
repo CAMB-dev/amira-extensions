@@ -1,6 +1,6 @@
 import { copyFileSync, type Dirent, lstatSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import path from "node:path"
-import { firstLines, type Repo, zsplit } from "./git.ts"
+import { firstLines, gitError, type Repo, zsplit } from "./git.ts"
 
 /** Where every checkpoint ref lives: refs/amira/checkpoints/<session>/<n>. */
 export const REF_PREFIX = "refs/amira/checkpoints/"
@@ -146,14 +146,15 @@ export class CheckpointStore {
   }
 
   /** Writes the work tree to the object store and returns its tree, without a checkpoint. */
-  scan(signal?: AbortSignal): Promise<Scan> {
-    return this.#locked(() => this.#scan(signal))
+  scan(signal?: AbortSignal, opts: { timeoutMs?: number } = {}): Promise<Scan> {
+    return this.#locked(() => this.#scan(signal, opts.timeoutMs))
   }
 
-  async #scan(signal?: AbortSignal): Promise<Scan> {
+  /** 	imeoutMs: for each git command, instead of the usual one (the first scan hashes every file). */
+  async #scan(signal?: AbortSignal, timeoutMs?: number): Promise<Scan> {
     const { git, root, mode } = this.repo
     const ours = { GIT_INDEX_FILE: this.repo.index }
-    const sig = signal ? { signal } : {}
+    const sig = { ...(signal ? { signal } : {}), ...(timeoutMs ? { timeoutMs } : {}) }
     // One listing: what the user tracks (tagged by -t) and what they neither track nor ignore.
     // Outside a repository nothing is tracked: every file not ignored counts as untracked.
     const listing = zsplit(
@@ -258,7 +259,7 @@ export class CheckpointStore {
       const r = await git.exec(add, { env: ours, ...sig })
       // --ignore-errors: unreadable files are left out, the rest is added; anything else fails.
       if (!r.ok && !/unable to index file|Permission denied|could not open/i.test(r.output)) {
-        throw new Error(`git add failed: ${firstLines(r.output) || `exit ${r.code}`}`)
+        throw gitError("add", r)
       }
     } finally {
       if (list) rmSync(list, { force: true })

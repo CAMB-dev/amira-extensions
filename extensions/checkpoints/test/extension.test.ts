@@ -433,3 +433,47 @@ test("checkpoints turned off for a reason stay off: later turns do not scan agai
   expect(t.errors).toEqual([expect.stringContaining("holds 3 files")])
   expect(await t.command("checkpoints", "")).toContain("Checkpoints are off here:")
 })
+
+/** A runner whose `git add` takes `slowMs` while `slow()` says so, honoring timeouts as runCommand does. */
+function slowAdds(slow: () => boolean, slowMs: number, seen: number[] = []): CheckpointsOptions["run"] {
+  return async (argv, o) => {
+    if (argv.includes("add") && slow()) {
+      seen.push(o.timeoutMs)
+      if (o.timeoutMs < slowMs) {
+        await Bun.sleep(o.timeoutMs)
+        return { output: "", exitCode: null, signalCode: null, timedOut: true, aborted: false, settled: true, contained: true }
+      }
+      await Bun.sleep(slowMs)
+    }
+    return run(argv, o)
+  }
+}
+
+test("the first scan gets much longer than timeoutMs, so a slow first hash still ends in checkpoints", async () => {
+  let first = true
+  const seen: number[] = []
+  const t = await setup({ timeoutMs: 1000 }, { run: slowAdds(() => first, 1500, seen) })
+  // The warm-up scan started with the session; wait for it.
+  await Bun.sleep(2500)
+  first = false
+  expect(seen[0]).toBeGreaterThanOrEqual(30 * 60_000)
+  await t.turn("write a.txt v2")
+  expect((await t.refs()).length).toBe(1)
+  expect(t.errors).toEqual([])
+})
+
+test("after three snapshots in a row run out of time, checkpoints are off for the session", async () => {
+  let slow = false
+  const t = await setup({ timeoutMs: 1000 }, { run: slowAdds(() => slow, 1500) })
+  await Bun.sleep(3000)
+  await t.turn("write a.txt v2")
+  expect((await t.refs()).length).toBe(1)
+  slow = true
+  for (let i = 3; i <= 5; i++) await t.turn(`write a.txt v${i}`)
+  expect((await t.refs()).length).toBe(1)
+  expect(t.errors.at(-1)).toContain("3 snapshots in a row took longer than timeoutMs (1000 ms)")
+  slow = false
+  await t.turn("write a.txt v6")
+  expect((await t.refs()).length).toBe(1)
+  expect(await t.command("checkpoints", "")).toContain("Checkpoints are off here: 3 snapshots in a row")
+})

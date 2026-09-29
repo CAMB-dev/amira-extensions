@@ -19,7 +19,12 @@ export interface GitResult {
   ok: boolean
   output: string
   code: number | null
+  /** It ran out of time. */
+  timedOut: boolean
 }
+
+/** A git command that ran out of time. */
+export class GitTimeoutError extends Error {}
 
 export interface ExecOptions {
   /** Added to the environment (GIT_INDEX_FILE and the like). */
@@ -27,6 +32,8 @@ export interface ExecOptions {
   signal?: AbortSignal
   /** Keep stderr out of output that is parsed. */
   stdoutOnly?: boolean
+  /** Instead of the timeout the Git was made with. */
+  timeoutMs?: number
 }
 
 /** Variables that would point git somewhere else than where we mean. */
@@ -117,18 +124,24 @@ export class Git {
   async exec(args: string[], opts: ExecOptions = {}): Promise<GitResult> {
     const env = gitEnv()
     Object.assign(env, opts.env)
+    const timeoutMs = opts.timeoutMs ?? this.#timeoutMs
     // Another Amira (or the user's git) may hold the index lock for a moment.
     for (let attempt = 0; ; attempt++) {
       const r = await this.#run(["git", ...this.#global, ...args], {
         cwd: this.#cwd,
         env,
-        timeoutMs: this.#timeoutMs,
+        timeoutMs,
         signal: opts.signal ?? new AbortController().signal,
         viaCmd: true,
         ...(opts.stdoutOnly ? { stdoutOnly: true } : {}),
       })
-      const result = { ok: r.exitCode === 0 && !r.timedOut && !r.aborted, output: r.output, code: r.exitCode }
-      if (r.timedOut) result.output = `timed out after ${this.#timeoutMs} ms`
+      const result: GitResult = {
+        ok: r.exitCode === 0 && !r.timedOut && !r.aborted,
+        output: r.output,
+        code: r.exitCode,
+        timedOut: r.timedOut,
+      }
+      if (r.timedOut) result.output = `timed out after ${timeoutMs} ms`
       if (r.aborted) result.output = "aborted"
       const lock = !result.ok && /Unable to create '([^']+\.lock)'/.exec(r.output)?.[1]
       if (lock && attempt < 8 && !opts.signal?.aborted) {
@@ -145,9 +158,15 @@ export class Git {
   /** Like exec, but throws with git's message when it fails. */
   async must(args: string[], opts: ExecOptions = {}): Promise<string> {
     const r = await this.exec(args, opts)
-    if (!r.ok) throw new Error(`git ${args[0]} failed: ${firstLines(r.output) || `exit ${r.code}`}`)
+    if (!r.ok) throw gitError(args[0] ?? "", r)
     return r.output
   }
+}
+
+/** The error for a git command that failed. */
+export function gitError(command: string, r: GitResult): Error {
+  const text = `git ${command} failed: ${firstLines(r.output) || `exit ${r.code}`}`
+  return r.timedOut ? new GitTimeoutError(text) : new Error(text)
 }
 
 /** A lock on a checkpoint ref older than this is left over from a git that was stopped. */

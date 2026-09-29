@@ -7,7 +7,7 @@ import type {
   UserMessage,
 } from "@amira/api"
 import { clip, clipDiff, files, oneLine, promptIndex, promptOf, row, time, what } from "./format.ts"
-import { openRepo, type Run } from "./git.ts"
+import { GitTimeoutError, openRepo, type Run } from "./git.ts"
 import { type CheckpointSettings, readSettings } from "./settings.ts"
 import { type Checkpoint, CheckpointStore, DisabledError, type Skipped } from "./store.ts"
 
@@ -29,6 +29,10 @@ interface PendingTurn {
 }
 
 const DAY = 24 * 3600_000
+/** At least this long for each git command of the first scan, which hashes every file. */
+const FIRST_SCAN_MS = 30 * 60_000
+/** After this many snapshots in a row run out of time, checkpoints are off for the session. */
+const MAX_TIMEOUTS = 3
 
 export function createCheckpointsExtension(options: CheckpointsOptions = {}) {
   return (api: ExtensionAPI): void => {
@@ -120,20 +124,40 @@ export function createCheckpointsExtension(options: CheckpointsOptions = {}) {
       const done = work(ctl.signal).then(
         () => "done" as const,
         (err: unknown) => {
+          // A git command that ran out of time is the snapshot running out of time.
+          if (err instanceof GitTimeoutError) return "timeout" as const
           if (!ctl.signal.aborted) fail(err)
           return "failed" as const
         },
       )
       const outcome = await Promise.race([done, timedOut])
       clearTimeout(timer)
+      if (outcome === "done") timeouts = 0
       if (outcome !== "timeout") return
       ctl.abort()
+      // Git was stopped in the middle; the lock it left on this process's index is removed by
+      // the next command that needs the index.
+      if (warming) {
+        // Waiting behind the first scan, which may take long; it has its own time limit.
+        reportOnce(
+          "checkpoints: the first snapshot of this directory is still being taken, so a turn went on without its checkpoint",
+        )
+        return
+      }
+      if (++timeouts >= MAX_TIMEOUTS) {
+        disableFor(
+          `${timeouts} snapshots in a row took longer than timeoutMs (${settings.timeoutMs} ms), so checkpoints are off for this session; raise extensions.checkpoints.timeoutMs, or add large directories to .gitignore`,
+        )
+        return
+      }
       reportOnce(
         `checkpoints: a snapshot took longer than ${settings.timeoutMs} ms, so a turn went on without its checkpoint`,
       )
-      // Git was stopped in the middle; the lock it left on this process's index is removed by
-      // the next command that needs the index.
     }
+    /** Snapshots that ran out of time, in a row. */
+    let timeouts = 0
+    /** The first scan is under way. */
+    let warming = false
 
     /** Starts the turn's checkpoint once; the turn's tool calls wait for it. */
     const startTurn = (session: string, turn: PendingTurn): Promise<void> => {
@@ -185,14 +209,25 @@ export function createCheckpointsExtension(options: CheckpointsOptions = {}) {
       api.on("session.start", (e) => {
         if (e.parentSessionId || warmed) return
         warmed = true
-        // The first snapshot hashes every file; do it now rather than in the first turn.
+        // The first snapshot hashes every file; do it now rather than in the first turn, with
+        // much more time than a turn's snapshot gets: once it is done, later ones are quick.
+        warming = true
         void getStore()
           .then(async (s) => {
             if (!s) return
-            await s.scan()
+            await s.scan(undefined, { timeoutMs: Math.max(FIRST_SCAN_MS, 20 * settings.timeoutMs) })
             await s.pruneOlder(settings.maxAgeDays * DAY)
           })
-          .catch(fail)
+          .catch((err: unknown) => {
+            if (err instanceof GitTimeoutError) {
+              disableFor(
+                `the first snapshot of ${api.cwd} took too long (${err.message}), so checkpoints are off for this session; add large directories to .gitignore`,
+              )
+            } else fail(err)
+          })
+          .finally(() => {
+            warming = false
+          })
       })
 
       // Before the turn's first model call nothing the turn does has happened yet. The snapshot
