@@ -114,14 +114,21 @@ function splitStatements(line: string): string[] {
   const out: string[] = []
   let cur = ""
   let quote = false
+  // Length of a `#name` / `&name` run just before this character (-1: none), so `;` ending an
+  // entity is not a separator. Tracked as we go to stay linear.
+  let entity = -1
   for (let i = 0; i < line.length; i++) {
     const ch = line[i]!
     if (ch === '"') quote = !quote
-    if (ch === ";" && !quote && !/[#&][a-zA-Z0-9]+$/.test(cur)) {
+    if (ch === ";" && !quote && entity <= 0) {
       out.push(cur)
       cur = ""
+      entity = -1
       continue
     }
+    if (ch === "#" || ch === "&") entity = 0
+    else if (entity >= 0 && /[a-zA-Z0-9]/.test(ch)) entity++
+    else entity = -1
     cur += ch
   }
   out.push(cur)
@@ -400,6 +407,7 @@ export function parseFlowchart(source: string): Flowchart | undefined {
 
   // Edges that name a subgraph connect to one of its members.
   const clusterIds = new Map(clusters.map((c, i) => [c.id, i]))
+  const order = new Map([...nodes.keys()].map((id, i) => [id, i]))
   const members = (ci: number): string[] => {
     const out: string[] = []
     for (const [id, c] of membership) {
@@ -407,18 +415,28 @@ export function parseFlowchart(source: string): Flowchart | undefined {
       while (k >= 0 && k !== ci) k = clusters[k]!.parent
       if (k === ci && !clusterIds.has(id)) out.push(id)
     }
-    const order = [...nodes.keys()]
-    return out.sort((a, b) => order.indexOf(a) - order.indexOf(b))
+    return out.sort((a, b) => order.get(a)! - order.get(b)!)
   }
+  const endpoints = new Set(edges.flatMap((e) => [e.from, e.to]))
   for (const [cid, ci] of clusterIds) {
     if (explicit.has(cid)) continue
+    if (!endpoints.has(cid)) {
+      if (nodes.has(cid) && members(ci).length) {
+        nodes.delete(cid)
+        membership.delete(cid)
+      }
+      continue
+    }
     const m = members(ci)
     if (m.length === 0) continue
     // An edge out of a subgraph leaves from its last member without an outgoing edge inside it;
     // an edge into a subgraph enters its first member without an incoming edge inside it.
-    const inside = edges.filter((e) => m.includes(e.from) && m.includes(e.to))
-    const sinks = m.filter((id) => !inside.some((e) => e.from === id))
-    const sources = m.filter((id) => !inside.some((e) => e.to === id))
+    const mset = new Set(m)
+    const inside = edges.filter((e) => mset.has(e.from) && mset.has(e.to))
+    const hasOut = new Set(inside.map((e) => e.from))
+    const hasIn = new Set(inside.map((e) => e.to))
+    const sinks = m.filter((id) => !hasOut.has(id))
+    const sources = m.filter((id) => !hasIn.has(id))
     const exit = sinks[sinks.length - 1] ?? m[m.length - 1]!
     const entry = sources[0] ?? m[0]!
     let used = false
