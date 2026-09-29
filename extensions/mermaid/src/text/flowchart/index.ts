@@ -23,8 +23,9 @@ export function renderFlowchart(source: string, width: number): FlowchartRender 
   for (const dir of dirs)
     for (const [nodeWrap, edgeWrap] of WRAPS) {
       const opts: LayoutOptions = { dir, nodeWrap, edgeWrap }
-      const lines = layoutFlowchart(fc, opts)
-      if (fits(lines)) return { lines, compact: false }
+      // The layout gives up (before drawing) when it cannot fit the width.
+      const lines = layoutFlowchart(fc, opts, width)
+      if (lines && fits(lines)) return { lines, compact: false }
     }
   return { lines: compactFlowchart(fc, width), compact: true }
 }

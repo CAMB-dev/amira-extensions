@@ -3,10 +3,14 @@
  *
  * Coordinates are computed along a "main" axis (the flow direction: down for TD, right for LR)
  * and a "cross" axis, then mapped to x/y for the chosen direction. Steps: break cycles by
- * reversing back edges, assign layers (longest path), insert dummy items for long edges and
- * spacer items for subgraph frames, order layers by barycenter sweeps (keeping subgraph members
- * together), place items along the cross axis under difference constraints, route every edge
- * orthogonally through per-gap channel rows, and draw.
+ * reversing back edges, assign layers (longest path; a labelled edge spans at least two layers
+ * so its label gets a layer slot of its own), insert dummy items for long edges, label items for
+ * edge labels and spacer items for subgraph frames, order layers by barycenter sweeps (keeping
+ * subgraph members together), place items along the cross axis under difference constraints,
+ * route every edge orthogonally through per-gap channel rows, and draw.
+ *
+ * Edge labels are items like nodes: they take part in ordering and spacing, so a label never
+ * overlaps another label, a box or a line, and it always sits on its own edge.
  */
 import { Canvas, DOWN, LEFT, RIGHT, UP, type Style } from "../canvas.ts"
 import { maxWidth, strWidth, truncate, wrapText } from "../util.ts"
@@ -21,13 +25,18 @@ export interface LayoutOptions {
   edgeWrap: number
 }
 
+/** Layouts with more items than this are not attempted (the compact list is used instead). */
+export const ITEM_BUDGET = 3000
+
 interface Item {
   idx: number
-  kind: "node" | "dummy" | "spacer"
+  /** `bound`: a virtual left/right frame border used only by the placement constraints. */
+  kind: "node" | "dummy" | "label" | "spacer" | "bound"
   node: number
   layer: number
   cluster: number
   box: Box | undefined
+  text: string[]
   cs: number
   ms: number
   x: number
@@ -62,7 +71,6 @@ interface Port {
   key: string
   segs: Seg[]
   off: number
-  labels: string[]
 }
 
 interface Group {
@@ -82,11 +90,19 @@ const ARROWS: Record<Dir, [string, string]> = {
   RL: ["◀", "▶"],
 }
 
-export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
+const minOf = (xs: readonly number[], init = Infinity) => xs.reduce((a, b) => (b < a ? b : a), init)
+const maxOf = (xs: readonly number[], init = -Infinity) => xs.reduce((a, b) => (b > a ? b : a), init)
+
+/**
+ * Lays the flowchart out and returns its lines, or undefined when the drawing would be wider
+ * than `width` (or too big to lay out). The width is known before anything is drawn.
+ */
+export function layoutFlowchart(fc: Flowchart, o: LayoutOptions, width = Infinity): string[] | undefined {
   const dir = o.dir
   const vertical = dir === "TD" || dir === "BT"
   const nodeIndex = new Map(fc.nodes.map((n, i) => [n.id, i]))
   const clusters = fc.clusters
+  const N = fc.nodes.length
 
   // ---- edges, self loops, labels -------------------------------------------------------
   const selfLoops: string[][] = fc.nodes.map(() => [])
@@ -100,7 +116,7 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
     layoutIdx: number
   }
   const drawn: DEdge[] = []
-  const ledges: Array<[number, number]> = []
+  const ledges: Array<{ a: number; b: number; len: number }> = []
   for (const e of fc.edges) {
     const a = nodeIndex.get(e.from)
     const b = nodeIndex.get(e.to)
@@ -109,17 +125,10 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
       if (e.style !== "invisible") selfLoops[a]!.push(e.label)
       continue
     }
-    ledges.push([a, b])
+    const label = e.style !== "invisible" && e.label.trim() ? wrapText(e.label, o.edgeWrap).filter((l) => l) : []
+    ledges.push({ a, b, len: label.length ? 2 : 1 })
     if (e.style === "invisible") continue
-    drawn.push({
-      a,
-      b,
-      style: e.style,
-      headFrom: e.headFrom,
-      headTo: e.headTo,
-      label: e.label ? wrapText(e.label, o.edgeWrap).filter((l, i, all) => l || all.length === 1) : [],
-      layoutIdx: ledges.length - 1,
-    })
+    drawn.push({ a, b, style: e.style, headFrom: e.headFrom, headTo: e.headTo, label, layoutIdx: ledges.length - 1 })
   }
   const nodeLines = fc.nodes.map((n, i) => {
     const lines = wrapText(n.label || n.id, o.nodeWrap)
@@ -128,9 +137,8 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
   })
 
   // ---- cycle breaking (DFS back edges get reversed) ------------------------------------
-  const N = fc.nodes.length
   const out: number[][] = fc.nodes.map(() => [])
-  ledges.forEach(([a], i) => out[a]!.push(i))
+  ledges.forEach(({ a }, i) => out[a]!.push(i))
   const reversed = ledges.map(() => false)
   const state = new Array<number>(N).fill(0)
   for (let s = 0; s < N; s++) {
@@ -147,7 +155,7 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
       }
       top[1]++
       const ei = out[v]![k]!
-      const w = ledges[ei]![1]
+      const w = ledges[ei]!.b
       if (state[w] === 1) reversed[ei] = true
       else if (state[w] === 0) {
         state[w] = 1
@@ -155,59 +163,68 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
       }
     }
   }
-  const dag = ledges.map(([a, b], i) => (reversed[i] ? ([b, a] as const) : ([a, b] as const)))
 
   // ---- layering (longest path, sources pulled down next to their children) --------------
   const indeg = new Array<number>(N).fill(0)
-  const succ: number[][] = fc.nodes.map(() => [])
-  const pred: number[][] = fc.nodes.map(() => [])
-  for (const [a, b] of dag) {
-    succ[a]!.push(b)
-    pred[b]!.push(a)
-    indeg[b]!++
-  }
+  const succ: Array<Array<[number, number]>> = fc.nodes.map(() => [])
+  const predCount = new Array<number>(N).fill(0)
+  ledges.forEach(({ a, b, len }, i) => {
+    const [u, v] = reversed[i] ? [b, a] : [a, b]
+    succ[u]!.push([v, len])
+    predCount[v]!++
+    indeg[v]!++
+  })
   const topo: number[] = []
-  const ready: number[] = []
+  let ready: number[] = []
   for (let i = 0; i < N; i++) if (indeg[i] === 0) ready.push(i)
   while (ready.length) {
-    ready.sort((p, q) => p - q)
-    const v = ready.shift()!
-    topo.push(v)
-    for (const w of succ[v]!) if (--indeg[w]! === 0) ready.push(w)
+    const next: number[] = []
+    for (const v of ready) {
+      topo.push(v)
+      for (const [w] of succ[v]!) if (--indeg[w]! === 0) next.push(w)
+    }
+    ready = next.sort((p, q) => p - q)
   }
-  for (let i = 0; i < N; i++) if (!topo.includes(i)) topo.push(i)
+  if (topo.length < N) {
+    const seen = new Set(topo)
+    for (let i = 0; i < N; i++) if (!seen.has(i)) topo.push(i)
+  }
   const layerOf = new Array<number>(N).fill(0)
-  for (const v of topo) for (const w of succ[v]!) layerOf[w] = Math.max(layerOf[w]!, layerOf[v]! + 1)
+  for (const v of topo) for (const [w, len] of succ[v]!) if (layerOf[v]! + len > layerOf[w]!) layerOf[w] = layerOf[v]! + len
   for (let t = topo.length - 1; t >= 0; t--) {
     const v = topo[t]!
-    if (pred[v]!.length === 0 && succ[v]!.length > 0) {
-      layerOf[v] = Math.min(...succ[v]!.map((w) => layerOf[w]!)) - 1
-    }
+    if (predCount[v] === 0 && succ[v]!.length > 0) layerOf[v] = minOf(succ[v]!.map(([w, len]) => layerOf[w]! - len))
   }
-  const used = [...new Set(layerOf)].sort((p, q) => p - q)
-  const remap = new Map(used.map((l, i) => [l, i]))
-  for (let i = 0; i < N; i++) layerOf[i] = remap.get(layerOf[i]!)!
-  const layerCount = used.length
+  const lmin = minOf(layerOf, 0)
+  for (let i = 0; i < N; i++) layerOf[i]! -= lmin
+
+  // Long edges need one dummy per layer they cross: too many means no drawing will fit.
+  let dummyCount = 0
+  for (const e of drawn) dummyCount += Math.abs(layerOf[e.b]! - layerOf[e.a]!) - 1
+  if (N + dummyCount > ITEM_BUDGET) return undefined
 
   // ---- clusters -------------------------------------------------------------------------
   const nodeCluster = fc.nodes.map((n) => fc.membership.get(n.id) ?? -1)
-  const depth = clusters.map((_, i) => {
-    let d = 0
-    for (let c = clusters[i]!.parent; c >= 0; c = clusters[c]!.parent) d++
-    return d
-  })
+  const depth: number[] = []
+  const anc: Array<Set<number>> = []
+  const chainOf: number[][] = []
   const chain = (c: number): number[] => {
-    const r: number[] = []
-    for (let k = c; k >= 0; k = clusters[k]!.parent) r.push(k)
+    if (c < 0) return []
+    let r = chainOf[c]
+    if (!r) {
+      r = [c, ...chain(clusters[c]!.parent)]
+      chainOf[c] = r
+    }
     return r
   }
-  const within = (c: number, anc: number): boolean => {
-    for (let k = c; k >= 0; k = clusters[k]!.parent) if (k === anc) return true
-    return anc === -1
+  for (let c = 0; c < clusters.length; c++) {
+    anc[c] = new Set(chain(c))
+    depth[c] = chain(c).length - 1
   }
+  const within = (c: number, a: number): boolean => a === -1 || (c >= 0 && anc[c]!.has(a))
   const lca = (c1: number, c2: number): number => {
-    const a = chain(c1)
-    for (let k = c2; k >= 0; k = clusters[k]!.parent) if (a.includes(k)) return k
+    if (c1 < 0) return -1
+    for (const k of chain(c2)) if (anc[c1]!.has(k)) return k
     return -1
   }
 
@@ -221,6 +238,7 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
       layer,
       cluster,
       box: undefined,
+      text: [],
       cs: 1,
       ms: 0,
       x: 0,
@@ -237,20 +255,27 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
     return it
   }
   const nodeItems = fc.nodes.map((_, i) => mk("node", i, layerOf[i]!, nodeCluster[i]!))
-  const edgeSegs: Seg[][] = []
-  for (const e of drawn) {
+  drawn.forEach((e, ei) => {
     const rev = reversed[e.layoutIdx]!
     const U = rev ? e.b : e.a
     const D = rev ? e.a : e.b
     const headU = rev ? e.headTo : e.headFrom
     const headD = rev ? e.headFrom : e.headTo
     const cl = lca(nodeCluster[U]!, nodeCluster[D]!)
-    const segs: Seg[] = []
     let prev = nodeItems[U]!
     const lu = layerOf[U]!
     const ld = layerOf[D]!
+    const labelAt = e.label.length ? lu + Math.floor((ld - lu) / 2) : -1
     for (let l = lu + 1; l <= ld; l++) {
-      const next = l === ld ? nodeItems[D]! : mk("dummy", -1, l, cl)
+      let next: Item
+      if (l === ld) next = nodeItems[D]!
+      else if (l === labelAt) {
+        next = mk("label", -1, l, cl)
+        next.text = e.label
+        const bw = maxWidth(e.label)
+        next.cs = vertical ? bw : e.label.length
+        next.ms = vertical ? e.label.length : bw + 2
+      } else next = mk("dummy", -1, l, cl)
       const seg: Seg = {
         u: prev,
         v: next,
@@ -262,48 +287,55 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
         uPort: undefined,
         vPort: undefined,
         row: 0,
-        edge: edgeSegs.length,
+        edge: ei,
       }
       prev.down.push(seg)
       next.up.push(seg)
-      segs.push(seg)
       prev = next
     }
-    edgeSegs.push(segs)
-  }
+  })
 
   // Frames: which clusters are drawn, their layer spans, spacers where a span has a hole.
   const drawnCluster = clusters.map(() => false)
   const span: Array<[number, number]> = clusters.map(() => [Infinity, -Infinity])
+  const layersOf: Array<Set<number>> = clusters.map(() => new Set())
+  for (const it of items) for (const c of chain(it.cluster)) layersOf[c]!.add(it.layer)
   const byDepth = clusters.map((_, i) => i).sort((p, q) => depth[q]! - depth[p]! || p - q)
   for (const c of byDepth) {
-    const members = items.filter((it) => it.cluster >= 0 && within(it.cluster, c))
-    if (members.length === 0) continue
+    const ls = layersOf[c]!
+    if (ls.size === 0) continue
     drawnCluster[c] = true
-    const lo = Math.min(...members.map((m) => m.layer))
-    const hi = Math.max(...members.map((m) => m.layer))
+    const lo = minOf([...ls])
+    const hi = maxOf([...ls])
     span[c] = [lo, hi]
-    for (let l = lo; l <= hi; l++) if (!members.some((m) => m.layer === l)) mk("spacer", -1, l, c)
+    for (let l = lo; l <= hi; l++)
+      if (!ls.has(l)) {
+        mk("spacer", -1, l, c)
+        for (const k of chain(c)) layersOf[k]!.add(l)
+      }
   }
-  const frameChain = (c: number) => chain(c).filter((k) => drawnCluster[k])
+  // Drawn frames around each cluster (itself included).
+  const dd = clusters.map((_, c) => chain(c).filter((k) => drawnCluster[k]).length)
+  const ddOf = (c: number) => (c < 0 ? 0 : dd[c]!)
 
   // ---- ports and boxes ------------------------------------------------------------------------
   const portKey = (head: Head, style: Style) => `${head}|${style}`
   for (const it of items) {
     if (it.kind === "spacer") continue
+    const passThrough = it.kind !== "node"
     const nearGroups = new Map<string, Port>()
     const farGroups = new Map<string, Port>()
     for (const s of it.up) {
-      const key = it.kind === "dummy" ? "d" : portKey(s.headD, s.style)
+      const key = passThrough ? "d" : portKey(s.headD, s.style)
       let p = nearGroups.get(key)
-      if (!p) nearGroups.set(key, (p = { item: it, far: false, key, segs: [], off: 0, labels: [] }))
+      if (!p) nearGroups.set(key, (p = { item: it, far: false, key, segs: [], off: 0 }))
       p.segs.push(s)
       s.vPort = p
     }
     for (const s of it.down) {
-      const key = it.kind === "dummy" ? "d" : portKey(s.headU, s.style)
+      const key = passThrough ? "d" : portKey(s.headU, s.style)
       let p = farGroups.get(key)
-      if (!p) farGroups.set(key, (p = { item: it, far: true, key, segs: [], off: 0, labels: [] }))
+      if (!p) farGroups.set(key, (p = { item: it, far: true, key, segs: [], off: 0 }))
       p.segs.push(s)
       s.uPort = p
     }
@@ -325,29 +357,37 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
     it.ms = vertical ? box.h : box.w
   }
   const rangeOf = (it: Item, far: boolean): Range => (it.box ? it.box[sideOf(far)] : [0, 0])
+  const co = (it: Item) => Math.floor((it.cs - 1) / 2)
 
-  // Edge labels sit next to the port that only this edge uses (target side preferred).
-  drawn.forEach((e, i) => {
-    if (!e.label.length) return
-    const segs = edgeSegs[i]!
-    const last = segs[segs.length - 1]!
-    const first = segs[0]!
-    const target = last.vPort!
-    const source = first.uPort!
-    const port = target.segs.length === 1 || source.segs.length !== 1 ? target : source
-    port.labels.push(...e.label)
-  })
-  const blockSize = (lines: string[]) => {
-    const bw = maxWidth(lines)
-    return vertical ? { main: lines.length, cross: bw, bw } : { main: bw + 2, cross: lines.length, bw }
+  // ---- drop empty layers, check the size can fit before doing the expensive work --------------
+  {
+    const used = [...new Set(items.map((it) => it.layer))].sort((p, q) => p - q)
+    const remap = new Map(used.map((l, i) => [l, i]))
+    for (const it of items) it.layer = remap.get(it.layer)!
+    for (let c = 0; c < clusters.length; c++)
+      if (drawnCluster[c]) span[c] = [remap.get(span[c]![0])!, remap.get(span[c]![1])!]
   }
-  const labelStart = (portCross: number, lines: string[]) => {
-    const { bw } = blockSize(lines)
-    return vertical ? portCross - Math.floor(bw / 2) : portCross - Math.floor((lines.length - 1) / 2)
-  }
-  // ---- ordering ---------------------------------------------------------------------------------
+  const layerCount = maxOf(items.map((it) => it.layer), -1) + 1
+  const gapBase = vertical ? 2 : 1
+  const margin = 2
+  const minCh = vertical ? 1 : 3
   const layers: Item[][] = Array.from({ length: layerCount }, () => [])
   for (const it of items) layers[it.layer]!.push(it)
+  const lsz = layers.map((ly) => maxOf(ly.map((it) => it.ms), 1))
+  if (vertical) {
+    const frameRoom = 2 * margin * maxOf(dd, 0)
+    for (const ly of layers) {
+      let w = frameRoom - gapBase
+      for (const it of ly) w += it.cs + gapBase
+      if (w > width) return undefined
+    }
+  } else {
+    let w = 0
+    for (let l = 0; l < layerCount; l++) w += lsz[l]! + (l ? minCh + 1 : 0)
+    if (w > width) return undefined
+  }
+
+  // ---- ordering ---------------------------------------------------------------------------------
   const setPos = () => layers.forEach((ly) => ly.forEach((it, i) => (it.pos = i)))
   setPos()
   const norm = (it: Item) => (it.pos + 0.5) / layers[it.layer]!.length
@@ -370,13 +410,15 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
     }
     const units: Unit[] = []
     const byCluster = new Map<number, Unit>()
+    const pd = parent < 0 ? -1 : depth[parent]!
     for (const it of list) {
       if (it.cluster === parent) {
         units.push({ key: key.get(it)!, first: it.pos, cluster: -2, items: [it] })
         continue
       }
-      let c = it.cluster
-      while (c >= 0 && clusters[c]!.parent !== parent) c = clusters[c]!.parent
+      // The ancestor of the item's cluster one level below `parent`.
+      const ch = chain(it.cluster)
+      const c = ch[ch.length - 1 - (pd + 1)]!
       let u = byCluster.get(c)
       if (!u) {
         u = { key: 0, first: it.pos, cluster: c, items: [] }
@@ -395,23 +437,28 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
     units.sort((p, q) => p.key - q.key || p.first - q.first)
     return units.flatMap((u) => (u.cluster === -2 ? u.items : arrange(u.cluster, u.items, key, rank)))
   }
+  // Crossings between adjacent layers, by counting inversions with a Fenwick tree.
   const crossings = (): number => {
     let n = 0
     for (let l = 0; l + 1 < layerCount; l++) {
-      const segs = layers[l]!.flatMap((it) => it.down)
-      for (let i = 0; i < segs.length; i++)
-        for (let j = i + 1; j < segs.length; j++) {
-          const a = segs[i]!
-          const b = segs[j]!
-          if ((a.u.pos - b.u.pos) * (a.v.pos - b.v.pos) < 0) n++
-        }
+      const segs = layers[l]!.flatMap((it) => it.down).map((s) => [s.u.pos, s.v.pos] as const)
+      segs.sort((p, q) => p[0] - q[0] || p[1] - q[1])
+      const size = layers[l + 1]!.length
+      const tree = new Array<number>(size + 1).fill(0)
+      let seen = 0
+      for (const [, v] of segs) {
+        let le = 0
+        for (let i = v + 1; i > 0; i -= i & -i) le += tree[i]!
+        n += seen - le
+        for (let i = v + 1; i <= size; i += i & -i) tree[i]!++
+        seen++
+      }
     }
     return n
   }
-  const sweepLayer = (l: number, down: boolean) => {
+  const sweepLayer = (l: number, down: boolean, rank: number[]) => {
     const ly = layers[l]!
     const key = new Map<Item, number>()
-    const rank = clusterRank()
     // Where an edge meets its neighbour: the neighbour's position, nudged by which of the
     // neighbour's port groups it uses, so edges sharing a port end up side by side.
     const at = (s: Seg): number => {
@@ -429,14 +476,17 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
     layers[l] = arrange(-1, ly, key, rank)
     layers[l]!.forEach((it, i) => (it.pos = i))
   }
-  // Group cluster members from the start.
-  for (let l = 0; l < layerCount; l++) sweepLayer(l, true)
+  {
+    const rank = clusterRank()
+    for (let l = 0; l < layerCount; l++) sweepLayer(l, true, rank)
+  }
   let best = layers.map((ly) => [...ly])
   let bestC = crossings()
   for (let iter = 0; iter < 8 && bestC > 0; iter++) {
     const down = iter % 2 === 0
-    if (down) for (let l = 1; l < layerCount; l++) sweepLayer(l, true)
-    else for (let l = layerCount - 2; l >= 0; l--) sweepLayer(l, false)
+    const rank = clusterRank()
+    if (down) for (let l = 1; l < layerCount; l++) sweepLayer(l, true, rank)
+    else for (let l = layerCount - 2; l >= 0; l--) sweepLayer(l, false, rank)
     const c = crossings()
     if (c < bestC) {
       bestC = c
@@ -453,39 +503,34 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
       if (!ports.length) continue
       const other = (p: Port) => p.segs.reduce((s, sg) => s + (far ? sg.v.pos : sg.u.pos), 0) / p.segs.length
       // Ties (several edges to the same neighbour) go by edge order, the same at both ends.
-      const firstEdge = (p: Port) => Math.min(...p.segs.map((sg) => sg.edge))
+      const firstEdge = (p: Port) => minOf(p.segs.map((sg) => sg.edge))
       ports.sort((p, q) => other(p) - other(q) || firstEdge(p) - firstEdge(q))
-      const slots = it.kind === "node" ? portSlots(rangeOf(it, far), ports.length, it.cs, vertical) : [0]
+      const slots = it.kind === "node" ? portSlots(rangeOf(it, far), ports.length, it.cs, vertical) : [co(it)]
       ports.forEach((p, i) => (p.off = slots[i] ?? slots[0]!))
     }
   }
-  // Cross extents: the item plus any edge labels hanging off its ports.
   for (const it of items) {
     it.L = 0
     it.R = it.cs - 1
-    for (const p of [...it.near, ...it.far]) {
-      if (!p.labels.length) continue
-      const a = labelStart(p.off, p.labels)
-      it.L = Math.min(it.L, a)
-      it.R = Math.max(it.R, a + blockSize(p.labels).cross - 1)
-    }
   }
 
   // ---- cross-axis placement ------------------------------------------------------------------
-  const gapBase = vertical ? 2 : 1
-  const margin = 2
-  const framesBetween = (a: Item, b: Item) => {
-    const ca = frameChain(a.cluster)
-    const cb = frameChain(b.cluster)
-    return ca.filter((c) => !cb.includes(c)).length + cb.filter((c) => !ca.includes(c)).length
+  const framesBetween = (a: Item, b: Item) => ddOf(a.cluster) + ddOf(b.cluster) - 2 * ddOf(lca(a.cluster, b.cluster))
+  // A line may pass one column from a label or another line; two labels keep three columns
+  // apart so they never read as one phrase.
+  const gapOf = (a: Item, b: Item) => {
+    if (!vertical) return gapBase
+    if (a.kind === "label" && b.kind === "label") return 3
+    return a.kind !== "node" && b.kind !== "node" ? 1 : gapBase
   }
-  const sep = (a: Item, b: Item) => a.R + 1 + gapBase + margin * framesBetween(a, b) - b.L
+  const sep = (a: Item, b: Item) => a.R + 1 + gapOf(a, b) + margin * framesBetween(a, b) - b.L
+  const runOf = (l: number, c: number) => layers[l]!.filter((it) => it.cluster >= 0 && within(it.cluster, c))
   // Frames need room for their title on the top border: widen the first layer's members.
   if (vertical)
     for (let c = 0; c < clusters.length; c++) {
       if (!drawnCluster[c] || !clusters[c]!.title) continue
       const l = dir === "TD" ? span[c]![0] : span[c]![1]
-      const run = layers[l]!.filter((it) => it.cluster >= 0 && within(it.cluster, c))
+      const run = runOf(l, c)
       if (!run.length) continue
       const tw = strWidth(clusters[c]!.title.replace(/\n/g, " ")) + 2
       const gapAfter = (i: number) => (i + 1 < run.length ? gapBase + margin * framesBetween(run[i]!, run[i + 1]!) : 0)
@@ -520,38 +565,32 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
         }
       }
     }
+  // Difference constraints x_b >= x_a + c. Frames get virtual left/right border items, so the
+  // items beside a frame (in any of its layers) stay outside it.
   const cons: Array<[Item, Item, number]> = []
   for (const ly of layers) for (let i = 0; i + 1 < ly.length; i++) cons.push([ly[i]!, ly[i + 1]!, sep(ly[i]!, ly[i + 1]!)])
   for (let c = 0; c < clusters.length; c++) {
     if (!drawnCluster[c]) continue
     const [lo, hi] = span[c]!
-    const firsts: Item[] = []
-    const lasts: Item[] = []
-    const prevs: Item[] = []
-    const nexts: Item[] = []
+    const lb = mk("bound", -1, -1, c)
+    const rb = mk("bound", -1, -1, c)
+    const inner = (it: Item) => margin * (ddOf(it.cluster) - dd[c]! + 1)
+    const outer = (it: Item) => {
+      const l = lca(it.cluster, c)
+      return 1 + gapBase + margin * (ddOf(it.cluster) - ddOf(l)) + margin * (dd[c]! - ddOf(l) - 1)
+    }
     for (let l = lo; l <= hi; l++) {
-      const run = layers[l]!.filter((it) => it.cluster >= 0 && within(it.cluster, c))
+      const run = runOf(l, c)
       if (!run.length) continue
       const f = run[0]!
       const t = run[run.length - 1]!
-      firsts.push(f)
-      lasts.push(t)
+      cons.push([lb, f, inner(f) - f.L])
+      cons.push([t, rb, t.R + inner(t)])
       const p = layers[l]![f.pos - 1]
       const q = layers[l]![t.pos + 1]
-      if (p) prevs.push(p)
-      if (q) nexts.push(q)
+      if (p) cons.push([p, lb, p.R + outer(p)])
+      if (q) cons.push([rb, q, outer(q) - q.L])
     }
-    for (const p of prevs) for (const f of firsts) if (p.layer !== f.layer) cons.push([p, f, sep(p, f)])
-    for (const t of lasts) for (const q of nexts) if (t.layer !== q.layer) cons.push([t, q, sep(t, q)])
-  }
-  for (let pass = 0; pass < items.length + 2; pass++) {
-    let changed = false
-    for (const [a, b, c] of cons)
-      if (b.x < a.x + c) {
-        b.x = a.x + c
-        changed = true
-      }
-    if (!changed) break
   }
   const inC = new Map<Item, Array<[Item, number]>>()
   const outC = new Map<Item, Array<[Item, number]>>()
@@ -561,46 +600,77 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
     inC.get(b)!.push([a, c])
     outC.get(a)!.push([b, c])
   }
-  const co = (it: Item) => (it.kind === "node" ? Math.floor((it.cs - 1) / 2) : 0)
-  const bounds = (it: Item): [number, number] => {
+  // Left-packed start: longest paths through the constraint graph (a DAG) in topological order.
+  {
+    const deg = new Map<Item, number>()
+    for (const [, b] of cons) deg.set(b, (deg.get(b) ?? 0) + 1)
+    let queue = items.filter((it) => !deg.get(it))
+    const done = new Set<Item>()
+    while (queue.length) {
+      const next: Item[] = []
+      for (const a of queue) {
+        done.add(a)
+        for (const [b, c] of outC.get(a) ?? []) {
+          if (b.x < a.x + c) b.x = a.x + c
+          const d = deg.get(b)! - 1
+          deg.set(b, d)
+          if (d === 0) next.push(b)
+        }
+      }
+      queue = next
+    }
+    // A cycle would be a bug in the ordering; relax what is left a bounded number of times.
+    if (done.size < items.length)
+      for (let pass = 0; pass < 50; pass++) {
+        let changed = false
+        for (const [a, b, c] of cons)
+          if (b.x < a.x + c) {
+            b.x = a.x + c
+            changed = true
+          }
+        if (!changed) break
+      }
+  }
+  // Frame borders are not placed: an item next to one is bounded by the items across it.
+  const loOf = (it: Item): number => {
     let lo = -Infinity
+    for (const [a, c] of inC.get(it) ?? []) lo = Math.max(lo, (a.kind === "bound" ? loOf(a) : a.x) + c)
+    return lo
+  }
+  const hiOf = (it: Item): number => {
     let hi = Infinity
-    for (const [a, c] of inC.get(it) ?? []) lo = Math.max(lo, a.x + c)
-    for (const [b, c] of outC.get(it) ?? []) hi = Math.min(hi, b.x - c)
-    return [lo, hi]
+    for (const [b, c] of outC.get(it) ?? []) hi = Math.min(hi, (b.kind === "bound" ? hiOf(b) : b.x) - c)
+    return hi
   }
   const median = (xs: number[]) => {
     const s = [...xs].sort((p, q) => p - q)
     const m = Math.floor(s.length / 2)
     return s.length % 2 ? s[m]! : Math.floor((s[m - 1]! + s[m]!) / 2)
   }
-  const clusterCenter = (c: number): number | undefined => {
-    const xs = items.filter((it) => it.kind !== "spacer" && it.cluster >= 0 && within(it.cluster, c))
-    return xs.length ? median(xs.map((it) => it.x + co(it))) : undefined
-  }
+  const clusterItems = clusters.map(() => [] as Item[])
+  for (const it of items) if (it.kind !== "spacer" && it.kind !== "bound") for (const c of chain(it.cluster)) clusterItems[c]!.push(it)
   for (let round = 0; round < 12; round++) {
     const down = round % 2 === 0
     const order = down ? layers : [...layers].reverse()
     for (const ly of order) {
       const want = new Map<Item, number>()
       for (const it of ly) {
-        let nb: Item[]
         if (it.kind === "spacer") {
-          const cc = clusterCenter(it.cluster)
-          if (cc !== undefined) want.set(it, cc)
+          const xs = clusterItems[it.cluster]!
+          if (xs.length) want.set(it, median(xs.map((m) => m.x + co(m))))
           continue
         }
-        if (it.kind === "dummy") nb = [...it.up.map((s) => s.u), ...it.down.map((s) => s.v)]
+        let segs: Seg[]
+        if (it.kind !== "node") segs = [...it.up, ...it.down]
         else {
-          nb = down ? it.up.map((s) => s.u) : it.down.map((s) => s.v)
-          if (!nb.length) nb = down ? it.down.map((s) => s.v) : it.up.map((s) => s.u)
+          segs = down ? it.up : it.down
+          if (!segs.length) segs = down ? it.down : it.up
           // Long edges bend around the node; the node lines up with its direct neighbours.
-          const real = nb.filter((n) => n.kind === "node")
-          if (real.length) nb = real
+          const real = segs.filter((sg) => (sg.u === it ? sg.v : sg.u).kind === "node")
+          if (real.length) segs = real
         }
-        if (!nb.length) continue
+        if (!segs.length) continue
         // Line up the ports at both ends of each edge, so edges run straight.
-        const segs = [...it.up, ...it.down].filter((sg) => nb.includes(sg.u === it ? sg.v : sg.u))
         want.set(
           it,
           median(segs.map((sg) => (sg.u === it ? sg.v.x + sg.vPort!.off - sg.uPort!.off : sg.u.x + sg.uPort!.off - sg.vPort!.off))),
@@ -608,19 +678,43 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
       }
       const right = ly.filter((it) => want.has(it) && want.get(it)! > it.x).reverse()
       const left = ly.filter((it) => want.has(it) && want.get(it)! < it.x)
-      for (const it of [...right, ...left]) {
-        const [lo, hi] = bounds(it)
-        it.x = Math.max(lo, Math.min(hi, want.get(it)!))
-      }
+      for (const it of [...right, ...left]) it.x = Math.max(loOf(it), Math.min(hiOf(it), want.get(it)!))
     }
   }
+  // Finally straighten one-to-one links (a node, its label, the next node) from the top down,
+  // so simple chains run without jogs.
+  for (let pass = 0; pass < 2; pass++)
+    for (const ly of layers) {
+      const want = new Map<Item, number>()
+      for (const it of ly) {
+        if (it.up.length !== 1) continue
+        const sg = it.up[0]!
+        if (sg.u.kind === "node" && sg.u.down.length !== 1) continue
+        want.set(it, sg.u.x + sg.uPort!.off - sg.vPort!.off)
+      }
+      const right = ly.filter((it) => want.has(it) && want.get(it)! > it.x).reverse()
+      const left = ly.filter((it) => want.has(it) && want.get(it)! < it.x)
+      for (const it of [...right, ...left]) it.x = Math.max(loOf(it), Math.min(hiOf(it), want.get(it)!))
+    }
+  const real = items.filter((it) => it.kind !== "bound")
 
   const portX = (p: Port) => p.item.x + p.off
 
   // ---- channels per gap ------------------------------------------------------------------------
-  const minCh = vertical ? 1 : 3
   const gapChannels: number[] = []
-  const gapUsed: number[] = []
+  const mkGroup = (segs: Seg[]): Group => {
+    const src = segs.map((s) => portX(s.uPort!))
+    const tgt = segs.map((s) => portX(s.vPort!))
+    return {
+      segs,
+      lo: Math.min(minOf(src), minOf(tgt)),
+      hi: Math.max(maxOf(src), maxOf(tgt)),
+      src: [...new Set(src)],
+      tgt: [...new Set(tgt)],
+      needsRow: segs.some((s) => portX(s.uPort!) !== portX(s.vPort!)),
+      row: 0,
+    }
+  }
   for (let g = 0; g + 1 < layerCount; g++) {
     const segs = layers[g]!.flatMap((it) => it.down)
     const groups: Group[] = []
@@ -639,84 +733,71 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
       }
     }
     for (const list of byTgt.values()) groups.push(mkGroup(list))
-    const rowed = groups.filter((gr) => gr.needsRow)
+    const rowed = groups.filter((gr) => gr.needsRow).sort((p, q) => p.lo - q.lo || p.hi - q.hi)
     const touch = (gr: Group, x: number) => x >= gr.lo && x <= gr.hi
     const overlap = (p: Group, q: Group) => p.lo <= q.hi + 1 && q.lo <= p.hi + 1
-    const before = new Map<Group, Set<Group>>(rowed.map((gr) => [gr, new Set()]))
+    // Which group's row should come first so its horizontal does not cross the other's verticals.
+    const preds = new Map<Group, Group[]>(rowed.map((gr) => [gr, []]))
+    const succs = new Map<Group, Group[]>(rowed.map((gr) => [gr, []]))
     for (let i = 0; i < rowed.length; i++)
-      for (let j = i + 1; j < rowed.length; j++) {
+      for (let j = i + 1; j < rowed.length && rowed[j]!.lo <= rowed[i]!.hi + 1; j++) {
         const p = rowed[i]!
         const q = rowed[j]!
         if (!overlap(p, q)) continue
-        // p above q avoids crossings when q's targets or p's sources lie under p's / q's span.
         const pFirst = q.tgt.filter((x) => touch(p, x)).length + p.src.filter((x) => touch(q, x)).length
         const qFirst = q.src.filter((x) => touch(p, x)).length + p.tgt.filter((x) => touch(q, x)).length
-        if (pFirst > qFirst) before.get(q)!.add(p)
-        else if (qFirst > pFirst) before.get(p)!.add(q)
+        if (pFirst > qFirst) {
+          preds.get(q)!.push(p)
+          succs.get(p)!.push(q)
+        } else if (qFirst > pFirst) {
+          preds.get(p)!.push(q)
+          succs.get(q)!.push(p)
+        }
       }
+    // Kahn's order (leftmost first); a cycle is broken at its leftmost group.
+    const left = new Map<Group, number>(rowed.map((gr) => [gr, preds.get(gr)!.length]))
     const done = new Set<Group>()
     const orderG: Group[] = []
+    let avail = rowed.filter((gr) => left.get(gr) === 0)
     while (orderG.length < rowed.length) {
-      const avail = rowed.filter((gr) => !done.has(gr))
-      avail.sort((p, q) => {
-        const pa = [...before.get(p)!].filter((x) => !done.has(x)).length
-        const qa = [...before.get(q)!].filter((x) => !done.has(x)).length
-        return pa - qa || p.lo - q.lo || p.hi - q.hi
-      })
-      const gr = avail[0]!
+      if (!avail.length) avail = [rowed.find((gr) => !done.has(gr))!]
+      avail.sort((p, q) => p.lo - q.lo || p.hi - q.hi)
+      const gr = avail.shift()!
+      if (done.has(gr)) continue
       done.add(gr)
       orderG.push(gr)
+      for (const q of succs.get(gr)!) {
+        const n = left.get(q)! - 1
+        left.set(q, n)
+        if (n === 0 && !done.has(q)) avail.push(q)
+      }
     }
-    const assigned: Group[] = []
+    const rows: Group[][] = []
+    const assigned = new Set<Group>()
     for (const gr of orderG) {
       let r = 0
-      for (const p of before.get(gr)!) if (assigned.includes(p)) r = Math.max(r, p.row + 1)
-      while (assigned.some((p) => p.row === r && overlap(p, gr))) r++
+      for (const p of preds.get(gr)!) if (assigned.has(p)) r = Math.max(r, p.row + 1)
+      while (rows[r]?.some((p) => overlap(p, gr))) r++
       gr.row = r
-      assigned.push(gr)
+      ;(rows[r] ??= []).push(gr)
+      assigned.add(gr)
     }
-    const usedRows = assigned.length ? Math.max(...assigned.map((gr) => gr.row)) + 1 : 0
+    const usedRows = rows.length
     // A short stub leaves each box before the first turn.
     const channels = usedRows === 0 ? minCh : Math.max(minCh, usedRows + 1)
     const offset = usedRows === 0 ? 0 : vertical ? channels - usedRows : Math.ceil((channels - usedRows) / 2)
     for (const gr of groups) for (const s of gr.segs) s.row = gr.row + offset
     gapChannels.push(channels)
-    gapUsed.push(usedRows)
-  }
-  function mkGroup(segs: Seg[]): Group {
-    const src = segs.map((s) => portX(s.uPort!))
-    const tgt = segs.map((s) => portX(s.vPort!))
-    const all = [...src, ...tgt]
-    return {
-      segs,
-      lo: Math.min(...all),
-      hi: Math.max(...all),
-      src: [...new Set(src)],
-      tgt: [...new Set(tgt)],
-      needsRow: segs.some((s) => portX(s.uPort!) !== portX(s.vPort!)),
-      row: 0,
-    }
   }
 
   // ---- main-axis positions ---------------------------------------------------------------------
-  const lsz = layers.map((ly) => Math.max(1, ...ly.map((it) => it.ms)))
-  const tops = (l: number) =>
-    clusters
-      .map((_, c) => c)
-      .filter((c) => drawnCluster[c] && span[c]![0] === l)
-      .sort((p, q) => depth[p]! - depth[q]! || p - q)
-  const bottoms = (l: number) =>
-    clusters
-      .map((_, c) => c)
-      .filter((c) => drawnCluster[c] && span[c]![1] === l)
-      .sort((p, q) => depth[q]! - depth[p]! || p - q)
+  const frameList = clusters.map((_, c) => c).filter((c) => drawnCluster[c])
+  const tops = (l: number) => frameList.filter((c) => span[c]![0] === l)
+  const bottoms = (l: number) => frameList.filter((c) => span[c]![1] === l)
   const frameTop = clusters.map(() => 0)
   const frameBottom = clusters.map(() => 0)
   const layerStart: number[] = []
-  const gapSrc: number[] = []
   const gapCh: number[] = []
-  const gapTgt: number[] = []
-  const labelMain = (ports: Port[]) => Math.max(0, ...ports.filter((p) => p.labels.length).map((p) => blockSize(p.labels).main))
   // Frames of the same depth never overlap, so they share a border row.
   const placeRows = (list: number[], at: number, into: number[], outerFirst: boolean): number => {
     const ds = [...new Set(list.map((c) => depth[c]!))].sort((p, q) => (outerFirst ? p - q : q - p))
@@ -737,34 +818,34 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
     if (l + 1 >= layerCount) break
     const segs = layers[l]!.flatMap((it) => it.down)
     if (segs.some((s) => s.headU !== "none")) m += 1
-    gapSrc[l] = m
-    m += labelMain(layers[l]!.flatMap((it) => it.far))
     gapCh[l] = m
     m += gapChannels[l]!
-    gapTgt[l] = m
-    m += labelMain(layers[l + 1]!.flatMap((it) => it.near))
     const n = placeRows(tops(l + 1), m, frameTop, true)
     m += n + (n ? 1 : 0)
-    m += 1 // arrow row
+    // The row for arrowheads (and open-end stubs) in front of a box.
+    if (segs.some((s) => s.v.kind === "node")) m += 1
   }
   const M = m
-  for (const it of items) it.m0 = layerStart[it.layer]! + Math.floor((lsz[it.layer]! - it.ms) / 2)
+  for (const it of real) it.m0 = layerStart[it.layer]! + Math.floor((lsz[it.layer]! - it.ms) / 2)
   // Pull frame borders in to their members when the members are smaller than their layer
   // (keeping the blank row and the arrow row inside the frame).
+  const childFrames = clusters.map(() => [] as number[])
+  for (const c of frameList) if (clusters[c]!.parent >= 0) childFrames[clusters[c]!.parent]!.push(c)
+  const directItems = clusters.map(() => [] as Item[])
+  for (const it of real) if (it.cluster >= 0) directItems[it.cluster]!.push(it)
   for (const c of byDepth) {
     if (!drawnCluster[c]) continue
     let inTop = Infinity
     let inBottom = -Infinity
-    for (const it of nodeItems)
-      if (it.cluster === c) {
+    for (const it of directItems[c]!)
+      if (it.kind === "node") {
         inTop = Math.min(inTop, it.m0 - 3)
         inBottom = Math.max(inBottom, it.m0 + it.ms + 1)
       }
-    for (let k = 0; k < clusters.length; k++)
-      if (drawnCluster[k] && clusters[k]!.parent === c) {
-        inTop = Math.min(inTop, frameTop[k]! - 1)
-        inBottom = Math.max(inBottom, frameBottom[k]! + 1)
-      }
+    for (const k of childFrames[c]!) {
+      inTop = Math.min(inTop, frameTop[k]! - 1)
+      inBottom = Math.max(inBottom, frameBottom[k]! + 1)
+    }
     if (Number.isFinite(inTop)) frameTop[c] = Math.max(frameTop[c]!, inTop)
     if (Number.isFinite(inBottom)) frameBottom[c] = Math.min(frameBottom[c]!, inBottom)
   }
@@ -774,24 +855,24 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
   const fr = clusters.map(() => -Infinity)
   for (const c of byDepth) {
     if (!drawnCluster[c]) continue
-    for (const it of items)
-      if (it.cluster === c) {
-        fl[c] = Math.min(fl[c]!, it.x + it.L - margin)
-        fr[c] = Math.max(fr[c]!, it.x + it.R + margin)
-      }
-    for (let k = 0; k < clusters.length; k++)
-      if (drawnCluster[k] && clusters[k]!.parent === c) {
-        fl[c] = Math.min(fl[c]!, fl[k]! - margin)
-        fr[c] = Math.max(fr[c]!, fr[k]! + margin)
-      }
+    for (const it of directItems[c]!) {
+      fl[c] = Math.min(fl[c]!, it.x + it.L - margin)
+      fr[c] = Math.max(fr[c]!, it.x + it.R + margin)
+    }
+    for (const k of childFrames[c]!) {
+      fl[c] = Math.min(fl[c]!, fl[k]! - margin)
+      fr[c] = Math.max(fr[c]!, fr[k]! + margin)
+    }
   }
-  let minX = Math.min(...items.map((it) => it.x + it.L), ...fl.filter((v) => Number.isFinite(v)))
+  let minX = Math.min(minOf(real.map((it) => it.x + it.L)), minOf(fl))
   if (!Number.isFinite(minX)) minX = 0
-  for (const it of items) it.x -= minX
+  for (const it of real) it.x -= minX
   for (let c = 0; c < clusters.length; c++) {
     fl[c]! -= minX
     fr[c]! -= minX
   }
+  const crossSize = Math.max(maxOf(real.map((it) => it.x + it.R + 1), 0), maxOf(fr.map((v) => v + 1), 0))
+  if ((vertical ? crossSize : M) > width) return undefined
 
   // ---- drawing ---------------------------------------------------------------------------------
   const cv = new Canvas()
@@ -807,7 +888,7 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
         return [M - 1 - mm, c]
     }
   }
-  const rect = (m0: number, ms: number, c0: number, cs: number) => {
+  const rect = (m0: number, ms: number, c0: number) => {
     switch (dir) {
       case "TD":
         return { x: c0, y: m0 }
@@ -855,16 +936,18 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
         cv.path(pts, s.style)
       }
   }
-  for (const it of items)
-    if (it.kind === "dummy") {
+  // Dummies and labels: the edge runs straight through their layer.
+  for (const it of real)
+    if (it.kind === "dummy" || it.kind === "label") {
       const s = it.up[0] ?? it.down[0]
       if (!s) continue
-      cv.path([pt(layerStart[it.layer]!, it.x), pt(layerStart[it.layer]! + lsz[it.layer]! - 1, it.x)], s.style)
+      const c = it.x + co(it)
+      cv.path([pt(layerStart[it.layer]!, c), pt(layerStart[it.layer]! + lsz[it.layer]! - 1, c)], s.style)
     }
 
   for (const it of nodeItems) {
     const box = it.box!
-    const r = rect(it.m0, it.ms, it.x, it.cs)
+    const r = rect(it.m0, it.ms, it.x)
     box.rows.forEach((row, i) => {
       const lead = row.length - row.trimStart().length
       cv.text(r.x + lead, r.y + i, row.trim())
@@ -882,7 +965,7 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
     else if (ch === "│") t = outward === RIGHT ? (thick ? "┝" : "├") : outward === LEFT ? (thick ? "┥" : "┤") : ""
     if (t) cv.text(x, y, t)
   }
-  for (const it of items)
+  for (const it of real)
     for (const s of it.down) {
       if (s.first && s.u.kind === "node") {
         const a = portX(s.uPort!)
@@ -902,22 +985,16 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
       }
     }
 
-  // Edge labels.
-  for (const it of items) {
-    for (const p of [...it.near, ...it.far]) {
-      if (!p.labels.length) continue
-      const { main, cross, bw } = blockSize(p.labels)
-      let m0: number
-      if (p.far) m0 = gapSrc[it.layer]!
-      else m0 = gapCh[it.layer - 1]! + gapChannels[it.layer - 1]! + (labelMain(layers[it.layer]!.flatMap((x) => x.near)) - main)
-      const c0 = labelStart(portX(p), p.labels)
-      const r = rect(m0, main, c0, cross)
-      p.labels.forEach((line, i) => {
-        const w = strWidth(line)
-        if (vertical) cv.text(r.x + Math.floor((bw - w) / 2), r.y + i, line)
-        else cv.text(r.x + 1 + Math.floor((bw - w) / 2), r.y + i, line)
-      })
-    }
+  // Edge labels, over their own edge's line.
+  for (const it of real) {
+    if (it.kind !== "label") continue
+    const r = rect(it.m0, it.ms, it.x)
+    const bw = maxWidth(it.text)
+    it.text.forEach((line, i) => {
+      const w = strWidth(line)
+      if (vertical) cv.text(r.x + Math.floor((bw - w) / 2), r.y + i, line)
+      else cv.text(r.x + 1 + Math.floor((bw - w) / 2), r.y + i, line)
+    })
   }
 
   // Frame titles go on the frame's top border where no edge crosses it.
