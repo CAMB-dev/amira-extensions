@@ -311,9 +311,13 @@ export class WorkflowRun {
         )
         wt = undefined
       }
-      if (this.status !== "running") return
     }
     const tree = wt && !("error" in wt) ? wt : undefined
+    // The run ended while the worktree was being made: nothing will work in it.
+    if (this.status !== "running") {
+      if (tree) await finishWorktree(this.#opts.git, tree, false)
+      return
+    }
     let child: ChildSession
     try {
       child = this.#opts.group.spawn({
