@@ -63,6 +63,27 @@ closes:
 The next `browser_open` starts a new one. While a browser is open, the status bar shows
 `browser <host>` (or `browser ×2` for several).
 
+## For other extensions: rendering HTML to a PNG
+
+With Amira's extension API 0.1.3 or later, the extension offers the service
+`browser.renderHtmlToPng` (`api.useService("browser.renderHtmlToPng")`), which the `mermaid`
+extension uses to draw diagrams it has no text layout for:
+
+```ts
+const render = api.useService("browser.renderHtmlToPng")
+const png = await render?.({ html, width: 800, selector: "#diagram", deviceScaleFactor: 2 })
+```
+
+- `html` is a self-contained page: a render reaches **no network at all** (every request and
+  WebSocket refused, the context offline), so scripts and styles must be inline.
+- The page is shot once it has loaded and, when it sets `window.amiraRenderDone` (a promise),
+  once that settles; a rejection fails the render with its message.
+- `selector` shoots only that element; else `height` sets the viewport and the shot, and
+  without it the whole page is shot at `width`. `deviceScaleFactor` (default 1) and
+  `timeoutMs` (default 15000) are optional.
+- It runs in a throwaway context of a browser that is open already (a session's), else of one
+  kept for renders, which shows in the status bar and closes when idle like the others.
+
 ## What pages may reach
 
 - `http` and `https` URLs, including `localhost`, `*.localhost` and loopback addresses:

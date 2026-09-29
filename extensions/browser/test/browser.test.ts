@@ -4,6 +4,7 @@ import { networkInterfaces, tmpdir } from "node:os"
 import path from "node:path"
 import type {
   ExtensionAPI,
+  HtmlToPngRequest,
   StatusItem,
   ToolContext,
   ToolDefinition,
@@ -52,6 +53,8 @@ const PAGES: Record<string, string> = {
 let server: ReturnType<typeof Bun.serve>
 let base: string
 let downloads = 0
+/** Requests a render made, which must be none. */
+let beacons = 0
 const tempDir = mkdtempSync(path.join(tmpdir(), "browser-ext-test-"))
 
 /**
@@ -90,6 +93,10 @@ beforeAll(() => {
         return Bun.sleep(1500).then(
           () => new Response("<title>Slow</title>", { headers: { "content-type": "text/html" } }),
         )
+      if (pathname.startsWith("/beacon")) {
+        beacons++
+        return new Response("seen")
+      }
       if (pathname === "/file.bin") {
         downloads++
         return new Response("binary", { headers: { "content-type": "application/octet-stream" } })
@@ -125,6 +132,8 @@ interface Harness {
   presenters: Map<string, ToolPresenter>
   loaded: string[]
   errors: string[]
+  /** Services the extension offers others (D88). */
+  services: Map<string, unknown>
 }
 
 function harness(settings: Partial<typeof DEFAULTS> = {}): Harness {
@@ -134,6 +143,7 @@ function harness(settings: Partial<typeof DEFAULTS> = {}): Harness {
   const items: StatusItem[] = []
   const loaded: string[] = []
   const errors: string[] = []
+  const services = new Map<string, unknown>()
   const api = {
     apiVersion: "0.1.1",
     cwd: process.cwd(),
@@ -152,6 +162,10 @@ function harness(settings: Partial<typeof DEFAULTS> = {}): Harness {
       return () => {}
     },
     requestRender() {},
+    provideService: (name: string, s: unknown) => {
+      services.set(name, s)
+      return () => {}
+    },
     reportError: (e: string) => void errors.push(e),
     runCommand: (argv: string[], o: Parameters<ExtensionAPI["runCommand"]>[1]) => runCommand(argv, o),
     on(type: string, h: (e: any) => void) {
@@ -165,6 +179,7 @@ function harness(settings: Partial<typeof DEFAULTS> = {}): Harness {
     presenters,
     loaded,
     errors,
+    services,
     async call(name, args = {}, sessionId = "s1") {
       const tool = tools.get(name)
       if (!tool) throw new Error(`no tool ${name}`)
@@ -363,6 +378,63 @@ describe.skipIf(!hasBrowser)("with a real browser", () => {
     const r = await h.call("browser_click", { selector: "#go" }, "other-session")
     expect(r.isError).toBe(true)
     expect(text(r)).toContain("browser_open")
+  })
+})
+
+describe.skipIf(!hasBrowser)("renderHtmlToPng, the service for other extensions", () => {
+  const pngSize = (b: Uint8Array) => {
+    const v = new DataView(b.buffer, b.byteOffset, b.byteLength)
+    return { width: v.getUint32(16), height: v.getUint32(20) }
+  }
+
+  test("renders a page once it says it is done, only its element, at the scale asked", async () => {
+    const h = harness()
+    const render = h.services.get("browser.renderHtmlToPng") as (r: HtmlToPngRequest) => Promise<Uint8Array>
+    expect(typeof render).toBe("function")
+    const html = `<!doctype html><body style="margin:0">
+      <div id="out" style="display:inline-block"></div>
+      <script>
+        window.amiraRenderDone = new Promise((done) => setTimeout(() => {
+          const box = document.getElementById("out")
+          box.style.width = "120px"; box.style.height = "40px"; box.style.background = "teal"
+          done()
+        }, 100))
+      </script></body>`
+    const png = await render({ html, width: 400, selector: "#out", deviceScaleFactor: 2 })
+    expect([...png.subarray(0, 8)]).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    expect(pngSize(png)).toEqual({ width: 240, height: 80 })
+    // Without a selector nor a height: the whole page at its width.
+    const page = await render({
+      html: `<body style="margin:0"><div style="height:900px"></div></body>`,
+      width: 300,
+    })
+    expect(pngSize(page)).toEqual({ width: 300, height: 900 })
+    // No tool call opened a browser: the render one shows in the status bar, and idles out.
+    expect(h.status()).toBe("browser")
+    await h.manager.closeAll("test over")
+  })
+
+  test("a render reaches no network, and fails when the page does", async () => {
+    const h = harness()
+    const render = h.services.get("browser.renderHtmlToPng") as (r: HtmlToPngRequest) => Promise<Uint8Array>
+    beacons = 0
+    const html = `<!doctype html><img src="${base}/beacon-img"><link rel="stylesheet" href="${base}/beacon-css">
+      <script>
+        window.amiraRenderDone = fetch("${base}/beacon-fetch").then(() => "reached", () => "refused")
+          .then((r) => { document.title = r; new WebSocket("${base.replace("http", "ws")}/beacon-ws") })
+      </script><p>hi</p>`
+    const png = await render({ html, width: 200, height: 100 })
+    expect(png.length).toBeGreaterThan(100)
+    await Bun.sleep(200)
+    expect(beacons).toBe(0)
+    const failing = `<script>window.amiraRenderDone = Promise.reject(new Error("syntax error in diagram"))</script>`
+    await expect(render({ html: failing, width: 200 })).rejects.toThrow("syntax error in diagram")
+    await expect(
+      render({ html: "<p>x</p>", width: 200, selector: "#missing", timeoutMs: 500 }),
+    ).rejects.toThrow()
+    await expect(render({ html: "x", width: 0 })).rejects.toThrow("width")
+    await expect(render({ html: 5 as unknown as string, width: 100 })).rejects.toThrow("html")
+    await h.manager.closeAll("test over")
   })
 })
 

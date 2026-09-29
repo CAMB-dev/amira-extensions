@@ -66,6 +66,16 @@ export interface SessionOptions {
 
 const cap = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s)
 
+/** A render of HTML to a PNG, checked (see renderRequest in index.ts). */
+export interface RenderRequest {
+  html: string
+  width: number
+  height?: number
+  deviceScaleFactor: number
+  selector?: string
+  timeoutMs: number
+}
+
 function launchArgs(exe: string, profile: string, s: BrowserSettings): string[] {
   const args = [
     exe,
@@ -338,6 +348,56 @@ export class BrowserSession {
     const page = await this.context.newPage()
     this.adopt(page)
     return page
+  }
+
+  /**
+   * Renders a self-contained HTML page to a PNG (the browser.renderHtmlToPng service): in a
+   * throwaway context of this browser, with no network at all (every request refused, offline,
+   * no WebSockets, no service workers), JavaScript on, dialogs dismissed. The page is shot once
+   * it loaded and `window.amiraRenderDone` (when it sets one) settled; only `selector`'s element
+   * when given, else the viewport, or the whole page when no height is given.
+   */
+  async renderHtml(req: RenderRequest, signal: AbortSignal): Promise<Uint8Array> {
+    await this.start(signal)
+    const browser = this.browser
+    if (!browser || this.ended) throw new Error("the browser closed")
+    const end = this.begin()
+    let context: BrowserContext | undefined
+    try {
+      context = await browser.newContext({
+        viewport: { width: req.width, height: req.height ?? 600 },
+        deviceScaleFactor: req.deviceScaleFactor,
+        offline: true,
+        acceptDownloads: false,
+        serviceWorkers: "block",
+        javaScriptEnabled: true,
+      })
+      // Nothing leaves the page: what it needs must be in it.
+      await context.route("**/*", (route) => {
+        const url = route.request().url()
+        if (url.startsWith("data:") || url === "about:blank") return route.continue().catch(() => {})
+        return route.abort("blockedbyclient").catch(() => {})
+      })
+      await context.routeWebSocket(/.*/, (ws) => ws.close({ code: 1008, reason: "no network for renders" }))
+      const ctx = context
+      const shot = async () => {
+        const page = await ctx.newPage()
+        page.on("dialog", (d) => void d.dismiss().catch(() => {}))
+        await page.setContent(req.html, { waitUntil: "load", timeout: req.timeoutMs })
+        await page.evaluate(async () => {
+          const done = (globalThis as { amiraRenderDone?: unknown }).amiraRenderDone
+          if (done && typeof (done as Promise<unknown>).then === "function") await done
+        })
+        const png = req.selector
+          ? await page.locator(req.selector).first().screenshot({ type: "png", timeout: req.timeoutMs })
+          : await page.screenshot({ type: "png", fullPage: req.height === undefined, timeout: req.timeoutMs })
+        return new Uint8Array(png)
+      }
+      return await raceSignal(shot(), AbortSignal.any([signal, AbortSignal.timeout(req.timeoutMs)]))
+    } finally {
+      await context?.close().catch(() => {})
+      end()
+    }
   }
 
   /**
