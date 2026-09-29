@@ -53,7 +53,7 @@ Nothing is installed for you: a server is used when its program is on `PATH` (on
 | `csharp` | `.cs` | `csharp-ls`, `OmniSharp -lsp`, `omnisharp -lsp` |
 
 A server starts the first time a file of its kind is checked, and keeps running until Amira
-exits. Each runs for a project folder: the topmost folder between the file and the working
+exits (then it is asked to shut down). Each runs for a project folder: the topmost folder between the file and the working
 directory that has one of the server's markers (`tsconfig.json`, `package.json`,
 `pyproject.toml`, `Cargo.toml`, `go.mod`, `*.sln`, ...), so a monorepo gets one server;
 without a marker, the working directory. A server that fails to start is reported once and
@@ -61,11 +61,23 @@ left alone until `/lsp restart`; one that crashes is started again, up to three 
 
 The first check of a new server waits longer (4 × `waitMs`), since servers load the project
 first. A server that does not answer in time adds nothing; the model can ask again with the
-`diagnostics` tool.
+`diagnostics` tool. Starting, asking and waiting share one time limit per check
+(`startupTimeoutMs` + 4 × `waitMs`, or `tscTimeoutMs` for the fallback), so a slow server
+never holds the edit back longer than that.
+
+A server that answers `textDocument/diagnostic` is asked. Otherwise the check waits for what
+it publishes about the text just sent: a publish naming that version is the answer at once;
+one without a version may be a first pass (typescript-language-server sends syntax errors
+first, type errors later), so the last one counts once the server has been quiet for the
+server's `settleMs` (1200 ms for `typescript`, 200 ms for the others).
 
 Without `typescript-language-server`, TypeScript files are checked with the project's own
-`tsc` (`node_modules/.bin`, else `PATH`): `tsc --noEmit -p` the nearest `tsconfig.json`. That
-is slower (the whole project) and skips JavaScript.
+`tsc` (`node_modules/.bin` in the working directory or a folder above it, up to the
+repository's root and never the home folder or above; else `PATH`): `tsc --noEmit -p` the
+nearest `tsconfig.json`. That is slower (the whole project) and skips JavaScript. A file the
+tsconfig does not include (excluded, outside `include`, or a tsconfig with only
+`references`) is not called clean: edits add nothing for it, and the `diagnostics` tool says
+it was not checked.
 
 ## Settings
 
@@ -93,6 +105,7 @@ In `settings.json`, under `extensions.lsp`:
           "extensions": [".zig"],
           "rootMarkers": ["build.zig"],
           "languageId": "zig",
+          "settleMs": 200,          // quiet time before a publish without a version counts
           "initializationOptions": {},
           "settings": {}            // answers workspace/configuration
         }
