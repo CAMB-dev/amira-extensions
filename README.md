@@ -23,6 +23,7 @@ amira ext remove mcp-server
 | [share](extensions/share) | `/export` the session as Markdown or HTML; `/commit`, `/pr` and `/review` git helpers |
 | [hooks](extensions/hooks) | Your commands on events: format or lint after each edit, block or ask before risky commands, tests after a turn |
 | [browser](extensions/browser) | `browser_*` tools: the model opens pages (your dev server) in an installed Chrome or Edge, screenshots, clicks, types and reads the console |
+| [checkpoints](extensions/checkpoints) | A snapshot of the files before each turn (private git refs); `/rewind` restores files, or files and conversation |
 
 ## The index
 

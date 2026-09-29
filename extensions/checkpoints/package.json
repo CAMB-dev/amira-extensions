@@ -1,0 +1,18 @@
+{
+  "name": "checkpoints",
+  "version": "0.1.0",
+  "description": "Checkpoints and /rewind: a snapshot of the files before each turn, in private git refs, and a way back to any of them",
+  "type": "module",
+  "scripts": {
+    "link-amira": "bun scripts/link-amira.ts",
+    "test": "bun test"
+  },
+  "amira": {
+    "engines": {
+      "amira": "^0.1.2"
+    },
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}
