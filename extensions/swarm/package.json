@@ -1,6 +1,6 @@
 {
   "name": "swarm",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Swarm mode: long-lived sub-agents that work on one goal together through a shared blackboard and direct messages",
   "type": "module",
   "scripts": {
