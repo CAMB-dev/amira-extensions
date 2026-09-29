@@ -1,5 +1,5 @@
-import { defineExtension, type ExtensionAPI, type ToolContext } from "@amira/api"
-import { BrowserSession } from "./browser.ts"
+import { defineExtension, type ExtensionAPI, type HtmlToPngRequest, type ToolContext } from "@amira/api"
+import { BrowserSession, type RenderRequest } from "./browser.ts"
 import { type DetectEnv, type FoundBrowser, findBrowser } from "./detect.ts"
 import { type Resolver, UrlPolicy } from "./policy.ts"
 import { browserPresenters } from "./presenters.ts"
@@ -59,6 +59,22 @@ export class BrowserManager {
     return session
   }
 
+  /**
+   * Renders HTML to a PNG for another extension (the browser.renderHtmlToPng service): in the
+   * browser of a session that has one open, else in one kept for renders, which idles out
+   * like the others.
+   */
+  async renderHtmlToPng(raw: HtmlToPngRequest): Promise<Uint8Array> {
+    const req = renderRequest(raw)
+    let session = this.open()[0]
+    if (!session) {
+      const had = this.sessions.get(RENDER_SESSION)
+      if (had && !had.closed) session = had
+      else session = this.session({ session: { sessionId: RENDER_SESSION } } as unknown as ToolContext)
+    }
+    return session.renderHtml(req, AbortSignal.timeout(req.timeoutMs + 30_000))
+  }
+
   /** Browsers open right now. */
   open(): BrowserSession[] {
     return [...this.sessions.values()].filter((s) => s.isOpen)
@@ -73,6 +89,35 @@ export class BrowserManager {
   async closeAll(reason: string) {
     await Promise.all([...this.sessions.keys()].map((id) => this.close(id, reason)))
   }
+}
+
+/** The browser kept for renders when no session has one open. */
+const RENDER_SESSION = "\0render"
+
+/** A render request as the service takes it, checked: sizes in range, a string of HTML. */
+export function renderRequest(raw: HtmlToPngRequest): RenderRequest {
+  const r = (raw ?? {}) as Partial<HtmlToPngRequest>
+  if (typeof r.html !== "string") throw new Error("renderHtmlToPng: html must be a string")
+  if (r.html.length > 32 * 1024 * 1024) throw new Error("renderHtmlToPng: html is over 32 MB")
+  const int = (v: unknown, name: string, min: number, max: number) => {
+    if (typeof v !== "number" || !Number.isFinite(v) || v < min || v > max)
+      throw new Error(`renderHtmlToPng: ${name} must be a number from ${min} to ${max}`)
+    return Math.round(v)
+  }
+  const req: RenderRequest = {
+    html: r.html,
+    width: int(r.width, "width", 16, 4096),
+    deviceScaleFactor:
+      r.deviceScaleFactor === undefined ? 1 : Math.min(4, Math.max(0.25, Number(r.deviceScaleFactor) || 1)),
+    timeoutMs: r.timeoutMs === undefined ? 15_000 : int(r.timeoutMs, "timeoutMs", 100, 120_000),
+  }
+  if (r.height !== undefined) req.height = int(r.height, "height", 16, 16_384)
+  if (r.selector !== undefined) {
+    if (typeof r.selector !== "string" || !r.selector.trim() || r.selector.length > 1000)
+      throw new Error("renderHtmlToPng: selector must be a CSS selector")
+    req.selector = r.selector
+  }
+  return req
 }
 
 function statusText(open: BrowserSession[]): string | undefined {
@@ -115,6 +160,11 @@ export function createBrowserExtension(opts: BrowserExtensionOptions = {}) {
       tone: "accent",
       text: () => statusText(manager.open()),
     })
+
+    // For other extensions (D88), where Amira offers services (API 0.1.3): e.g. mermaid
+    // diagrams rendered to an image.
+    if (typeof api.provideService === "function")
+      api.provideService("browser.renderHtmlToPng", (req) => manager.renderHtmlToPng(req))
 
     const report = (err: unknown) =>
       api.reportError(`browser: ${err instanceof Error ? err.message : String(err)}`)
