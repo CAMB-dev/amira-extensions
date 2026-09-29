@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test"
 import { mkdtempSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { networkInterfaces, tmpdir } from "node:os"
 import path from "node:path"
 import type {
   ExtensionAPI,
@@ -10,6 +10,7 @@ import type {
   ToolPresenter,
   ToolResult,
 } from "@amira/api"
+import { isPrivateAddress } from "@amira/api"
 import { runCommand } from "@amira/proc"
 import type { BrowserManager } from "../src/index.ts"
 import { createBrowserExtension, findBrowser } from "../src/index.ts"
@@ -53,12 +54,38 @@ let base: string
 let downloads = 0
 const tempDir = mkdtempSync(path.join(tmpdir(), "browser-ext-test-"))
 
+/**
+ * A server on this machine's private-network address (when it has one), which the policy
+ * refuses: what redirects must not reach.
+ */
+const lanIp = Object.values(networkInterfaces())
+  .flat()
+  .find((a) => a?.family === "IPv4" && !a.internal && isPrivateAddress(a.address))?.address
+let lan: ReturnType<typeof Bun.serve> | undefined
+let lanUrl = ""
+
 beforeAll(() => {
+  if (lanIp) {
+    lan = Bun.serve({
+      hostname: lanIp,
+      port: 0,
+      fetch: () =>
+        new Response("<title>Secret</title><p>intranet secret</p>", {
+          headers: { "content-type": "text/html" },
+        }),
+    })
+    lanUrl = `http://${lanIp}:${lan.port}/`
+  }
   server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     async fetch(req) {
       const { pathname } = new URL(req.url)
+      if (pathname === "/to-lan") return Response.redirect(lanUrl, 302)
+      if (pathname === "/lan-img")
+        return new Response(`<title>Img</title><img src="/to-lan">`, {
+          headers: { "content-type": "text/html" },
+        })
       if (pathname === "/slow")
         return Bun.sleep(1500).then(
           () => new Response("<title>Slow</title>", { headers: { "content-type": "text/html" } }),
@@ -78,6 +105,7 @@ beforeAll(() => {
 
 afterAll(async () => {
   server?.stop(true)
+  lan?.stop(true)
   // Profiles stay locked for a moment after their browser died.
   for (let i = 0; i < 40; i++) {
     try {
@@ -299,6 +327,38 @@ describe.skipIf(!hasBrowser)("with a real browser", () => {
     expect(text(await h.call("browser_console"))).toContain("[dialog] confirm: sure? (dismissed)")
   })
 
+  test.skipIf(!lanIp)("a redirect to a refused address is left, and reported", async () => {
+    const r = await h.call("browser_open", { url: `${base}/to-lan` })
+    expect(r.isError).toBe(true)
+    expect(text(r)).toContain("redirected to a refused address")
+    expect(text(r)).not.toContain("intranet secret")
+    expect(text(await h.call("browser_eval", { expression: "location.href" }))).toBe('"about:blank"')
+    // A subresource cannot be stopped once redirected, but it is reported.
+    const img = await h.call("browser_open", { url: `${base}/lan-img` })
+    expect(text(img)).toContain("a redirect reached a refused address")
+  })
+
+  test("a page closed by its own script is replaced by the next browser_open", async () => {
+    await h.call("browser_open", { url: `${base}/next` })
+    await h.call("browser_eval", { expression: "window.close()" })
+    await Bun.sleep(300)
+    const r = await h.call("browser_open", { url: `${base}/` })
+    expect(r.isError).toBeUndefined()
+    expect(text(r)).toContain("Home page")
+  })
+
+  test("browser_console clear forgets only what it listed", async () => {
+    await h.call("browser_console", { clear: true })
+    await h.call("browser_open", { url: `${base}/broken` })
+    await h.call("browser_console", { level: "error", clear: true })
+    const rest = text(await h.call("browser_console"))
+    expect(rest).not.toContain("bad thing")
+    expect(rest).toBe("No console messages.")
+    await h.call("browser_open", { url: `${base}/` })
+    await h.call("browser_console", { level: "error", clear: true })
+    expect(text(await h.call("browser_console"))).toContain("[warning] a warning")
+  })
+
   test("tools other than browser_open need an open page", async () => {
     const r = await h.call("browser_click", { selector: "#go" }, "other-session")
     expect(r.isError).toBe(true)
@@ -322,6 +382,16 @@ describe.skipIf(!hasBrowser)("lifetime", () => {
     expect(text(again)).toContain("Next")
     expect(pidOf(h, "s1")).not.toBe(pid)
     await h.manager.closeAll("test over")
+  })
+
+  test("browser_close while the browser is starting stops the start", async () => {
+    const h = harness()
+    const opening = h.call("browser_open", { url: `${base}/` })
+    await Bun.sleep(50)
+    expect(text(await h.call("browser_close"))).toBe("Closed the browser.")
+    expect((await opening).isError).toBe(true)
+    expect(h.manager.open()).toEqual([])
+    expect(text(await h.call("browser_close"))).toBe("No browser is open.")
   })
 
   test("the end of the session, or of a sub-agent, closes its browser", async () => {

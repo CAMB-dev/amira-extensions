@@ -2,7 +2,7 @@ import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import type { RunCommandOptions, RunCommandResult } from "@amira/api"
-import type { Browser, BrowserContext, ConsoleMessage, Dialog, Page, WebError } from "playwright-core"
+import type { Browser, BrowserContext, ConsoleMessage, Dialog, Frame, Page, WebError } from "playwright-core"
 import type { FoundBrowser } from "./detect.ts"
 import type { UrlPolicy } from "./policy.ts"
 import type { BrowserSettings } from "./settings.ts"
@@ -18,6 +18,9 @@ export interface LogEntry {
   /** Where it came from: a script location, or the refused URL. */
   where?: string
 }
+
+/** How the log records a page left because a redirect led to a refused address. */
+export const LEFT_PAGE = "left a page a redirect led to"
 
 const MAX_LOG = 300
 const MAX_ENTRY_CHARS = 2000
@@ -105,6 +108,7 @@ export class BrowserSession {
   private idleTimer: ReturnType<typeof setTimeout> | undefined
   private ended = false
   private seq = 0
+  private readonly adopted = new WeakSet<Page>()
   /** Tool calls running now. */
   private busy = 0
   readonly log: LogEntry[] = []
@@ -113,6 +117,11 @@ export class BrowserSession {
 
   get isOpen(): boolean {
     return !!this.context && !this.ended
+  }
+
+  /** Open, or on its way: a browser_close has something to close. */
+  get active(): boolean {
+    return !this.ended && (!!this.context || !!this.starting)
   }
 
   /** Closed for good: idle, crashed, failed to start, or closed on purpose. */
@@ -251,10 +260,37 @@ export class BrowserSession {
       this.push("blocked", refusal, ws.url())
       await ws.close({ code: 1008, reason: "refused by Amira's browser settings" })
     })
+    // Playwright continues redirects without asking the route, so a redirect can reach a
+    // refused address. A subresource that did is already loaded: say so at least.
+    context.on("request", (req) => {
+      if (!req.redirectedFrom()) return
+      void policy.checkRequest(req.url()).then((refusal) => {
+        if (refusal)
+          this.push("blocked", `a redirect reached a refused address and was loaded: ${refusal}`, req.url())
+      })
+    })
+  }
+
+  /**
+   * Leaves a document the policy refuses, which only a redirect can have loaded: the page goes
+   * to about:blank. Returns the refusal, if any.
+   */
+  async leaveRefused(page: Page, frame: Frame = page.mainFrame()): Promise<string | undefined> {
+    const url = frame.url()
+    const refusal = await this.opts.policy.checkRequest(url)
+    if (!refusal) return undefined
+    this.push("blocked", `${LEFT_PAGE}: ${refusal}`, url)
+    if (frame === page.mainFrame()) await page.goto("about:blank").catch(() => {})
+    else await frame.evaluate(() => (globalThis as any).location.replace("about:blank")).catch(() => {})
+    return refusal
   }
 
   private adopt(page: Page) {
     this.current = page
+    // A page arrives both from newPage() and from the context's "page" event.
+    if (this.adopted.has(page)) return
+    this.adopted.add(page)
+    page.on("framenavigated", (frame) => void this.leaveRefused(page, frame))
     page.on("dialog", (d) => this.onDialog(d))
     page.on("close", () => {
       if (this.current !== page) return
@@ -292,6 +328,16 @@ export class BrowserSession {
     const p = this.current
     if (!this.context || !p || p.isClosed()) throw new NoPageError()
     return p
+  }
+
+  /** The current page, or a new one when the last was closed (e.g. by window.close()). */
+  async ensurePage(): Promise<Page> {
+    const p = this.current
+    if (p && !p.isClosed()) return p
+    if (!this.context) throw new NoPageError()
+    const page = await this.context.newPage()
+    this.adopt(page)
+    return page
   }
 
   /**

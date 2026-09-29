@@ -1,6 +1,6 @@
 import { defineTool, type ToolContext, type ToolDefinition, type ToolResult, textResult } from "@amira/api"
 import type { Locator, Page } from "playwright-core"
-import { type BrowserSession, type LogEntry, NoPageError, raceSignal } from "./browser.ts"
+import { type BrowserSession, LEFT_PAGE, type LogEntry, NoPageError, raceSignal } from "./browser.ts"
 import type { UrlPolicy } from "./policy.ts"
 import type { BrowserSettings } from "./settings.ts"
 
@@ -180,12 +180,24 @@ export function browserTools(env: ToolEnv): ToolDefinition[] {
       if (refusal) return textResult(refusal, true)
       await session.start(ctx.signal)
       ctx.session?.loadTools(TOOL_NAMES.filter((n) => n !== OPEN_TOOL))
-      const page = session.page()
+      const page = await session.ensurePage()
       const mark = session.mark
       const waitUntil = ["load", "domcontentloaded", "networkidle"].includes(str(p.waitUntil))
         ? (p.waitUntil as "load")
         : "load"
-      const response = await page.goto(checked.url, { waitUntil })
+      let response: Awaited<ReturnType<Page["goto"]>> = null
+      let failed: unknown
+      try {
+        response = await page.goto(checked.url, { waitUntil })
+      } catch (err) {
+        // Possibly because the page was already led away from a refused redirect target.
+        failed = err
+      }
+      const redirected =
+        (await session.leaveRefused(page)) ??
+        session.log.find((e) => e.seq > mark && e.type === "blocked" && e.text.startsWith(LEFT_PAGE))?.text
+      if (redirected) return textResult(`${checked.url} redirected to a refused address. ${redirected}`, true)
+      if (failed) throw failed
       const state = await pageState(page)
       const status = response?.status()
       const text = await page
@@ -309,6 +321,8 @@ export function browserTools(env: ToolEnv): ToolDefinition[] {
   ): Promise<ToolResult> => {
     await settle(page)
     const now = session.page()
+    const redirected = await session.leaveRefused(now)
+    if (redirected) return textResult(`${done}, which led to a refused address. ${redirected}`, true)
     const state = await pageState(now)
     const problems = problemsSince(session, mark)
     const lines = [done, `Now at ${describe(state)}`, ...problemLines(problems)]
@@ -526,7 +540,10 @@ export function browserTools(env: ToolEnv): ToolDefinition[] {
       const limit = Number.isInteger(p.limit) ? Math.min(300, Math.max(1, p.limit as number)) : 50
       const matching = session.log.filter(keep)
       const shown = matching.slice(-limit)
-      if (p.clear) session.log.splice(0, session.log.length)
+      if (p.clear) {
+        const seen = new Set(shown.map((e) => e.seq))
+        session.log.splice(0, session.log.length, ...session.log.filter((e) => !seen.has(e.seq)))
+      }
       if (!shown.length) return textResult("No console messages.")
       const lines = shown.map((e) => `[${e.type}] ${e.text}${e.where ? `  (${e.where})` : ""}`)
       const head = matching.length > shown.length ? `Last ${shown.length} of ${matching.length}:\n` : ""
@@ -544,7 +561,8 @@ export function browserTools(env: ToolEnv): ToolDefinition[] {
     exposure: "deferred",
     async execute(_p, ctx) {
       const session = env.existing(ctx)
-      if (!session?.isOpen) return textResult("No browser is open.")
+      // A browser still starting counts: closing it stops the start.
+      if (!session?.active) return textResult("No browser is open.")
       await session.close("closed by the model")
       return textResult("Closed the browser.")
     },

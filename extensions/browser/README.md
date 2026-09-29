@@ -76,9 +76,14 @@ The next `browser_open` starts a new one. While a browser is open, the status ba
 Refused requests show up in `browser_console` as `[blocked]`, and in the result of the call
 that caused them.
 
-The checks are best effort: redirects of subresources are not checked hop by hop, and a host
-name is resolved again by the browser, so a name that changes its answer (DNS rebinding) can
-get past them. The browser's DevTools port listens on 127.0.0.1 while it runs.
+A host name that cannot be resolved for the check is refused too.
+
+The checks are best effort. Playwright follows redirects without asking, so a page (or
+frame) a redirect led to a refused address is left for `about:blank` as soon as it loads,
+and the call reports it; a script or image redirected there is already loaded, and is only
+reported (`a redirect reached a refused address`). A host name is resolved again by the
+browser, so a name that changes its answer (DNS rebinding) can get past the checks. The
+browser's DevTools port listens on 127.0.0.1 while it runs.
 
 ## Settings
 
