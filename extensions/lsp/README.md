@@ -8,7 +8,7 @@ result, so it fixes them in its next step instead of finding out later.
 amira ext install lsp
 ```
 
-Needs Amira's extension API with `openPipe` and the `tool.result.after` interceptor.
+Needs Amira's extension API 0.1.2 (`openPipe` and the `tool.call.after` interceptor). The check runs after other extensions' `tool.call.after` handlers, so it sees a file a formatter hook just rewrote.
 
 ## What the model sees
 

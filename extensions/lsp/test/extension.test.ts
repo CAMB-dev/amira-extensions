@@ -199,6 +199,28 @@ test("a failed edit adds no file, but still reports for the batch; the severity 
   expect(mock.requests).toHaveLength(2)
 })
 
+test("the check runs after other tool.call.after handlers, so it sees what a formatter wrote", async () => {
+  const { mock, agent, host } = await setup([
+    () => ({ toolCalls: [{ id: "w1", name: "write", args: { path: "a.fk", content: "ERROR: unformatted\n" } }] }),
+    (req) => {
+      expect(textOf(results(req)[0])).toBe("Wrote a.fk\nformatted")
+      return { text: "ok" }
+    },
+  ])
+  // Loaded after lsp, at the default priority: a formatter hook that fixes the file.
+  await host.load(
+    (api) =>
+      void api.intercept("tool.call.after", (v) => {
+        writeFileSync(path.resolve(v.cwd, String(v.args.path)), "fine\n")
+        const content = [...v.result.content, { type: "text" as const, text: "formatted" }]
+        return { action: "modify", value: { ...v, result: { ...v.result, content } } }
+      }),
+    "pkg:formatter",
+  )
+  expect(await agent.prompt("go")).toMatchObject({ reason: "done" })
+  expect(mock.requests).toHaveLength(2)
+})
+
 test("the diagnostics tool checks any file, with warnings by default", async () => {
   const { dir, mock, agent } = await setup([
     () => ({

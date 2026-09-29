@@ -42,6 +42,8 @@ export const DIAGNOSTICS_TOOL = "diagnostics"
 const TOOL_MAX_ITEMS = 100
 /** Diagnostic lines under an edit in the transcript's summary view. */
 const SUMMARY_LINES = 3
+/** tool.call.after priority: late, so formatters (default 0) have changed the file first. */
+export const LSP_PRIORITY = 100
 
 export interface LspExtensionOptions {
   /** Looks programs up on PATH; tests pass their own. */
@@ -115,7 +117,7 @@ const diagnosticsPresenter: ToolPresenter<{ path?: string }, DiagnosticsDetails>
 
 /** The file a successful edit or write changed: the absolute path in its details, else its `path` argument. */
 export function editedFile(
-  v: Pick<InterceptorMap["tool.result.after"], "args" | "cwd" | "result">,
+  v: Pick<InterceptorMap["tool.call.after"], "args" | "cwd" | "result">,
 ): string | undefined {
   const details = v.result.details as { path?: unknown } | undefined
   if (typeof details?.path === "string" && path.isAbsolute(details.path)) return details.path
@@ -211,7 +213,7 @@ function setUp(api: ExtensionAPI, settings: LspSettings, which: Which) {
   // servers found to that call's result.
   const timeoutMs = Math.max(settings.startupTimeoutMs + settings.waitMs * 4, settings.tscTimeoutMs) + 5000
   api.intercept(
-    "tool.result.after",
+    "tool.call.after",
     async (v, ctx) => {
       if (!tools.has(v.name)) return { action: "pass" }
       let mine = touched.get(ctx.sessionId)
@@ -238,7 +240,8 @@ function setUp(api: ExtensionAPI, settings: LspSettings, which: Which) {
       const result: ToolResult = { ...v.result, content: [...v.result.content, { type: "text", text }] }
       return { action: "modify", value: { ...v, result } }
     },
-    { timeoutMs },
+    // After handlers that change the file (e.g. a formatter hook), so the check sees the result.
+    { timeoutMs, priority: LSP_PRIORITY },
   )
 
   const tool: ToolDefinition<{ path: string; severity?: Severity }> = {

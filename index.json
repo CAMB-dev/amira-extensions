@@ -33,7 +33,7 @@
       "description": "Language server diagnostics after edits: errors in the files the model changed go back to it with the tool result; also a diagnostics tool and /lsp",
       "version": "0.1.0",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/lsp" },
-      "engines": { "amira": "^0.1.1" },
+      "engines": { "amira": "^0.1.2" },
       "tags": ["lsp", "diagnostics", "typescript", "python", "rust", "go", "csharp"],
       "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/lsp"
     }
