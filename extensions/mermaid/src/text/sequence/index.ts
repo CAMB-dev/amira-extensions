@@ -21,8 +21,8 @@ export function renderSequence(source: string, width: number): SequenceRender | 
   const seq = parseSequence(source)
   if (!seq) return undefined
   for (const o of ATTEMPTS) {
-    const lines = layoutSequence(seq, o)
-    if (lines.every((l) => strWidth(l) <= width)) return { lines, compact: false }
+    const lines = layoutSequence(seq, o, width)
+    if (lines && lines.every((l) => strWidth(l) <= width)) return { lines, compact: false }
   }
   return { lines: compactSequence(seq, width), compact: true }
 }

@@ -20,7 +20,11 @@ type Op =
   | { t: "note"; e: Note; y: number; lines: string[]; x0: number; w: number }
   | { t: "frame"; y0: number; y1: number; l: number; r: number; seps: Array<{ y: number; text: string }>; title: string }
 
-export function layoutSequence(seq: Sequence, o: SequenceOptions): string[] {
+/**
+ * Lays the diagram out and returns its lines, or undefined when it would be wider than `width`
+ * (the width is known before anything is drawn).
+ */
+export function layoutSequence(seq: Sequence, o: SequenceOptions, width = Infinity): string[] | undefined {
   const P = seq.participants.length
   const names = seq.participants.map((p) => wrapText(p.label, o.wrap))
   const boxW = seq.participants.map((p, i) => (p.actor ? Math.max(maxWidth(names[i]!), 3) : maxWidth(names[i]!) + 4))
@@ -34,11 +38,12 @@ export function layoutSequence(seq: Sequence, o: SequenceOptions): string[] {
   }
 
   // ---- horizontal: minimum distances between lifelines ------------------------------------
-  const dist = new Map<string, number>()
+  // dist[j]: for each i < j, the least distance from lifeline i to lifeline j.
+  const dist: Array<Map<number, number>> = seq.participants.map(() => new Map())
   const need = (i: number, j: number, d: number) => {
     if (i < 0 || j >= P || i >= j) return
-    const k = `${i},${j}`
-    dist.set(k, Math.max(dist.get(k) ?? 0, d))
+    const m = dist[j]!
+    m.set(i, Math.max(m.get(i) ?? 0, d))
   }
   for (let i = 0; i + 1 < P; i++) need(i, i + 1, rw[i]! + 1 + o.gap + lw[i + 1]!)
   let leftNeed = 0
@@ -71,12 +76,12 @@ export function layoutSequence(seq: Sequence, o: SequenceOptions): string[] {
   const xs: number[] = []
   for (let j = 0; j < P; j++) {
     let x = 0
-    for (let i = 0; i < j; i++) {
-      const d = dist.get(`${i},${j}`)
-      if (d !== undefined) x = Math.max(x, xs[i]! + d)
-    }
+    for (const [i, d] of dist[j]!) x = Math.max(x, xs[i]! + d)
     xs.push(j === 0 ? 0 : Math.max(x, xs[j - 1]! + 1))
   }
+
+  // Already too wide from the participants alone: give up before laying out rows.
+  if (xs[P - 1]! + rw[P - 1]! - (xs[0]! - lw[0]!) + 1 > width) return undefined
 
   // ---- vertical: one pass assigns rows and frame extents ----------------------------------
   const headH = Math.max(...seq.participants.map((p, i) => (p.actor ? 3 + names[i]!.length : 2 + names[i]!.length)))
@@ -164,6 +169,9 @@ export function layoutSequence(seq: Sequence, o: SequenceOptions): string[] {
     if (op.t === "note") minX = Math.min(minX, op.x0)
   }
   const sx = (x: number) => x - minX
+  let maxX = Math.max(...xs.map((x, i) => x + rw[i]!))
+  if (Number.isFinite(ext[1])) maxX = Math.max(maxX, ext[1])
+  if (maxX - minX + 1 > width) return undefined
 
   // ---- draw ------------------------------------------------------------------------------------
   const cv = new Canvas()
