@@ -238,7 +238,9 @@ test("servers are shut down when Amira exits, within its exit handlers' time", a
 
 test("the check runs after other tool.call.after handlers, so it sees what a formatter wrote", async () => {
   const { mock, agent, host } = await setup([
-    () => ({ toolCalls: [{ id: "w1", name: "write", args: { path: "a.fk", content: "ERROR: unformatted\n" } }] }),
+    () => ({
+      toolCalls: [{ id: "w1", name: "write", args: { path: "a.fk", content: "ERROR: unformatted\n" } }],
+    }),
     (req) => {
       expect(textOf(results(req)[0])).toBe("Wrote a.fk\nformatted")
       return { text: "ok" }

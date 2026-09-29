@@ -141,8 +141,7 @@ export class LspClient {
         if (e.type === "spawned") {
           this.#pid = e.pid
           spawned.resolve()
-        }
-        else if (e.type === "stdout") reader.push(e.data)
+        } else if (e.type === "stdout") reader.push(e.data)
         else if (e.type === "stderr") {
           this.#stderrTail = (this.#stderrTail + e.data).slice(-2000)
           this.#log(e.data)
@@ -354,10 +353,7 @@ export class LspClient {
         if (k === key) settled()
       }
       const onAbort = () => finish(false)
-      const deadline = setTimeout(
-        () => finish(current() !== undefined),
-        Math.max(0, deadlineAt - Date.now()),
-      )
+      const deadline = setTimeout(() => finish(current() !== undefined), Math.max(0, deadlineAt - Date.now()))
       this.#listeners.add(listener)
       signal?.addEventListener("abort", onAbort, { once: true })
       if (signal?.aborted) return finish(false)

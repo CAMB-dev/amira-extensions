@@ -6,10 +6,10 @@ import type { OpenPipeOptions } from "@amira/api"
 import { type Diagnostic, LspClient } from "../src/client.ts"
 import { countsInText, describeCounts, diagnosticLine, formatReports } from "../src/format.ts"
 import { editedFile, lspBlock, withDiagnostics } from "../src/index.ts"
+import { checkBudgetMs } from "../src/manager.ts"
 import { encodeMessage, MessageReader, type RpcMessage } from "../src/rpc.ts"
 import { DEFAULT_SERVERS, findCommand, findRoot, languageIdFor, serverFor } from "../src/servers.ts"
 import { readSettings } from "../src/settings.ts"
-import { checkBudgetMs } from "../src/manager.ts"
 import { findTsc, parseTscFileList, parseTscOutput, type RunCommand, runTsc } from "../src/tsc.ts"
 import { fileKey, pathToUri, uriKey, uriToPath } from "../src/uri.ts"
 
@@ -134,9 +134,9 @@ test("settings: defaults, a server of the user's own, and problems reported inst
     waitMs: -1,
   })
   expect(d.servers.find((x) => x.id === "typescript")?.settleMs).toBe(1200)
-  expect(readSettings({ servers: { go: { settleMs: 500 } } }).servers.find((x) => x.id === "go")?.settleMs).toBe(
-    500,
-  )
+  expect(
+    readSettings({ servers: { go: { settleMs: 500 } } }).servers.find((x) => x.id === "go")?.settleMs,
+  ).toBe(500)
   expect(readSettings({ servers: { go: { settleMs: "x" } } }).problems).toEqual([
     "extensions.lsp.servers.go.settleMs must be a number of at least 0",
   ])
@@ -274,7 +274,15 @@ test("tsc runs for several projects share one time limit; a check's budget cover
     limits.push(opts.timeoutMs)
     const took = Math.min(opts.timeoutMs, 400)
     await Bun.sleep(took)
-    return { output: "", exitCode: 0, signalCode: null, timedOut: took < 400, aborted: false, settled: true, contained: true }
+    return {
+      output: "",
+      exitCode: 0,
+      signalCode: null,
+      timedOut: took < 400,
+      aborted: false,
+      settled: true,
+      contained: true,
+    }
   }
   const started = Date.now()
   const r = await runTsc(["tsc"], [path.join(dir, "a", "x.ts"), path.join(dir, "b", "x.ts")], dir, run, {
@@ -308,9 +316,14 @@ test("tsc is looked for up to the repository root, never in the home folder or a
   expect(findTsc(loose, () => null, lookup, home)).toBeUndefined()
   expect(looked).toEqual([loose, path.join(home, "loose")])
   // The project's own tsc wins over PATH.
-  expect(findTsc(pkg, () => "/usr/bin/tsc", (dir) => (dir.startsWith(repo) ? `${dir}/tsc` : undefined), home)).toBe(
-    path.join(pkg, "node_modules", ".bin") + "/tsc",
-  )
+  expect(
+    findTsc(
+      pkg,
+      () => "/usr/bin/tsc",
+      (dir) => (dir.startsWith(repo) ? `${dir}/tsc` : undefined),
+      home,
+    ),
+  ).toBe(path.join(pkg, "node_modules", ".bin") + "/tsc")
 
   const listed = parseTscFileList(
     [
