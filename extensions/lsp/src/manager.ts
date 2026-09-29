@@ -340,12 +340,20 @@ export class ServerManager {
     this.#deps.onChange()
   }
 
+  /** Stops every server; resolves once they are stopped, including ones a call before began to stop. */
   async stopAll(): Promise<void> {
     const entries = [...this.#entries.values()]
     this.#entries.clear()
-    await Promise.all(entries.map((e) => e.client.close().catch(() => {})))
+    for (const e of entries) {
+      const closing = e.client.close().catch(() => {})
+      this.#closing.add(closing)
+      void closing.then(() => this.#closing.delete(closing))
+    }
+    await Promise.all([...this.#closing])
     this.#deps.onChange()
   }
+
+  #closing = new Set<Promise<void>>()
 }
 
 export interface ServerDescription {

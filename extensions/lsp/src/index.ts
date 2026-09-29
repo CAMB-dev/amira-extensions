@@ -340,6 +340,14 @@ function setUp(api: ExtensionAPI, settings: LspSettings, which: Which) {
     touched.clear()
     void manager.stopAll()
   })
+  // Amira waits a few seconds for exit handlers: time for the servers to shut down cleanly
+  // (answer shutdown, then exit) instead of being killed with the host's process trees.
+  api.onExit(async (signal) => {
+    if (signal.aborted) return
+    const cut = Promise.withResolvers<void>()
+    signal.addEventListener("abort", () => cut.resolve(), { once: true })
+    await Promise.race([manager.stopAll(), cut.promise])
+  })
 }
 
 /** The text /lsp prints. */

@@ -223,6 +223,19 @@ test("files of a batch cut short by an abort are not reported with the next turn
   expect(await agent.prompt("again")).toMatchObject({ reason: "done" })
 })
 
+test("servers are shut down when Amira exits, within its exit handlers' time", async () => {
+  const { agent, host, command } = await setup([
+    () => ({ toolCalls: [{ id: "w1", name: "write", args: { path: "a.fk", content: "fine\n" } }] }),
+    () => ({ text: "ok" }),
+  ])
+  await agent.prompt("go")
+  expect(await command("")).toContain("running · fake-lsp")
+  const started = Date.now()
+  await host.runExitHandlers()
+  expect(Date.now() - started).toBeLessThan(4000)
+  expect(await command("")).not.toContain("running")
+})
+
 test("the check runs after other tool.call.after handlers, so it sees what a formatter wrote", async () => {
   const { mock, agent, host } = await setup([
     () => ({ toolCalls: [{ id: "w1", name: "write", args: { path: "a.fk", content: "ERROR: unformatted\n" } }] }),
