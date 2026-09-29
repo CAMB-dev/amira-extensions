@@ -749,6 +749,25 @@ export function layoutFlowchart(fc: Flowchart, o: LayoutOptions): string[] {
   }
   const M = m
   for (const it of items) it.m0 = layerStart[it.layer]! + Math.floor((lsz[it.layer]! - it.ms) / 2)
+  // Pull frame borders in to their members when the members are smaller than their layer
+  // (keeping the blank row and the arrow row inside the frame).
+  for (const c of byDepth) {
+    if (!drawnCluster[c]) continue
+    let inTop = Infinity
+    let inBottom = -Infinity
+    for (const it of nodeItems)
+      if (it.cluster === c) {
+        inTop = Math.min(inTop, it.m0 - 3)
+        inBottom = Math.max(inBottom, it.m0 + it.ms + 1)
+      }
+    for (let k = 0; k < clusters.length; k++)
+      if (drawnCluster[k] && clusters[k]!.parent === c) {
+        inTop = Math.min(inTop, frameTop[k]! - 1)
+        inBottom = Math.max(inBottom, frameBottom[k]! + 1)
+      }
+    if (Number.isFinite(inTop)) frameTop[c] = Math.max(frameTop[c]!, inTop)
+    if (Number.isFinite(inBottom)) frameBottom[c] = Math.min(frameBottom[c]!, inBottom)
+  }
 
   // ---- frames (cross extents) and normalisation -----------------------------------------------
   const fl = clusters.map(() => Infinity)
