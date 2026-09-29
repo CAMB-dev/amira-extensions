@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
+  readFileSync,
   renameSync,
   rmSync,
   statSync,
@@ -245,6 +246,11 @@ export interface Repo {
   emptyTree: string
   /** Line endings and filters are left alone (git 2.40 and newer). */
   raw: boolean
+  /**
+   * The repository's info/attributes, when it sets attributes: they apply to snapshots and
+   * restores in spite of `raw` (git reads that file whatever the attribute source is).
+   */
+  attributes?: string
   git: Git
 }
 
@@ -357,7 +363,16 @@ export async function openRepo(
   // Attributes read from an empty tree: no eol conversion or filters, so snapshots hold the
   // files byte for byte and restores write them back the same way.
   if (raw) git.setGlobal([...global, `--attr-source=${emptyTree}`])
+  // $GIT_DIR/info/attributes applies whatever the attribute source is.
+  const infoAttributes = await git.exec(["rev-parse", "--path-format=absolute", "--git-path", "info/attributes"], {
+    stdoutOnly: true,
+  })
+  const attributesFile =
+    infoAttributes.ok && infoAttributes.output.trim()
+      ? path.normalize(infoAttributes.output.trim())
+      : path.join(gitDir, "info", "attributes")
   return {
+    ...(setsAttributes(attributesFile) ? { attributes: attributesFile } : {}),
     mode,
     root,
     gitDir,
@@ -368,6 +383,17 @@ export async function openRepo(
     emptyTree,
     raw,
     git,
+  }
+}
+
+/** Whether an attributes file sets anything (more than comments and blank lines). */
+function setsAttributes(file: string): boolean {
+  try {
+    return readFileSync(file, "utf8")
+      .split(/\r?\n/)
+      .some((l) => l.trim() && !l.trim().startsWith("#"))
+  } catch {
+    return false
   }
 }
 

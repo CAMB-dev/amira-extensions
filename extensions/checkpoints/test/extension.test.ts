@@ -527,3 +527,16 @@ test("/rewind waits for background sub-agents, a persistent one only while it wo
   expect(await t.command("rewind", "1 --yes")).toContain("Restored 1 file from checkpoint #1: a.txt")
   expect(t.read("a.txt")).toBe("v1\n")
 })
+
+test("attributes in .git/info/attributes, which still apply, are pointed out once", async () => {
+  const dir = await repo({ "a.txt": "v1\n" })
+  write(dir, ".git/info/attributes", "# comments alone set nothing\n")
+  const quiet = await setup({}, {}, dir)
+  await quiet.turn("write a.txt v2")
+  expect(quiet.errors).toEqual([])
+  write(dir, ".git/info/attributes", "*.txt text eol=crlf\n")
+  const t = await setup({}, {}, dir)
+  await t.turn("write a.txt v3")
+  await t.turn("write a.txt v4")
+  expect(t.errors).toEqual([expect.stringMatching(/info[\\/]attributes sets git attributes, and they apply to checkpoints too/)])
+})

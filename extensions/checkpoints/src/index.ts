@@ -61,6 +61,11 @@ export function createCheckpointsExtension(options: CheckpointsOptions = {}) {
           disabled = repo.disabled
           return undefined
         }
+        if (repo.attributes) {
+          reportOnce(
+            `checkpoints: ${repo.attributes} sets git attributes, and they apply to checkpoints too: line endings or filters set there may change files as they are snapshotted and restored`,
+          )
+        }
         return new CheckpointStore(repo, settings)
       })
       return store
