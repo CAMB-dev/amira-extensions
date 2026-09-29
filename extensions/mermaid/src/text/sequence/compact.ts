@@ -38,7 +38,8 @@ export function compactSequence(seq: Sequence, width: number): string[] {
           wrapHanging(head, width - pw - 2, width - pw - 4).forEach((l, k) =>
             out.push(truncate(prefix + (k ? "│   " : i ? "├ " : "┌ ") + l, width)),
           )
-          walk(s.events, prefix + "│ ")
+          // Deep nesting stops indenting at half the width, so text always has room.
+          walk(s.events, pw + 2 <= width / 2 ? prefix + "│ " : prefix)
         })
         out.push(truncate(prefix + "└", width))
       }
