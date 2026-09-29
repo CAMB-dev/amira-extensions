@@ -72,6 +72,15 @@
       "engines": { "amira": "^0.1.2" },
       "tags": ["hooks", "formatter", "lint", "guard", "automation"],
       "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/hooks"
+    },
+    {
+      "name": "browser",
+      "description": "Browser tools: the model opens pages (e.g. your dev server) in an installed Chrome or Edge, headless, and takes screenshots, clicks, types, evaluates and reads the console",
+      "version": "0.1.0",
+      "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/browser" },
+      "engines": { "amira": "^0.1.1" },
+      "tags": ["browser", "playwright", "screenshot", "web", "testing"],
+      "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/browser"
     }
   ]
 }
