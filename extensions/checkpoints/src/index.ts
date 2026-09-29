@@ -63,10 +63,14 @@ export function createCheckpointsExtension(options: CheckpointsOptions = {}) {
     }
     const fail = (err: unknown) => {
       const text = err instanceof Error ? err.message : String(err)
-      if (err instanceof DisabledError) {
-        disabled = text
-        reportOnce(`checkpoints: ${text}`)
-      } else reportOnce(`checkpoints: ${text}`)
+      if (err instanceof DisabledError) disableFor(text)
+      else reportOnce(`checkpoints: ${text}`)
+    }
+    /** Checkpoints are off for the rest of the session: no later turn scans the files again. */
+    const disableFor = (reason: string) => {
+      disabled = reason
+      store = Promise.resolve(undefined)
+      reportOnce(`checkpoints: ${reason}`)
     }
 
     /** Parents of sub-agent sessions, so their tool calls count for the top-level session. */

@@ -56,8 +56,12 @@ function model(req: ModelRequest) {
   return { text: i ? "done" : "ok" }
 }
 
-async function setup(settings: Record<string, unknown> = {}, options: CheckpointsOptions = {}) {
-  const dir = await repo({ "a.txt": "v1\n", ".gitignore": "*.log\n" })
+async function setup(
+  settings: Record<string, unknown> = {},
+  options: CheckpointsOptions = {},
+  at?: string,
+) {
+  const dir = at ?? (await repo({ "a.txt": "v1\n", ".gitignore": "*.log\n" }))
   const mock = createMockDialect()
   for (let i = 0; i < 100; i++) mock.push(model)
   const ai = createAi({
@@ -404,4 +408,28 @@ test("/rewind says which files it could not restore, and still how to go back", 
   expect(out).toContain("Could not restore 1 file (open in another program?): b.txt (git: error: unable to unlink old 'b.txt'")
   expect(out).toContain("The files as they were are checkpoint #3; /rewind 3 goes back to them.")
   expect(t.read("a.txt")).toBe("v1\n")
+})
+test("checkpoints turned off for a reason stay off: later turns do not scan again", async () => {
+  const dir = tmp("crowded")
+  for (let i = 0; i < 3; i++) write(dir, `f${i}.txt`, `${i}\n`)
+  let scans = 0
+  const t = await setup(
+    { maxUntrackedFiles: 1 },
+    {
+      run: (argv, o) => {
+        if (argv.includes("ls-files")) scans++
+        return run(argv, o)
+      },
+    },
+    dir,
+  )
+  // A tool call waits for the turn's checkpoint.
+  await t.turn("write a.txt 1")
+  await t.turn("write a.txt 2")
+  const after = scans
+  expect(after).toBeGreaterThan(0)
+  await t.turn("write a.txt 3")
+  expect(scans).toBe(after)
+  expect(t.errors).toEqual([expect.stringContaining("holds 3 files")])
+  expect(await t.command("checkpoints", "")).toContain("Checkpoints are off here:")
 })
