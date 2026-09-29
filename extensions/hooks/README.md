@@ -113,7 +113,8 @@ names to regular expressions, all of which must match (`"*"` matches the argumen
 Runs in the background after the main session's turn, one hook after another; a hook still
 running from the turn before is not started again. `onlyAfterEdits: true` runs it only after
 turns in which a file was edited or written (by any agent). Its output is shown to you, not
-sent to the model.
+sent to the model. When Amira exits (in print mode, right after the turn), hooks still running
+get the same few seconds as `sessionEnd` hooks to finish.
 
 ## Options
 

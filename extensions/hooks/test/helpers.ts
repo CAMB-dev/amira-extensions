@@ -13,8 +13,11 @@ export interface SetupOptions {
   project?: Record<string, unknown>
   /** `extensions.hooks` of the project's .amira/settings.json. */
   projectSettings?: Record<string, unknown>
-  /** Answers every confirm dialog; undefined leaves it unanswered (cancelled at once, as print mode does). */
-  confirm?: (title: string, message: string) => boolean | undefined
+  /**
+   * Answers every confirm dialog; undefined cancels it at once (as print mode does), null leaves
+   * it open.
+   */
+  confirm?: (title: string, message: string) => boolean | undefined | null
   home?: string
   project_dir?: string
   deps?: HooksDeps
@@ -97,6 +100,7 @@ export async function setup(steps: MockStep[], o: SetupOptions = {}) {
     const message = e.data.message ?? ""
     asked.push({ title, message })
     const answer = o.confirm?.(title, message)
+    if (answer === null) return
     if (answer === undefined) host.ui.cancel(e.data.requestId)
     else host.ui.respond(e.data.requestId, answer)
   })

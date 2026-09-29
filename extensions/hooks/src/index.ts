@@ -76,6 +76,16 @@ export function createHooksExtension(deps: HooksDeps = {}): Extension {
     /** After-turn hooks still running, so a quick next turn does not start them twice. */
     const busy = new Set<Hook>()
     let sessionId: string | undefined
+    /** Hooks running in the background (after turn, session start), which exit waits for. */
+    const pending = new Set<Promise<unknown>>()
+    /** Stops those when Amira exits. */
+    const lifetime = new AbortController()
+    const background = (work: () => Promise<unknown>) => {
+      const p = work()
+        .catch((err) => api.reportError(`hooks: ${err instanceof Error ? err.message : String(err)}`))
+        .finally(() => pending.delete(p))
+      pending.add(p)
+    }
 
     const load = () => {
       loaded = loadHooks(cwd, home)
@@ -92,6 +102,8 @@ export function createHooksExtension(deps: HooksDeps = {}): Extension {
     load()
 
     const projectHooks = () => loaded.hooks.filter((h) => h.origin === "project")
+    const projectFiles = () =>
+      loaded.files.project.map((f) => path.relative(cwd, f).replaceAll("\\", "/")).join(", ")
 
     /** Asks the user once whether the project's hooks may run; resolves whether they may. */
     const ensureTrust = (signal?: AbortSignal): Promise<boolean> => {
@@ -106,7 +118,7 @@ export function createHooksExtension(deps: HooksDeps = {}): Extension {
               `  ${EVENT_LABEL[h.event]} · ${h.name}: ${h.command ?? `${h.action}${h.reason ? ` (${h.reason})` : ""}`}`,
           )
           .join("\n")
-        const files = loaded.files.project.map((f) => path.relative(cwd, f)).join(", ")
+        const files = projectFiles()
         const answer = await api.ui.confirm(
           changed ? "This project's hooks changed. Run them?" : "Run this project's hooks?",
           `${files} ${changed ? "now asks" : "asks"} Amira to run commands on your machine, with your permissions:\n${list}\n\nYes remembers these hooks for this project; when they change you are asked again.`,
@@ -355,7 +367,7 @@ export function createHooksExtension(deps: HooksDeps = {}): Extension {
       }
       const wasEdited = edited
       edited = false
-      void (async () => {
+      background(async () => {
         const hooks = (await active("afterTurn")).filter(
           (h) => h.on.includes(e.data.reason) && (!h.onlyAfterEdits || wasEdited) && !busy.has(h),
         )
@@ -365,22 +377,24 @@ export function createHooksExtension(deps: HooksDeps = {}): Extension {
             const r = await run(hook, {
               vars: { AMIRA_TURN_END: e.data.reason },
               input: { sessionId: e.sessionId, turn: { reason: e.data.reason, edited: wasEdited } },
+              signal: lifetime.signal,
             })
             show(noticeOf(r))
           } finally {
             busy.delete(hook)
           }
         }
-      })().catch((err) => api.reportError(`hooks: ${err instanceof Error ? err.message : String(err)}`))
+      })
     })
 
     api.on("session.start", (e) => {
       if (e.parentSessionId !== undefined) return
       sessionId = e.sessionId
       const reason = e.data.reason
-      void (async () => {
-        // The project's hooks are asked about as the session starts, not in the middle of a turn.
-        if (!off && loaded.options.enabled) await ensureTrust()
+      // The project's hooks are asked about as the session starts, not in the middle of a turn;
+      // the user's own session-start hooks do not wait for the answer.
+      if (!off && loaded.options.enabled) background(() => ensureTrust())
+      background(async () => {
         const hooks = (await active("sessionStart")).filter(
           (h) => !h.reasons.length || h.reasons.includes(reason),
         )
@@ -389,19 +403,24 @@ export function createHooksExtension(deps: HooksDeps = {}): Extension {
             vars: { AMIRA_SESSION_START: reason },
             input: { sessionId: e.sessionId, reason },
             target: reason,
+            signal: lifetime.signal,
           })
           show(noticeOf(r))
         }
-      })().catch((err) => api.reportError(`hooks: ${err instanceof Error ? err.message : String(err)}`))
+      })
     })
 
     api.onExit(async (signal) => {
-      // Asking at exit would hold it up: only hooks allowed already run.
-      if (off || !loaded.options.enabled) return
-      const hooks = loaded.hooks.filter(
-        (h) => h.event === "sessionEnd" && (h.origin === "user" || trustStatus === "trusted"),
-      )
-      await Promise.all(hooks.map((hook) => run(hook, { vars: {}, input: {}, signal })))
+      // Hooks still running (after the last turn, e.g. in print mode) get the same time to finish.
+      signal.addEventListener("abort", () => lifetime.abort(), { once: true })
+      const hooks =
+        off || !loaded.options.enabled
+          ? []
+          : // Asking at exit would hold it up: only hooks allowed already run.
+            loaded.hooks.filter(
+              (h) => h.event === "sessionEnd" && (h.origin === "user" || trustStatus === "trusted"),
+            )
+      await Promise.all([...pending, ...hooks.map((hook) => run(hook, { vars: {}, input: {}, signal }))])
     })
 
     // ---- what the user sees: a status item while hooks run, /hooks, the runs view ----
@@ -422,7 +441,7 @@ export function createHooksExtension(deps: HooksDeps = {}): Extension {
     const viewData = (): ViewData => ({ runs })
 
     const trustLine = (): string => {
-      const files = loaded.files.project.map((f) => path.relative(cwd, f).replaceAll("\\", "/")).join(", ")
+      const files = projectFiles()
       switch (trustStatus) {
         case "none":
           return "Project hooks: none."

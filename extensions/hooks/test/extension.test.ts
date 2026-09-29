@@ -400,3 +400,24 @@ test("invalid entries are reported and skipped", async () => {
   expect(all).toContain('"afterTurn" must be a list of hooks')
   expect(await command("")).toContain("fine · every file · fine · user")
 })
+
+test("the user's session-start hooks do not wait for the question about the project's", async () => {
+  const { agent, asked, notices } = await setup([], {
+    user: { sessionStart: [{ name: "hello", command: "echo hi" }] },
+    project: projectHooks,
+    confirm: () => null,
+  })
+  agent.start("startup")
+  await until(() => notices().some((n) => n.includes("hook hello")))
+  expect(asked).toHaveLength(1)
+})
+
+test("exit waits for after-turn hooks still running, as in print mode", async () => {
+  const { agent, host, cwd, bus } = await setup([{ text: "done" }], {
+    user: { afterTurn: [{ name: "slow", command: 'sleep 1; echo ok > "$AMIRA_PROJECT_DIR/after.txt"' }] },
+  })
+  await agent.prompt("go")
+  await bus.flush()
+  await host.runExitHandlers(15_000)
+  expect(readFileSync(path.join(cwd, "after.txt"), "utf8").trim()).toBe("ok")
+})
