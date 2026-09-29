@@ -120,6 +120,24 @@ test("a publish about older text is not taken for the answer, and URIs in anothe
   expect(r.diagnostics.map((d) => d.message)).toEqual(["new"])
 })
 
+test("publishes without a version in two passes: the second is the answer once it settled", async () => {
+  const { dir } = workspace()
+  const c = client(dir, { FAKE_LSP_PASSES: "400" })
+  await c.start()
+  const file = path.join(dir, "a.fk")
+  c.sync(file, "TYPE: late type error\n", "fake")
+  const r = await c.diagnostics(file, { waitMs: 5000, settleMs: 1000 })
+  expect(r.fresh).toBe(true)
+  expect(r.diagnostics.map((d) => d.message)).toEqual(["late type error"])
+  // Asked again with no change: the settled answer at once, without another settle.
+  const started = Date.now()
+  expect((await c.diagnostics(file, { waitMs: 5000, settleMs: 1000 })).diagnostics).toHaveLength(1)
+  expect(Date.now() - started).toBeLessThan(500)
+  // A settle shorter than the gap takes the first pass: the error is missed.
+  c.sync(file, "TYPE: another\n", "fake")
+  expect(await c.diagnostics(file, { waitMs: 5000, settleMs: 50 })).toEqual({ diagnostics: [], fresh: true })
+})
+
 test("a server that answers textDocument/diagnostic is asked directly", async () => {
   const { dir, log, received } = workspace()
   const c = client(dir, { FAKE_LSP_PULL: "1", FAKE_LSP_LOG: log })

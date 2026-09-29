@@ -9,6 +9,8 @@
  *   FAKE_LSP_URIS    "vscode": publish URIs as file:///c%3A/... (lower-case drive, encoded colon)
  *   FAKE_LSP_STALE   "1": publish the old diagnostics again right after a change, without a version
  *   FAKE_LSP_EXIT_ON_SHUTDOWN "1": exit at shutdown without answering
+ *   FAKE_LSP_PASSES  ms: publish in two passes without a version, as typescript-language-server
+ *                    does: first without the `TYPE: text` lines (errors), this long after with them
  */
 import { appendFileSync } from "node:fs"
 
@@ -26,12 +28,12 @@ function send(message: Record<string, unknown>) {
   process.stdout.write(`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`)
 }
 
-function diagnosticsOf(text: string) {
+function diagnosticsOf(text: string, types = true) {
   const out: unknown[] = []
   for (const [line, content] of text.split("\n").entries()) {
-    const m = /(ERROR|WARN|INFO): (.*)/.exec(content)
-    if (!m) continue
-    const severity = m[1] === "ERROR" ? 1 : m[1] === "WARN" ? 2 : 3
+    const m = /(ERROR|WARN|INFO|TYPE): (.*)/.exec(content)
+    if (!m || (m[1] === "TYPE" && !types)) continue
+    const severity = m[1] === "ERROR" || m[1] === "TYPE" ? 1 : m[1] === "WARN" ? 2 : 3
     const start = { line, character: m.index }
     out.push({ range: { start, end: start }, severity, code: "F1", source: "fake", message: m[2] })
   }
@@ -52,6 +54,23 @@ function publishLater(uri: string) {
     setTimeout(() => {
       const doc = docs.get(uri)
       if (!doc) return
+      if (env.FAKE_LSP_PASSES) {
+        send({
+          method: "textDocument/publishDiagnostics",
+          params: { uri: outUri(uri), diagnostics: diagnosticsOf(doc.text, false) },
+        })
+        const text = doc.text
+        timers.set(
+          uri,
+          setTimeout(() => {
+            send({
+              method: "textDocument/publishDiagnostics",
+              params: { uri: outUri(uri), diagnostics: diagnosticsOf(text) },
+            })
+          }, Number(env.FAKE_LSP_PASSES)),
+        )
+        return
+      }
       send({
         method: "textDocument/publishDiagnostics",
         params: { uri: outUri(uri), version: doc.version, diagnostics: diagnosticsOf(doc.text) },

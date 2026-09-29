@@ -138,7 +138,13 @@ export class ServerManager {
     }
     const wait = entry.checks++ === 0 ? waitMs * FIRST_CHECK_FACTOR : waitMs
     const results = await Promise.all(
-      present.map((file) => client.diagnostics(file, { waitMs: wait, signal })),
+      present.map((file) =>
+        client.diagnostics(file, {
+          waitMs: wait,
+          signal,
+          ...(spec.settleMs !== undefined ? { settleMs: spec.settleMs } : {}),
+        }),
+      ),
     )
     return present.map((file, i) => ({
       file,

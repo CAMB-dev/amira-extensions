@@ -19,6 +19,12 @@ export interface ServerSpec {
   settings?: Record<string, unknown>
   /** Without a server: check TypeScript with `tsc --noEmit` instead. */
   tscFallback?: boolean
+  /**
+   * For a server that publishes diagnostics without a version: how long after its last
+   * publish about a file to take that one as the answer (it may send another pass).
+   * Default 200 ms.
+   */
+  settleMs?: number
 }
 
 export const DEFAULT_SERVERS: ServerSpec[] = [
@@ -36,6 +42,8 @@ export const DEFAULT_SERVERS: ServerSpec[] = [
       ".jsx": "javascriptreact",
     },
     tscFallback: true,
+    // It publishes syntax errors first and type errors later, neither with a version.
+    settleMs: 1200,
   },
   {
     id: "python",

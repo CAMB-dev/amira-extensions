@@ -56,6 +56,8 @@ interface Doc {
 
 interface Published {
   seq: number
+  /** When it arrived (Date.now()). */
+  at: number
   version?: number
   diagnostics: Diagnostic[]
 }
@@ -69,8 +71,8 @@ interface Pending {
 /** How long a server gets to answer shutdown, and to exit after its stdin is closed. */
 const SHUTDOWN_MS = 1500
 const EXIT_GRACE_MS = 2000
-/** How long to wait for more publishes about a file once one arrived (servers send several). */
-const DEFAULT_SETTLE_MS = 200
+/** How long to wait for more publishes without a version about a file once one arrived. */
+export const DEFAULT_SETTLE_MS = 200
 
 /** One language server process, spoken to over stdio. */
 export class LspClient {
@@ -267,8 +269,10 @@ export class LspClient {
 
   /**
    * The diagnostics for a file synced before: asked for when the server answers requests for
-   * them, otherwise the ones it publishes about the text last sent, waiting up to `waitMs`
-   * (and `settleMs` after each publish, since servers often send several).
+   * them, otherwise the ones it publishes about the text last sent, waiting up to `waitMs`.
+   * A publish that names the version sent (or a later one) is the answer. One without a
+   * version may be a first pass (typescript-language-server publishes syntax errors, then
+   * type errors): the answer is the last one once `settleMs` passed without another.
    */
   async diagnostics(
     file: string,
@@ -333,12 +337,16 @@ export class LspClient {
         const p = fresh ? current() : this.#published.get(key)
         resolve({ diagnostics: p?.diagnostics ?? [], fresh: fresh && p !== undefined })
       }
-      const listener = (k: string) => {
-        if (k !== key && k !== "*") return
-        if (k === "*") return finish(false)
-        if (!current()) return
+      const settled = () => {
+        const p = current()
+        if (!p) return
+        if (p.version !== undefined) return finish(true)
         clearTimeout(settle)
-        settle = setTimeout(() => finish(true), settleMs)
+        settle = setTimeout(() => finish(true), Math.max(0, p.at + settleMs - Date.now()))
+      }
+      const listener = (k: string) => {
+        if (k === "*") return finish(false)
+        if (k === key) settled()
       }
       const onAbort = () => finish(false)
       const deadline = setTimeout(() => finish(current() !== undefined), waitMs)
@@ -346,8 +354,8 @@ export class LspClient {
       signal?.addEventListener("abort", onAbort, { once: true })
       if (signal?.aborted) return finish(false)
       if (this.state === "failed" || this.state === "closed") return finish(false)
-      // Already answered (e.g. while other files were being synced): settle from here.
-      if (current()) listener(key)
+      // Already answered (e.g. while other files were being synced, or the text is unchanged).
+      settled()
     })
   }
 
@@ -397,6 +405,7 @@ export class LspClient {
       if (!key || !Array.isArray(params.diagnostics)) return
       this.#published.set(key, {
         seq: ++this.#seq,
+        at: Date.now(),
         ...(typeof params.version === "number" ? { version: params.version } : {}),
         diagnostics: params.diagnostics,
       })

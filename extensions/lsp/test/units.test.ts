@@ -132,6 +132,13 @@ test("settings: defaults, a server of the user's own, and problems reported inst
     },
     waitMs: -1,
   })
+  expect(d.servers.find((x) => x.id === "typescript")?.settleMs).toBe(1200)
+  expect(readSettings({ servers: { go: { settleMs: 500 } } }).servers.find((x) => x.id === "go")?.settleMs).toBe(
+    500,
+  )
+  expect(readSettings({ servers: { go: { settleMs: "x" } } }).problems).toEqual([
+    "extensions.lsp.servers.go.settleMs must be a number of at least 0",
+  ])
   expect(s.severity).toBe("warning")
   expect(s.maxItems).toBe(5)
   expect(s.waitMs).toBe(4000)

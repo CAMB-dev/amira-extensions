@@ -139,6 +139,11 @@ function readServers(raw: unknown, problems: string[]): ServerSpec[] {
         spec.languageIds = {}
       } else problems.push(`${where}.languageId must be a string`)
     }
+    if (e.settleMs !== undefined) {
+      if (typeof e.settleMs === "number" && Number.isFinite(e.settleMs) && e.settleMs >= 0)
+        spec.settleMs = e.settleMs
+      else problems.push(`${where}.settleMs must be a number of at least 0`)
+    }
     if (e.initializationOptions !== undefined) spec.initializationOptions = e.initializationOptions
     if (e.settings !== undefined) {
       if (e.settings && typeof e.settings === "object" && !Array.isArray(e.settings)) {
@@ -161,6 +166,7 @@ function readServers(raw: unknown, problems: string[]): ServerSpec[] {
         : {}),
       ...(spec.settings ? { settings: spec.settings } : {}),
       ...(spec.tscFallback ? { tscFallback: true } : {}),
+      ...(spec.settleMs !== undefined ? { settleMs: spec.settleMs } : {}),
     }
     // A user's server comes first, so it wins for extensions a built-in one claims too.
     if (index >= 0) out.splice(index, 1)
