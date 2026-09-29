@@ -14,7 +14,7 @@ import type {
   UserMessage,
   ViewDefinition,
 } from "@amira/api"
-import { createWorkflowExtension, readSettings } from "../src/index.ts"
+import { asksForWorkflow, createWorkflowExtension, readSettings } from "../src/index.ts"
 import { type Answer, type FakeGroup, fakeGroup } from "./fakes.ts"
 
 const dirs: string[] = []
@@ -230,6 +230,38 @@ test("a user message asking for a workflow lets the model start one, after the u
   // The next user message that does not ask shuts the gate again.
   t.say("thanks")
   expect((await t.call({ script: SCRIPT })).isError).toBe(true)
+})
+
+test("asking for a workflow takes asking, not just the word", async () => {
+  for (const yes of [
+    "Use a workflow to review the three packages",
+    "run this as a workflow please",
+    "do it with a multi-agent workflow",
+    "review everything via workflows",
+    "try the workflow tool on this",
+    "/workflow review it",
+    "用工作流审查这三个包",
+    "请使用一个工作流来做",
+    "通过 workflow 跑一下",
+  ]) {
+    expect(`${yes}: ${asksForWorkflow(yes)}`).toBe(`${yes}: true`)
+  }
+  for (const no of [
+    "fix the failing GitHub Actions workflow",
+    "explain the workflow in .github/workflows/ci.yml",
+    "our git workflow is rebase-then-merge",
+    "the release workflow broke after the last commit",
+    "修复失败的 GitHub 工作流",
+    "这个工作流的 yaml 有问题",
+  ]) {
+    expect(`${no}: ${asksForWorkflow(no)}`).toBe(`${no}: false`)
+  }
+  // Mentioning one without asking keeps the tool shut.
+  const t = setup()
+  t.say("fix the failing GitHub Actions workflow")
+  const r = await t.call({ script: SCRIPT })
+  expect(t.text(r)).toMatch(/has not asked for a workflow/)
+  expect(t.confirms).toHaveLength(0)
 })
 
 test("a notice turn does not count as the user asking or not asking", async () => {

@@ -37,7 +37,8 @@ export const VIEW_KIND = "workflow"
 export interface WorkflowSettings {
   /**
    * When the model may start a workflow: "explicit" (default) only when the user asked for one
-   * (their message mentions a workflow, or they used /workflow); "always"; "never".
+   * (their message asks to use one, see asksForWorkflow, or they used /workflow); "always";
+   * "never".
    * Every start is still confirmed by the user.
    */
   enabled?: "explicit" | "always" | "never"
@@ -99,9 +100,22 @@ export function readSettings(raw: unknown, report: (error: string) => void = () 
   return out
 }
 
-/** Whether a user's message asks for a workflow. */
+/**
+ * "use a workflow", "run this as a workflow", "with a workflow", "via workflows": a verb or
+ * preposition of using one, then the word. The bare word is not enough: "fix the failing
+ * GitHub Actions workflow" or "our git workflow" do not ask for one.
+ */
+const ASK_EN =
+  /\b(?:use|using|run|start|launch|kick off|spin up|do|try|with|via|through|as)\s+(?:(?:it|this|that|these|them|everything|the task|the work)\s+(?:as|with|via|through|using|in)\s+)?(?:(?:a|an|one|another|new|dynamic|multi-agent|small|big|quick)\s+)*workflows?\b/i
+/** The tool or the command by name. */
+const ASK_NAMED = /\bworkflow tool\b|(?:^|\s)\/workflow\b/i
+/** 用工作流, 使用一个工作流, 通过 workflow, 启动工作流, 跑个工作流 ... */
+const ASK_ZH =
+  /(?:用|使用|采用|通过|借助|以|启动|开启|开|跑|运行)\s*(?:个|一个|一下|下)?\s*(?:工作流|workflow)/i
+
+/** Whether a user's message asks for a workflow (see ASK_EN). */
 export function asksForWorkflow(text: string): boolean {
-  return /\bworkflows?\b/i.test(text) || /工作流/.test(text)
+  return ASK_EN.test(text) || ASK_NAMED.test(text) || ASK_ZH.test(text)
 }
 
 function messageText(m: UserMessage): string {
