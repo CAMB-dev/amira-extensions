@@ -196,6 +196,7 @@ export class ServerManager {
           : {}),
         ...(spec.settings ? { settings: spec.settings } : {}),
         onExit: (reason) => this.#onCrash(key, client, spec, root, reason),
+        killProcess: (pid) => this.#killTree(pid, root),
       })
       entry = { spec, root, client, checks: 0 }
       this.#entries.set(key, entry)
@@ -214,6 +215,18 @@ export class ServerManager {
       }
       return undefined
     }
+  }
+
+  /** Ends a server process and what it started (a `.cmd` launcher's node, say). */
+  #killTree(pid: number, cwd: string) {
+    if (process.platform !== "win32") {
+      process.kill(pid, "SIGKILL")
+      return
+    }
+    const argv = ["taskkill", "/PID", String(pid), "/T", "/F"]
+    this.#deps
+      .runCommand(argv, { cwd, timeoutMs: 10_000, signal: new AbortController().signal })
+      .catch(() => {})
   }
 
   #crashes = new Map<string, number>()

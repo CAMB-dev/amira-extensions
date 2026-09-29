@@ -2,7 +2,8 @@ import { expect, test } from "bun:test"
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import type { Diagnostic } from "../src/client.ts"
+import type { OpenPipeOptions } from "@amira/api"
+import { type Diagnostic, LspClient } from "../src/client.ts"
 import { countsInText, describeCounts, diagnosticLine, formatReports } from "../src/format.ts"
 import { editedFile, lspBlock, withDiagnostics } from "../src/index.ts"
 import { encodeMessage, MessageReader, type RpcMessage } from "../src/rpc.ts"
@@ -74,6 +75,38 @@ test("a message of several MB in small chunks is read whole, and the next one af
   expect(got).toHaveLength(2)
   expect((got[0]!.params as { big: string }).big).toBe(big)
   expect(got[1]).toMatchObject({ id: 7 })
+})
+
+test("a server the host lost track of is killed by the pid it started with, and counts as exited", async () => {
+  let onEvent: OpenPipeOptions["onEvent"] = () => {}
+  const killed: number[] = []
+  const exits: string[] = []
+  const c = new LspClient({
+    argv: ["srv"],
+    root: path.resolve("/proj"),
+    startupTimeoutMs: 5000,
+    openPipe: (_argv, opts) => {
+      onEvent = opts.onEvent
+      return {
+        write(data) {
+          // Answer initialize (request 1) at once.
+          if (data.includes('"initialize"'))
+            queueMicrotask(() => onEvent({ type: "stdout", data: encodeMessage({ id: 1, result: {} }) }))
+        },
+        close() {},
+      }
+    },
+    killProcess: (pid) => void killed.push(pid),
+    onExit: (reason) => void exits.push(reason),
+  })
+  const started = c.start()
+  onEvent({ type: "spawned", pid: 4242 })
+  await started
+  expect(c.state).toBe("ready")
+  onEvent({ type: "exit", code: null, error: "the worker running it was lost" })
+  expect(killed).toEqual([4242])
+  expect(exits).toEqual(["the worker running it was lost"])
+  expect(c.state).toBe("failed")
 })
 
 test("settings: defaults, a server of the user's own, and problems reported instead of failing", () => {

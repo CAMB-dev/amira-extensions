@@ -29,6 +29,11 @@ export interface ClientOptions {
   onLog?: (text: string) => void
   /** The server exited, or broke the protocol, after it had started. */
   onExit?: (reason: string) => void
+  /**
+   * Ends a server the host lost track of (it may still run). Default: process.kill; the
+   * manager passes one that ends the whole process tree.
+   */
+  killProcess?: (pid: number) => void
 }
 
 export type ClientState = "starting" | "ready" | "failed" | "closed"
@@ -87,6 +92,7 @@ export class LspClient {
   #started: Promise<void> | undefined
   #stderrTail = ""
   #closing: Promise<void> | undefined
+  #pid: number | undefined
 
   constructor(opts: ClientOptions) {
     this.#opts = opts
@@ -130,7 +136,10 @@ export class LspClient {
       cwd: this.#opts.root,
       ...(this.#opts.env ? { env: this.#opts.env } : {}),
       onEvent: (e) => {
-        if (e.type === "spawned") spawned.resolve()
+        if (e.type === "spawned") {
+          this.#pid = e.pid
+          spawned.resolve()
+        }
         else if (e.type === "stdout") reader.push(e.data)
         else if (e.type === "stderr") {
           this.#stderrTail = (this.#stderrTail + e.data).slice(-2000)
@@ -140,6 +149,9 @@ export class LspClient {
           const reason =
             e.error ?? `exited with code ${e.code}${tail ? `: ${tail.split("\n").slice(-3).join(" ")}` : ""}`
           spawned.reject(new Error(`could not start ${this.#opts.argv[0]}: ${reason}`))
+          // An exit with an error after it started: the host lost the process, which may
+          // still run. End it, or it keeps running beside the server started in its place.
+          if (e.error && this.#pid !== undefined) this.#kill(this.#pid)
           this.#onExit(reason)
         }
       },
@@ -449,6 +461,15 @@ export class LspClient {
       clearTimeout(p.timer)
       p.reject(new Error(reason))
       this.#pending.delete(id)
+    }
+  }
+
+  #kill(pid: number) {
+    try {
+      if (this.#opts.killProcess) this.#opts.killProcess(pid)
+      else process.kill(pid)
+    } catch {
+      // Gone already.
     }
   }
 
