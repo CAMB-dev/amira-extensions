@@ -57,7 +57,14 @@ function shortError(err: unknown): string {
   const m = message(err)
     .replace(ANSI, "")
     .split(/\n\s*\n|\nCall log:/)[0] as string
-  return m.replace(/^\w+\.\w+: /, "").trim()
+  // "fill: Error: ..." and "evaluateHandle: ReferenceError: ...": the method name and a bare
+  // "Error:" say nothing; stack frames point into Playwright's own evaluation code.
+  return m
+    .replace(/^[a-z]\w*(?:\.\w+)*: (?:Error: )?/, "")
+    .split("\n")
+    .filter((l) => !/^\s+at /.test(l))
+    .join("\n")
+    .trim()
 }
 
 async function pageState(page: Page): Promise<{ url: string; title: string }> {

@@ -239,7 +239,10 @@ describe.skipIf(!hasBrowser)("with a real browser", () => {
     expect(text(long).length).toBeLessThan(DEFAULTS.maxEvalChars + 200)
     const err = await h.call("browser_eval", { expression: "nope.nope" })
     expect(err.isError).toBe(true)
-    expect(text(err)).toContain("nope is not defined")
+    expect(text(err)).toBe("ReferenceError: nope is not defined")
+    const notField = await h.call("browser_type", { selector: "#go", text: "x" })
+    expect(notField.isError).toBe(true)
+    expect(text(notField)).toStartWith("Element is not an <input>")
   })
 
   test("browser_screenshot returns an image of the viewport, the full page or an element", async () => {

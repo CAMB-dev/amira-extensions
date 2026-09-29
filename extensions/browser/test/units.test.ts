@@ -1,5 +1,9 @@
 import { expect, test } from "bun:test"
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync } from "node:fs"
+import { tmpdir } from "node:os"
+import path from "node:path"
 import type { Settings } from "@amira/api"
+import { removeStaleProfiles } from "../src/browser.ts"
 import type { DetectEnv } from "../src/detect.ts"
 import { findBrowser, imageSize, isLoopback, readSettings, UrlPolicy } from "../src/index.ts"
 import { ignoredProjectKeys } from "../src/settings.ts"
@@ -157,4 +161,19 @@ test("imageSize reads PNG and JPEG headers", () => {
     0xff, 0xd8, 0xff, 0xe0, 0, 4, 0, 0, 0xff, 0xc0, 0, 11, 8, 1, 0x2c, 1, 0xf4, 3, 0, 0, 0,
   ])
   expect(imageSize(jpg)).toEqual({ width: 500, height: 300 })
+})
+
+test("profiles older than any browser can live are swept; newer ones and other directories stay", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "browser-sweep-"))
+  try {
+    for (const name of ["amira-browser-old", "amira-browser-new", "something-else"])
+      mkdirSync(path.join(dir, name))
+    const old = new Date(Date.now() - 26 * 60 * 60 * 1000)
+    utimesSync(path.join(dir, "amira-browser-old"), old, old)
+    utimesSync(path.join(dir, "something-else"), old, old)
+    removeStaleProfiles(dir)
+    expect(readdirSync(dir).sort()).toEqual(["amira-browser-new", "something-else"])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

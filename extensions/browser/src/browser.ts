@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs"
+import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import type { RunCommandOptions, RunCommandResult } from "@amira/api"
@@ -139,7 +139,12 @@ export class BrowserSession {
 
   private async launch(): Promise<void> {
     const { settings, found } = this.opts
-    const profile = mkdtempSync(path.join(this.opts.tempDir ?? tmpdir(), "amira-browser-"))
+    const temp = this.opts.tempDir ?? tmpdir()
+    if (!staleSwept) {
+      staleSwept = true
+      removeStaleProfiles(temp)
+    }
+    const profile = mkdtempSync(path.join(temp, PROFILE_PREFIX))
     this.profile = profile
     const abort = new AbortController()
     this.abort = abort
@@ -337,6 +342,31 @@ function removeLater(dir: string, tries = 5) {
     rmSync(dir, { recursive: true, force: true })
   } catch {
     if (tries > 0) setTimeout(() => removeLater(dir, tries - 1), 1000).unref?.()
+  }
+}
+
+const PROFILE_PREFIX = "amira-browser-"
+let staleSwept = false
+
+/**
+ * Removes profiles left behind by browsers that ended with Amira (an exit does not wait for
+ * the removal). Only ones untouched for longer than a browser may live, so a profile another
+ * Amira is using is never removed.
+ */
+export function removeStaleProfiles(dir: string, now = Date.now()) {
+  let names: string[]
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return
+  }
+  for (const name of names) {
+    if (!name.startsWith(PROFILE_PREFIX)) continue
+    const full = path.join(dir, name)
+    try {
+      if (now - statSync(full).mtimeMs > MAX_LIFETIME_MS + 60 * 60 * 1000)
+        rmSync(full, { recursive: true, force: true })
+    } catch {}
   }
 }
 
