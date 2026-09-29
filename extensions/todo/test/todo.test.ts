@@ -243,6 +243,9 @@ test("the model's lists: shown live, committed when they change meaningfully, ke
   // The transcript: progress on the head, the list under committed calls only.
   expect(writePresenter.summary!(calls[1]!.args)).toBe("1/3 done")
   expect(writePresenter.result!(view(calls[1]!))).toBe("› Testing it")
+  // A committed call lists the items under it, so its result line only names the plan.
+  expect(writePresenter.result!(view(calls[0]!))).toBe("plan · 3 items")
+  expect(writePresenter.result!(view(calls[2]!))).toBe("plan · 4 items")
   expect(writePresenter.body!(view(calls[1]!), { detail: "summary", width: 80 })).toEqual([])
   expect(writePresenter.body!(view(calls[2]!), { detail: "summary", width: 80 })).toEqual([
     { kind: "muted", text: "✓ Write the parser" },

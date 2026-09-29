@@ -2,6 +2,7 @@ import type {
   Extension,
   ExtensionAPI,
   SessionData,
+  ToolCallView,
   ToolDefinition,
   ToolLine,
   ToolPresenter,
@@ -89,6 +90,14 @@ function argTodos(args: Record<string, unknown>): Todo[] | undefined {
   return "todos" in parsed ? parsed.todos : undefined
 }
 
+/**
+ * Whether a todo_write call's list went to the transcript. A resumed call has no details; the
+ * lists that were committed are the ones whose result gave the model the whole list back.
+ */
+function committed(call: ToolCallView<Record<string, unknown>, TodoDetails>): boolean {
+  return call.result.details?.snapshot ?? /^\[(x|>| )\] /m.test(call.text)
+}
+
 /** How the transcript shows todo_write calls: progress on the head, the list when it was committed. */
 export const writePresenter: ToolPresenter<Record<string, unknown>, TodoDetails> = {
   summary(args) {
@@ -104,16 +113,15 @@ export const writePresenter: ToolPresenter<Record<string, unknown>, TodoDetails>
     if (!todos) return undefined
     if (!todos.length) return "cleared the list"
     if (allDone(todos)) return "all done"
+    // A committed call shows the list under it, the item in progress included.
+    if (committed(call)) return `plan · ${todos.length} ${todos.length === 1 ? "item" : "items"}`
     const now = current(todos)
     return now ? `${MARKS.in_progress} ${now.activeForm ?? now.content}` : progressText(todos)
   },
   body(call) {
     if (call.result.isError) return []
     const todos = call.result.details?.todos ?? argTodos(call.args)
-    // A resumed call has no details; the lists that were committed are the ones whose result
-    // gave the model the whole list back.
-    const snapshot = call.result.details?.snapshot ?? /^\[(x|>| )\] /m.test(call.text)
-    if (!todos || !snapshot) return []
+    if (!todos || !committed(call)) return []
     return todos.map((t): ToolLine => itemLine(t))
   },
   running: () => [],
