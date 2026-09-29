@@ -477,3 +477,53 @@ test("after three snapshots in a row run out of time, checkpoints are off for th
   expect((await t.refs()).length).toBe(1)
   expect(await t.command("checkpoints", "")).toContain("Checkpoints are off here: 3 snapshots in a row")
 })
+
+test("/rewind waits for background sub-agents, a persistent one only while it works", async () => {
+  const t = await setup()
+  await t.turn("write a.txt v2")
+  const parent = { sessionId: t.agent.sessionId }
+  const start = (child: string, persistent = false) =>
+    t.bus.emit(
+      "subagent.start",
+      {
+        childSessionId: child,
+        prompt: "x",
+        model: { provider: "mock", model: "m" },
+        depth: 1,
+        cwd: t.dir,
+        context: "fresh",
+        queued: false,
+        ...(persistent ? { persistent } : {}),
+      },
+      parent,
+    )
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+  start("s_bg")
+  start("s_helper", true)
+  // A sub-agent of the sub-agent counts for the top-level session too.
+  t.bus.emit(
+    "subagent.start",
+    {
+      childSessionId: "s_grandchild",
+      prompt: "y",
+      model: { provider: "mock", model: "m" },
+      depth: 2,
+      cwd: t.dir,
+      context: "fresh",
+      queued: true,
+    },
+    { sessionId: "s_bg", parentSessionId: t.agent.sessionId },
+  )
+  await t.bus.flush()
+  expect(await failure(t.command("rewind", "1 --yes"))).toContain("3 sub-agents are still running")
+  t.bus.emit("subagent.end", { childSessionId: "s_grandchild", status: "done", usage, durationMs: 1 } as never, {
+    sessionId: "s_bg",
+  })
+  t.bus.emit("subagent.end", { childSessionId: "s_bg", status: "done", usage, durationMs: 1 } as never, parent)
+  await t.bus.flush()
+  expect(await failure(t.command("rewind", "1 --yes"))).toContain("a sub-agent is still running")
+  t.bus.emit("subagent.state", { childSessionId: "s_helper", state: "idle", turns: 1 }, parent)
+  await t.bus.flush()
+  expect(await t.command("rewind", "1 --yes")).toContain("Restored 1 file from checkpoint #1: a.txt")
+  expect(t.read("a.txt")).toBe("v1\n")
+})

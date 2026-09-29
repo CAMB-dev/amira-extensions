@@ -196,8 +196,52 @@ export function createCheckpointsExtension(options: CheckpointsOptions = {}) {
       }
     }
 
+    /** Sub-agents running or queued, by the top-level session they work for. */
+    const working = new Map<string, Set<string>>()
+    const childRoot = new Map<string, string>()
+    const setWorking = (child: string, on: boolean) => {
+      const root = childRoot.get(child)
+      if (!root) return
+      const set = working.get(root) ?? new Set<string>()
+      if (on) set.add(child)
+      else set.delete(child)
+      working.set(root, set)
+    }
+    api.on("subagent.start", (e) => {
+      parents.set(e.data.childSessionId, e.sessionId)
+      childRoot.set(e.data.childSessionId, rootOf(e.sessionId))
+      setWorking(e.data.childSessionId, true)
+    })
+    api.on("subagent.state", (e) => setWorking(e.data.childSessionId, e.data.state !== "idle"))
+    api.on("subagent.end", (e) => {
+      setWorking(e.data.childSessionId, false)
+      childRoot.delete(e.data.childSessionId)
+    })
+    /** How many sub-agents of the session are running or waiting to: they may change files. */
+    const busyChildren = (ctx: CommandContext): number => {
+      try {
+        if (typeof ctx.session.subagents === "function") {
+          return ctx.session.subagents().filter((a) => a.status === "running" || a.status === "queued").length
+        }
+      } catch {}
+      return working.get(ctx.session.info().id)?.size ?? 0
+    }
+    /** Why a rewind cannot run now, if it cannot. */
+    const notNow = (ctx: CommandContext, meanwhile: boolean): string | undefined => {
+      const pre = meanwhile ? "nothing was restored: " : ""
+      if (ctx.session.info().busy) {
+        return meanwhile
+          ? "a turn started meanwhile; nothing was restored. Rewind after it ends"
+          : "a turn is running; rewind after it ends (or press Esc to stop it)"
+      }
+      const n = busyChildren(ctx)
+      if (n) {
+        return `${pre}${n === 1 ? "a sub-agent is" : `${n} sub-agents are`} still running and may change files; rewind after ${n === 1 ? "it ends" : "they end"} (or stop ${n === 1 ? "it" : "them"})`
+      }
+      return undefined
+    }
+
     if (settings.enabled) {
-      api.on("subagent.start", (e) => void parents.set(e.data.childSessionId, e.sessionId))
       api.on("turn.start", (e) => {
         if (e.parentSessionId || !e.turnId) return
         pending.set(e.sessionId, { turnId: e.turnId, prompt: e.data.prompt })
@@ -371,8 +415,8 @@ export function createCheckpointsExtension(options: CheckpointsOptions = {}) {
     const rewind = async (args: string, ctx: CommandContext) => {
       const opts = parseRewindArgs(args)
       if ("error" in opts) throw new Error(opts.error)
-      if (ctx.session.info().busy)
-        throw new Error("a turn is running; rewind after it ends (or press Esc to stop it)")
+      const busy = notNow(ctx, false)
+      if (busy) throw new Error(busy)
       const s = await need(ctx)
       if (!s) return
       const session = ctx.session.info().id
@@ -481,10 +525,10 @@ export function createCheckpointsExtension(options: CheckpointsOptions = {}) {
         }
       }
       if (!choice || choice === "Cancel") return ctx.print("Nothing restored.")
-      // A turn may have started while the dialog was open (a background result woke the session).
-      if (ctx.session.info().busy) {
-        throw new Error("a turn started meanwhile; nothing was restored. Rewind after it ends")
-      }
+      // A turn may have started while the dialog was open (a background result woke the
+      // session), or a sub-agent.
+      const meanwhile = notNow(ctx, true)
+      if (meanwhile) throw new Error(meanwhile)
 
       const out: string[] = []
       let warn = false
