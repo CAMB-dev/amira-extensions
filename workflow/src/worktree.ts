@@ -3,7 +3,11 @@ import { mkdirSync, rmSync } from "node:fs"
 import path from "node:path"
 
 /** Runs git in `cwd`; `stdoutOnly` keeps stderr out of output that is parsed. */
-export type RunGit = (args: string[], cwd: string, stdoutOnly?: boolean) => Promise<{ output: string; ok: boolean }>
+export type RunGit = (
+  args: string[],
+  cwd: string,
+  stdoutOnly?: boolean,
+) => Promise<{ output: string; ok: boolean }>
 
 /**
  * A workflow agent's own checkout (isolation "worktree"), in the same place the agent

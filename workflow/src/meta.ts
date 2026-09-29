@@ -28,7 +28,8 @@ export function parseMeta(source: string): WorkflowMeta {
 /** parseMeta, and where the literal ends in `source`. */
 export function readMeta(source: string): { meta: WorkflowMeta; end: number } {
   const m = /(^|\n)\s*export\s+const\s+meta\s*(?::[^=]+)?=\s*/.exec(source)
-  if (!m) throw new ScriptError("the script must start with `export const meta = { name, description, phases }`")
+  if (!m)
+    throw new ScriptError("the script must start with `export const meta = { name, description, phases }`")
   const parser = new LiteralParser(source, m.index + m[0].length)
   let value: unknown
   try {
@@ -40,7 +41,8 @@ export function readMeta(source: string): { meta: WorkflowMeta; end: number } {
 }
 
 function checkMeta(value: unknown): WorkflowMeta {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new ScriptError("meta must be an object")
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new ScriptError("meta must be an object")
   const v = value as Record<string, unknown>
   if (typeof v.name !== "string" || !NAME.test(v.name)) {
     throw new ScriptError('meta.name must be a short name of letters, digits, "-", "_" and "."')
@@ -52,7 +54,11 @@ function checkMeta(value: unknown): WorkflowMeta {
   if (!Array.isArray(phases) || !phases.every((p) => typeof p === "string" && p.trim())) {
     throw new ScriptError("meta.phases must be a list of phase titles")
   }
-  return { name: v.name, description: v.description.replace(/\s+/g, " ").trim(), phases: phases.map((p) => p.trim()) }
+  return {
+    name: v.name,
+    description: v.description.replace(/\s+/g, " ").trim(),
+    phases: phases.map((p) => p.trim()),
+  }
 }
 
 /** A JSON5-ish literal reader: comments, single quotes, unquoted keys, trailing commas. */
@@ -79,7 +85,9 @@ class LiteralParser {
       this.i += word.length
       return word === "true" ? true : word === "false" ? false : null
     }
-    throw new Error(`unexpected ${word ? `"${word}"` : c === undefined ? "end of script" : `"${c}"`} at ${this.where()}`)
+    throw new Error(
+      `unexpected ${word ? `"${word}"` : c === undefined ? "end of script" : `"${c}"`} at ${this.where()}`,
+    )
   }
 
   private object(): Record<string, unknown> {
@@ -143,7 +151,15 @@ class LiteralParser {
       if (c === "\n" && quote !== "`") throw new Error(`line break in a string at ${this.where()}`)
       if (c === "\\") {
         const n = this.src[this.i + 1]
-        const map: Record<string, string> = { n: "\n", t: "\t", r: "\r", "\\": "\\", "'": "'", '"': '"', "`": "`" }
+        const map: Record<string, string> = {
+          n: "\n",
+          t: "\t",
+          r: "\r",
+          "\\": "\\",
+          "'": "'",
+          '"': '"',
+          "`": "`",
+        }
         if (n === "u") {
           out += String.fromCharCode(Number.parseInt(this.src.slice(this.i + 2, this.i + 6), 16))
           this.i += 6

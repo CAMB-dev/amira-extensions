@@ -123,7 +123,9 @@ test("files, processes, the network and modules are out of reach", async () => {
 
 test("imports are refused before anything runs", () => {
   expect(() => start({ source: `${META}import fs from "node:fs"\nreturn 1` })).toThrow(/cannot import/)
-  expect(() => start({ source: `${META}const fs = await import("node:fs")\nreturn 1` })).toThrow(/cannot import/)
+  expect(() => start({ source: `${META}const fs = await import("node:fs")\nreturn 1` })).toThrow(
+    /cannot import/,
+  )
   expect(() => start({ source: `${META}const fs = require("node:fs")\nreturn 1` })).toThrow(/cannot import/)
   // Types only matter to editors.
   const { run } = start({ source: `import type { Api } from "./workflow"\n${META}return 2` })
@@ -203,7 +205,9 @@ test("agents queue behind the group's maxConcurrent, and maxAgents fails the cal
   expect(group.peak).toBe(2)
   expect(group.spawned).toHaveLength(4)
   expect(run.result).toBe(1)
-  expect(run.flow.phases.flatMap((p) => p.items).filter((i) => i.kind === "agent" && i.status === "error")).toHaveLength(1)
+  expect(
+    run.flow.phases.flatMap((p) => p.items).filter((i) => i.kind === "agent" && i.status === "error"),
+  ).toHaveLength(1)
 })
 
 test("budget: total from the settings, spent from the group's use", async () => {
@@ -242,7 +246,9 @@ test("unknown options are refused with a message the script sees", async () => {
 })
 
 test("a role's tools and prompt reach the agent", async () => {
-  const { run, group } = start({ source: `${META}return await agent("scan", { role: "explorer", model: "p/m" })` })
+  const { run, group } = start({
+    source: `${META}return await agent("scan", { role: "explorer", model: "p/m" })`,
+  })
   await run.done
   const o = group.spawned[0]!
   expect(o.role).toBe("explorer")
@@ -280,9 +286,9 @@ test("resuming an unchanged run replays every call from the journal and starts n
   await again.run.done
   expect(again.group.spawned).toHaveLength(0)
   expect(again.run.result).toEqual(first.run.result)
-  expect(again.run.flow.phases.flatMap((p) => p.items).every((i) => i.kind === "agent" && i.status === "cached")).toBe(
-    true,
-  )
+  expect(
+    again.run.flow.phases.flatMap((p) => p.items).every((i) => i.kind === "agent" && i.status === "cached"),
+  ).toBe(true)
 })
 
 test("after a crash, a resume runs only what never finished", async () => {
@@ -295,7 +301,10 @@ test("after a crash, a resume runs only what never finished", async () => {
   const journal = readJournal(first.dir).filter((e) => !e.text.startsWith("did: verify"))
   const again = start({ source: FANOUT, dir: first.dir, previous: journal })
   await again.run.done
-  expect(again.group.spawned.map((o) => o.prompt)).toEqual(["find b", "verify did: find a,did: find b,did: find c"])
+  expect(again.group.spawned.map((o) => o.prompt)).toEqual([
+    "find b",
+    "verify did: find a,did: find b,did: find c",
+  ])
 })
 
 test("an edited script replays its unchanged prefix and reruns from the first change on", async () => {
@@ -304,7 +313,9 @@ test("an edited script replays its unchanged prefix and reruns from the first ch
   const edited = FANOUT.replace('"verify "', '"double-check "')
   const again = start({ source: edited, dir: first.dir, previous: readJournal(first.dir) })
   await again.run.done
-  expect(again.group.spawned.map((o) => o.prompt)).toEqual(["double-check did: find a,did: find b,did: find c"])
+  expect(again.group.spawned.map((o) => o.prompt)).toEqual([
+    "double-check did: find a,did: find b,did: find c",
+  ])
   // Changing an early call reruns everything that came after it, even calls that look unchanged.
   const early = FANOUT.replace('["a", "b", "c"]', '["a", "B", "c"]')
   const third = start({ source: early, dir: first.dir, previous: readJournal(first.dir) })

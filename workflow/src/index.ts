@@ -52,6 +52,53 @@ export interface WorkflowSettings {
 export const DEFAULT_MAX_AGENTS = 30
 export const DEFAULT_MAX_CONCURRENT = 6
 
+const positive = (v: unknown): number | undefined =>
+  typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined
+
+/**
+ * The `workflow` section of settings.json, checked: a field that does not fit is reported and
+ * left at its default.
+ */
+export function readSettings(raw: unknown, report: (error: string) => void = () => {}): WorkflowSettings {
+  if (raw === undefined) return {}
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    report("settings: workflow must be an object; using the defaults")
+    return {}
+  }
+  const r = raw as Record<string, unknown>
+  const out: WorkflowSettings = {}
+  const bad = (field: string, want: string) =>
+    report(`settings: workflow.${field} must be ${want}; using the default`)
+  if (r.enabled !== undefined) {
+    if (r.enabled === "explicit" || r.enabled === "always" || r.enabled === "never") out.enabled = r.enabled
+    else bad("enabled", '"explicit", "always" or "never"')
+  }
+  for (const key of ["maxAgents", "maxConcurrent"] as const) {
+    if (r[key] === undefined) continue
+    const n = positive(r[key])
+    if (n !== undefined) out[key] = Math.floor(n)
+    else bad(key, "a positive number")
+  }
+  if (r.budget !== undefined) {
+    const b = r.budget && typeof r.budget === "object" ? (r.budget as Record<string, unknown>) : undefined
+    const tokens = positive(b?.tokens)
+    const costUsd = positive(b?.costUsd)
+    if (
+      !b ||
+      (b.tokens !== undefined && tokens === undefined) ||
+      (b.costUsd !== undefined && costUsd === undefined)
+    ) {
+      bad("budget", "{ tokens?, costUsd? } with positive numbers")
+    } else if (tokens !== undefined || costUsd !== undefined) {
+      out.budget = {
+        ...(tokens !== undefined ? { tokens: Math.floor(tokens) } : {}),
+        ...(costUsd !== undefined ? { costUsd } : {}),
+      }
+    }
+  }
+  return out
+}
+
 /** Whether a user's message asks for a workflow. */
 export function asksForWorkflow(text: string): boolean {
   return /\bworkflows?\b/i.test(text) || /工作流/.test(text)
@@ -97,7 +144,13 @@ interface Launch {
 
 export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
   return (api: ExtensionAPI) => {
-    const settings = (): WorkflowSettings => (api.settings as { workflow?: WorkflowSettings }).workflow ?? {}
+    const reported = new Set<string>()
+    const settings = (): WorkflowSettings =>
+      readSettings(api.settings.workflow, (error) => {
+        if (reported.has(error)) return
+        reported.add(error)
+        api.reportError(error)
+      })
     const runs = new Map<string, WorkflowRun>()
     /** Which session started each run. */
     const owners = new Map<string, string>()
@@ -167,7 +220,11 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         `Phases: ${phasesLine(meta)}`,
         `Estimate: ${describeEstimate(estimate(source))}`,
         `Limits: ${limits.join(", ")}`,
-        ...(resume ? [`Resumes run ${resume.id}: ${resume.previous.length} journaled results are reused where the script is unchanged.`] : []),
+        ...(resume
+          ? [
+              `Resumes run ${resume.id}: ${resume.previous.length} journaled results are reused where the script is unchanged.`,
+            ]
+          : []),
       ].join("\n")
     }
 
@@ -186,7 +243,9 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       )
       if (ok !== true) {
         l.notice?.cancel()
-        return ok === false ? "The user declined to start the workflow." : "Nobody confirmed the workflow, so it did not start."
+        return ok === false
+          ? "The user declined to start the workflow."
+          : "Nobody confirmed the workflow, so it did not start."
       }
       const s = settings()
       let group: SpawnGroup
@@ -197,7 +256,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
           maxConcurrent: s.maxConcurrent ?? DEFAULT_MAX_CONCURRENT,
           ...(s.budget ? { budget: s.budget } : {}),
           compact: true,
-        } as SpawnGroupOptions)
+        })
       } catch (err) {
         l.notice?.cancel()
         return `The workflow could not start: ${errorText(err)}`
@@ -246,16 +305,19 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
 
     /** The group's one-line status in the transcript: phase and counts. */
     const setStatus = (run: WorkflowRun) => {
-      const g = run.group as SpawnGroup & { setStatus?: (text: string) => void }
       const phase = run.flow.current ? `${run.flow.current} · ` : ""
-      g.setStatus?.(`${run.id} · ${phase}${countsLine(run.flow)}`)
+      run.group.setStatus(`${run.id} · ${phase}${countsLine(run.flow)}`)
     }
 
     /** A run to resume: its stored script and journal. */
-    const resumable = (id: string): { source: string; args: unknown; previous: JournalEntry[]; resumes: number } | string => {
+    const resumable = (
+      id: string,
+    ): { source: string; args: unknown; previous: JournalEntry[]; resumes: number } | string => {
       const live = runs.get(id)
       if (live?.status === "running") return `Run ${id} is still running.`
-      const dir = [path.join(runsRoot(), id), path.join(api.home, "workflow-runs", id)].find((d) => existsSync(d))
+      const dir = [path.join(runsRoot(), id), path.join(api.home, "workflow-runs", id)].find((d) =>
+        existsSync(d),
+      )
       const stored = dir ? readRun(dir) : undefined
       if (!dir || !stored) return `No workflow run ${id} was found.`
       return {
@@ -274,7 +336,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
     }
 
     type Params = { script?: string; name?: string; args?: unknown; resume?: string }
-    const tool: ToolDefinition<Params> & { mainOnly: boolean } = {
+    const tool: ToolDefinition<Params> = {
       name: WORKFLOW_TOOL,
       mainOnly: true,
       description: `Runs a workflow: a TypeScript script that orchestrates many sub-agents (fan-out, verification, pipelines) deterministically, in the background. Only use it when the user asked for a workflow; otherwise propose one. Load the "workflow" skill first for how to write scripts. The script runs in a sandbox with only agent(prompt, {label, phase, schema, role, model, isolation}), parallel(thunks), pipeline(items, ...stages), phase(title), log(msg), args, budget and workflow(name, args); it starts with \`export const meta = { name, description, phases }\` and its top level ends with \`return result\`. The user confirms every start. The call returns at once with the run's id; the script's return value comes back to you by itself as a message when the run ends: end your turn instead of waiting. Give "script" (the source), or "name" (a saved workflow from .amira/workflows or ~/.amira/workflows), and "args" for the script. "resume" with a run id reruns that run (with "script" or "name" to use an edited script), replaying unchanged agent calls from its journal.`,
@@ -310,7 +372,10 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
           const saved = findSaved(api.cwd, api.home, p.name)
           if (!saved) {
             const names = listSaved(api.cwd, api.home).map((w) => w.name)
-            return textResult(`No saved workflow "${p.name}". Saved workflows: ${names.join(", ") || "none"}.`, true)
+            return textResult(
+              `No saved workflow "${p.name}". Saved workflows: ${names.join(", ") || "none"}.`,
+              true,
+            )
           }
           source = readFileSync(saved.file, "utf8")
           origin = saved.file
@@ -373,7 +438,10 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         if (run.logs.length) {
           lines.push({ kind: "text", text: "" }, { kind: "muted", text: "Log" })
           for (const l of run.logs.slice(-50)) {
-            lines.push({ kind: l.level === "info" ? "text" : l.level, text: `  ${l.nest ? `[${l.nest.split("#")[0]}] ` : ""}${l.text}` })
+            lines.push({
+              kind: l.level === "info" ? "text" : l.level,
+              text: `  ${l.nest ? `[${l.nest.split("#")[0]}] ` : ""}${l.text}`,
+            })
           }
         }
         return lines
@@ -394,9 +462,12 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
     const listText = () => {
       const saved = listSaved(api.cwd, api.home)
       const lines = ["Saved workflows (run with /workflow <name> [args]):"]
-      if (!saved.length) lines.push("  none (save scripts in .amira/workflows/*.ts or ~/.amira/workflows/*.ts)")
+      if (!saved.length)
+        lines.push("  none (save scripts in .amira/workflows/*.ts or ~/.amira/workflows/*.ts)")
       for (const w of saved) {
-        lines.push(`  ${w.name} (${w.scope})${w.meta ? ` - ${w.meta.description}` : ` - cannot read: ${w.problem}`}`)
+        lines.push(
+          `  ${w.name} (${w.scope})${w.meta ? ` - ${w.meta.description}` : ` - cannot read: ${w.problem}`}`,
+        )
       }
       const recent = [...runs.values()].reverse()
       const stored = listRuns(runsRoot()).filter((r) => !runs.has(r.id))
@@ -405,7 +476,9 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         for (const r of recent) lines.push(`  ${r.id} ${r.meta.name} · ${r.status} · ${countsLine(r.flow)}`)
         for (const r of stored.slice(0, 10)) lines.push(`  ${r.id} ${r.meta.name} · ${r.status} (earlier)`)
       }
-      lines.push("Also: /workflow view [id], /workflow stop [id], /workflow resume <id>, /workflow <task> to ask for a workflow.")
+      lines.push(
+        "Also: /workflow view [id], /workflow stop [id], /workflow resume <id>, /workflow <task> to ask for a workflow.",
+      )
       return lines.join("\n")
     }
 
@@ -419,9 +492,13 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       }
     }
 
-    const commandLaunch = async (ctx: CommandContext, l: Omit<Launch, "ui" | "createGroup" | "notice" | "send">) => {
-      const control = ctx.session as typeof ctx.session & { expectNotice?: () => PendingNotice }
-      if (!control.createGroup) throw new Error("workflows need an agent tree, which this frontend does not have")
+    const commandLaunch = async (
+      ctx: CommandContext,
+      l: Omit<Launch, "ui" | "createGroup" | "notice" | "send">,
+    ) => {
+      const control = ctx.session
+      if (!control.createGroup)
+        throw new Error("workflows need an agent tree, which this frontend does not have")
       const notice = control.expectNotice?.()
       const run = await launch({
         ...l,
@@ -429,10 +506,14 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         signal: ctx.signal,
         createGroup: (o) => control.createGroup!(o),
         notice,
-        send: (m) => void ctx.session.send(messageText(m), m.display ? { display: m.display } : {}).catch(() => {}),
+        send: (m) =>
+          void ctx.session.send(messageText(m), m.display ? { display: m.display } : {}).catch(() => {}),
       })
       if (typeof run === "string") ctx.print(run, "warning")
-      else ctx.print(`Started workflow run ${run.id} (${run.meta.name}); /workflow view ${run.id} shows its progress.`)
+      else
+        ctx.print(
+          `Started workflow run ${run.id} (${run.meta.name}); /workflow view ${run.id} shows its progress.`,
+        )
     }
 
     api.registerCommand({
@@ -441,7 +522,10 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       args: {
         hint: "[name [args] | view [id] | stop [id] | resume <id> | task]",
         complete: (): CommandCandidate[] => [
-          ...listSaved(api.cwd, api.home).map((w) => ({ value: w.name, ...(w.meta ? { description: w.meta.description } : {}) })),
+          ...listSaved(api.cwd, api.home).map((w) => ({
+            value: w.name,
+            ...(w.meta ? { description: w.meta.description } : {}),
+          })),
           { value: "view", description: "show a run's progress tree" },
           { value: "stop", description: "stop a run" },
           { value: "resume", description: "resume a run from its journal" },
@@ -458,7 +542,10 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         if (first === "view") {
           const id = rest[0]
           const run = id ? runs.get(id) : latest()
-          if (!run) throw new Error(id ? `no workflow run ${id} in this session` : "no workflow has run in this session")
+          if (!run)
+            throw new Error(
+              id ? `no workflow run ${id} in this session` : "no workflow has run in this session",
+            )
           if (!ctx.openView) {
             ctx.print(`${run.meta.name} ${run.id} · ${run.status} · ${countsLine(run.flow)}`)
             return
@@ -469,7 +556,8 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         if (first === "stop") {
           const id = rest[0]
           const run = id ? runs.get(id) : [...runs.values()].reverse().find((r) => r.status === "running")
-          if (!run?.stop()) throw new Error(id ? `workflow run ${id} is not running` : "no workflow is running")
+          if (!run?.stop())
+            throw new Error(id ? `workflow run ${id} is not running` : "no workflow is running")
           ctx.print(`Stopped workflow run ${run.id}.`)
           return
         }
@@ -524,7 +612,8 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       if (e.parentSessionId !== undefined) return
       if (root && root !== e.sessionId) {
         // Another conversation took over (/clear, /resume): its runs have nobody to report to.
-        for (const [id, owner] of owners) if (owner !== e.sessionId) runs.get(id)?.stop("its session was closed")
+        for (const [id, owner] of owners)
+          if (owner !== e.sessionId) runs.get(id)?.stop("its session was closed")
       }
       root = e.sessionId
       if (e.data.sessionFile) sessionFile = e.data.sessionFile

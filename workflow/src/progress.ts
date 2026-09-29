@@ -93,7 +93,9 @@ export function formatDuration(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000))
   if (s < 60) return `${s}s`
   const m = Math.floor(s / 60)
-  return m < 60 ? `${m}m${String(s % 60).padStart(2, "0")}s` : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`
+  return m < 60
+    ? `${m}m${String(s % 60).padStart(2, "0")}s`
+    : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`
 }
 
 function cost(c: number | undefined): string {
@@ -157,7 +159,8 @@ export function treeLines(flow: FlowNode, now: number, prefix = ""): ViewLine[] 
     for (const [ii, item] of p.items.entries()) {
       const last = ii === p.items.length - 1
       const b = last ? "└ " : "├ "
-      if (item.kind === "agent") out.push({ kind: KIND[item.status], text: `${base}${b}${agentText(item, now)}` })
+      if (item.kind === "agent")
+        out.push({ kind: KIND[item.status], text: `${base}${b}${agentText(item, now)}` })
       else {
         const t = totals(item)
         const mark = item.state === "running" ? "●" : item.state === "done" ? "✓" : "✗"

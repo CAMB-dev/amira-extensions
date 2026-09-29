@@ -41,9 +41,13 @@ function parseRole(text: string, file: string): Role {
   const match = /^---[ \t]*\r?\n(?:([\s\S]*?)\r?\n)?---[ \t]*(?:\r?\n|$)/.exec(src)
   const yaml = match?.[1] ?? ""
   const parsed = yaml.trim() ? Bun.YAML.parse(yaml) : {}
-  const data = (parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {}) as Record<string, unknown>
+  const data = (parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {}) as Record<
+    string,
+    unknown
+  >
   const body = match ? src.slice(match[0].length) : src
-  const name = typeof data.name === "string" && data.name.trim() ? data.name.trim() : path.basename(file, ".md")
+  const name =
+    typeof data.name === "string" && data.name.trim() ? data.name.trim() : path.basename(file, ".md")
   const tools =
     typeof data.tools === "string"
       ? data.tools.split(/[,\s]+/).filter(Boolean)

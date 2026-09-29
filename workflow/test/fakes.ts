@@ -25,7 +25,10 @@ export interface FakeGroup extends SpawnGroup {
  * A spawn group whose children answer with `answer(opts)` after a tick, honouring
  * maxConcurrent and maxAgents the way core does (queueing, and refusing past the cap).
  */
-export function fakeGroup(options: SpawnGroupOptions, answer: (o: SpawnOptions) => Answer | Promise<Answer>): FakeGroup {
+export function fakeGroup(
+  options: SpawnGroupOptions,
+  answer: (o: SpawnOptions) => Answer | Promise<Answer>,
+): FakeGroup {
   let running = 0
   const waiting: (() => void)[] = []
   let n = 0
@@ -57,7 +60,12 @@ export function fakeGroup(options: SpawnGroupOptions, answer: (o: SpawnOptions) 
         for (const l of listeners) l()
       }
       let abortWith: ((r: SubagentResult) => void) | undefined
-      const base = { sessionId: id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, steps: 1, durationMs: 5 }
+      const base = {
+        sessionId: id,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        steps: 1,
+        durationMs: 5,
+      }
       const result = new Promise<SubagentResult>((resolve) => {
         abortWith = resolve
         const go = async () => {

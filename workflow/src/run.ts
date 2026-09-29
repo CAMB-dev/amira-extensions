@@ -67,15 +67,18 @@ function cleanOpts(o: AgentOpts): AgentOpts | string {
   if (o.phase !== undefined) out.phase = String(o.phase)
   if (o.role !== undefined) out.role = String(o.role)
   if (o.model !== undefined) {
-    if (typeof o.model !== "string" || !/^[^/]+\/.+/.test(o.model)) return 'opts.model must look like "provider/model"'
+    if (typeof o.model !== "string" || !/^[^/]+\/.+/.test(o.model))
+      return 'opts.model must look like "provider/model"'
     out.model = o.model
   }
   if (o.isolation !== undefined) {
-    if (o.isolation !== "none" && o.isolation !== "worktree") return 'opts.isolation must be "none" or "worktree"'
+    if (o.isolation !== "none" && o.isolation !== "worktree")
+      return 'opts.isolation must be "none" or "worktree"'
     out.isolation = o.isolation
   }
   if (o.schema !== undefined) {
-    if (!o.schema || typeof o.schema !== "object" || Array.isArray(o.schema)) return "opts.schema must be a JSON Schema object"
+    if (!o.schema || typeof o.schema !== "object" || Array.isArray(o.schema))
+      return "opts.schema must be a JSON Schema object"
     out.schema = o.schema
   }
   return out
@@ -144,9 +147,16 @@ export class WorkflowRun {
     const worker = (this.#opts.worker ?? sandboxWorker)()
     this.#worker = worker
     worker.onmessage = (e) => void this.#handle(e.data)
-    worker.onerror = (e) => this.#end("error", undefined, `the script crashed: ${e.message ?? "unknown error"}`)
+    worker.onerror = (e) =>
+      this.#end("error", undefined, `the script crashed: ${e.message ?? "unknown error"}`)
     const total = this.#opts.budgetTokens
-    this.#post({ t: "run", code: this.#code, args: this.#opts.args ?? null, budgetTotal: total ?? null, spent: 0 })
+    this.#post({
+      t: "run",
+      code: this.#code,
+      args: this.#opts.args ?? null,
+      budgetTotal: total ?? null,
+      spent: 0,
+    })
   }
 
   /** Stops the run: its agents are stopped and the script is ended where it is. */
@@ -207,7 +217,10 @@ export class WorkflowRun {
       case "nestEnd": {
         const node = this.#nests.get(m.nest)
         if (node) node.state = m.ok ? "done" : "error"
-        this.#log(m.ok ? "info" : "warning", `workflow ${node?.name ?? m.nest} ${m.ok ? "finished" : "failed"}`)
+        this.#log(
+          m.ok ? "info" : "warning",
+          `workflow ${node?.name ?? m.nest} ${m.ok ? "finished" : "failed"}`,
+        )
         break
       }
       case "done":
@@ -222,14 +235,20 @@ export class WorkflowRun {
   #nested(m: Extract<WorkerMessage, { t: "workflow" }>) {
     const source = this.#opts.loadWorkflow(m.name)
     if (source === undefined) {
-      this.#reply(m.id, { ok: false, error: `no saved workflow named "${m.name}" (in .amira/workflows or ~/.amira/workflows)` })
+      this.#reply(m.id, {
+        ok: false,
+        error: `no saved workflow named "${m.name}" (in .amira/workflows or ~/.amira/workflows)`,
+      })
       return
     }
     let compiled: ReturnType<typeof compileScript>
     try {
       compiled = compileScript(source)
     } catch (err) {
-      this.#reply(m.id, { ok: false, error: `workflow "${m.name}": ${err instanceof Error ? err.message : String(err)}` })
+      this.#reply(m.id, {
+        ok: false,
+        error: `workflow "${m.name}": ${err instanceof Error ? err.message : String(err)}`,
+      })
       return
     }
     const nest = `${compiled.meta.name}#${++this.#nestCount}`
@@ -247,7 +266,13 @@ export class WorkflowRun {
       return
     }
     const flow = this.#flowOf(m.nest)
-    const node: AgentNode = { kind: "agent", call: m.id, label: label(m.prompt, opts.label), status: "queued", tokens: 0 }
+    const node: AgentNode = {
+      kind: "agent",
+      call: m.id,
+      label: label(m.prompt, opts.label),
+      status: "queued",
+      tokens: 0,
+    }
     phaseOf(flow, opts.phase ?? flow.current).items.push(node)
     const key = this.journal.key(callHash(m.prompt, opts, m.nest))
     const hit = this.journal.replay(key, m.seen, this.#delivered)
@@ -264,7 +289,10 @@ export class WorkflowRun {
       node.status = "error"
       node.note = `unknown role ${opts.role}`
       this.#opts.onChange()
-      this.#reply(m.id, { ok: false, error: `unknown role "${opts.role}"; known roles: ${[...this.#opts.roles().keys()].join(", ")}` })
+      this.#reply(m.id, {
+        ok: false,
+        error: `unknown role "${opts.role}"; known roles: ${[...this.#opts.roles().keys()].join(", ")}`,
+      })
       return
     }
     const isolation = opts.isolation ?? role?.isolation ?? "none"
@@ -276,7 +304,11 @@ export class WorkflowRun {
         name: `${this.id}_${m.id}`,
       })
       if ("error" in wt) {
-        this.#log("warning", `${node.label}: no worktree (${wt.error}); it works in the shared directory`, m.nest)
+        this.#log(
+          "warning",
+          `${node.label}: no worktree (${wt.error}); it works in the shared directory`,
+          m.nest,
+        )
         wt = undefined
       }
       if (this.status !== "running") return
@@ -324,7 +356,11 @@ export class WorkflowRun {
     if (tree) {
       const line = await finishWorktree(this.#opts.git, tree, r.status === "done")
       node.note = line
-      this.#log(line.includes("NOT merged") || line.includes("kept") ? "warning" : "info", `${node.label}: ${line}`, m.nest)
+      this.#log(
+        line.includes("NOT merged") || line.includes("kept") ? "warning" : "info",
+        `${node.label}: ${line}`,
+        m.nest,
+      )
     }
     if (r.status !== "done") node.note = r.error ?? r.status
     this.#opts.onChange()
@@ -332,7 +368,7 @@ export class WorkflowRun {
       this.journal.record({
         key,
         label: node.label,
-        ...(opts.phase ?? flow.current ? { phase: opts.phase ?? flow.current } : {}),
+        ...((opts.phase ?? flow.current) ? { phase: opts.phase ?? flow.current } : {}),
         ...(m.nest ? { nest: m.nest } : {}),
         text: r.text,
         ...(r.value !== undefined ? { value: r.value } : {}),
@@ -343,7 +379,10 @@ export class WorkflowRun {
       })
       this.#reply(m.id, { ok: true, value: opts.schema ? r.value : r.text })
     } else {
-      this.#reply(m.id, { ok: false, error: `agent "${node.label}" ${r.status === "aborted" ? "was stopped" : "failed"}: ${r.error ?? r.status}` })
+      this.#reply(m.id, {
+        ok: false,
+        error: `agent "${node.label}" ${r.status === "aborted" ? "was stopped" : "failed"}: ${r.error ?? r.status}`,
+      })
     }
   }
 
@@ -371,13 +410,18 @@ export class WorkflowRun {
     if (status === "done") this.result = value
     if (error !== undefined) this.error = error
     this.flow.state = status === "done" ? "done" : "error"
-    for (const n of this.#nests.values()) if (n.state === "running") n.state = status === "done" ? "done" : "error"
+    for (const n of this.#nests.values())
+      if (n.state === "running") n.state = status === "done" ? "done" : "error"
     try {
       this.#worker?.terminate()
     } catch {}
     this.#worker = undefined
     // Agents the script did not wait for end with it.
-    this.#opts.group.end(status === "done" ? "the workflow finished" : `the workflow ${status === "stopped" ? "was stopped" : "failed"}`)
+    this.#opts.group.end(
+      status === "done"
+        ? "the workflow finished"
+        : `the workflow ${status === "stopped" ? "was stopped" : "failed"}`,
+    )
     if (status !== "done") this.#log(status === "stopped" ? "warning" : "error", error ?? status)
     writeRun(this.#opts.dir, this.record)
     this.#opts.onChange()

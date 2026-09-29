@@ -117,14 +117,19 @@ function lockDown() {
   Object.defineProperty(RealDate.prototype, "constructor", { value: SafeDate })
   Object.defineProperty(SafeDate, "now", { value: () => forbid("Date.now()") })
   ;(globalThis as Record<string, unknown>).Date = SafeDate
-  Object.defineProperty(Math, "random", { value: () => forbid("Math.random()"), writable: false, configurable: false })
+  Object.defineProperty(Math, "random", {
+    value: () => forbid("Math.random()"),
+    writable: false,
+    configurable: false,
+  })
   for (const name of REMOVED) {
     try {
       delete (globalThis as Record<string, unknown>)[name]
     } catch {}
   }
   // `(function () {}).constructor("...")` would compile code with the real globals.
-  const blocked = () => forbid("Compiling code at run time", "workflow scripts cannot create functions from strings")
+  const blocked = () =>
+    forbid("Compiling code at run time", "workflow scripts cannot create functions from strings")
   for (const proto of [
     Function.prototype,
     Object.getPrototypeOf(async () => {}),
@@ -154,7 +159,11 @@ function request<T>(message: WorkerMessage & { id: number }): Promise<T> {
       post(message)
     } catch (err) {
       pending.delete(message.id)
-      reject(new Error(`could not pass the call on (only plain data can be): ${err instanceof Error ? err.message : err}`))
+      reject(
+        new Error(
+          `could not pass the call on (only plain data can be): ${err instanceof Error ? err.message : err}`,
+        ),
+      )
     }
   })
 }
@@ -178,34 +187,55 @@ function makeApi(args: unknown, nest: string | undefined) {
       return Promise.reject(new TypeError("agent(prompt, opts): opts must be an object"))
     }
     const id = ++seq
-    return request({ t: "agent", id, seen, prompt, opts: JSON.parse(JSON.stringify(opts)), ...(nest ? { nest } : {}) })
+    return request({
+      t: "agent",
+      id,
+      seen,
+      prompt,
+      opts: JSON.parse(JSON.stringify(opts)),
+      ...(nest ? { nest } : {}),
+    })
   }
   const settle = async <T>(thunk: () => T | Promise<T>, what: string): Promise<T | null> => {
     try {
       return await thunk()
     } catch (err) {
-      post({ t: "log", msg: `${what} failed: ${err instanceof Error ? err.message : String(err)}`, level: "warning", ...(nest ? { nest } : {}) })
+      post({
+        t: "log",
+        msg: `${what} failed: ${err instanceof Error ? err.message : String(err)}`,
+        level: "warning",
+        ...(nest ? { nest } : {}),
+      })
       return null
     }
   }
   const parallel = (thunks: unknown) => {
     if (!Array.isArray(thunks) || !thunks.every((f) => typeof f === "function")) {
-      return Promise.reject(new TypeError("parallel(thunks): pass an array of functions, e.g. items.map((x) => () => agent(...))"))
+      return Promise.reject(
+        new TypeError(
+          "parallel(thunks): pass an array of functions, e.g. items.map((x) => () => agent(...))",
+        ),
+      )
     }
     return Promise.all(thunks.map((f, i) => settle(f as () => unknown, `parallel task ${i + 1}`)))
   }
   const pipeline = (items: unknown, ...stages: unknown[]) => {
-    if (!Array.isArray(items)) return Promise.reject(new TypeError("pipeline(items, ...stages): items must be an array"))
+    if (!Array.isArray(items))
+      return Promise.reject(new TypeError("pipeline(items, ...stages): items must be an array"))
     if (!stages.every((s) => typeof s === "function")) {
       return Promise.reject(new TypeError("pipeline(items, ...stages): each stage must be a function"))
     }
     return Promise.all(
       items.map((item, index) =>
-        settle(async () => {
-          let value: unknown = item
-          for (const stage of stages) value = await (stage as (v: unknown, item: unknown, i: number) => unknown)(value, item, index)
-          return value
-        }, `pipeline item ${index + 1}`),
+        settle(
+          async () => {
+            let value: unknown = item
+            for (const stage of stages)
+              value = await (stage as (v: unknown, item: unknown, i: number) => unknown)(value, item, index)
+            return value
+          },
+          `pipeline item ${index + 1}`,
+        ),
       ),
     )
   }
@@ -223,9 +253,13 @@ function makeApi(args: unknown, nest: string | undefined) {
     remaining: () => Math.max(0, total - spent),
   })
   const workflow = nest
-    ? () => Promise.reject(new Error("workflow() can only be used one level deep: a nested workflow cannot start another"))
+    ? () =>
+        Promise.reject(
+          new Error("workflow() can only be used one level deep: a nested workflow cannot start another"),
+        )
     : (name: unknown, wargs?: unknown) => {
-        if (typeof name !== "string" || !name.trim()) return Promise.reject(new TypeError("workflow(name, args): name must be a string"))
+        if (typeof name !== "string" || !name.trim())
+          return Promise.reject(new TypeError("workflow(name, args): name must be a string"))
         const id = ++seq
         return request<{ code: string; args: unknown; name: string }>({
           t: "workflow",
@@ -269,12 +303,16 @@ self.onmessage = (e) => {
           try {
             out = value === undefined ? null : JSON.parse(JSON.stringify(value))
           } catch (err) {
-            post({ t: "error", message: `the script's result is not plain data: ${err instanceof Error ? err.message : err}` })
+            post({
+              t: "error",
+              message: `the script's result is not plain data: ${err instanceof Error ? err.message : err}`,
+            })
             return
           }
           post({ t: "done", value: out })
         },
-        (err) => post({ t: "error", message: err instanceof Error ? `${err.name}: ${err.message}` : String(err) }),
+        (err) =>
+          post({ t: "error", message: err instanceof Error ? `${err.name}: ${err.message}` : String(err) }),
       )
       break
     }
