@@ -15,6 +15,7 @@ amira ext remove mcp-server
 | Extension | What it does |
 |---|---|
 | [mcp-server](mcp-server) | `amira mcp serve`: Amira as an MCP server, so Claude Code, Codex, Gemini CLI and others can hand it tasks |
+| [swarm](swarm) | `/swarm <goal>`: long-lived agents that work together through a shared blackboard and messages |
 
 ## The index
 
