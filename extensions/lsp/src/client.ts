@@ -86,6 +86,7 @@ export class LspClient {
   #capabilities: Record<string, any> = {}
   #started: Promise<void> | undefined
   #stderrTail = ""
+  #closing: Promise<void> | undefined
 
   constructor(opts: ClientOptions) {
     this.#opts = opts
@@ -338,8 +339,16 @@ export class LspClient {
     })
   }
 
-  /** Asks the server to shut down, then ends it. */
-  async close(): Promise<void> {
+  /**
+   * Asks the server to shut down, then ends it. Its exiting meanwhile is expected, not a
+   * crash: onExit is not called.
+   */
+  close(): Promise<void> {
+    this.#closing ??= this.#close()
+    return this.#closing
+  }
+
+  async #close(): Promise<void> {
     if (this.state === "closed" || this.state === "failed") return
     const wasReady = this.state === "ready"
     if (wasReady) {
@@ -414,6 +423,11 @@ export class LspClient {
 
   #onExit(reason: string) {
     if (this.state === "closed" || this.state === "failed") return
+    if (this.#closing) {
+      // Stopping anyway: the shutdown request need not wait for an answer that cannot come.
+      this.#rejectAll(reason)
+      return
+    }
     const wasRunning = this.state === "ready"
     this.#fail(reason)
     if (wasRunning) this.#opts.onExit?.(reason)

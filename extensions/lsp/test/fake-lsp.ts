@@ -8,6 +8,7 @@
  *   FAKE_LSP_SILENT  "1": never publish
  *   FAKE_LSP_URIS    "vscode": publish URIs as file:///c%3A/... (lower-case drive, encoded colon)
  *   FAKE_LSP_STALE   "1": publish the old diagnostics again right after a change, without a version
+ *   FAKE_LSP_EXIT_ON_SHUTDOWN "1": exit at shutdown without answering
  */
 import { appendFileSync } from "node:fs"
 
@@ -104,6 +105,7 @@ function onMessage(m: any) {
       return send({ id: m.id, result: { kind: "full", items: doc ? diagnosticsOf(doc.text) : [] } })
     }
     case "shutdown":
+      if (env.FAKE_LSP_EXIT_ON_SHUTDOWN === "1") process.exit(0)
       return send({ id: m.id, result: null })
     case "exit":
       return process.exit(0)

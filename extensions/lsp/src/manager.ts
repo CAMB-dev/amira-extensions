@@ -195,7 +195,7 @@ export class ServerManager {
           ? { initializationOptions: spec.initializationOptions }
           : {}),
         ...(spec.settings ? { settings: spec.settings } : {}),
-        onExit: (reason) => this.#onCrash(key, spec, root, reason),
+        onExit: (reason) => this.#onCrash(key, client, spec, root, reason),
       })
       entry = { spec, root, client, checks: 0 }
       this.#entries.set(key, entry)
@@ -218,7 +218,9 @@ export class ServerManager {
 
   #crashes = new Map<string, number>()
 
-  #onCrash(key: string, spec: ServerSpec, root: string, reason: string) {
+  #onCrash(key: string, client: LspClient, spec: ServerSpec, root: string, reason: string) {
+    // A server replaced meanwhile (stopped, then started again) is not this one's to remove.
+    if (this.#entries.get(key)?.client !== client) return
     this.#entries.delete(key)
     const crashes = (this.#crashes.get(key) ?? 0) + 1
     this.#crashes.set(key, crashes)

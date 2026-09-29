@@ -232,6 +232,42 @@ test("the manager starts one server per root lazily, checks files together and r
   expect(await m.check([b], dir, signal)).toEqual([])
 })
 
+test("a server exiting while it is stopped is no crash, and does not take its replacement with it", async () => {
+  const { dir } = workspace()
+  process.env.FAKE_LSP_EXIT_ON_SHUTDOWN = "1"
+  cleanup.push(() => delete process.env.FAKE_LSP_EXIT_ON_SHUTDOWN)
+  const exits: string[] = []
+  const c = new LspClient({
+    argv: [process.execPath, FAKE],
+    root: dir,
+    openPipe: pipe,
+    startupTimeoutMs: 30_000,
+    onExit: (reason) => void exits.push(reason),
+  })
+  await c.start()
+  await c.close()
+  await Bun.sleep(200)
+  expect(c.state).toBe("closed")
+  expect(exits).toEqual([])
+
+  const errors: string[] = []
+  const m = manager(errors)
+  const a = path.join(dir, "a.fk")
+  writeFileSync(a, "ERROR: e\n")
+  const signal = new AbortController().signal
+  await m.check([a], dir, signal)
+  expect(m.running).toBe(1)
+  // Stopped, and a check starts a new server for the same folder before the old one is gone.
+  const stopping = m.stopAll()
+  const again = m.check([a], dir, signal)
+  await stopping
+  expect((await again)[0]).toMatchObject({ fresh: true, diagnostics: [{ message: "e" }] })
+  await Bun.sleep(300)
+  expect(m.running).toBe(1)
+  expect(m.describe().find((s) => s.id === "fake")!.running).toMatchObject([{ state: "ready" }])
+  expect(errors).toEqual([])
+})
+
 test("a server that cannot start is reported once and not tried again until restart", async () => {
   const { dir } = workspace()
   const errors: string[] = []
