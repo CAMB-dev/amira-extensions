@@ -1,0 +1,11 @@
+{
+  "name": "workflow",
+  "version": "0.1.0",
+  "description": "Dynamic workflows: TypeScript scripts that orchestrate many sub-agents, with a journal to resume them",
+  "type": "module",
+  "amira": {
+    "engines": { "amira": "^0.1" },
+    "extensions": ["./src/index.ts"],
+    "skills": ["./skills"]
+  }
+}

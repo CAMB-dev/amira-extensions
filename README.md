@@ -15,6 +15,7 @@ amira ext remove mcp-server
 | Extension | What it does |
 |---|---|
 | [mcp-server](mcp-server) | `amira mcp serve`: Amira as an MCP server, so Claude Code, Codex, Gemini CLI and others can hand it tasks |
+| [workflow](workflow) | `/workflow` and a `workflow` tool: TypeScript scripts that orchestrate many sub-agents, with limits, a progress view and resume |
 
 ## The index
 
