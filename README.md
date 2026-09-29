@@ -21,6 +21,7 @@ amira ext remove mcp-server
 | [notify](extensions/notify) | Notifications when a long turn ends, a question waits or background agents finish: desktop (Windows, macOS, Linux) or webhooks (Telegram, Discord, WeCom, JSON) |
 | [todo](extensions/todo) | `todo_write` and `todo_read`: the model's todo list for multi-step work, shown live above the activity line |
 | [share](extensions/share) | `/export` the session as Markdown or HTML; `/commit`, `/pr` and `/review` git helpers |
+| [hooks](extensions/hooks) | Your commands on events: format or lint after each edit, block or ask before risky commands, tests after a turn |
 
 ## The index
 
