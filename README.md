@@ -17,6 +17,7 @@ amira ext remove mcp-server
 | [mcp-server](mcp-server) | `amira mcp serve`: Amira as an MCP server, so Claude Code, Codex, Gemini CLI and others can hand it tasks |
 | [workflow](workflow) | `/workflow` and a `workflow` tool: TypeScript scripts that orchestrate many sub-agents, with limits, a progress view and resume |
 | [swarm](swarm) | `/swarm <goal>`: long-lived agents that work together through a shared blackboard and messages |
+| [checkpoints](extensions/checkpoints) | A snapshot of the files before each turn (private git refs); `/rewind` restores files, or files and conversation |
 
 ## The index
 

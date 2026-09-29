@@ -27,6 +27,15 @@
       "engines": { "amira": "^0.1.1" },
       "tags": ["agents", "swarm", "multi-agent", "orchestration"],
       "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/swarm"
+    },
+    {
+      "name": "checkpoints",
+      "description": "Checkpoints and /rewind: a snapshot of the files before each turn, in private git refs, and a way back to any of them (files, or files and conversation)",
+      "version": "0.1.0",
+      "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/checkpoints" },
+      "engines": { "amira": "^0.1.1" },
+      "tags": ["checkpoints", "rewind", "undo", "git", "snapshots"],
+      "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/checkpoints"
     }
   ]
 }
