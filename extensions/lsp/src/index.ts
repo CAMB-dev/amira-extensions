@@ -289,6 +289,7 @@ function setUp(api: ExtensionAPI, settings: LspSettings, which: Which) {
           true,
         )
       }
+      if (!c.fresh && c.note) return textResult(`${c.source} did not check ${shown}: ${c.note}.`, true)
       if (!c.fresh) {
         return textResult(
           `The ${c.source} server did not report on ${shown} in time; try again shortly.`,

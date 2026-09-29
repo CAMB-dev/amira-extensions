@@ -346,29 +346,45 @@ test("a server that cannot start is reported once and not tried again until rest
 test("without a TypeScript server, tsc --noEmit checks the project", async () => {
   const { dir } = workspace()
   const errors: string[] = []
-  // A stand-in for tsc: prints what real tsc prints for a type error in the file asked about.
+  // A stand-in for tsc: prints what real tsc prints for a type error in the file asked about,
+  // then (--listFiles) the project's files: src/a.ts only, and nothing for a solution tsconfig.
   const fakeTsc = path.join(dir, "fake-tsc.ts")
+  const a = path.join(dir, "src", "a.ts")
   writeFileSync(
     fakeTsc,
     [
       "const args = process.argv.slice(2)",
-      "if (!args.includes('--noEmit')) process.exit(9)",
+      "if (!args.includes('--noEmit') || !args.includes('--listFiles')) process.exit(9)",
+      "if (/[\\\\/]sol[\\\\/]tsconfig\\.json$/.test(args.at(-1))) process.exit(0)",
       "console.log('src/a.ts(2,5): error TS2322: Type \\'string\\' is not assignable to type \\'number\\'.')",
+      `console.log(${JSON.stringify(a.replace(/\\/g, "/"))})`,
       "process.exit(2)",
     ].join("\n"),
   )
-  writeFileSync(path.join(dir, "tsconfig.json"), "{}")
-  const a = path.join(dir, "src", "a.ts")
+  writeFileSync(path.join(dir, "tsconfig.json"), '{ "include": ["src"] }')
   mkdirSync(path.dirname(a))
   writeFileSync(a, "let x: number\nx = 'no'\n")
+  // Outside the project's include: tsc says nothing about it, which is not "no problems".
+  const b = path.join(dir, "scripts", "b.ts")
+  mkdirSync(path.dirname(b))
+  writeFileSync(b, "let y: number = 'no'\n")
+  // A solution-style tsconfig (only references) checks no files of its own.
+  const c = path.join(dir, "sol", "c.ts")
+  mkdirSync(path.dirname(c))
+  writeFileSync(path.join(dir, "sol", "tsconfig.json"), '{ "files": [], "references": [{ "path": ".." }] }')
+  writeFileSync(c, "")
   const { runTsc } = await import("../src/tsc.ts")
-  const run = await runTsc([process.execPath, fakeTsc], [a], dir, runCommand, {
+  const { fileKey } = await import("../src/uri.ts")
+  const run = await runTsc([process.execPath, fakeTsc], [a, b, c], dir, runCommand, {
     timeoutMs: 30_000,
     signal: new AbortController().signal,
   })
   expect(run.error).toBeUndefined()
-  expect([...run.byFile.values()][0]).toMatchObject([
+  expect(run.byFile.get(fileKey(a))).toMatchObject([
     { severity: 1, code: "TS2322", range: { start: { line: 1 } } },
   ])
+  expect(run.byFile.has(fileKey(b))).toBe(false)
+  expect(run.notChecked.get(fileKey(b))).toMatch(/not part of the project tsconfig\.json/)
+  expect(run.notChecked.get(fileKey(c))).toMatch(/only "references"/)
   expect(errors).toEqual([])
 })

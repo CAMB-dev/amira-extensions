@@ -10,7 +10,7 @@ import { encodeMessage, MessageReader, type RpcMessage } from "../src/rpc.ts"
 import { DEFAULT_SERVERS, findCommand, findRoot, languageIdFor, serverFor } from "../src/servers.ts"
 import { readSettings } from "../src/settings.ts"
 import { checkBudgetMs } from "../src/manager.ts"
-import { parseTscOutput, type RunCommand, runTsc } from "../src/tsc.ts"
+import { findTsc, parseTscFileList, parseTscOutput, type RunCommand, runTsc } from "../src/tsc.ts"
 import { fileKey, pathToUri, uriKey, uriToPath } from "../src/uri.ts"
 
 const diag = (line: number, character: number, message: string, severity = 1, code?: string): Diagnostic => ({
@@ -289,6 +289,39 @@ test("tsc runs for several projects share one time limit; a check's budget cover
   const s = readSettings({ waitMs: 1000, startupTimeoutMs: 5000, tscTimeoutMs: 8000 })
   expect(checkBudgetMs(s)).toBe(9000)
   expect(checkBudgetMs({ ...s, tscTimeoutMs: 20_000 })).toBe(20_000)
+})
+
+test("tsc is looked for up to the repository root, never in the home folder or above; its file list is read", () => {
+  const home = mkdtempSync(path.join(tmpdir(), "lsp-home-"))
+  const repo = path.join(home, "repo")
+  const pkg = path.join(repo, "packages", "a")
+  mkdirSync(pkg, { recursive: true })
+  mkdirSync(path.join(repo, ".git"))
+  const looked: string[] = []
+  const lookup = (dir: string) => void looked.push(path.dirname(path.dirname(dir)))
+  expect(findTsc(pkg, () => "/usr/bin/tsc", lookup, home)).toBe("/usr/bin/tsc")
+  expect(looked).toEqual([pkg, path.join(repo, "packages"), repo])
+  // No repository: up to just below the home folder.
+  looked.length = 0
+  const loose = path.join(home, "loose", "x")
+  mkdirSync(loose, { recursive: true })
+  expect(findTsc(loose, () => null, lookup, home)).toBeUndefined()
+  expect(looked).toEqual([loose, path.join(home, "loose")])
+  // The project's own tsc wins over PATH.
+  expect(findTsc(pkg, () => "/usr/bin/tsc", (dir) => (dir.startsWith(repo) ? `${dir}/tsc` : undefined), home)).toBe(
+    path.join(pkg, "node_modules", ".bin") + "/tsc",
+  )
+
+  const listed = parseTscFileList(
+    [
+      "src/a.ts(1,5): error TS2322: Type 'string' is not assignable to type 'number'.",
+      "  continued",
+      "C:/proj/src/a.ts",
+      "/proj/src/b.ts",
+      "Found 1 error.",
+    ].join("\n"),
+  )
+  expect(listed).toEqual(new Set([fileKey("C:/proj/src/a.ts"), fileKey("/proj/src/b.ts")]))
 })
 
 test("the file an edit changed: the absolute path in its details, else its path argument", () => {

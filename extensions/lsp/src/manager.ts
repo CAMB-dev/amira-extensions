@@ -31,6 +31,8 @@ export interface FileCheck {
   diagnostics: Diagnostic[]
   /** False when the server did not answer in time (the diagnostics may be old, or none). */
   fresh: boolean
+  /** Why the file could not be checked, when that is known (e.g. tsc: not in the project). */
+  note?: string
 }
 
 interface Entry {
@@ -199,12 +201,12 @@ export class ServerManager {
       if (run.error !== "aborted") this.#reportOnce(`tsc:${cwd}`, `lsp: ${run.error}`)
       return ts.map((file) => ({ file, source: "tsc", diagnostics: [], fresh: false }))
     }
-    return ts.map((file) => ({
-      file,
-      source: "tsc",
-      diagnostics: run.byFile.get(fileKey(file)) ?? [],
-      fresh: true,
-    }))
+    return ts.map((file): FileCheck => {
+      const key = fileKey(file)
+      const note = run.notChecked.get(key)
+      if (note !== undefined) return { file, source: "tsc", diagnostics: [], fresh: false, note }
+      return { file, source: "tsc", diagnostics: run.byFile.get(key) ?? [], fresh: run.byFile.has(key) }
+    })
   }
 
   #findTsc(cwd: string): string | undefined {
