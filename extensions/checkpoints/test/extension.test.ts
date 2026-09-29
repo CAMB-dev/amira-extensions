@@ -252,7 +252,8 @@ test("/rewind explains itself when there is nothing to do or nobody to ask", asy
   )
   // Only the conversation goes back.
   expect(await t.command("rewind", "1 --conversation --yes")).toBe(
-    "The conversation is back to before turn 1. Its message was: “hello”",
+    "The conversation is back to before turn 1. Its message was: “hello”\n" +
+      "The turns shown above from there on stay on screen, but the model no longer sees them.",
   )
   expect(t.rewound).toEqual([0])
   await t.turn("write a.txt v2")

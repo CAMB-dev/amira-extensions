@@ -58,6 +58,20 @@ export class Git {
     this.#global = args
   }
 
+  /** Where our own index files live: only locks there (and on our refs) are ever removed. */
+  #own: string | undefined
+
+  setOwnDir(dir: string): void {
+    this.#own = path.resolve(dir).toLowerCase()
+  }
+
+  /** A lock of ours: on an index of ours or on a checkpoint ref, never one of the user's. */
+  #ownsLock(lock: string): boolean {
+    const p = path.resolve(lock).toLowerCase()
+    if (this.#own && p.startsWith(this.#own + path.sep)) return true
+    return /[\\/]refs[\\/]amira[\\/]checkpoints[\\/]/.test(p)
+  }
+
   async exec(args: string[], opts: ExecOptions = {}): Promise<GitResult> {
     const env: Record<string, string | undefined> = { ...process.env, ...IDENTITY }
     for (const k of INHERITED) delete env[k]
@@ -79,7 +93,7 @@ export class Git {
       if (lock && attempt < 8 && !opts.signal?.aborted) {
         // A git stopped in the middle (Amira exited, a snapshot timed out) leaves its lock
         // behind; one that old is nobody's. A live one goes away in a moment.
-        if (ageMs(lock) > STALE_LOCK_MS) rmSync(lock, { force: true })
+        if (this.#ownsLock(lock) && ageMs(lock) > STALE_LOCK_MS) rmSync(lock, { force: true })
         else await Bun.sleep(100 + attempt * 100)
         continue
       }
@@ -224,6 +238,7 @@ export async function openRepo(
   const noAttributes = path.join(scratch, "no-attributes")
   if (!existsSync(noAttributes)) writeFileSync(noAttributes, "")
   const git = new Git(run, root, opts.timeoutMs)
+  git.setOwnDir(scratch)
   const global = [
     ...(mode === "shadow" ? [`--git-dir=${gitDir}`, `--work-tree=${root}`] : []),
     "-c",

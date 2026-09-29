@@ -354,7 +354,8 @@ export function createCheckpointsExtension(options: CheckpointsOptions = {}) {
         paths = []
         for (const p of opts.files) {
           const rel = path.relative(s.repo.root, path.resolve(ctx.cwd, p))
-          if (rel.startsWith("..") || path.isAbsolute(rel)) throw new Error(`${p} is outside ${s.repo.root}`)
+          if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel))
+            throw new Error(`${p} is outside ${s.repo.root}`)
           paths.push(rel.split(path.sep).join("/"))
         }
         if (!paths.length) throw new Error("--files needs at least one path")
@@ -450,6 +451,10 @@ export function createCheckpointsExtension(options: CheckpointsOptions = {}) {
         }
       }
       if (!choice || choice === "Cancel") return ctx.print("Nothing restored.")
+      // A turn may have started while the dialog was open (a background result woke the session).
+      if (ctx.session.info().busy) {
+        throw new Error("a turn started meanwhile; nothing was restored. Rewind after it ends")
+      }
 
       const out: string[] = []
       if (changes.length) {
@@ -471,6 +476,9 @@ export function createCheckpointsExtension(options: CheckpointsOptions = {}) {
           out.push(
             `The conversation is back to before turn ${turn}. Its message was: “${clip(oneLine(target.meta.prompt ?? ""), 200)}”`,
           )
+          if (ctx.frontend === "tui") {
+            out.push("The turns shown above from there on stay on screen, but the model no longer sees them.")
+          }
         } catch (err) {
           out.push(`The conversation was not rewound: ${err instanceof Error ? err.message : String(err)}`)
         }
