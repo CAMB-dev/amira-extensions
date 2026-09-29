@@ -217,7 +217,7 @@ export function createSwarmExtension(): Extension {
               l.expectNotice?.()?.deliver(
                 notice(
                   `[swarm ${id} · message from ${from}] ${text}\n\n(If it needs an answer, give it with the swarm tool: action "message", to "${from}". Otherwise just end your turn.)`,
-                  `✉ swarm · ${from}: ${clip(oneLine(text), 160)}`,
+                  `✉️ swarm · ${from}: ${clip(oneLine(text), 160)}`,
                 ),
               )
             },
@@ -381,7 +381,7 @@ export function createSwarmExtension(): Extension {
       const problem = l.swarm.tell("user", name, text)
       if (problem) throw new Error(problem)
       const m = l.swarm.member(name)
-      ctx.print(`✉ you → ${m?.name ?? name}${m?.status === "paused" ? " (held until it is resumed)" : ""}`)
+      ctx.print(`✉️ you → ${m?.name ?? name}${m?.status === "paused" ? " (held until it is resumed)" : ""}`)
     }
 
     /** `@all <text>` and `/swarm msg all <text>`: one message to every member. */
@@ -390,7 +390,7 @@ export function createSwarmExtension(): Extension {
       if (!l) throw new Error("no swarm is running")
       const sent = l.swarm.tellAll(text)
       if (typeof sent === "string") throw new Error(sent)
-      ctx.print(`✉ you → all (${sent} member${sent === 1 ? "" : "s"})`)
+      ctx.print(`✉️ you → all (${sent} member${sent === 1 ? "" : "s"})`)
     }
 
     /** Whether `name` (after @ or `/swarm msg`) means every member. */

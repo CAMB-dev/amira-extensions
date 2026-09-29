@@ -322,7 +322,7 @@ export class Swarm {
     this.#record({ type: "message", swarm: this.id, from: "user", to: "all", text: body, at: Date.now() })
     this.#log({ kind: "message", from: "user", to: "all", text: body })
     for (const m of to)
-      this.#hand(m, `[message from the user, to every member] ${body}`, `✉ user → all: ${body}`)
+      this.#hand(m, `[message from the user, to every member] ${body}`, `✉️ user → all: ${body}`)
     return to.length
   }
 
@@ -526,7 +526,7 @@ export class Swarm {
     this.#record({ type: "message", swarm: this.id, from, to: m.spec.name, text, at })
     this.#log({ kind: "message", from, to: m.spec.name, text })
     const who = from === "user" ? "the user" : from === "commander" ? "the commander" : from
-    this.#hand(m, `[message from ${who}] ${text}`, `✉ ${from}: ${text}`)
+    this.#hand(m, `[message from ${who}] ${text}`, `✉️ ${from}: ${text}`)
   }
 
   /** Hands a message to a member, or holds it while the member (or the swarm) is paused. */

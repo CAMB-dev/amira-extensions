@@ -467,7 +467,7 @@ test("the user messages a member with @name; the swarm counts it as progress, no
   expect(host.inputs.claim("hello @writer")).toBeUndefined()
   await handler.run("@writer make it shorter", ctx)
   gate = false
-  expect(printed).toEqual(["✉ you → writer"])
+  expect(printed).toEqual(["✉️ you → writer"])
   await until(() => root.messages.some((m) => m.role === "user" && m.display?.origin === "swarm"))
   const writerSaw = mock.requests.find(
     (r) => who(r) === "writer" && lastText(r).includes("[message from the user] make it shorter"),
@@ -992,7 +992,7 @@ test("/swarm commands and the commander's tool actions steer a running swarm", a
   )
   await root.prompt("start")
   expect(await command(host, root, "pause a")).toEqual(["Paused a."])
-  expect(await command(host, root, "msg a hello there")).toEqual(["✉ you → a (held until it is resumed)"])
+  expect(await command(host, root, "msg a hello there")).toEqual(["✉️ you → a (held until it is resumed)"])
   await Bun.sleep(30)
   const got = (text: string) => mock.requests.some((r) => who(r) === "a" && lastText(r).includes(text))
   expect(got("hello there")).toBe(false)
@@ -1039,7 +1039,7 @@ test("@all from the input box reaches every member; the timeline keeps it once",
   expect(host.inputs.claim("@all")).toBeUndefined()
   await handler.run("@all check in", ctx)
   gate = false
-  expect(printed).toEqual(["✉ you → all (3 members)"])
+  expect(printed).toEqual(["✉️ you → all (3 members)"])
   await until(() => root.messages.some((m) => m.role === "user" && m.display?.origin === "swarm"))
   for (const name of ["planner", "researcher", "writer"]) {
     const saw = mock.requests.filter(
@@ -1051,7 +1051,7 @@ test("@all from the input box reaches every member; the timeline keeps it once",
   const messages = past!.timeline.filter((e) => e.kind === "message")
   expect(messages).toHaveLength(1)
   expect(messages[0]).toMatchObject({ from: "user", to: "all", text: "check in" })
-  expect(timelineLine(messages[0]!).text).toMatch(/✉ you → all: check in$/)
+  expect(timelineLine(messages[0]!).text).toMatch(/✉️ you → all: check in$/)
   // Once it ended, @all goes to the model again.
   expect(host.inputs.claim("@all again")).toBeUndefined()
 })
@@ -1079,7 +1079,7 @@ test("/swarm msg all reaches every member; a paused one gets it on resume", asyn
   const complete = host.commands.get("swarm")!.def.args!.complete!
   expect((await complete("", {} as never)).map((c) => c.value)).toContain("msg all ")
   expect(await command(host, root, "pause a")).toEqual(["Paused a."])
-  expect(await command(host, root, "msg all hello everyone")).toEqual(["✉ you → all (2 members)"])
+  expect(await command(host, root, "msg all hello everyone")).toEqual(["✉️ you → all (2 members)"])
   const got = (name: string) =>
     mock.requests.some((r) => who(r) === name && lastText(r).includes("to every member] hello everyone"))
   await until(() => got("b"))

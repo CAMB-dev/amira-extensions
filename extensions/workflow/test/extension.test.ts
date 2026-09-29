@@ -239,7 +239,7 @@ test("a user message asking for a workflow marks the confirmation as asked for",
   expect(body).toContain("finished")
   expect(body).toContain('"saw tui"')
   expect(notice.display?.origin).toBe("workflow")
-  expect(notice.display?.text).toMatch(/^◆ workflow fanout finished · 4 agents · \d+s · 400 tok$/)
+  expect(notice.display?.text).toMatch(/^◆ workflow fanout ✓ 4 agents · \d+s · 400 tok$/)
   // The next user message that does not ask makes the next start the model's proposal again.
   t.say("thanks")
   expect((await t.call({ script: SCRIPT })).isError).toBeUndefined()
@@ -548,7 +548,40 @@ test("/workflow view opens the progress view; /workflow stop stops a run", async
   await t.run(`stop ${id}`)
   expect(t.printed.at(-1)).toBe(`Stopped workflow run ${id}.`)
   await until(() => t.notices.length === 1)
-  expect(t.notices[0]!.display?.text).toMatch(/^◆ workflow slow was stopped/)
+  expect(t.notices[0]!.display?.text).toMatch(/^◆ workflow slow ⊘ /)
+})
+
+test("x in the view asks before it stops the run; no keeps it running", async () => {
+  const t = setup({ settings: { enabled: "always" }, answer: () => new Promise<Answer>(() => {}) })
+  const slow = `export const meta = { name: "slow", description: "waits", phases: [] }
+    return await agent("never answers")`
+  const r = await t.call({ script: slow })
+  const id = /run (wf_\w+)/.exec(t.text(r))![1]!
+  const asked: string[] = []
+  let yes = false
+  const control = {
+    close: () => {},
+    requestRender: () => {},
+    prompt: async () => undefined,
+    confirm: async (q: string, o?: { yes?: string; no?: string }) => {
+      asked.push(`${q} y ${o?.yes} · ${o?.no}`)
+      return yes
+    },
+  }
+  const x = t.view.keys!.find((k) => k.key === "x")!
+  x.run({ id }, control)
+  await until(() => asked.length === 1)
+  expect(asked[0]).toBe("Stop the workflow run slow? y stops it · keeps it running")
+  await Bun.sleep(20)
+  expect(t.notices).toHaveLength(0)
+  yes = true
+  x.run({ id }, control)
+  await until(() => t.notices.length === 1, "stopped")
+  expect(t.notices[0]!.display?.text).toMatch(/^◆ workflow slow ⊘ /)
+  // Once it has ended, x has nothing to stop and asks nothing.
+  x.run({ id }, control)
+  await Bun.sleep(20)
+  expect(asked).toHaveLength(2)
 })
 
 test("resume by id replays the journal: no agent runs again", async () => {

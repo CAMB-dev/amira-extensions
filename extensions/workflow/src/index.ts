@@ -13,13 +13,14 @@ import type {
   ToolResult,
   UiApi,
   UserMessage,
+  ViewControl,
   ViewDefinition,
   ViewLine,
 } from "@amira/api"
 import { compileScript } from "./compile.ts"
 import { type JournalEntry, listRuns, readJournal, readRun } from "./journal.ts"
 import { estimate, readMeta, sizeLine, type WorkflowMeta, workspaceLine } from "./meta.ts"
-import { countsLine, formatDuration, formatTokens, totals, treeLines } from "./progress.ts"
+import { countsLine, formatDuration, formatTokens, runStateText, totals, treeLines } from "./progress.ts"
 import { loadRoles } from "./roles.ts"
 import { type ScriptWorker, WorkflowRun } from "./run.ts"
 import { findSaved, listSaved } from "./saved.ts"
@@ -33,6 +34,18 @@ export { WorkflowRun } from "./run.ts"
 
 export const WORKFLOW_TOOL = "workflow"
 export const VIEW_KIND = "workflow"
+
+/**
+ * Asks the user to confirm stopping, at the bottom of the view: "Stop …? y stops it · any other
+ * key keeps it running" (ViewControl.confirm, API 0.1.4). A frontend without it asks for "yes"
+ * to be typed instead.
+ */
+export async function confirmStop(view: ViewControl, question: string): Promise<boolean> {
+  if (typeof view.confirm === "function")
+    return view.confirm(question, { yes: "stops it", no: "keeps it running" })
+  const answer = await view.prompt(`${question} Type "yes" to stop it:`)
+  return answer?.toLowerCase() === "yes"
+}
 
 /** settings.json `extensions.workflow` (D81). */
 export interface WorkflowSettings {
@@ -242,8 +255,9 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       return {
         role: "user",
         content: [{ type: "text", text: `${head}\n\n${body}` }],
+        // Shaped like a sub-agent's end line: how it ended as ✓ ✗ ⊘, which the frontend colors.
         display: {
-          text: `◆ workflow ${run.meta.name} ${ended} · ${t.agents} agents · ${took} · ${formatTokens(t.tokens)} tok`,
+          text: `◆ workflow ${run.meta.name} ${run.status === "done" ? "✓" : run.status === "stopped" ? "⊘" : "✗"} ${t.agents} agent${t.agents === 1 ? "" : "s"} · ${took} · ${formatTokens(t.tokens)} tok${t.failed ? ` · ${t.failed} failed` : ""}`,
           origin: "workflow",
         },
       }
@@ -488,7 +502,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       kind: VIEW_KIND,
       title(d) {
         const run = runOf(d)
-        return run ? `Workflow ${run.meta.name} · ${run.id} · ${run.status}` : "Workflow"
+        return run ? `Workflow ${run.meta.name} · ${run.id} · ${runStateText(run.status)}` : "Workflow"
       },
       header(d, o) {
         const run = runOf(d)
@@ -520,8 +534,14 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
           key: "x",
           label: "stop",
           run(d, v) {
-            runOf(d)?.stop()
-            v.requestRender()
+            const run = runOf(d)
+            // A run that has ended has nothing left to stop: no question for it.
+            if (!run || run.status !== "running") return
+            // Stopping ends every agent of the run: the user says so first, as for a sub-agent.
+            void confirmStop(v, `Stop the workflow run ${run.meta.name}?`).then((yes) => {
+              if (yes) run.stop()
+              v.requestRender()
+            })
           },
         },
       ],
@@ -542,8 +562,10 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       const stored = listRuns(runsRoot()).filter((r) => !runs.has(r.id))
       if (recent.length || stored.length) {
         lines.push("Runs:")
-        for (const r of recent) lines.push(`  ${r.id} ${r.meta.name} · ${r.status} · ${countsLine(r.flow)}`)
-        for (const r of stored.slice(0, 10)) lines.push(`  ${r.id} ${r.meta.name} · ${r.status} (earlier)`)
+        for (const r of recent)
+          lines.push(`  ${r.id} ${r.meta.name} · ${runStateText(r.status)} · ${countsLine(r.flow)}`)
+        for (const r of stored.slice(0, 10))
+          lines.push(`  ${r.id} ${r.meta.name} · ${runStateText(r.status)} (earlier)`)
       }
       lines.push(
         "Also: /workflow view [id], /workflow stop [id], /workflow resume <id>, /workflow <task> to ask for a workflow.",
@@ -617,7 +639,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
               id ? `no workflow run ${id} in this session` : "no workflow has run in this session",
             )
           if (!ctx.openView) {
-            ctx.print(`${run.meta.name} ${run.id} · ${run.status} · ${countsLine(run.flow)}`)
+            ctx.print(`${run.meta.name} ${run.id} · ${runStateText(run.status)} · ${countsLine(run.flow)}`)
             return
           }
           ctx.openView({ kind: VIEW_KIND, data: { id: run.id } })
