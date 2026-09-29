@@ -1,8 +1,10 @@
 {
   "name": "mermaid",
   "version": "0.1.0",
+  "description": "```mermaid blocks in replies as diagrams: flowcharts and sequence diagrams as Unicode text that fits the width, other types as images through the browser and images extensions",
   "type": "module",
   "scripts": {
+    "link-amira": "bun scripts/link-amira.ts",
     "test": "bun test"
   },
   "amira": {
