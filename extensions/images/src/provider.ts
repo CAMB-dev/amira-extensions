@@ -48,7 +48,7 @@ export class Skipped extends Error {}
 export class ImageFiles implements ImageProvider {
   readonly id = "images"
   private readonly maxBytes: number
-  private readonly timeoutMs: number
+  readonly timeoutMs: number
   private active = 0
   private queue: (() => void)[] = []
   /** Files whose bytes are kept, oldest first, by source. */
@@ -77,7 +77,12 @@ export class ImageFiles implements ImageProvider {
       source = path
       read = () => readLocal(path, this.maxBytes)
     }
-    const bytes = await this.limited(() => read(ctx.signal), false)
+    // Amira gave up on it while it waited its turn: nothing is read. A download's own time
+    // starts only now, when it gets its turn.
+    const bytes = await this.limited(() => {
+      ctx.signal.throwIfAborted()
+      return read(ctx.signal)
+    }, false)
     const size = imageSize(bytes)
     if (!size || !canShow(ctx.protocol, size.format)) return undefined
     const file = new OpenedFile(this, source, size, bytes, read)
@@ -192,7 +197,7 @@ export class OpenedFile implements OpenedImage {
   /** Its bytes: kept, or read again (once, however many sizes ask). */
   async bytes(): Promise<Uint8Array> {
     if (this.bytesKept) return this.bytesKept
-    this.reading ??= this.read(AbortSignal.timeout(10_000)).finally(() => {
+    this.reading ??= this.read(AbortSignal.timeout(this.files.timeoutMs)).finally(() => {
       this.reading = undefined
     })
     const bytes = await this.reading

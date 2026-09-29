@@ -162,6 +162,29 @@ test("a few are read or encoded at once; an inline one that waits past its time 
   expect(await e).toMatchObject({ width: 40 })
 })
 
+test("a download's time starts when it gets its turn; one Amira gave up on while it waited is not made", async () => {
+  const started: string[] = []
+  let release = () => {}
+  const n = net(async (url) => {
+    started.push(url)
+    if (url.endsWith("/first.png")) await new Promise<void>((go) => (release = go))
+    return new Response(png(20, 20), { headers: { "content-type": "image/png" } })
+  })
+  const files = new ImageFiles({ fetch: n.fetch, resolve: publicDns, timeoutMs: 50, concurrency: 1 })
+  const first = files.open({ url: "https://x.test/first.png" }, ctx())
+  const gaveUp = new AbortController()
+  const second = files.open({ url: "https://x.test/second.png" }, ctx("sixel", gaveUp.signal))
+  const third = files.open({ url: "https://x.test/third.png" }, ctx())
+  await Bun.sleep(80)
+  gaveUp.abort()
+  release()
+  expect(await first).toMatchObject({ width: 20 })
+  await expect(second).rejects.toThrow()
+  // Waited longer than a download may take, and still made in time once its turn came.
+  expect(await third).toMatchObject({ width: 20 })
+  expect(started).toEqual(["https://93.184.215.14/first.png", "https://93.184.215.14/third.png"])
+})
+
 test("files' bytes are kept for other sizes up to a limit; one let go of is read again", async () => {
   writeFileSync(join(dir, "a.png"), png(40, 60))
   writeFileSync(join(dir, "b.png"), png(40, 60))
