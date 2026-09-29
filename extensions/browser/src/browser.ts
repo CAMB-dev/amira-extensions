@@ -105,6 +105,8 @@ export class BrowserSession {
   private idleTimer: ReturnType<typeof setTimeout> | undefined
   private ended = false
   private seq = 0
+  /** Tool calls running now. */
+  private busy = 0
   readonly log: LogEntry[] = []
 
   constructor(private readonly opts: SessionOptions) {}
@@ -292,10 +294,26 @@ export class BrowserSession {
     return p
   }
 
-  /** Restarts the idle countdown; called around every tool call. */
+  /**
+   * Marks a tool call as running: the browser does not idle out meanwhile, however long the
+   * call takes. The returned function ends it and restarts the idle countdown.
+   */
+  begin(): () => void {
+    this.busy++
+    if (this.idleTimer) clearTimeout(this.idleTimer)
+    let done = false
+    return () => {
+      if (done) return
+      done = true
+      this.busy--
+      this.touch()
+    }
+  }
+
+  /** Restarts the idle countdown, unless a call is running. */
   touch() {
     if (this.idleTimer) clearTimeout(this.idleTimer)
-    if (this.ended) return
+    if (this.ended || this.busy > 0) return
     const ms = this.opts.settings.idleMinutes * 60_000
     this.idleTimer = setTimeout(() => void this.close(`idle for ${this.opts.settings.idleMinutes} min`), ms)
     this.idleTimer.unref?.()

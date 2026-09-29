@@ -57,8 +57,12 @@ beforeAll(() => {
   server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
-    fetch(req) {
+    async fetch(req) {
       const { pathname } = new URL(req.url)
+      if (pathname === "/slow")
+        return Bun.sleep(1500).then(
+          () => new Response("<title>Slow</title>", { headers: { "content-type": "text/html" } }),
+        )
       if (pathname === "/file.bin") {
         downloads++
         return new Response("binary", { headers: { "content-type": "application/octet-stream" } })
@@ -332,6 +336,13 @@ describe.skipIf(!hasBrowser)("lifetime", () => {
     expect(alive(main)).toBe(true)
     h.emit("session.end", { sessionId: "main", data: { reason: "exit" } })
     await until(() => !alive(main))
+  })
+
+  test("a call that takes longer than the idle time does not close the browser under it", async () => {
+    const h = harness({ idleMinutes: 0.005 })
+    const r = await h.call("browser_open", { url: `${base}/slow` })
+    expect(text(r)).toContain("Slow")
+    await h.manager.closeAll("test over")
   })
 
   test("an idle browser closes by itself", async () => {

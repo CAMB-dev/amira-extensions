@@ -129,14 +129,14 @@ function tool<P>(
         return textResult(message(err), true)
       }
       if (!session || (!opts.start && !session.isOpen)) return textResult(new NoPageError().message, true)
-      session.touch()
+      const end = session.begin()
+      // Ends when the work does, not when an abort gives up waiting for it.
+      const work = run(p ?? ({} as P), session, ctx).finally(end)
       try {
-        return await raceSignal(run(p ?? ({} as P), session, ctx), ctx.signal)
+        return await raceSignal(work, ctx.signal)
       } catch (err) {
         if (ctx.signal.aborted) throw err
         return textResult(shortError(err), true)
-      } finally {
-        session.touch()
       }
     },
   })
