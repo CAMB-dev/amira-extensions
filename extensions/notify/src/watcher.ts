@@ -55,7 +55,7 @@ export class Watcher {
   /** Open dialogs waiting for their delay to pass. */
   #dialogs = new Map<string, unknown>()
   /** Background completions gathered for one notification. */
-  #batch: string[] = []
+  #batch: { parent: string; what: string }[] = []
   #batchTimer: unknown
 
   constructor(opts: WatcherOptions) {
@@ -75,6 +75,16 @@ export class Watcher {
         if (this.#topLevel(e.sessionId, e.parentSessionId)) {
           this.#turns.set(e.sessionId, e.ts)
           this.#lastText.delete(e.sessionId)
+          // Background results not told yet usually start this very turn (as its notice): they
+          // are told with its end, which also catches a turn that ends before the batch would.
+          const mine = this.#batch.filter((b) => b.parent === e.sessionId)
+          if (mine.length) {
+            this.#batch = this.#batch.filter((b) => b.parent !== e.sessionId)
+            this.#finishedDuringTurn.set(e.sessionId, [
+              ...(this.#finishedDuringTurn.get(e.sessionId) ?? []),
+              ...mine.map((b) => b.what),
+            ])
+          }
         }
         return
       case "message.end": {
@@ -183,11 +193,11 @@ export class Watcher {
       this.#finishedDuringTurn.set(parent, list)
       return
     }
-    this.#batch.push(what)
+    this.#batch.push({ parent, what })
     if (this.#batchTimer !== undefined) return
     this.#batchTimer = this.#set(() => {
       this.#batchTimer = undefined
-      const done = this.#batch.splice(0)
+      const done = this.#batch.splice(0).map((b) => b.what)
       if (!done.length) return
       const head = done.length > 1 ? [`${done.length} background tasks ended`] : []
       this.#opts.notify({ kind: "background", title: this.#opts.title, body: [...head, ...done].join("\n") })

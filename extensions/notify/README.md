@@ -18,7 +18,7 @@ it, focus counts as unknown and it notifies as if you were away.
 |---|---|
 | A turn of the main session ran at least `longTurnSeconds` (30) and ended | `Done after 2m 05s` and the start of the reply, or `Failed after …` and the error. A turn you interrupt never notifies. |
 | A question (a confirm, a choice, an approval, a form) is still open after `dialogDelaySeconds` (2) | `Waiting for your answer: <question>` |
-| Background sub-agents, workflows or swarms of the main session ended | `◆ <title> finished (42s)`; several close together make one notification. Ending while the main session is in a turn, they are told when that turn ends. |
+| Background sub-agents, workflows or swarms of the main session ended | `◆ <title> finished (42s)`; several close together make one notification. While the main session is in a turn, or when their results start one (they usually do), they are told when that turn ends. |
 
 By default (`"when": "unfocused"`) nothing is sent while the terminal has focus. The TUI
 tells focus from the terminal's focus reports (Windows Terminal, VS Code, iTerm2, kitty,

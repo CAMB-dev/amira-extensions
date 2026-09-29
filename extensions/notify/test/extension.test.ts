@@ -201,6 +201,20 @@ test("background sub-agents: told when the main session is idle, batched; with t
   s.t.advance(3_000)
   await s.emit("turn.end", { reason: "done", steps: 1 }, { at: at + 3_000 })
   expect(s.bodies().at(-1)).toBe("◆ Late one finished (42s)")
+
+  // Ending while idle, its result starts a turn at once (as a notice): the turn's end tells,
+  // even when that turn is over before the batch would have gone out (print mode exits then).
+  const count = s.bodies().length
+  await start("c5", "Quick one")
+  await end("c5")
+  const at2 = s.t.now()
+  await s.emit("turn.start", { prompt }, { at: at2 })
+  s.t.advance(800)
+  await s.emit("turn.end", { reason: "done", steps: 1 }, { at: at2 + 800 })
+  expect(s.bodies().slice(count)).toEqual(["◆ Quick one finished (42s)"])
+  s.t.advance(5_000)
+  await s.settle()
+  expect(s.bodies().slice(count)).toHaveLength(1)
 })
 
 test("workflows and swarms: their group's end, not each member's", async () => {
