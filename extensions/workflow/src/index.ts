@@ -528,7 +528,8 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
           label: "stop",
           run(d, v) {
             const run = runOf(d)
-            if (!run) return
+            // A run that has ended has nothing left to stop: no question for it.
+            if (!run || run.status !== "running") return
             // Stopping ends every agent of the run: the user says so first, as for a sub-agent.
             void confirmStop(v, `Stop the workflow run ${run.meta.name}?`).then((yes) => {
               if (yes) run.stop()

@@ -568,6 +568,10 @@ test("x in the view asks before it stops the run; no keeps it running", async ()
   x.run({ id }, control)
   await until(() => t.notices.length === 1, "stopped")
   expect(t.notices[0]!.display?.text).toMatch(/^◆ workflow slow ⊘ /)
+  // Once it has ended, x has nothing to stop and asks nothing.
+  x.run({ id }, control)
+  await Bun.sleep(20)
+  expect(asked).toHaveLength(2)
 })
 
 test("resume by id replays the journal: no agent runs again", async () => {
