@@ -1,0 +1,18 @@
+{
+  "name": "share",
+  "version": "0.1.0",
+  "description": "Export sessions as Markdown or HTML, and git helpers: commit messages, PR drafts and branch reviews",
+  "type": "module",
+  "scripts": {
+    "link-amira": "bun scripts/link-amira.ts",
+    "test": "bun test"
+  },
+  "amira": {
+    "engines": {
+      "amira": "^0.1.2"
+    },
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}

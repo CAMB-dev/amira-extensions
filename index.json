@@ -54,6 +54,15 @@
       "engines": { "amira": "^0.1.2" },
       "tags": ["todo", "plan", "tasks", "progress"],
       "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/todo"
+    },
+    {
+      "name": "share",
+      "description": "Export sessions as Markdown or self-contained HTML (secrets redacted), and git helpers: /commit messages, /pr drafts (opened with gh) and /review by a reviewer sub-agent",
+      "version": "0.1.0",
+      "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/share" },
+      "engines": { "amira": "^0.1.2" },
+      "tags": ["export", "markdown", "html", "git", "commit", "pull-request", "review", "github"],
+      "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/share"
     }
   ]
 }
