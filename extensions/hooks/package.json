@@ -1,5 +1,6 @@
 {
   "name": "hooks",
+  "license": "Apache-2.0",
   "version": "0.1.0",
   "description": "Hooks: your commands on Amira's events, e.g. a formatter after each edit, a guard before risky shell commands, tests after a turn",
   "type": "module",

@@ -1,5 +1,6 @@
 {
   "name": "notify",
+  "license": "Apache-2.0",
   "version": "0.1.0",
   "description": "Notifications when Amira needs you: a long turn ended, a question waits, background agents finished; on the desktop or through webhooks",
   "type": "module",

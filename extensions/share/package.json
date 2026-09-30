@@ -1,5 +1,6 @@
 {
   "name": "share",
+  "license": "Apache-2.0",
   "version": "0.1.0",
   "description": "Export sessions as Markdown or HTML, and git helpers: commit messages, PR drafts and branch reviews",
   "type": "module",

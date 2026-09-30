@@ -1,5 +1,6 @@
 {
   "name": "images",
+  "license": "Apache-2.0",
   "version": "0.1.0",
   "description": "Images in replies drawn in the terminal (Sixel, kitty, iTerm2): local files and http(s) URLs, decoded and encoded off the main thread",
   "type": "module",

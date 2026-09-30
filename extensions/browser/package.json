@@ -1,5 +1,6 @@
 {
   "name": "browser",
+  "license": "Apache-2.0",
   "version": "0.1.1",
   "description": "Browser tools: the model opens pages in a headless Chrome or Edge, takes screenshots, clicks, types and reads the console",
   "type": "module",

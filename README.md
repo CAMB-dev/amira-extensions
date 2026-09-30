@@ -99,3 +99,7 @@ One directory per extension under `extensions/`, with its own README, plus an en
 startup, and start processes only through `runCommand` or `openPipe`.
 
 </details>
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). Bundled third-party code keeps its own license (for example `extensions/mermaid/vendor/`).

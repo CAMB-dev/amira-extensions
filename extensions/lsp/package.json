@@ -1,5 +1,6 @@
 {
   "name": "lsp",
+  "license": "Apache-2.0",
   "version": "0.1.0",
   "description": "Language server diagnostics after edits: errors in the files the model just changed go back to it with the tool result",
   "type": "module",

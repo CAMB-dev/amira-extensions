@@ -1,5 +1,6 @@
 {
   "name": "checkpoints",
+  "license": "Apache-2.0",
   "version": "0.1.0",
   "description": "Checkpoints and /rewind: a snapshot of the files before each turn, in private git refs, and a way back to any of them",
   "type": "module",

@@ -1,5 +1,6 @@
 {
   "name": "mcp-server",
+  "license": "Apache-2.0",
   "version": "0.1.0",
   "description": "Serve Amira over MCP (stdio) so other coding agents can delegate tasks to it",
   "type": "module",

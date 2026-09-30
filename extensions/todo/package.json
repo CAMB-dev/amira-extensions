@@ -1,5 +1,6 @@
 {
   "name": "todo",
+  "license": "Apache-2.0",
   "version": "0.1.0",
   "description": "A todo list the model keeps for multi-step work, shown live above the activity line and kept with the session",
   "type": "module",
