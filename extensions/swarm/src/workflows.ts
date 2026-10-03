@@ -32,6 +32,9 @@ export interface MemberWorkflowSettings {
   maxPerMember: number
 }
 
+const MAX_RESULT_CHARS = 8000
+const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
+
 interface Run {
   owner: string
   name: string
@@ -181,7 +184,10 @@ export class MemberWorkflows {
         this.#publish()
         this.hooks.result(
           owner,
-          `Workflow ${result.runId} (${result.name}) ${result.status}.\n${result.error !== undefined ? `Error: ${result.error}` : `Result: ${JSON.stringify(result.result) ?? "null"}`}`,
+          clip(
+            `Workflow ${result.runId} (${result.name}) ${result.status}.\n${result.error !== undefined ? `Error: ${result.error}` : `Result: ${JSON.stringify(result.result) ?? "null"}`}`,
+            MAX_RESULT_CHARS,
+          ),
         )
         run.unsubscribe?.()
         this.hooks.changed()
