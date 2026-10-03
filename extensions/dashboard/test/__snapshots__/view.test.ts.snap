@@ -1054,6 +1054,14 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
                         "text": "no changes  │  ",
                       },
                       {
+                        "kind": "accent",
+                        "text": "Open diff",
+                      },
+                      {
+                        "kind": "text",
+                        "text": "   ",
+                      },
+                      {
                         "kind": "muted",
                         "text": "⋮",
                       },

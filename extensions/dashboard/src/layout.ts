@@ -180,7 +180,7 @@ export function timeline(source: DashboardSource, ctx: UiContext, selected?: str
       const can = (action: DashboardAgent["actions"][number]) =>
         !!source.act && agent.actions.includes(action)
       const labels = [
-        ...(agent.files.length ? [part("Open diff", "accent")] : []),
+        part("Open diff", "accent"),
         ...(can("pause") || can("resume") ? [part(can("resume") ? "Resume" : "Pause")] : []),
         ...(can("request-changes") ? [part("Request changes")] : []),
         part("⋮", "muted"),

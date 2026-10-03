@@ -48,7 +48,7 @@ Phases and cards start expanded, with the first active phase’s agent selected.
               │ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   09:00:00  ✓ ○ Review          1 agent · 45s                                                                                                                              review  ▾
               │  ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-              └──▶ ✓ Refund audit  Review authorization …                  ━━━━━━━━━━━━━━  100%                                                                  no changes  │  ⋮ │
+              └──▶ ✓ Refund audit  Review authorization …                  ━━━━━━━━━━━━━━  100%                                                      no changes  │  Open diff   ⋮ │
               │  │   No authorization issues found.                                                                                                                               │
               │  │   done in 45s                                                                                                                                                  │
               │  │                                                                                                                                                                │

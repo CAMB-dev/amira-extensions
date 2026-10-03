@@ -54,7 +54,7 @@ exports[`approved prototype fidelity 180x52: equivalent scenario matches the tar
   "              │  │   Changed files                                                                                                                                                │",
   "              │  │   db/migrations/20240512_add_jti.sql           +14  -0                                                                                                         │",
   "              │  │ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── │",
-  "              ├──▶ ● worker-3      更新登录流程文档        [Markdown]      ━━━━━━━───────  50%                                         no changes  │  Pause   Request changes   ⋮ │",
+  "              ├──▶ ● worker-3      更新登录流程文档        [Markdown]      ━━━━━━━───────  50%                             no changes  │  Open diff   Pause   Request changes   ⋮ │",
   "              │  │   在登录流程文档里补充刷新令牌轮换和退出登录的说明。                                                                                                           │",
   "              │  │                                                                                                                                                                │",
   "              │  │ 3 agents · 2 running                                                                            e expand all · o diff · p pause/resume · r changes · a actions │",
