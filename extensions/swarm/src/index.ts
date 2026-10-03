@@ -24,6 +24,7 @@ import {
   swarmsFromRecords,
 } from "./swarm.ts"
 import { memberLine, type SwarmViewData, swarmView, timelineLine, VIEW_KIND } from "./view.ts"
+import type { WorkflowRunner } from "./workflows.ts"
 
 export { Blackboard } from "./blackboard.ts"
 export {
@@ -38,7 +39,7 @@ export { swarmView, VIEW_KIND } from "./view.ts"
 export const SWARM_TOOL = "swarm"
 /** The key a swarm's records go under in the session (SessionData). */
 export const DATA_KEY = "swarm"
-/** Tools a swarm member never gets: starting swarms and workflows is the main session's (D81). */
+/** Main-session tools stay excluded; members use their own workflow service tools (D108). */
 const MEMBER_EXCLUDED = [SWARM_TOOL, "workflow"]
 
 /** Whether a user's message asks for a swarm. */
@@ -214,6 +215,9 @@ export function createSwarmExtension(): Extension {
       const owner = root ?? ""
       let entry: Live | undefined
       let swarm: Swarm
+      const runner = s.memberWorkflows.enabled
+        ? (api.useService?.("workflow.runner") as WorkflowRunner | undefined)
+        : undefined
       try {
         swarm = new Swarm({
           id,
@@ -221,6 +225,7 @@ export function createSwarmExtension(): Extension {
           members,
           limits,
           group,
+          ...(runner ? { workflows: { runner, limits: s.memberWorkflows } } : {}),
           spawn: { excludeTools: MEMBER_EXCLUDED, ...(l.toolCallId ? { toolCallId: l.toolCallId } : {}) },
           hooks: {
             changed,

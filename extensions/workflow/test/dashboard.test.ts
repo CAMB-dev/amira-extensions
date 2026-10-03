@@ -222,6 +222,12 @@ test("finished run loading exposes script phases, call details, and original chi
   expect(adapter.source.act).toBeUndefined()
   expect(adapter.source.details("missing")).toBeUndefined()
   expect(adapter.source.snapshot()).toEqual(snapshot)
+  writeRun(dir, { ...record, startedBy: { sessionId: "s_member", label: "researcher" } })
+  adapter.load([root])
+  expect(adapter.source.snapshot().phases[0]!.name).toBe("review · researcher · Read")
+  expect(adapter.source.details(agents[0]!.id)!.summary.map(lineText)).toContain(
+    "Started by: researcher (s_member)",
+  )
 })
 
 test("legacy resumed runs retain calls without attempt metadata", () => {

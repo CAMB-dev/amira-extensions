@@ -15,6 +15,8 @@ import type {
 import { createSwarmExtension } from "../src/index.ts"
 import { readSettings } from "../src/limits.ts"
 import type { SwarmRecord } from "../src/swarm.ts"
+import type { WorkflowRunner } from "../src/workflows.ts"
+import { workflowRunner } from "./workflow-fake.ts"
 
 const members = [
   { name: "writer", role: "writer", brief: "Write the proposal" },
@@ -34,6 +36,9 @@ async function harness(
     enabled?: string
     answer?: boolean
     session?: "missing" | "unavailable"
+    runner?: WorkflowRunner
+    memberWorkflows?: { enabled?: boolean; maxRunning?: number; maxPerMember?: number }
+    idle?: boolean
   } = {},
 ) {
   let mode = opts.mode
@@ -41,6 +46,7 @@ async function harness(
   const confirmations: string[] = []
   const notices: string[] = []
   const inboxes = new Map<string, UserMessage[]>()
+  const spawnOptions = new Map<string, SpawnOptions>()
   const records: SwarmRecord[] = []
   const handlers = new Map<string, (event: AnyEvent) => void>()
   const groups: Promise<void>[] = []
@@ -56,6 +62,8 @@ async function harness(
       spawn: (options: SpawnOptions) => {
         const inbox: UserMessage[] = []
         inboxes.set(options.title!, inbox)
+        spawnOptions.set(options.title!, options)
+        let idle = opts.idle ?? false
         const id = `child-${++spawned}`
         let finish!: (result: SubagentResult) => void
         let stopped = false
@@ -69,7 +77,7 @@ async function harness(
         return {
           id,
           get state() {
-            return stopped ? "ended" : "working"
+            return stopped ? "ended" : idle ? "idle" : "working"
           },
           turns: 1,
           pendingNotices: 0,
@@ -85,6 +93,7 @@ async function harness(
           send: (message: UserMessage) => {
             if (stopped) return false
             inbox.push(message)
+            idle = false
             return true
           },
           stop,
@@ -101,7 +110,15 @@ async function harness(
   }
   const api = {
     cwd: process.cwd(),
-    settings: { extensions: { swarm: opts.enabled === undefined ? {} : { enabled: opts.enabled } } },
+    settings: {
+      extensions: {
+        swarm: {
+          ...(opts.enabled === undefined ? {} : { enabled: opts.enabled }),
+          ...(opts.memberWorkflows ? { memberWorkflows: opts.memberWorkflows } : {}),
+        },
+      },
+    },
+    useService: (name: string) => (name === "workflow.runner" ? opts.runner : undefined),
     ...(opts.session === "missing"
       ? {}
       : {
@@ -160,6 +177,14 @@ async function harness(
     notices,
     inboxes,
     records,
+    spawnOptions,
+    memberTool: (owner: string, name: string, params = {}) => {
+      const memberTool = spawnOptions.get(owner)!.extraTools!.find((tool) => tool.name === name)!
+      return memberTool.execute(params, {
+        ...ctx,
+        session: { ...ctx.session!, sessionId: `session-${owner}`, depth: 1 },
+      })
+    },
     tool,
     execute: (params: { action: string; to?: string; text?: string }) => tool.execute(params, ctx),
     get spawned() {
@@ -408,4 +433,138 @@ test("switching to auto does not bypass a previous decline for the same goal", a
   expect(textOf(await h.start())).toContain("Started swarm")
   expect(h.spawned).toBe(2)
   expect(h.confirmations).toHaveLength(1)
+})
+
+for (const available of [false, true]) {
+  for (const enabled of [false, true]) {
+    test(`member workflow tools require service=${available} and enabled=${enabled}`, async () => {
+      const service = workflowRunner()
+      const h = await harness({
+        mode: "auto",
+        ...(available ? { runner: service.runner } : {}),
+        memberWorkflows: { enabled },
+      })
+      await h.start()
+      for (const options of h.spawnOptions.values()) {
+        expect(options.excludeTools).toEqual(["swarm", "workflow"])
+        const tools = options.extraTools!.filter((tool) => tool.name.includes("workflow"))
+        expect(tools.map((tool) => tool.name)).toEqual(
+          available && enabled ? ["start_workflow", "workflow_status", "stop_workflow"] : [],
+        )
+        expect(tools.every((tool) => !tool.mainOnly)).toBe(true)
+      }
+    })
+  }
+}
+
+test("available service enables member workflows by default and settings reach the limit guard", async () => {
+  const service = workflowRunner()
+  const h = await harness({ mode: "auto", runner: service.runner, memberWorkflows: { maxRunning: 1 } })
+  await h.start()
+  await h.memberTool("writer", "start_workflow", { name: "check" })
+  const blocked = await h.memberTool("reviewer", "start_workflow", { name: "check" })
+  expect(blocked.isError).toBe(true)
+  expect(textOf(blocked)).toContain("writer: wf1")
+  expect(service.starts).toHaveLength(1)
+})
+
+for (const status of ["done", "error"]) {
+  test(`member workflow ${status} is recorded on the board and delivered only to its owner`, async () => {
+    const service = workflowRunner()
+    const h = await harness({ mode: "auto", runner: service.runner })
+    await h.start()
+    await h.memberTool("writer", "start_workflow", { name: "check" })
+    expect(textOf(await h.memberTool("reviewer", "blackboard_read", { key: "workflows" }))).toContain(
+      "writer: wf1 (check)",
+    )
+    expect(
+      (await h.memberTool("writer", "blackboard_write", { key: "workflows", value: "hide runs" })).isError,
+    ).toBe(true)
+    service.finish("wf1", status, "check output")
+    expect(h.inboxes.get("writer")).toHaveLength(1)
+    expect(h.inboxes.get("reviewer")).toHaveLength(0)
+    expect(h.inboxes.get("writer")![0]!.content).toEqual([
+      {
+        type: "text",
+        text: `[message from workflow] Workflow wf1 (check) ${status}.\n${status === "error" ? "Error: check output" : 'Result: "check output"'}`,
+      },
+    ])
+    expect(h.records.filter((record) => record.type === "board").map((record) => record.write.value)).toEqual(
+      ["writer: awaiting start (check)", "writer: wf1 (check)", "No member workflows running."],
+    )
+    expect(h.records.filter((record) => record.type === "message")).toEqual([
+      expect.objectContaining({ from: "workflow", to: "writer" }),
+    ])
+  })
+}
+
+test("pending and running workflows prevent idle swarm shutdown; results wake their member", async () => {
+  const service = workflowRunner()
+  const h = await harness({ mode: "auto", runner: service.runner, idle: true })
+  await h.start()
+  const pending = service.pending()
+  const start = h.memberTool("writer", "start_workflow", { name: "check" })
+  // Resume asks the swarm to reconsider idle shutdown while confirmation is pending.
+  await h.execute({ action: "pause" })
+  await h.execute({ action: "resume" })
+  await Bun.sleep(10)
+  expect(h.records.some((record) => record.type === "end")).toBe(false)
+  pending.resolve({ runId: "wf1" })
+  await start
+  await Bun.sleep(10)
+  expect(h.records.some((record) => record.type === "end")).toBe(false)
+  service.finish("wf1")
+  await Bun.sleep(10)
+  expect(h.inboxes.get("writer")).toHaveLength(1)
+  expect(h.records.some((record) => record.type === "end")).toBe(false)
+})
+
+test("a failed pending workflow start releases idle shutdown", async () => {
+  const service = workflowRunner()
+  const h = await harness({ mode: "auto", runner: service.runner, idle: true })
+  await h.start()
+  service.next(async () => ({ error: "Not confirmed" }))
+  expect((await h.memberTool("writer", "start_workflow", { name: "check" })).isError).toBe(true)
+  // Let the swarm's idle recheck run before awaiting group cleanup.
+  await Bun.sleep(10)
+  expect(h.records.some((record) => record.type === "end")).toBe(true)
+})
+
+test("paused owners hold workflow results without ending the idle swarm", async () => {
+  const service = workflowRunner()
+  const h = await harness({ mode: "auto", runner: service.runner, idle: true })
+  await h.start()
+  await h.memberTool("writer", "start_workflow", { name: "check" })
+  await h.execute({ action: "pause", to: "writer" })
+  service.finish("wf1")
+  await Bun.sleep(10)
+  expect(h.inboxes.get("writer")).toHaveLength(0)
+  expect(h.records.some((record) => record.type === "end")).toBe(false)
+  await h.execute({ action: "resume", to: "writer" })
+  expect(h.inboxes.get("writer")).toHaveLength(1)
+})
+
+test("swarm stop cancels member runs and confirmations before recording its final board", async () => {
+  const service = workflowRunner()
+  const h = await harness({ mode: "auto", runner: service.runner })
+  await h.start()
+  await h.memberTool("writer", "start_workflow", { name: "check" })
+  service.next(
+    (_request, ctx) =>
+      new Promise((resolve) => {
+        ctx.signal.addEventListener("abort", () => resolve({ error: "Cancelled" }), { once: true })
+      }),
+  )
+  const pending = h.memberTool("reviewer", "start_workflow", { name: "check" })
+  await h.stop()
+  expect((await pending).isError).toBe(true)
+  expect(service.stops).toEqual(["wf1"])
+  expect(service.starts[1]!.ctx.signal.aborted).toBe(true)
+  expect(h.records.at(-1)?.type).toBe("end")
+  const lastBoard = h.records.filter((record) => record.type === "board").at(-1)!
+  expect(lastBoard.write.value).toBe("No member workflows running.")
+  const count = h.records.length
+  service.finish("wf1", "error", "Late failure")
+  expect(h.records).toHaveLength(count)
+  expect(h.inboxes.get("writer")).toHaveLength(0)
 })

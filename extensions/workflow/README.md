@@ -46,6 +46,8 @@ A running workflow shows as one line under the call that started it. When it end
 goes to the model as a message, and the transcript shows a short line.
 
 Only the main session has the `workflow` tool and command: sub-agents, at any depth, never do.
+Since **0.1.9**, swarm members can instead use the swarm's own workflow tools through the
+optional `workflow.runner` service (see below).
 
 Since **0.1.8**, the model can also inspect and stop workflows through the tool:
 
@@ -60,6 +62,40 @@ Existing calls with only `script`/`name`/`args`/`resume` still start a run. Stop
 tool needs no confirmation. The model may stop runs it started when they are no longer
 useful, stuck, or you ask, and should tell you when it does. Start confirmations are unchanged;
 you can still intervene with `/workflow stop`.
+
+## Workflows started by swarm members
+
+With both extensions installed, swarm members get `start_workflow`, `workflow_status` and
+`stop_workflow` when `extensions.swarm.memberWorkflows.enabled` is on (the default). They can
+inspect and stop only their own runs. Swarm defaults allow **3 running workflows per swarm**
+and **1 per member**, including starts awaiting confirmation. Members coordinate through the
+`workflows` blackboard entry and direct messages; a limit response names the owners and runs.
+The swarm stays active while a member waits for a workflow. Results and failures go back to
+the starting member, not as duplicate notices to the main session. Stopping the swarm stops
+its member workflows, including starts awaiting confirmation.
+
+Every start follows the same workflow settings, permission-mode policy, validation, limits,
+journal and dashboard path as the main tool. Required confirmations are shown to you, not
+the member. `startedBy: { sessionId, label }` is stored in `run.json` and shown in the progress
+view and dashboard; attribution survives resume. No new budget is imposed: configured
+workflow budgets and the starting member's session/tree limits still apply. Workflow agents
+receive neither swarm nor workflow tools, including the member tools; they cannot start a
+swarm or another orchestration run. The script-level `workflow(name, args)` helper still
+runs saved scripts within the same run's limits and journal.
+
+Extensions can use the optional service without importing this package:
+
+- `api.useService("workflow.runner")` returns the runner when workflow is installed.
+- `start({ script?, name?, args?, startedBy: { sessionId, label } }, ctx)` returns
+  `Promise<{ runId } | { error }>` and uses the caller's `ToolContext` to create its spawn group.
+- `status(runId)` returns `{ runId, name, status, startedBy?, result?, error? }`, or `undefined`
+  for an unknown run. It describes runs started in this extension instance.
+- `stop(runId)` returns whether it stopped a running run; stopping needs no confirmation.
+- `onResult(runId, callback)` delivers the settled status/result/error once and returns an
+  unsubscribe function. Late subscribers also receive the result, in a microtask.
+
+Consumers enforce their own ownership and concurrency rules; the service does not expose
+any extra tools to sub-agents.
 
 ## Scripts
 

@@ -8,6 +8,7 @@ import type {
   PendingNotice,
   SpawnGroup,
   SpawnGroupOptions,
+  ToolContext,
   ToolDefinition,
   ToolPresenter,
   ToolResult,
@@ -19,7 +20,7 @@ import type {
 } from "@amira/api"
 import { compileScript } from "./compile.ts"
 import { bindWorkflowSource, createWorkflowSource } from "./dashboard.ts"
-import { type JournalEntry, listRuns, readJournal, readRun, successful } from "./journal.ts"
+import { type JournalEntry, listRuns, type RunRecord, readJournal, readRun, successful } from "./journal.ts"
 import { estimate, readMeta, sizeLine, type WorkflowMeta, workspaceLine } from "./meta.ts"
 import { countsLine, formatDuration, formatTokens, runStateText, totals, treeLines } from "./progress.ts"
 import { loadRoles } from "./roles.ts"
@@ -160,7 +161,33 @@ export interface WorkflowExtensionOptions {
   git?: RunGit
 }
 
+// Structural service contract: consumers mirror it without importing workflow or augmenting AmiraServices.
+interface RunnerResult {
+  runId: string
+  name: string
+  status: string
+  startedBy?: { sessionId: string; label: string }
+  result?: unknown
+  error?: string
+}
+
+interface WorkflowRunner {
+  start(
+    request: {
+      script?: string
+      name?: string
+      args?: unknown
+      startedBy: { sessionId: string; label: string }
+    },
+    ctx: ToolContext,
+  ): Promise<{ runId: string } | { error: string }>
+  status(runId: string): RunnerResult | undefined
+  stop(runId: string): boolean
+  onResult(runId: string, listener: (result: RunnerResult) => void): () => void
+}
+
 interface Launch {
+  startedBy?: { sessionId: string; label: string }
   source: string
   origin: string
   args: unknown
@@ -172,7 +199,13 @@ interface Launch {
   /** Started by the user's own /workflow command: messages go to the user, not the model. */
   command?: boolean
   /** Resuming this run: its id and journal. */
-  resume?: { id: string; dir: string; previous: JournalEntry[]; resumes: number }
+  resume?: {
+    id: string
+    dir: string
+    previous: JournalEntry[]
+    resumes: number
+    startedBy?: { sessionId: string; label: string }
+  }
   ui: UiApi
   signal?: AbortSignal
   createGroup(opts: SpawnGroupOptions): SpawnGroup
@@ -196,6 +229,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         api.reportError(error)
       })
     const runs = new Map<string, WorkflowRun>()
+    const lifetime = new AbortController()
     /** Which session started each run. */
     const owners = new Map<string, string>()
     let root: string | undefined
@@ -245,6 +279,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
 
     const dashboard = createWorkflowSource(api.cwd)
     const dashboardBinding = bindWorkflowSource(api, dashboard.source, () => {
+      lifetime.abort()
       for (const run of runs.values()) run.stop("the workflow extension was unloaded")
       dashboard.dispose()
     })
@@ -286,6 +321,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       source: string,
       initiator: Launch["initiator"],
       resume?: Launch["resume"],
+      startedBy?: Launch["startedBy"],
     ) => {
       const s = settings()
       const max = s.maxAgents ?? DEFAULT_MAX_AGENTS
@@ -301,6 +337,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       ).length
       return [
         initiator === "user" ? "You asked for this workflow." : "The model proposes this workflow.",
+        ...(startedBy ? [`Started by: ${startedBy.label} (${startedBy.sessionId})`] : []),
         meta.description,
         `Phases: ${phasesLine(meta)}`,
         `Agents: ${sizeLine(estimate(source))}, at most ${max}, ${concurrent} at a time.`,
@@ -316,7 +353,10 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
 
     /** Asks the user, then starts the run in the background. Returns the run, or why it did not start. */
     const launch = async (l: Launch): Promise<WorkflowRun | string> => {
+      l = { ...l, signal: AbortSignal.any([lifetime.signal, ...(l.signal ? [l.signal] : [])]) }
+      if (l.signal?.aborted) return "The workflow start was cancelled."
       const s = settings()
+      const startedBy = l.startedBy ?? l.resume?.startedBy
       const mode = s.enabled ?? "mode"
       const auto = mode === "mode" && api.session?.()?.info().permissions?.mode === "auto"
       if (mode === "never")
@@ -334,9 +374,10 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       if (mode !== "always" && !auto) {
         const ok = await l.ui.confirm(
           `${l.resume ? "Resume" : "Start"} workflow "${meta.name}"?`,
-          confirmText(meta, l.source, l.initiator, l.resume),
+          confirmText(meta, l.source, l.initiator, l.resume, startedBy),
           l.signal ? { signal: l.signal } : {},
         )
+        if (l.signal?.aborted) return "The workflow start was cancelled."
         if (ok !== true) {
           for (const k of keys) declined.add(k)
           // The user's ask is used up: asking again is what lets this workflow be proposed again.
@@ -383,6 +424,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
           source: l.source,
           origin: l.origin,
           args: l.args,
+          ...(startedBy ? { startedBy: { ...startedBy } } : {}),
           group,
           cwd: api.cwd,
           home: api.home,
@@ -424,13 +466,14 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
     /** The group's one-line status in the transcript: phase and counts. */
     const setStatus = (run: WorkflowRun) => {
       const phase = run.flow.current ? `${run.flow.current} · ` : ""
-      run.group.setStatus(`${run.id} · ${phase}${countsLine(run.flow)}`)
+      const owner = run.record.startedBy
+      run.group.setStatus(`${run.id} · ${owner ? `${owner.label} · ` : ""}${phase}${countsLine(run.flow)}`)
     }
 
     /** A run to resume: its stored script and journal. */
     const resumable = (
       id: string,
-    ): { dir: string; source: string; args: unknown; previous: JournalEntry[]; resumes: number } | string => {
+    ): (Omit<NonNullable<Launch["resume"]>, "id"> & { source: string; args: unknown }) | string => {
       const live = runs.get(id)
       if (live && !live.settled) return `Run ${id} is still running or settling its agents.`
       const dir = [path.join(runsRoot(), id), path.join(api.home, "workflow-runs", id)].find((d) =>
@@ -444,6 +487,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         args: stored.record.args,
         previous: readJournal(dir),
         resumes: (stored.record.resumes ?? 0) + 1,
+        ...(stored.record.startedBy ? { startedBy: stored.record.startedBy } : {}),
       }
     }
 
@@ -454,12 +498,95 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       const cost = totals(run.flow).cost
       return [
         `Workflow run ${run.id} (${run.meta.name}) · ${runStateText(run.status)}`,
+        ...(run.record.startedBy
+          ? [`Started by: ${run.record.startedBy.label} (${run.record.startedBy.sessionId})`]
+          : []),
         `Phase: ${run.flow.current || "none"}`,
         `${countsLine(run.flow)}${cost === undefined ? " · cost unknown" : cost === 0 ? " · $0.00" : ""} · ${formatDuration(now - run.startedAt)}`,
         ...treeLines(run.flow, now).map((line) => line.text),
         ...(run.error ? [`Error: ${run.error}`] : []),
       ].join("\n")
     }
+
+    /** Shared inline/saved source resolution for the main tool and service callers. */
+    const resolveSource = (script?: string, name?: string): { source: string; origin: string } | string => {
+      if (script !== undefined) return { source: script, origin: "inline" }
+      if (!name) return 'Give "script", "name" or "resume".'
+      const saved = findSaved(api.cwd, api.home, name)
+      if (!saved) {
+        const names = listSaved(api.cwd, api.home).map((w) => w.name)
+        return `No saved workflow "${name}". Saved workflows: ${names.join(", ") || "none"}.`
+      }
+      return { source: readFileSync(saved.file, "utf8"), origin: saved.file }
+    }
+
+    const runnerResult = (record: RunRecord): RunnerResult => ({
+      runId: record.id,
+      name: record.meta.name,
+      status: record.status,
+      ...(record.startedBy ? { startedBy: { ...record.startedBy } } : {}),
+      ...(record.status === "done" ? { result: record.result } : {}),
+      ...(record.error !== undefined ? { error: record.error } : {}),
+    })
+    const runner: WorkflowRunner = {
+      async start(request, ctx) {
+        if (ctx.signal.aborted) return { error: "The workflow start was cancelled." }
+        const session = ctx.session
+        if (!session?.createGroup) return { error: "Workflows need an agent tree to start." }
+        if (
+          !request.startedBy ||
+          typeof request.startedBy.sessionId !== "string" ||
+          !request.startedBy.sessionId.trim() ||
+          typeof request.startedBy.label !== "string" ||
+          !request.startedBy.label.trim()
+        ) {
+          return { error: "Give startedBy with a sessionId and label." }
+        }
+        try {
+          const source = resolveSource(request.script, request.name)
+          if (typeof source === "string") return { error: source }
+          const run = await launch({
+            ...source,
+            args: request.args,
+            startedBy: { ...request.startedBy },
+            initiator: explicit ? "user" : "model",
+            ui: api.ui,
+            signal: ctx.signal,
+            // The caller's session owns this group, so its ancestor budgets still apply.
+            createGroup: (o) => session.createGroup!(o),
+            // The consumer delivers the result via onResult, not a duplicate root notice.
+            expectNotice: () => undefined,
+          })
+          return typeof run === "string" ? { error: run } : { runId: run.id }
+        } catch (err) {
+          return { error: ctx.signal.aborted ? "The workflow start was cancelled." : errorText(err) }
+        }
+      },
+      status(runId) {
+        const run = runs.get(runId)
+        return run ? runnerResult(run.record) : undefined
+      },
+      stop: (runId) => runs.get(runId)?.stop("stopped by the caller") ?? false,
+      onResult(runId, listener) {
+        let active = true
+        // Promise callbacks replay settled runs in a microtask too: a fast completion cannot
+        // race the consumer's subscription. Unsubscribing also cancels a queued replay.
+        void runs.get(runId)?.done.then((record) => {
+          if (!active) return
+          active = false
+          try {
+            listener(runnerResult(record))
+          } catch (err) {
+            api.reportError(`Workflow result listener failed: ${errorText(err)}`)
+          }
+        })
+        return () => {
+          active = false
+        }
+      },
+    }
+    const releaseRunner = api.provideService("workflow.runner", runner)
+    api.onExit?.(() => releaseRunner())
 
     type Params = {
       action?: "start" | "status" | "list" | "stop"
@@ -509,32 +636,19 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         if (action !== "start")
           return textResult(`Unknown action "${action}": use start, status, list or stop.`, true)
         let source = p.script
-        let origin = "inline"
         let args = p.args
         let resume: Launch["resume"]
         if (p.resume) {
           const r = resumable(p.resume)
           if (typeof r === "string") return textResult(r, true)
-          resume = { id: p.resume, dir: r.dir, previous: r.previous, resumes: r.resumes }
+          resume = { id: p.resume, ...r }
           source ??= p.name ? undefined : r.source
           args ??= r.args
         }
-        if (source === undefined && p.name) {
-          const saved = findSaved(api.cwd, api.home, p.name)
-          if (!saved) {
-            const names = listSaved(api.cwd, api.home).map((w) => w.name)
-            return textResult(
-              `No saved workflow "${p.name}". Saved workflows: ${names.join(", ") || "none"}.`,
-              true,
-            )
-          }
-          source = readFileSync(saved.file, "utf8")
-          origin = saved.file
-        }
-        if (source === undefined) return textResult('Give "script", "name" or "resume".', true)
+        const resolved = resolveSource(source, p.name)
+        if (typeof resolved === "string") return textResult(resolved, true)
         const run = await launch({
-          source,
-          origin,
+          ...resolved,
           args,
           initiator: explicit ? "user" : "model",
           ...(resume ? { resume } : {}),
@@ -579,6 +693,14 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         const took = formatDuration((run.endedAt ?? o.now) - run.startedAt)
         return [
           { kind: "muted", text: run.meta.description },
+          ...(run.record.startedBy
+            ? [
+                {
+                  kind: "text" as const,
+                  text: `Started by: ${run.record.startedBy.label} (${run.record.startedBy.sessionId})`,
+                },
+              ]
+            : []),
           { kind: "text", text: `${countsLine(run.flow)} · ${took}` },
           ...(run.error ? [{ kind: "error" as const, text: run.error }] : []),
         ]
@@ -732,7 +854,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
             source: r.source,
             origin: "resume",
             args: newer ?? r.args,
-            resume: { id, dir: r.dir, previous: r.previous, resumes: r.resumes },
+            resume: { id, ...r },
           })
           return
         }
