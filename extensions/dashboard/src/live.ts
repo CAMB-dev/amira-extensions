@@ -289,7 +289,8 @@ export function createLiveSource(
       return {
         workspace,
         phases: [{ id: "agents", name: "Agents", groups: [...groups.values()] }],
-        note: "Live files and logs cover recent activity while this dashboard is open; older details may be omitted.",
+        warning:
+          "Live files and logs cover recent activity while this dashboard is open; older details may be omitted.",
       }
     },
     details(agentId) {
