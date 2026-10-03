@@ -1,0 +1,26 @@
+{
+  "name": "btw",
+  "license": "Apache-2.0",
+  "version": "0.1.0",
+  "description": "Ask a quick side question while the main agent keeps working, without changing the conversation",
+  "type": "module",
+  "scripts": {
+    "link-amira": "bun scripts/link-amira.ts",
+    "test": "bun test",
+    "typecheck": "tsc -p tsconfig.json",
+    "lint": "biome check ."
+  },
+  "amira": {
+    "engines": {
+      "amira": "^0.1.24"
+    },
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.14",
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2"
+  }
+}
