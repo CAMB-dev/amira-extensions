@@ -85,6 +85,7 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
     agentsOf(fixture.snapshot)[0]!.sessionId = "child-session"
     fixture.data.session = {
       info: () => ({ id: "root" }),
+      subagents: () => [{ id: "child-session" }],
       subagentMessages: (id: string) => {
         expect(id).toBe("child-session")
         return [{ role: "user", content: [{ type: "text", text: "Child transcript contents" }] }]
@@ -178,6 +179,7 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
     agentsOf(fixture.snapshot)[0]!.sessionId = "child-session"
     fixture.data.session = {
       info: () => ({ id: "root" }),
+      subagents: () => [{ id: "child-session" }],
       trace: () =>
         new Promise((resolve) => {
           finish = resolve

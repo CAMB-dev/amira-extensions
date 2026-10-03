@@ -236,7 +236,7 @@ function details(data: DashboardViewData, agent?: DashboardAgent): UiNode {
       : data.pendingAction
   const labels = [
     ["open-diff", "Open diff", "o"],
-    ...(agent.sessionId && data.session
+    ...(agent.sessionId && readable(data.session, agent.sessionId)
       ? [
           ["open-transcript", "Open transcript", ""],
           ["open-trace", "Open trace", ""],
@@ -309,7 +309,17 @@ function details(data: DashboardViewData, agent?: DashboardAgent): UiNode {
       body: statsPanel(detail.stats, agentsOf(data.source.snapshot())),
     })
   for (const tab of sourceTabs(detail?.tabs)) {
-    const body = tab.render()
+    let body: UiNode | ViewLine[]
+    try {
+      body = tab.render()
+    } catch (error) {
+      body = [
+        {
+          kind: "warning",
+          text: `This tab failed to render: ${error instanceof Error ? error.message : String(error)}`,
+        },
+      ]
+    }
     tabs.push({
       key: tab.key,
       label: tab.label,
@@ -319,6 +329,15 @@ function details(data: DashboardViewData, agent?: DashboardAgent): UiNode {
     })
   }
   return { type: "tabs", id: "detail", tabs }
+}
+
+/** Transcript and trace are offered only for descendants the session itself lists. */
+function readable(session: SessionControl | undefined, id: string): boolean {
+  try {
+    return !!session?.subagents().some((child) => child.id === id)
+  } catch {
+    return false
+  }
 }
 
 function sourceTabs(tabs: DashboardTab[] = []): DashboardTab[] {

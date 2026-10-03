@@ -40,6 +40,7 @@ function setup() {
   const info = { id: "root" }
   const session = {
     info: () => info,
+    subagents: () => [{ id: "child-session" }],
     subagentMessages: mock((_id: string): readonly Message[] | undefined => messages),
     trace: mock(async (_id?: string): Promise<TraceRecord[]> => records),
   }
@@ -199,4 +200,24 @@ test("custom line and nested widget tabs are namespaced, navigable and backward 
   expect(JSON.stringify(tree)).toContain("Board contents")
   expect(JSON.stringify(tree)).toContain("Message contents")
   expect(JSON.stringify(tree)).not.toContain("Invalid override")
+})
+
+test("session actions are hidden for sessions the host does not list, and a throwing tab is contained", () => {
+  const s = setup()
+  s.session.subagents = () => []
+  expect(JSON.stringify(s.render())).not.toContain("Open transcript")
+  s.session.subagents = () => [{ id: "child-session" }]
+  s.details.payments!.tabs = [
+    {
+      key: "boom",
+      label: "Boom",
+      render: () => {
+        throw new Error("bad tab")
+      },
+    },
+  ]
+  dashboardView.onEvent!({ type: "activate", id: "timeline", key: "agent:payments" }, s.data, s.control)
+  const body = JSON.stringify(s.render())
+  expect(body).toContain("This tab failed to render: bad tab")
+  expect(body).toContain("Summary")
 })
