@@ -10,7 +10,7 @@ function render(fixture: Fixture, width = 180): UiNode {
   return dashboardView.ui!(fixture.data, fixture.context(width))
 }
 
-/** Traverse inactive tab bodies and tree details too: widget IDs are view-wide. */
+/** Traverse rendered subtrees, including nested source tabs and tree details. */
 function nodes(node: UiNode): UiNode[] {
   const children: UiNode[] = []
   if (node.type === "column" || node.type === "row") {
@@ -112,63 +112,146 @@ describe("public semantic rendering (not terminal raster snapshots)", () => {
     expect(fixture.control.requestRender).not.toHaveBeenCalled()
   })
 
-  test("widget IDs are globally unique, including inactive tabs, at both widths and on both pages", () => {
+  test("widget IDs stay unique as each tab becomes active at both widths and on both pages", () => {
     const fixture = viewFixture()
+    const bodies = ["summary", "diff", "logs", "actions", "stats"]
     for (const width of [180, 80]) {
       for (const page of [undefined, "payments"]) {
         if (fixture.context().page) fixture.control.popPage()
         if (page) send(fixture, { type: "activate", id: "timeline", key: `agent:${page}` })
-        const all = nodes(render(fixture, width))
-        const ids = all.flatMap((node) => ("id" in node && node.id ? [node.id] : []))
-        expect(ids.length).toBeGreaterThan(0)
-        expect(new Set(ids).size).toBe(ids.length)
-        expect(ids).toEqual(
-          expect.arrayContaining(
-            ["detail", "summary", "diff", "logs", "actions", "stats"].map(fixture.widgetId),
-          ),
-        )
-        for (const node of all) {
-          if (node.type !== "tree") continue
-          const keys = treeItems(node.items).map((item) => item.key)
-          expect(new Set(keys).size).toBe(keys.length)
+        for (const active of bodies) {
+          send(fixture, { type: "tab", id: "detail", key: active })
+          const all = nodes(render(fixture, width))
+          const ids = all.flatMap((node) => ("id" in node && node.id ? [node.id] : []))
+          expect(new Set(ids).size).toBe(ids.length)
+          expect(ids).toContain(fixture.widgetId("detail"))
+          expect(ids).toContain(fixture.widgetId(active))
+          for (const inactive of bodies.filter((body) => body !== active))
+            expect(ids).not.toContain(fixture.widgetId(inactive))
+          for (const node of all) {
+            if (node.type !== "tree") continue
+            const keys = treeItems(node.items).map((item) => item.key)
+            expect(new Set(keys).size).toBe(keys.length)
+          }
         }
       }
     }
   })
 
-  test("wide timeline supplies every card; narrow timeline only supplies the selected card", () => {
+  test("timeline has one level of phase rows and selectable card headers, without group rows", () => {
     const fixture = viewFixture()
-    for (const width of [180, 80]) {
-      const timeline = nodes(render(fixture, width)).find((node) => node.type === "tree")
-      if (timeline?.type !== "tree") throw new Error("Missing timeline")
-      const cards = treeItems(timeline.items)
-        .filter((item) => item.detail)
-        .map((item) => item.key)
-      expect(cards).toEqual(
-        width === 180 ? ["agent:payments", "agent:receipts", "agent:audit"] : ["agent:payments"],
-      )
+    const timeline = widget(fixture, "timeline")
+    if (timeline.type !== "tree") throw new Error("Missing timeline")
+    expect(timeline.items.map((item) => item.key)).toEqual([
+      "phase:implementation",
+      "agent:payments",
+      "agent:receipts",
+      "phase:review",
+      "agent:audit",
+    ])
+    for (const item of timeline.items) {
+      expect(item.children ?? []).toEqual([])
+      expect(item.detail).toBeDefined()
+      expect(item.row?.length).toBeGreaterThan(0)
     }
   })
 
-  test("details use body height, clamped to 7–18 rows independently of width", () => {
+  test("wide timeline supplies every card; narrow timeline supplies the selected phase's whole box", () => {
     const fixture = viewFixture()
-    for (const width of [80, 180]) {
-      for (const [height, expected] of [
-        [0, 7],
-        [20, 7],
-        [30, 11],
-        [40, 14],
-        [51, 18],
-        [100, 18],
-      ]) {
-        const tree = dashboardView.ui!(fixture.data, fixture.context(width, height))
-        if (tree.type !== "column") throw new Error("Missing layout")
-        expect(tree.children.find(({ node }) => node.type === "box")?.size).toBe(expected)
+    for (const selected of ["agent:payments", "agent:receipts", "agent:audit", "phase:review"]) {
+      send(fixture, { type: "select", id: "timeline", key: selected })
+      for (const width of [180, 80]) {
+        const timeline = nodes(render(fixture, width)).find((node) => node.type === "tree")
+        if (timeline?.type !== "tree") throw new Error("Missing timeline")
+        expect(
+          timeline.items.filter((item) => item.key.startsWith("phase:")).map((item) => item.key),
+        ).toEqual(["phase:implementation", "phase:review"])
+        const cards = timeline.items.filter((item) => item.key.startsWith("agent:"))
+        expect(cards.map((item) => item.key)).toEqual(
+          width === 180
+            ? ["agent:payments", "agent:receipts", "agent:audit"]
+            : selected === "agent:audit" || selected === "phase:review"
+              ? ["agent:audit"]
+              : ["agent:payments", "agent:receipts"],
+        )
+        expect(cards.every((item) => item.detail)).toBe(true)
       }
     }
   })
 
-  test("unselected and phase-selected details stay at minimum height", () => {
+  test("card progress distinguishes unreported progress from reported zero", () => {
+    const fixture = viewFixture()
+    const receipts = agentsOf(fixture.snapshot).find((agent) => agent.id === "receipts")!
+    for (const width of [180, 80]) {
+      for (const progress of [undefined, 0]) {
+        receipts.progress = progress
+        const timeline = nodes(render(fixture, width)).find((node) => node.type === "tree")
+        if (timeline?.type !== "tree") throw new Error("Missing timeline")
+        const card = timeline.items.find((item) => item.key === "agent:receipts")!
+        const indicator = card.row?.at(-1)
+        expect(indicator?.text).toBe(
+          `${"─".repeat(width === 180 ? 14 : 6)}  ${progress === undefined ? "—" : "0%"}`,
+        )
+        if (progress === undefined) expect(indicator?.kind).toBe("muted")
+      }
+    }
+  })
+
+  test("selected details use 6 narrow rows or 30% of wide body height clamped to 9–15 rows", () => {
+    const fixture = viewFixture()
+    for (const width of [80, 180]) {
+      for (const [height, expected] of [
+        [0, 9],
+        [20, 9],
+        [30, 9],
+        [35, 11],
+        [40, 12],
+        [51, 15],
+        [100, 15],
+      ]) {
+        const tree = dashboardView.ui!(fixture.data, fixture.context(width, height))
+        if (tree.type !== "column") throw new Error("Missing layout")
+        expect(
+          tree.children.find(
+            ({ node }) => node.type === "column" && JSON.stringify(node.children[0]).includes("≡"),
+          )?.size,
+        ).toBe(width === 80 ? 6 : expected)
+      }
+    }
+  })
+
+  test("details keep tab headers in one row and render only the active body at full width", () => {
+    const fixture = viewFixture()
+    for (const width of [80, 180]) {
+      for (const page of [undefined, "payments"]) {
+        if (fixture.context().page) fixture.control.popPage()
+        if (page) send(fixture, { type: "activate", id: "timeline", key: `agent:${page}` })
+        send(fixture, { type: "tab", id: "detail", key: "diff" })
+        const tree = render(fixture, width)
+        if (tree.type !== "column") throw new Error("Missing layout")
+        const panel = tree.children.find(
+          ({ node }) => node.type === "column" && JSON.stringify(node.children[0]).includes("≡"),
+        )?.node
+        if (panel?.type !== "column") throw new Error("Missing details panel")
+        expect(panel.children[0]).toMatchObject({ size: 1, node: { type: "text" } })
+        expect(JSON.stringify(panel.children[0])).toContain("≡")
+        const detail = panel.children[1]?.node
+        if (detail?.type !== "column") throw new Error("Missing details content")
+        const header = detail.children[0]!
+        expect(header.size).toBe(1)
+        if (header.node.type !== "row") throw new Error("Missing details header")
+        const tabs = header.node.children[0]!.node
+        if (tabs.type !== "tabs") throw new Error("Missing tabs")
+        expect(tabs.tabs.every((tab) => tab.body.type === "spacer")).toBe(true)
+        expect(detail.children[1]).toEqual({ size: 1, node: { type: "rule" } })
+        expect(detail.children[2]?.size).toBeUndefined()
+        expect(detail.children[2]?.node).toMatchObject({ type: "text", id: fixture.widgetId("diff") })
+        expect(detail.children).toHaveLength(3)
+      }
+    }
+  })
+
+  test("unselected and phase-selected details use only a handle and one placeholder row", () => {
     const fixture = viewFixture()
     fixture.data.selected = undefined
     for (const selected of [undefined, "phase:implementation", "group:implementation:workers"]) {
@@ -176,7 +259,16 @@ describe("public semantic rendering (not terminal raster snapshots)", () => {
       for (const width of [80, 180]) {
         const tree = dashboardView.ui!(fixture.data, fixture.context(width, 51))
         if (tree.type !== "column") throw new Error("Missing layout")
-        expect(tree.children.find(({ node }) => node.type === "box")?.size).toBe(7)
+        const panel = tree.children.find(
+          ({ node }) => node.type === "column" && JSON.stringify(node.children[0]).includes("≡"),
+        )
+        expect(panel?.size).toBe(2)
+        if (panel?.node.type !== "column") throw new Error("Missing details panel")
+        expect(panel.node.children).toHaveLength(2)
+        expect(panel.node.children[0]).toMatchObject({ size: 1, node: { type: "text" } })
+        expect(JSON.stringify(panel.node.children[0])).toContain("≡")
+        expect(panel.node.children[1]?.node).toMatchObject({ type: "text", id: "selection-hint" })
+        expect(words(fixture, "selection-hint")).toHaveLength(1)
       }
     }
   })
@@ -187,17 +279,30 @@ describe("public semantic rendering (not terminal raster snapshots)", () => {
     const tree = widget(fixture, "timeline")
     if (tree.type !== "tree") throw new Error("Missing timeline")
     expect(tree.expanded).toBe("all")
-    const serialized = JSON.stringify(tree)
-    expect(serialized).toContain("p Resume")
-    expect(serialized).toContain("p Pause · r Request changes")
-    const audit = treeItems(tree.items).find((item) => item.key === "agent:audit")!
-    expect(JSON.stringify(audit.detail)).not.toContain("p Pause")
-    expect(JSON.stringify(audit.detail)).not.toContain("r Request changes")
+    const header = (id: string) => {
+      const card = tree.items.find((item) => item.key === `agent:${id}`)!
+      return [...(card.row ?? []), ...(card.aside ?? [])].map((part) => part.text).join("")
+    }
+    expect(header("payments")).toContain("Pause")
+    expect(header("payments")).toContain("Request changes")
+    expect(header("payments")).not.toContain("Resume")
+    expect(header("receipts")).toContain("Resume")
+    expect(header("receipts")).not.toContain("Pause")
+    expect(header("receipts")).not.toContain("Request changes")
+    expect(header("audit")).not.toContain("Pause")
+    expect(header("audit")).not.toContain("Resume")
+    expect(header("audit")).not.toContain("Request changes")
+    for (const id of ["payments", "receipts", "audit"]) {
+      expect(header(id)).toContain("Open diff")
+      expect(header(id)).not.toContain("p Pause")
+      expect(header(id)).not.toContain("p Resume")
+    }
   })
 
   test("empty source remains a valid semantic tree", () => {
     const fixture = viewFixture()
     fixture.snapshot.phases = []
+    fixture.snapshot.note = undefined
     expect(words(fixture, "empty")).toEqual([
       "No agents yet. Start a task with sub-agents, then return here.",
     ])
@@ -339,6 +444,8 @@ describe("agent actions", () => {
       { kind: "muted", text: "No diff available for this file (only its path was reported)." },
     ])
     send(fixture, { type: "activate", id: "timeline", key: "agent:receipts" })
+    send(fixture, { type: "tab", id: "detail", key: "actions" })
+    expect(widget(fixture, "actions").type).toBe("table")
     send(fixture, { type: "activate", id: "actions", key: JSON.stringify(["receipts", "open-diff"]) })
     expect(words(fixture, "diff")).toEqual([
       "templates/receipt.html",
@@ -368,6 +475,8 @@ describe("agent actions", () => {
   test("action table activation and page r/x shortcuts dispatch the same guarded operations", async () => {
     const fixture = viewFixture()
     send(fixture, { type: "activate", id: "timeline", key: "agent:payments" })
+    send(fixture, { type: "tab", id: "detail", key: "actions" })
+    expect(widget(fixture, "actions").type).toBe("table")
     send(fixture, { type: "activate", id: "actions", key: JSON.stringify(["payments", "pause"]) })
     await Promise.resolve()
     expect(fixture.act).toHaveBeenLastCalledWith("payments", "pause", undefined)

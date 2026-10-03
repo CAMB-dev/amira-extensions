@@ -7,6 +7,9 @@ export interface DashboardFile {
   path: string
   /** Actual diff lines, when supplied by the source. Paths alone are not a diff. */
   diff?: ViewLine[]
+  /** Reported line counts; omitted when only a path is known. */
+  added?: number
+  removed?: number
 }
 
 export interface DashboardAgent {
@@ -30,19 +33,33 @@ export interface DashboardGroup {
   id: string
   name: string
   ref?: string
+  status?: DashboardStatus
+  startedAt?: number
+  durationMs?: number
+  description?: string
+  stepCount?: number
   agents: DashboardAgent[]
 }
 
 export interface DashboardPhase {
   id: string
   name: string
+  ref?: string
+  status?: DashboardStatus
+  startedAt?: number
+  durationMs?: number
+  description?: string
+  stepCount?: number
   groups: DashboardGroup[]
 }
 
 export interface DashboardSnapshot {
   workspace: string
   phases: DashboardPhase[]
+  /** Usage/data caveat, shown in Stats (or as the empty-source explanation). */
   note?: string
+  /** Operational warning that must remain visible in Summary, independently of Stats. */
+  warning?: string
 }
 
 export interface DashboardTab {
@@ -55,6 +72,9 @@ export interface DashboardTab {
 
 export interface DashboardDetails {
   summary: ViewLine[]
+  /** Explicit source-reported steps, never inferred from tool counts. */
+  steps?: { text: string; status: "done" | "running" | "queued" }[]
+  notes?: ViewLine[]
   logs: ViewLine[]
   stats?: TraceSummary
   tabs?: DashboardTab[]
