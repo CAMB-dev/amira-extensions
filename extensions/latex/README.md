@@ -84,34 +84,21 @@ not access to Amira's theme; no theme information is exposed in the renderer con
 
 ## Current core limits
 
-Checked against `packages/api/src/render.ts`, `packages/tui/src/markdown-nodes.ts`,
-`packages/tui/src/blocks/reply.ts`, `packages/tui-kit/src/markdown/` and
-`packages/cli/src/print.ts` in the local Amira checkout. No core files are changed.
+Checked against `packages/api/src/render.ts` and `packages/cli/src/print.ts`. These are what
+core needs for math beyond fences; no core files are changed by this extension.
 
-- **Only fences are claimable.** `MarkdownNode` contains only code and standalone images;
-  `MarkdownRenderMatch` only has `codeLang` and `image`. The parser has no math nodes:
-  `$$…$$` and `\[…\]` go through ordinary paragraph/escape handling. Supporting these
-  requires math-aware block tokenization (including streaming closure), a display-math
-  node/matcher in the API and registry, and dispatch in both transcript render paths.
-- **Inline math is unchanged by this extension.** `$…$` and `\(…\)` cannot be claimed.
-  Core needs an inline-math tokenizer and a text-only inline renderer contract wired into
-  paragraph layout, preserving surrounding emphasis, links and wrapping. Dollar recognition
-  must exclude escaped dollars and code spans, require no space after the opening or before
-  the closing `$`, and reject a digit immediately after the closing `$`. Currency such as
-  `$5 and $10` is not interpreted as math here.
-- **`--print` bypasses Markdown renderers.** Plain renderer contexts (`images: false`) use
-  Unicode, but actual CLI print/JSON output remains original source. Core would need to
-  route completed blocks through the renderer registry with `images: false`, retaining
-  streaming source while incomplete. The extension does not mutate stored/model replies.
-- **Terminal image alt text cannot be supplied.** `MarkdownRenderResult`/`ImageInput` have
-  no alt or text-fallback field. The HTML card's accessible label is the exact LaTeX source,
-  but screenshot bytes cannot carry that label to the transcript. Core needs optional alt
-  text and fallback lines on image results, propagated through inline pending images and
-  full-screen image marks. Currently core supplies its own code/language fallback if image
-  decoding/encoding fails, or an async render exceeds the inline deadline.
-- **Exact theme tracking needs core support.** Expose light/dark appearance (ideally actual
-  foreground/background colours) in `MarkdownRenderContext`, include it in renderer cache
-  keys, and invalidate/re-render on theme changes. Until then `COLORFGBG` is only a hint.
+1. **Claim inline math and display math.** Renderers match only `codeLang` fences and
+   standalone images. `$…$`, `\(…\)`, `$$…$$` and `\[…\]` need math nodes in
+   `MarkdownNode`/`MarkdownRenderMatch` (display as a block, inline as text-only), with
+   streaming closure. `$` must not match currency (`$5 and $10`), escapes or code spans.
+2. **Run renderers in `--print`.** Completed blocks bypass the registry there, so replies
+   print as source. Route them through it with `images: false`.
+3. **Alt text on image results.** `MarkdownRenderResult` images carry no alt or text
+   fallback, so a picture cannot say what formula it shows. Add optional alt text and
+   fallback lines, kept for the inline and full-screen paths.
+4. **Theme in `MarkdownRenderContext`.** Pictures cannot know light or dark, so this
+   extension guesses from `COLORFGBG`. Expose it (ideally foreground and background colours)
+   and re-render when it changes.
 
 ## Offline assets
 
