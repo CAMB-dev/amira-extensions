@@ -150,7 +150,8 @@ export function createSwarmExtension(): Extension {
       const problem = checkRoster(members, s.maxMembers)
       if (problem) return problem
       const limits = withOverrides(s.limits, l.limits)
-      if (s.enabled === "ask") {
+      const auto = s.enabled === "mode" && api.session?.()?.info().permissions?.mode === "auto"
+      if (s.enabled === "ask" || (s.enabled === "mode" && !auto)) {
         const roster = members
           .map((m) => `  ${m.name} (${m.role}): ${clip(oneLine(m.brief), 100)}`)
           .join("\n")
@@ -256,6 +257,7 @@ export function createSwarmExtension(): Extension {
       const started: Live = { swarm, owner, ...(final ? { final } : {}) }
       entry = started
       swarms.set(id, started)
+      if (auto) api.notify(`Swarm ${id} started without asking: permission mode is auto.`)
       void swarm.done.then((report) => {
         changed()
         if (started.orphaned) return
@@ -284,7 +286,7 @@ export function createSwarmExtension(): Extension {
     const tool: ToolDefinition<Params> = {
       name: SWARM_TOOL,
       description:
-        'Runs a swarm: long-lived sub-agents (members) that work on one goal together in the background, through a shared blackboard and messages to each other. Start one when it clearly helps (several agents that must keep talking to each other over a longer task); for one-off sub-tasks use the agent tool. action "start" takes "goal" and "members" (2 or more, each {name, role, brief, model?}); it proposes the swarm: the user sees the goal, roster and limits and approves or declines it. When the user declines, do not start a swarm for that goal again unless they ask. The call returns at once: members\' messages to you and the final report (members\' results and the blackboard) come back by themselves, so end your turn instead of waiting. "message" sends "text" to member "to"; "status" shows members, blackboard keys and the latest timeline; "stop" ends the swarm.',
+        'Runs a swarm: long-lived sub-agents (members) that work on one goal together in the background, through a shared blackboard and messages to each other. Start one when it clearly helps (several agents that must keep talking to each other over a longer task); for one-off sub-tasks use the agent tool. action "start" takes "goal" and "members" (2 or more, each {name, role, brief, model?}); confirmation follows extensions.swarm.enabled (default "mode": start without asking in permission mode "auto", otherwise show the user the goal, roster and limits to approve or decline). When the user declines, do not start a swarm for that goal again unless they ask. The call returns at once: members\' messages to you and the final report (members\' results and the blackboard) come back by themselves, so end your turn instead of waiting. "message" sends "text" to member "to"; "status" shows members, blackboard keys and the latest timeline; "stop" ends the swarm.',
       parameters: {
         type: "object",
         properties: {

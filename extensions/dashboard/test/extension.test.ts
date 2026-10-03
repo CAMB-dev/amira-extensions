@@ -133,7 +133,7 @@ function setup(agents: SubagentInfo[] = []) {
       opened.push(view)
       if (!alreadyOpen && "data" in view) {
         opens++
-        views[0]?.onOpen?.(view.data, {} as UiControl)
+        views[0]?.onOpen?.(view.data, { setState: () => {} } as unknown as UiControl)
       }
       return true
     },

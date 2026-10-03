@@ -9,8 +9,10 @@ A workflow is a TypeScript script that orchestrates many sub-agents deterministi
 `workflow` tool runs it in the background and sends you its return value as a message when it
 ends. Reach for one when it clearly helps: many agents fanning out, agents checking each
 other's work, or a long pipeline; for one or two sub-agents use the agent tool. Calling the tool
-proposes the workflow: the user sees its name, description, phases and estimated size, and
-approves or declines it, so write a `meta.description` that says plainly what the run does.
+proposes the workflow: when settings and the current permission mode require confirmation,
+the user sees its name, description, phases and estimated size, and approves or declines it.
+The default follows the permission mode: auto starts without asking; edits and plan ask.
+Write a `meta.description` that says plainly what the run does.
 If the user declines, carry on without it and do not call the tool again for the same workflow
 (renamed or reworded) unless they ask for it; the tool refuses such a repeat.
 

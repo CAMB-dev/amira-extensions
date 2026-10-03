@@ -145,15 +145,7 @@ export function viewFixture() {
   const state: UiState = {
     selected: { timeline: "agent:payments", actions: "open-diff" },
     expanded: {
-      timeline: [
-        "phase:implementation",
-        "group:implementation:workers",
-        "agent:payments",
-        "agent:receipts",
-        "phase:review",
-        "group:review:workers",
-        "agent:audit",
-      ],
+      timeline: ["phase:implementation", "agent:payments", "agent:receipts", "phase:review", "agent:audit"],
     },
     activeTabs: { detail: "summary" },
     scroll: { logs: { top: 0, following: true } },
