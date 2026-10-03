@@ -1,8 +1,9 @@
 # latex
 
-LaTeX in `math`, `latex` and `tex` fences in [Amira](https://github.com/CAMB-dev/Amira)'s
-replies: Unicode text everywhere the Markdown renderer runs, with KaTeX pictures when the
-`browser` and `images` extensions can draw them.
+LaTeX inline and display math, plus `math`, `latex` and `tex` fences in
+[Amira](https://github.com/CAMB-dev/Amira)'s replies: Unicode text, with KaTeX pictures for
+blocks when the `browser` and `images` extensions can draw them. Inline math always uses
+Unicode text segments that wrap with the paragraph. Plain print mode (`amira -p`) uses text.
 
 ```sh
 amira ext install latex
@@ -11,14 +12,33 @@ amira ext install browser
 amira ext install images
 ```
 
-Requires Amira extension API 0.1.3 or later. An open fence stays source while streaming.
-After it closes, the renderer replaces it. The inline transcript waits up to 12 seconds
-for a picture; if that deadline expires, core commits the source instead. Full-screen
-replies redraw when a picture arrives.
+Requires Amira extension API 0.1.27 or later. An open fence or display math block stays
+source while streaming. After it closes, the renderer replaces it. The inline transcript
+waits up to 12 seconds for a picture; if that deadline expires, core commits the source
+instead. Full-screen replies redraw when a picture arrives.
 
-## Example
+## Examples
 
-Ask Amira to use a math fence:
+Inline math uses `$…$` or `\(…\)`:
+
+```markdown
+The relation $x^2 + y^2 = z^2$ holds when \(\alpha = 0\).
+```
+
+Display math uses `$$…$$` or `\[…\]`, including multiline blocks:
+
+```markdown
+$$
+x^2 + a_i \le \frac{\alpha}{\sqrt{2}}
+$$
+
+\[ E = mc^2 \]
+```
+
+Core recognizes the delimiters; code spans, escaped dollars and currency such as
+`$5 and $10` stay literal. Unclosed math stays source.
+
+Math fences still work:
 
 ````markdown
 ```math
@@ -39,12 +59,15 @@ $$x^2 + a_i \le \frac{\alpha}{\sqrt{2}}, \quad x \in \mathbb{R}$$
 
 Pictures are tightly cropped, scaled down without clipping to fit the width, and passed
 as PNG bytes to Amira's image providers. The `images` extension handles Sixel, kitty and
-iTerm2 protocols; this extension never writes terminal escape sequences itself.
+iTerm2 protocols; this extension never writes terminal escape sequences itself. Each picture
+carries the LaTeX source as `alt` and width-wrapped Unicode lines as `fallback`, used when
+images cannot be drawn or the transcript is copied or printed.
 
 ## Text fallback
 
-`mode: "text"`, a source over 20,000 characters, a missing browser or image provider, a terminal without graphics,
-`TERM=dumb`, and browser/KaTeX failures all use the small hand-written converter:
+Inline math, print mode (`images: false`), `mode: "text"`, a source over 20,000 characters,
+a missing browser or image provider, a terminal without graphics, `TERM=dumb`, and
+browser/KaTeX failures all use the small hand-written converter:
 
 - Greek letters and common operators: `\alpha` → α, `\sum` → ∑, `\infty` → ∞,
   `\le` → ≤, `\rightarrow` → →, `\in` → ∈, `\mathbb{R}` → ℝ.
@@ -72,33 +95,17 @@ In your or the project's `settings.json`:
 }
 ```
 
-- `mode`: `"auto"` (default) and `"image"` try pictures when supported and fall back to text;
-  `"text"` never starts the browser.
+- `mode`: `"auto"` (default) and `"image"` try pictures for blocks when supported and fall
+  back to text; `"text"` never starts the browser. Inline math and print mode always use text.
 - `maxWidth`: maximum picture width in CSS pixels, 16–4096 (default 900). The renderer also
   caps this at approximately ten pixels per available terminal column; core performs the
   final fit using the real cell size. Invalid settings use defaults. Reload after changes.
 
-Pictures use light text on a dark card by default. When the terminal sets `COLORFGBG` with
-background index 7 or 15, they use dark text on a light card. This is a best-effort hint,
-not access to Amira's theme; no theme information is exposed in the renderer context.
-
-## Current core limits
-
-Checked against `packages/api/src/render.ts` and `packages/cli/src/print.ts`. These are what
-core needs for math beyond fences; no core files are changed by this extension.
-
-1. **Claim inline math and display math.** Renderers match only `codeLang` fences and
-   standalone images. `$…$`, `\(…\)`, `$$…$$` and `\[…\]` need math nodes in
-   `MarkdownNode`/`MarkdownRenderMatch` (display as a block, inline as text-only), with
-   streaming closure. `$` must not match currency (`$5 and $10`), escapes or code spans.
-2. **Run renderers in `--print`.** Completed blocks bypass the registry there, so replies
-   print as source. Route them through it with `images: false`.
-3. **Alt text on image results.** `MarkdownRenderResult` images carry no alt or text
-   fallback, so a picture cannot say what formula it shows. Add optional alt text and
-   fallback lines, kept for the inline and full-screen paths.
-4. **Theme in `MarkdownRenderContext`.** Pictures cannot know light or dark, so this
-   extension guesses from `COLORFGBG`. Expose it (ideally foreground and background colours)
-   and re-render when it changes.
+Pictures use the render context's theme: supplied foreground/background colours take
+precedence, otherwise `theme.dark` selects light text on a dark card or dark text on a
+light card. Only when the context has no theme does the legacy `COLORFGBG` hint apply
+(background index 7 or 15 means light; otherwise dark). Fence rendering retains this
+compatibility fallback, but loading the extension requires API 0.1.27 for math claims.
 
 ## Offline assets
 

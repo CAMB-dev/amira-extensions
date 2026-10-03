@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto"
 import { readFileSync } from "node:fs"
-import type { HtmlToPngRequest } from "@amira/api"
+import type { HtmlToPngRequest, MarkdownRenderContext } from "@amira/api"
 
 export const KATEX_VERSION = "0.16.22"
-export type MathTheme = "light" | "dark"
+export type MathTheme = "light" | "dark" | MarkdownRenderContext["theme"]
 export type RenderHtml = (req: HtmlToPngRequest) => Promise<Uint8Array>
 
 let assets: { js: string; css: string } | undefined
@@ -20,7 +20,7 @@ function katexAssets(): { js: string; css: string } {
   return assets
 }
 
-/** The API does not expose the terminal palette; use its conventional background hint. */
+/** Compatibility fallback for hosts without a theme in their render context. */
 export function terminalTheme(colorfgbg = process.env.COLORFGBG): MathTheme {
   const background = colorfgbg?.split(";").at(-1)
   return background === "7" || background === "15" ? "light" : "dark"
@@ -30,13 +30,20 @@ function jsString(s: string): string {
   return JSON.stringify(s).replaceAll("<", "\\u003c")
 }
 
+function themeColors(theme: MathTheme): { foreground: string; background: string } {
+  const palette = typeof theme === "string" ? { dark: theme === "dark" } : theme
+  return {
+    foreground: palette.foreground ?? (palette.dark ? "#eee" : "#111"),
+    background: palette.background ?? (palette.dark ? "#181818" : "#fff"),
+  }
+}
+
 /** A tight card, scaled to the requested width without clipping long formulae. */
 export function mathPage(source: string, width: number, theme: MathTheme): string {
   const { js, css } = katexAssets()
-  const foreground = theme === "light" ? "#111" : "#eee"
-  const background = theme === "light" ? "#fff" : "#181818"
+  const { foreground, background } = themeColors(theme)
   return `<!doctype html><html><head><meta charset="utf-8"><style>${css}
-html,body{margin:0;background:${background};color:${foreground}}
+html,body{margin:0}
 #math{display:inline-block;padding:4px;box-sizing:border-box}
 #formula{display:inline-block;font-size:24px}
 .katex-display{margin:0}
@@ -44,6 +51,8 @@ html,body{margin:0;background:${background};color:${foreground}}
 </style></head><body><div id="math" role="img"><div id="formula"></div></div>
 <script>${js}</script><script>
 window.amiraRenderDone = (async () => {
+  document.body.style.backgroundColor = ${jsString(background)}
+  document.body.style.color = ${jsString(foreground)}
   const card = document.getElementById("math")
   const formula = document.getElementById("formula")
   const source = ${jsString(source)}
@@ -74,7 +83,9 @@ export class MathImages {
   private cache = new Map<string, Promise<Uint8Array>>()
 
   key(source: string, width: number, theme: MathTheme): string {
-    return createHash("sha256").update(`${KATEX_VERSION}\0${width}\0${theme}\0${source}`).digest("hex")
+    return createHash("sha256")
+      .update(`${KATEX_VERSION}\0${width}\0${JSON.stringify(themeColors(theme))}\0${source}`)
+      .digest("hex")
   }
 
   render(source: string, width: number, theme: MathTheme, renderHtml: RenderHtml): Promise<Uint8Array> {
