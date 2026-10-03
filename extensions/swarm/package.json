@@ -1,7 +1,7 @@
 {
   "name": "swarm",
   "license": "Apache-2.0",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Swarm mode: long-lived sub-agents that work on one goal together through a shared blackboard and direct messages",
   "type": "module",
   "scripts": {

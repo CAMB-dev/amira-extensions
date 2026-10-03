@@ -12,15 +12,22 @@ amira ext install workflow
 
 The model may propose a workflow when one clearly helps, and you can ask for one yourself:
 say so in your message ("use a workflow to ..."), or run `/workflow <task>` or
-`/workflow <name>`. Every start asks you to confirm, showing whether the model proposes it or
-you asked for it, and the script's name, description, phases, estimated number of agents
-(or "dynamic") and limits. If you decline, the model is told so and may not propose the same
-workflow (by name, or the same script renamed) again in this session unless you ask for it;
-a different workflow may still be proposed.
+`/workflow <name>`. By default, `enabled: "mode"` follows the current permission mode at each
+start: **auto** starts without asking; **edits** and **plan** ask you to confirm. Shift+Tab
+changes the mode during a session. This applies whether the model proposes the workflow or
+you ask for it. If the host supplies no permission info, it asks as well.
 
-Where nobody can confirm (print mode, an rpc client that does not answer dialogs), the model
-cannot start one: run it yourself with `/workflow <name>` in the interactive UI, or set
-`enabled` to `"always"`.
+The confirmation shows whether the model proposes it or you asked for it, and the script's
+name, description, phases, estimated number of agents (or "dynamic") and limits. If you
+decline, the model is told so and may not propose the same workflow (by name, or the same
+script renamed) again in this session unless you ask for it; a different workflow may still
+be proposed. An auto-mode start says "started without asking: permission mode is auto" in
+the transcript.
+
+With the default setting and Amira's default **auto** permission mode, the model can start
+workflows in `amira -p`. Where nobody can confirm (print mode, an rpc client that does not
+answer dialogs), **edits**, **plan**, missing permission info, or explicit `"ask"` refuse the
+start. Use the interactive UI to confirm, or set `enabled` to `"always"` to skip confirmation.
 
 Since 0.1.1, `"always"` starts workflows without the confirmation (before, it only let the
 model start one unasked, and every start was still confirmed). The earlier default
@@ -123,7 +130,7 @@ removal or extension unload event.
 {
   "extensions": {
     "workflow": {
-      "enabled": "ask",        // "ask" (default): confirm every start; "always": start without asking; "never"
+      "enabled": "mode",       // default: follow the current permission mode (see below)
       "maxAgents": 30,         // agents a run may start in all
       "maxConcurrent": 6,      // agents of a run working at once (the tree's own limit still applies)
       "budget": { "tokens": 2000000, "costUsd": 5 }   // optional; spent, the run's agents are stopped and no more start
@@ -131,6 +138,10 @@ removal or extension unload event.
   }
 }
 ```
+
+`enabled` accepts `"mode"` (default: **auto** starts without asking; **edits**, **plan**, or
+missing permission info ask), `"ask"` (confirm every start), `"always"` (start without asking),
+or `"never"` (refuse every start). Explicit settings override the permission mode.
 
 ## Tests
 

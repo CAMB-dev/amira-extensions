@@ -698,7 +698,7 @@ test("settings: bad values are reported and ignored; a start can only lower the 
   expect(problems.length).toBe(3)
   // Without settings a swarm has no budget of its own; the session's budget, if any, applies.
   expect(readSettings(undefined).limits.budget).toBeUndefined()
-  expect(readSettings(undefined).enabled).toBe("ask")
+  expect(readSettings(undefined).enabled).toBe("mode")
   // The older values: "explicit" is "ask"; confirm: false never overrides "never".
   const quiet: string[] = []
   expect(readSettings({ enabled: "explicit" }, (p) => void quiet.push(p)).enabled).toBe("ask")

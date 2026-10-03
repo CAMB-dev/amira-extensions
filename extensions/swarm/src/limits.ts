@@ -35,11 +35,11 @@ export const DEFAULT_LIMITS: SwarmLimits = {
 /** The extension's settings: `extensions.swarm` in settings.json. */
 export interface SwarmSettings {
   /**
-   * How a swarm starts: "ask" (the default) asks the user to confirm every start, which is the
-   * gate; "always" starts without asking; "never" starts none. Older settings read as:
-   * "explicit" is "ask", and `confirm: false` turns "ask" into "always".
+   * How a swarm starts: "mode" (the default) skips confirmation only in permission mode
+   * "auto"; "ask" confirms every start; "always" starts without asking; "never" starts none.
+   * Older settings read as: "explicit" is "ask", and `confirm: false` turns "ask" into "always".
    */
-  enabled: "ask" | "always" | "never"
+  enabled: "mode" | "ask" | "always" | "never"
   /** Most members a swarm may have. */
   maxMembers: number
   limits: SwarmLimits
@@ -52,14 +52,15 @@ const positive = (v: unknown): number | undefined =>
 export function readSettings(raw: unknown, report: (problem: string) => void = () => {}): SwarmSettings {
   const s = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {}
   const out: SwarmSettings = {
-    enabled: "ask",
+    enabled: s.confirm === false ? "always" : s.confirm === true ? "ask" : "mode",
     maxMembers: 6,
     limits: { ...DEFAULT_LIMITS },
   }
   if (s.enabled !== undefined) {
-    if (s.enabled === "ask" || s.enabled === "always" || s.enabled === "never") out.enabled = s.enabled
+    if (s.enabled === "mode" || s.enabled === "ask" || s.enabled === "always" || s.enabled === "never")
+      out.enabled = s.enabled
     else if (s.enabled === "explicit") out.enabled = "ask"
-    else report('"extensions.swarm.enabled" must be "ask", "always" or "never"')
+    else report('"extensions.swarm.enabled" must be "mode", "ask", "always" or "never"')
   }
   // The older `confirm` setting: false skipped the confirmation, which "always" does now.
   if (s.confirm !== undefined) {
