@@ -8,7 +8,13 @@ import type {
   ViewLine,
   ViewSegment,
 } from "@amira/api"
-import { agentsOf, type DashboardAction, type DashboardAgent, type DashboardSource, type DashboardStatus } from "./source.ts"
+import {
+  agentsOf,
+  type DashboardAction,
+  type DashboardAgent,
+  type DashboardSource,
+  type DashboardStatus,
+} from "./source.ts"
 
 export const VIEW_KIND = "dashboard"
 const TABS = ["summary", "diff", "logs", "actions", "stats"]
@@ -81,7 +87,10 @@ function card(agent: DashboardAgent, narrow: boolean): UiNode {
         {
           size: 1,
           node: text([
-            { kind: "muted", text: `${agent.files.length} ${agent.files.length === 1 ? "file" : "files"} reported changed · ${money(agent.cost)}` },
+            {
+              kind: "muted",
+              text: `${agent.files.length} ${agent.files.length === 1 ? "file" : "files"} reported changed · ${money(agent.cost)}`,
+            },
           ]),
         },
         ...agent.files

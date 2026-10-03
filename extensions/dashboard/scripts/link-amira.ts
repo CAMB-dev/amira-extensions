@@ -1,7 +1,8 @@
 /**
  * The tests use the public API and fake sessions; link that API and its AI dependency:
  * `bun run link-amira <path to an Amira checkout>` links them into node_modules/@amira (the
- * checkout needs a `bun install`). At runtime the extension only imports @amira/api, which
+ * checkout needs a `bun install`). The TUI and its widget kit are linked too when present; they
+ * only serve test/tui-render.test.ts, which is skipped without them. At runtime the extension only imports @amira/api, which
  * Amira provides itself.
  */
 import { existsSync, mkdirSync, rmSync, symlinkSync } from "node:fs"
@@ -14,9 +15,10 @@ if (!repo) {
 }
 const dir = path.join(import.meta.dir, "..", "node_modules", "@amira")
 mkdirSync(dir, { recursive: true })
-for (const name of ["api", "ai"]) {
+for (const name of ["api", "ai", "tui", "tui-kit"]) {
   const target = path.resolve(repo, "packages", name)
   if (!existsSync(path.join(target, "package.json"))) {
+    if (name === "tui" || name === "tui-kit") continue
     console.error(`${target} is not an Amira package; is ${repo} an Amira checkout?`)
     process.exit(1)
   }
