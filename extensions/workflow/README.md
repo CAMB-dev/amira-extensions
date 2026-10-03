@@ -47,6 +47,20 @@ goes to the model as a message, and the transcript shows a short line.
 
 Only the main session has the `workflow` tool and command: sub-agents, at any depth, never do.
 
+Since **0.1.8**, the model can also inspect and stop workflows through the tool:
+
+| Tool action | |
+|---|---|
+| `start` (default) | Run `script` or saved `name` with `args`, or `resume` a run from its journal |
+| `status` | Progress for `id`, or all runs started in this session: status, phase states, agent counts, tokens, cost and elapsed time |
+| `list` | Saved workflows and runs started in this session |
+| `stop` | Stop `id`, or all running runs in this session, including their unfinished agents |
+
+Existing calls with only `script`/`name`/`args`/`resume` still start a run. Stopping through the
+tool needs no confirmation. The model may stop runs it started when they are no longer
+useful, stuck, or you ask, and should tell you when it does. Start confirmations are unchanged;
+you can still intervene with `/workflow stop`.
+
 ## Scripts
 
 ```ts

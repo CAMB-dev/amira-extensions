@@ -580,6 +580,100 @@ test("the estimate says dynamic when agents are started in loops", async () => {
   expect(t.confirms[0]!.message).toContain("Agents: 1 or more (some run in loops)")
 })
 
+test("tool status and list report completed runs and saved workflows without confirming", async () => {
+  const t = setup({ answer: () => ({ text: "ok", tokens: 250, cost: 0.01 }) })
+  mkdirSync(path.join(t.cwd, ".amira", "workflows"), { recursive: true })
+  writeFileSync(path.join(t.cwd, ".amira", "workflows", "fanout.ts"), SCRIPT)
+  expect(t.text(await t.call({ action: "status" }))).toBe("No workflow has run in this session.")
+  expect(t.text(await t.call({ action: "list" }))).toContain("fanout (project)")
+  // Omitting action remains a start, including saved workflows and arguments.
+  const r = await t.call({ name: "fanout", args: { value: 1 } })
+  const id = /run (wf_\w+)/.exec(t.text(r))![1]!
+  await until(() => t.notices.length === 1)
+  const status = t.text(await t.call({ action: "status", id }))
+  expect(status).toContain(`Workflow run ${id} (fanout) · done`)
+  expect(status).toContain("Phase: Verify")
+  expect(status).toMatch(/4\/4 agents · 1\.0k tok · \$0\.04 · \d+s/)
+  expect(status).toContain("├ ✓ Explore")
+  expect(status).toContain("└ ✓ Verify")
+  expect(t.text(await t.call({ action: "status" }))).toBe(status)
+  const list = t.text(await t.call({ action: "list" }))
+  expect(list).toContain("fanout (project) - Three looks and a check")
+  expect(list).toContain(`${id} fanout · done · 4/4 agents`)
+  expect(t.confirms).toHaveLength(1)
+})
+
+test("tool status reports failed agents and phases", async () => {
+  const t = setup({ settings: { enabled: "always" }, answer: () => ({ error: "provider down" }) })
+  const r = await t.call({ action: "start", script: SCRIPT })
+  const id = /run (wf_\w+)/.exec(t.text(r))![1]!
+  await until(() => t.notices.length === 1)
+  const status = t.text(await t.call({ action: "status", id }))
+  expect(status).toContain(`Workflow run ${id} (fanout) · failed`)
+  expect(status).toMatch(/\d+ failed/)
+  expect(status).toContain("├ ✗ Explore")
+  expect(status).toContain("└ ✗ Verify")
+  expect(status).toContain("provider down")
+})
+
+test("tool stop stops one run or all running runs and their agents without confirmation", async () => {
+  const t = setup({ answer: () => new Promise<Answer>(() => {}) })
+  const ids: string[] = []
+  for (let i = 0; i < 3; i++) {
+    const r = await t.call({ script: SCRIPT })
+    ids.push(/run (wf_\w+)/.exec(t.text(r))![1]!)
+  }
+  await until(() => t.groups.every((g) => g.spawned.length === 3))
+  const status = t.text(await t.call({ action: "status" }))
+  for (const id of ids) expect(status).toContain(`Workflow run ${id} (fanout) · running`)
+  expect(status).toContain("Phase: Explore")
+  expect(status).toContain("0/3 agents · 3 working")
+  expect(status).toContain("├ ● Explore")
+  expect(status).toContain("└ ◌ Verify")
+  t.answerConfirm(false)
+  expect(t.text(await t.call({ action: "stop", id: ids[0] }))).toBe(
+    `Stopped workflow run ${ids[0]} (fanout).`,
+  )
+  await until(() => t.notices.length === 1)
+  expect(t.groups[0]!.children()).toHaveLength(0)
+  expect(t.groups[1]!.endReason).toBeUndefined()
+  expect(t.groups[2]!.endReason).toBeUndefined()
+  expect(t.text(await t.call({ action: "status", id: ids[0] }))).toContain("· stopped")
+  const stopped = t.text(await t.call({ action: "stop" }))
+  expect(stopped).not.toContain(ids[0]!)
+  for (const id of ids.slice(1)) expect(stopped).toContain(`Stopped workflow run ${id}`)
+  await until(() => t.notices.length === 3)
+  for (const g of t.groups) {
+    expect(g.children()).toHaveLength(0)
+    expect(g.endReason).toBeDefined()
+  }
+  expect(t.text(await t.call({ action: "stop" }))).toBe("No workflow is running.")
+  expect(t.text(await t.call({ action: "stop", id: ids[0] }))).toContain("is not running")
+  expect(t.confirms).toHaveLength(3)
+})
+
+test("tool controls are main-only and scoped to this session", async () => {
+  const t = setup({ settings: { enabled: "always" } })
+  const r = await t.call({ script: SCRIPT })
+  const id = /run (wf_\w+)/.exec(t.text(r))![1]!
+  await until(() => t.notices.length === 1)
+  for (const action of ["status", "list", "stop"]) {
+    expect((await t.call({ action }, 1)).isError).toBe(true)
+  }
+  t.emit("session.start", { sessionId: "s_other", data: { reason: "new" } })
+  expect(t.text(await t.call({ action: "status" }))).toBe("No workflow has run in this session.")
+  expect(t.text(await t.call({ action: "list" }))).not.toContain(id)
+  for (const action of ["status", "stop"]) {
+    for (const target of [id, "wf_missing"]) {
+      const result = await t.call({ action, id: target })
+      expect(result.isError).toBe(true)
+      expect(t.text(result)).toBe(`No workflow run ${target} in this session.`)
+    }
+  }
+  expect((await t.call({ action: "unknown" })).isError).toBe(true)
+  expect(t.groups).toHaveLength(1)
+})
+
 test("progress: the group's status line follows the phases and counts, and the view shows the tree", async () => {
   const t = setup({ settings: { enabled: "always" } })
   const r = await t.call({ script: SCRIPT })

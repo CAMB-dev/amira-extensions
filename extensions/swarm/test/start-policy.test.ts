@@ -5,13 +5,16 @@ import type {
   ExtensionAPI,
   PermissionMode,
   SpawnGroup,
+  SpawnOptions,
   SubagentResult,
   ToolContext,
   ToolDefinition,
   ToolResult,
+  UserMessage,
 } from "@amira/api"
 import { createSwarmExtension } from "../src/index.ts"
 import { readSettings } from "../src/limits.ts"
+import type { SwarmRecord } from "../src/swarm.ts"
 
 const members = [
   { name: "writer", role: "writer", brief: "Write the proposal" },
@@ -37,6 +40,8 @@ async function harness(
   let tool!: ToolDefinition
   const confirmations: string[] = []
   const notices: string[] = []
+  const inboxes = new Map<string, UserMessage[]>()
+  const records: SwarmRecord[] = []
   const handlers = new Map<string, (event: AnyEvent) => void>()
   const groups: Promise<void>[] = []
   let spawned = 0
@@ -48,7 +53,9 @@ async function harness(
     })
     groups.push(ended)
     return {
-      spawn: () => {
+      spawn: (options: SpawnOptions) => {
+        const inbox: UserMessage[] = []
+        inboxes.set(options.title!, inbox)
         const id = `child-${++spawned}`
         let finish!: (result: SubagentResult) => void
         let stopped = false
@@ -75,6 +82,11 @@ async function harness(
             }),
           },
           result: () => result,
+          send: (message: UserMessage) => {
+            if (stopped) return false
+            inbox.push(message)
+            return true
+          },
           stop,
           abort: stop,
         } as ChildSession
@@ -128,7 +140,15 @@ async function harness(
     toolCallId: "start",
     signal: new AbortController().signal,
     update: () => {},
-    session: { sessionId: "root", depth: 0, createGroup },
+    session: {
+      sessionId: "root",
+      depth: 0,
+      createGroup,
+      data: {
+        append: (_key: string, record: SwarmRecord) => records.push(record),
+        read: () => records,
+      },
+    },
   } as unknown as ToolContext
   const stop = async () => {
     await tool.execute({ action: "stop" }, ctx)
@@ -138,13 +158,18 @@ async function harness(
   return {
     confirmations,
     notices,
+    inboxes,
+    records,
+    tool,
+    execute: (params: { action: string; to?: string; text?: string }) => tool.execute(params, ctx),
     get spawned() {
       return spawned
     },
     setMode: (value: PermissionMode) => {
       mode = value
     },
-    start: (goal = "Compare options") => tool.execute({ action: "start", goal, members }, ctx),
+    start: (goal = "Compare options", limits?: Record<string, number>) =>
+      tool.execute({ action: "start", goal, members, ...(limits ? { limits } : {}) }, ctx),
     stop,
     prompt: (text: string) =>
       handlers.get("turn.start")?.({
@@ -156,6 +181,133 @@ async function harness(
       }),
   }
 }
+
+test("tool pause/resume holds a member's messages without confirmation", async () => {
+  const h = await harness({ mode: "edits", answer: true })
+  await h.start()
+  expect(h.tool.mainOnly).toBe(true)
+  expect(textOf(await h.execute({ action: "pause", to: "writer" }))).toBe("Paused writer.")
+  expect(textOf(await h.execute({ action: "status" }))).toContain("paused")
+  await h.execute({ action: "message", to: "writer", text: "Wait for review" })
+  await h.execute({ action: "message", to: "reviewer", text: "Review now" })
+  expect(h.inboxes.get("writer")).toHaveLength(0)
+  expect(h.inboxes.get("reviewer")).toHaveLength(1)
+  expect(textOf(await h.execute({ action: "resume", to: "writer" }))).toBe("Resumed writer.")
+  expect(h.inboxes.get("writer")).toHaveLength(1)
+  expect(h.confirmations).toHaveLength(1)
+})
+
+for (const to of [undefined, "all", "ALL"]) {
+  test(`tool pause/resume ${to ?? "without a target"} controls the whole swarm`, async () => {
+    const h = await harness({ mode: "edits", answer: true })
+    await h.start()
+    const target = to === undefined ? {} : { to }
+    expect(textOf(await h.execute({ action: "pause", ...target }))).toContain("Paused swarm")
+    expect(textOf(await h.execute({ action: "status" }))).toContain("· paused ·")
+    expect(textOf(await h.execute({ action: "message", to: "all", text: "Hold this" }))).toBe(
+      "Sent to all (2 members).",
+    )
+    for (const inbox of h.inboxes.values()) expect(inbox).toHaveLength(0)
+    expect(textOf(await h.execute({ action: "resume", ...target }))).toContain("Resumed swarm")
+    expect(textOf(await h.execute({ action: "status" }))).toContain("· running ·")
+    for (const inbox of h.inboxes.values()) expect(inbox).toHaveLength(1)
+    expect(h.confirmations).toHaveLength(1)
+  })
+}
+
+test("tool broadcast attributes one recorded message to the commander and charges each recipient", async () => {
+  const h = await harness({ mode: "auto" })
+  await h.start()
+  expect(textOf(await h.execute({ action: "message", to: "ALL", text: "Share findings" }))).toBe(
+    "Sent to all (2 members).",
+  )
+  for (const inbox of h.inboxes.values()) {
+    expect(inbox).toHaveLength(1)
+    expect(inbox[0]!.content).toEqual([
+      { type: "text", text: "[message from the commander, to every member] Share findings" },
+    ])
+  }
+  expect(h.records.filter((record) => record.type === "message")).toEqual([
+    expect.objectContaining({ from: "commander", to: "all", text: "Share findings" }),
+  ])
+  expect(textOf(await h.execute({ action: "status" }))).toContain("· 2 messages ·")
+  const empty = await h.execute({ action: "message", to: "all", text: " " })
+  expect(empty.isError).toBe(true)
+  expect(textOf(empty)).toContain("empty")
+  for (const inbox of h.inboxes.values()) expect(inbox).toHaveLength(1)
+})
+
+test("tool broadcast cannot bypass message limits or partially deliver", async () => {
+  const h = await harness({ mode: "auto" })
+  await h.start("Compare options", { max_messages: 2 })
+  await h.execute({ action: "message", to: "writer", text: "First" })
+  const result = await h.execute({ action: "message", to: "all", text: "Too many" })
+  expect(result.isError).toBe(true)
+  expect(textOf(result)).toContain("too few messages")
+  expect(h.inboxes.get("writer")).toHaveLength(1)
+  expect(h.inboxes.get("reviewer")).toHaveLength(0)
+  expect(textOf(await h.execute({ action: "status" }))).toContain("· 1 messages ·")
+})
+
+test("tool broadcasts are not progress and respect each recipient's exchange limit", async () => {
+  const h = await harness({ mode: "auto" })
+  await h.start()
+  for (let i = 0; i < readSettings(undefined).limits.maxPairExchanges; i++) {
+    expect((await h.execute({ action: "message", to: "reviewer", text: "More?" })).isError).not.toBe(true)
+  }
+  const result = await h.execute({ action: "message", to: "all", text: "More for everyone?" })
+  expect(result.isError).toBe(true)
+  expect(textOf(result)).toContain("You and reviewer have exchanged")
+  expect(h.inboxes.get("writer")).toHaveLength(0)
+  const other = await harness({ mode: "auto" })
+  await other.start()
+  for (let i = 0; i < readSettings(undefined).limits.maxPairExchanges; i++) {
+    expect((await other.execute({ action: "message", to: "all", text: "More?" })).isError).not.toBe(true)
+  }
+  expect((await other.execute({ action: "message", to: "writer", text: "Again?" })).isError).toBe(true)
+})
+
+test("tool stop_member stops only its target; stopping controls never confirm", async () => {
+  const h = await harness({ mode: "edits", answer: true })
+  await h.start()
+  expect(textOf(await h.execute({ action: "stop_member", to: "writer" }))).toBe("Stopping writer.")
+  expect(h.records).toContainEqual(
+    expect.objectContaining({ type: "stop-member", member: "writer", reason: "stopped by the commander" }),
+  )
+  expect((await h.execute({ action: "message", to: "writer", text: "Too late" })).isError).toBe(true)
+  expect(textOf(await h.execute({ action: "message", to: "all", text: "Continue" }))).toBe(
+    "Sent to all (1 member).",
+  )
+  expect(h.inboxes.get("writer")).toHaveLength(0)
+  expect(h.inboxes.get("reviewer")).toHaveLength(1)
+  expect(textOf(await h.execute({ action: "stop" }))).toContain("Stopping swarm")
+  await h.stop()
+  expect(h.records).toContainEqual(
+    expect.objectContaining({ type: "end", reason: "stopped by the commander" }),
+  )
+  expect(h.confirmations).toHaveLength(1)
+})
+
+test("tool controls reject invalid targets without stopping the swarm", async () => {
+  const h = await harness({ mode: "auto" })
+  await h.start()
+  for (const action of ["pause", "resume", "stop_member", "message"]) {
+    const result = await h.execute({ action, to: "missing", text: "Hello" })
+    expect(result.isError).toBe(true)
+    expect(textOf(result)).toContain('No member "missing"')
+  }
+  for (const to of [undefined, "", "all", "ALL"]) {
+    const result = await h.execute({ action: "stop_member", ...(to === undefined ? {} : { to }) })
+    expect(result.isError).toBe(true)
+    expect(textOf(result)).toContain('"to" must name one member')
+  }
+  for (const action of ["pause", "resume"]) {
+    expect((await h.execute({ action, to: "" })).isError).toBe(true)
+  }
+  expect(textOf(await h.execute({ action: "status" }))).toContain("· running ·")
+  expect(h.records.some((record) => record.type === "stop-member")).toBe(false)
+  expect(h.confirmations).toHaveLength(0)
+})
 
 test("settings default to mode, accept explicit mode, and preserve legacy mappings", () => {
   expect(readSettings(undefined).enabled).toBe("mode")

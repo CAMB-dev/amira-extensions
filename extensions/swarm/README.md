@@ -72,10 +72,22 @@ before its next model call; messages from one sender arrive in the order they we
 - `/swarm stop [name]`: stop one member, or the whole swarm.
 - `/swarm list`: swarms of this session, including ones from before a resume.
 
-The main session can use the `swarm` tool too: `status`, `message` (to a member) and
-`stop`. Members' messages to `"commander"` reach it as notices. Unlike yours, the main
-session's messages count against the swarm's message limit and the exchange limit with
-that member, and are not progress.
+Since 0.1.9, the main session has the same controls through the `swarm` tool:
+
+- `status`: show members, blackboard keys and the latest timeline.
+- `message`: send `text` to member `to`, or `to: "all"` to broadcast.
+- `pause` / `resume`: hold or deliver messages for member `to`, or the whole swarm with
+  `to: "all"` or no `to`.
+- `stop_member`: stop one member; `to` is required and cannot be `"all"`.
+- `stop`: end the whole swarm.
+
+These controls need no confirmation; the start policy above is unchanged. The main session
+may pause or stop swarms it started when they are no longer useful, stuck, or you ask, and
+should tell you what it did. Members' messages to `"commander"` reach it as notices. Unlike
+yours, the main session's messages count against the swarm's message limit and each
+recipient's exchange limit, and are not progress. Broadcasts count once per recipient and
+are refused without sending if any limit would be exceeded; the timeline records one
+`commander → all` message.
 
 `/clear` or `/resume` while a swarm runs stops it; its report then goes nowhere (the
 conversation that started it is closed).

@@ -358,22 +358,37 @@ export class Swarm {
   }
 
   /**
-   * Sends `text` from the user to every member that can still get messages (running, idle, or
-   * paused: a paused one gets it on resume). Like a direct message from the user it counts as
-   * progress and not against the limits; the timeline and the records keep it once, as a
-   * message to "all". Returns how many members it went to, or the problem.
+   * Sends `text` to every member that can still get messages (running, idle, or paused: a
+   * paused one gets it on resume). User messages count as progress, not against limits;
+   * commander messages count against the limits once per recipient, and are not progress.
+   * The timeline and records keep it once, as a message to "all". Returns how many members
+   * it went to, or the problem (without sending to any member).
    */
-  tellAll(text: string): number | string {
+  tellAll(text: string, from: "user" | "commander" = "user"): number | string {
     if (!this.live) return `The swarm has ${this.#state === "ended" ? "ended" : "is ending"}.`
     const body = oneLine(text) ? text.trim() : ""
     if (!body) return "The message is empty."
     const to = [...this.#members.values()].filter((m) => m.child.state !== "ended" && !m.stopping)
     if (!to.length) return "No member can get messages any more: every one has ended or is stopping."
-    this.#progress()
-    this.#record({ type: "message", swarm: this.id, from: "user", to: "all", text: body, at: Date.now() })
-    this.#log({ kind: "message", from: "user", to: "all", text: body })
+    if (from === "commander") {
+      if (this.#messages + to.length > this.limits.maxMessages)
+        return `The swarm has too few messages left to reach all ${to.length} members; stop it, or let it end.`
+      for (const m of to) {
+        const count = this.#pairs.get(pairKey("commander", m.spec.name)) ?? 0
+        if (count >= this.limits.maxPairExchanges)
+          return `You and ${m.spec.name} have exchanged ${count} messages while it wrote nothing to the blackboard. Stop the swarm, or leave it to the user.`
+      }
+      for (const m of to) {
+        const pair = pairKey("commander", m.spec.name)
+        this.#pairs.set(pair, (this.#pairs.get(pair) ?? 0) + 1)
+      }
+      this.#messages += to.length
+      this.#chatter += to.length
+    } else this.#progress()
+    this.#record({ type: "message", swarm: this.id, from, to: "all", text: body, at: Date.now() })
+    this.#log({ kind: "message", from, to: "all", text: body })
     for (const m of to)
-      this.#hand(m, `[message from the user, to every member] ${body}`, `✉️ user → all: ${body}`)
+      this.#hand(m, `[message from the ${from}, to every member] ${body}`, `✉️ ${from} → all: ${body}`)
     return to.length
   }
 
