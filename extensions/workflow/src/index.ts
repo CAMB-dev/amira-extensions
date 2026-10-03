@@ -447,14 +447,37 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       }
     }
 
-    type Params = { script?: string; name?: string; args?: unknown; resume?: string }
+    const sessionRuns = () => [...runs.values()].filter((run) => owners.get(run.id) === (root ?? ""))
+
+    const statusText = (run: WorkflowRun) => {
+      const now = run.endedAt ?? Date.now()
+      const cost = totals(run.flow).cost
+      return [
+        `Workflow run ${run.id} (${run.meta.name}) · ${runStateText(run.status)}`,
+        `Phase: ${run.flow.current || "none"}`,
+        `${countsLine(run.flow)}${cost === undefined ? " · cost unknown" : cost === 0 ? " · $0.00" : ""} · ${formatDuration(now - run.startedAt)}`,
+        ...treeLines(run.flow, now).map((line) => line.text),
+        ...(run.error ? [`Error: ${run.error}`] : []),
+      ].join("\n")
+    }
+
+    type Params = {
+      action?: "start" | "status" | "list" | "stop"
+      id?: string
+      script?: string
+      name?: string
+      args?: unknown
+      resume?: string
+    }
     const tool: ToolDefinition<Params> = {
       name: WORKFLOW_TOOL,
       mainOnly: true,
-      description: `Runs a workflow: a TypeScript script that orchestrates many sub-agents (fan-out, verification, pipelines) deterministically, in the background. Use it when a workflow clearly helps (many agents fanning out, checking each other's work, or a long pipeline); for one or two sub-agents use the agent tool. Calling it proposes the workflow: when confirmation is required by settings and the current permission mode, the user sees its name, description, phases and estimated size and approves or declines it. When the user declines one, do not call it again for the same workflow unless they ask. Load the "workflow" skill first for how to write scripts. The script runs in a sandbox with only agent(prompt, {label, phase, schema, role, model, isolation}), parallel(thunks), pipeline(items, ...stages), phase(title), log(msg), args, budget and workflow(name, args); it starts with \`export const meta = { name, description, phases }\` and its top level ends with \`return result\`. The call returns at once with the run's id; the script's return value comes back to you by itself as a message when the run ends: end your turn instead of waiting. Give "script" (the source), or "name" (a saved workflow from .amira/workflows or ~/.amira/workflows), and "args" for the script. "resume" with a run id reruns that run (with "script" or "name" to use an edited script), replaying unchanged agent calls from its journal.`,
+      description: `Run and control background workflows: TypeScript scripts orchestrating many sub-agents. For one or two agents, use the agent tool instead. Load the "workflow" skill before writing scripts. action "start" (default) takes "script" or saved "name", plus "args"; "resume" reruns an earlier run by id, replaying unchanged journaled calls (optionally with an edited script/name). Start confirmation follows settings and permission mode; never propose a declined workflow again unless the user asks. Starts return a run id immediately; results arrive automatically, so end your turn instead of waiting. "status" shows status, phases, agent counts, tokens, cost and elapsed time for "id" or all session runs. "list" shows saved workflows and session runs. "stop" stops "id" or all running session runs and their unfinished agents, without confirmation. You may stop runs you started when no longer useful, stuck, or the user asks; tell the user when you do.`,
       parameters: {
         type: "object",
         properties: {
+          action: { type: "string", enum: ["start", "status", "list", "stop"], default: "start" },
+          id: { type: "string", description: "status/stop: run id; omit for all runs in this session." },
           script: { type: "string", description: "The workflow script (TypeScript)." },
           name: { type: "string", description: "A saved workflow to run instead of a script." },
           args: { description: "Passed to the script as `args` (any JSON value)." },
@@ -467,6 +490,24 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         if (!session?.createGroup || session.depth > 0) {
           return textResult("Workflows can only be started from the main session.", true)
         }
+        const action = p.action ?? "start"
+        if (action === "list") return textResult(listText(true))
+        if (action === "status" || action === "stop") {
+          const selected = sessionRuns().filter((run) => !p.id || run.id === p.id)
+          if (p.id && !selected.length) return textResult(`No workflow run ${p.id} in this session.`, true)
+          if (action === "status")
+            return textResult(selected.map(statusText).join("\n\n") || "No workflow has run in this session.")
+          const stopped = selected.filter((run) => run.stop("stopped by the commander"))
+          return textResult(
+            stopped.length
+              ? stopped.map((run) => `Stopped workflow run ${run.id} (${run.meta.name}).`).join("\n")
+              : p.id
+                ? `Workflow run ${p.id} is not running.`
+                : "No workflow is running.",
+          )
+        }
+        if (action !== "start")
+          return textResult(`Unknown action "${action}": use start, status, list or stop.`, true)
         let source = p.script
         let origin = "inline"
         let args = p.args
@@ -511,6 +552,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
 
     const presenter: ToolPresenter<Params> = {
       summary(args) {
+        if (args.action && args.action !== "start") return `· ${args.action}${args.id ? ` ${args.id}` : ""}`
         if (args.resume) return `· resume ${args.resume}`
         if (args.name) return `· ${args.name}`
         const name = /name\s*:\s*["'`]([^"'`]+)/.exec(args.script ?? "")?.[1]
@@ -518,7 +560,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       },
       result(call) {
         if (call.result.isError) return undefined
-        const id = /run (wf_\w+)/.exec(call.text)?.[1]
+        const id = /^Started workflow run (wf_\w+)/.exec(call.text)?.[1]
         return id ? `started ${id} in the background · /workflow view ${id}` : undefined
       },
     }
@@ -575,7 +617,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       follow: false,
     }
 
-    const listText = () => {
+    const listText = (sessionOnly = false) => {
       const saved = listSaved(api.cwd, api.home)
       const lines = ["Saved workflows (run with /workflow <name> [args]):"]
       if (!saved.length)
@@ -585,8 +627,8 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
           `  ${w.name} (${w.scope})${w.meta ? ` - ${w.meta.description}` : ` - cannot read: ${w.problem}`}`,
         )
       }
-      const recent = [...runs.values()].reverse()
-      const stored = listRuns(runsRoot()).filter((r) => !runs.has(r.id))
+      const recent = (sessionOnly ? sessionRuns() : [...runs.values()]).reverse()
+      const stored = sessionOnly ? [] : listRuns(runsRoot()).filter((r) => !runs.has(r.id))
       if (recent.length || stored.length) {
         lines.push("Runs:")
         for (const r of recent)

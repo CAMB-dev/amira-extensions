@@ -286,11 +286,14 @@ export function createSwarmExtension(): Extension {
     const tool: ToolDefinition<Params> = {
       name: SWARM_TOOL,
       description:
-        'Runs a swarm: long-lived sub-agents (members) that work on one goal together in the background, through a shared blackboard and messages to each other. Start one when it clearly helps (several agents that must keep talking to each other over a longer task); for one-off sub-tasks use the agent tool. action "start" takes "goal" and "members" (2 or more, each {name, role, brief, model?}); confirmation follows extensions.swarm.enabled (default "mode": start without asking in permission mode "auto", otherwise show the user the goal, roster and limits to approve or decline). When the user declines, do not start a swarm for that goal again unless they ask. The call returns at once: members\' messages to you and the final report (members\' results and the blackboard) come back by themselves, so end your turn instead of waiting. "message" sends "text" to member "to"; "status" shows members, blackboard keys and the latest timeline; "stop" ends the swarm.',
+        'Run and control a swarm: long-lived sub-agents sharing a blackboard and messages. Use it for sustained collaboration; for one-off tasks use the agent tool. action "start" takes "goal" and 2+ "members" ({name, role, brief, model?}). Start confirmation follows extensions.swarm.enabled and permission mode (default: auto starts without asking, otherwise confirm). Never repropose a declined goal unless the user asks. Starts return immediately; member messages and the final report arrive automatically, so end your turn instead of waiting. "message" sends "text" to member "to" or "all"; "status" shows members, blackboard keys and timeline. "pause"/"resume" hold/deliver messages for member "to" or "all" (omitted means all); "stop_member" requires one member "to"; "stop" ends the swarm. Controls need no confirmation. You may pause or stop swarms you started when no longer useful, stuck, or the user asks; tell the user when you do.',
       parameters: {
         type: "object",
         properties: {
-          action: { type: "string", enum: ["start", "message", "status", "stop"] },
+          action: {
+            type: "string",
+            enum: ["start", "message", "status", "pause", "resume", "stop_member", "stop"],
+          },
           goal: { type: "string", description: "start: what the swarm must produce." },
           members: {
             type: "array",
@@ -306,7 +309,11 @@ export function createSwarmExtension(): Extension {
               required: ["name", "role", "brief"],
             },
           },
-          to: { type: "string", description: "message: the member's name." },
+          to: {
+            type: "string",
+            description:
+              'message: a member or "all". pause/resume: a member or "all" (omitted means all). stop_member: one member, required.',
+          },
           text: { type: "string", description: "message: what to tell it." },
           limits: {
             type: "object",
@@ -356,14 +363,35 @@ export function createSwarmExtension(): Extension {
         }
         if (!l) return textResult("No swarm is running.", true)
         if (action === "message") {
+          if (isAll(p.to ?? "")) {
+            const sent = l.swarm.tellAll(p.text ?? "", "commander")
+            return typeof sent === "string"
+              ? textResult(sent, true)
+              : textResult(`Sent to all (${sent} member${sent === 1 ? "" : "s"}).`)
+          }
           const problem = l.swarm.tell("commander", p.to ?? "", p.text ?? "")
           return problem ? textResult(problem, true) : textResult(`Sent to ${p.to}.`)
+        }
+        if (action === "pause" || action === "resume") {
+          const name = p.to === undefined || isAll(p.to) ? undefined : p.to
+          const problem = action === "pause" ? l.swarm.pause(name) : l.swarm.resume(name)
+          return problem
+            ? textResult(problem, true)
+            : textResult(`${action === "pause" ? "Paused" : "Resumed"} ${name ?? `swarm ${l.swarm.id}`}.`)
+        }
+        if (action === "stop_member") {
+          if (!p.to || isAll(p.to)) return textResult('"to" must name one member to stop, not "all".', true)
+          const problem = l.swarm.stopMember(p.to, "stopped by the commander")
+          return problem ? textResult(problem, true) : textResult(`Stopping ${p.to}.`)
         }
         if (action === "stop") {
           void l.swarm.stop("stopped by the commander")
           return textResult(`Stopping swarm ${l.swarm.id}; its report follows.`)
         }
-        return textResult(`Unknown action "${action}": use start, message, status or stop.`, true)
+        return textResult(
+          `Unknown action "${action}": use start, message, status, pause, resume, stop_member or stop.`,
+          true,
+        )
       },
     }
 

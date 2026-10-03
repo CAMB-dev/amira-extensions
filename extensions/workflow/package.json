@@ -1,7 +1,7 @@
 {
   "name": "workflow",
   "license": "Apache-2.0",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Dynamic workflows: TypeScript scripts that orchestrate many sub-agents, with a journal to resume them",
   "type": "module",
   "scripts": {
