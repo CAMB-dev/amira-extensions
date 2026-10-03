@@ -1,13 +1,20 @@
 import { expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
 import { runInNewContext } from "node:vm"
-import type { ExtensionAPI, HtmlToPngRequest, MarkdownNode, MarkdownRendererDefinition } from "@amira/api"
+import type {
+  ExtensionAPI,
+  HtmlToPngRequest,
+  MarkdownNode,
+  MarkdownRenderContext,
+  MarkdownRendererDefinition,
+} from "@amira/api"
 import extension, { latexRenderer, MathImages, mathPage, readSettings, terminalTheme } from "../src/index.ts"
 
 const SOURCE = String.raw`x^2 + \alpha \le \infty`
 const TEXT = { lines: [{ text: "x² + α ≤ ∞", kind: "text" as const }] }
 const node = (code = SOURCE, lang = "math"): MarkdownNode => ({ type: "code", lang, info: lang, code })
-const ctx = { width: 80, images: true, maxImageRows: 20 }
+const math = (display = true, source = SOURCE): MarkdownNode => ({ type: "math", display, source })
+const ctx = { width: 80, images: true, maxImageRows: 20, theme: { dark: true } }
 
 function setup(
   o: {
@@ -54,13 +61,19 @@ test("settings validate mode and maxWidth", () => {
   }
 })
 
-test("registers only math, latex and tex fences; other nodes are declined", async () => {
+test("registers math, latex and tex fences plus inline and display math; other nodes are declined", async () => {
   const renderers: MarkdownRendererDefinition[] = []
   await extension({
     settings: {},
     registerMarkdownRenderer: (r: MarkdownRendererDefinition) => renderers.push(r),
   } as unknown as ExtensionAPI)
-  expect(renderers.map((r) => [r.id, r.match])).toEqual([["latex", { codeLang: ["math", "latex", "tex"] }]])
+  expect(renderers.map((r) => [r.id, r.match])).toEqual([
+    ["latex", { codeLang: ["math", "latex", "tex"] }],
+    ["latex-math", { math: "both" }],
+  ])
+  // Core strips $$…$$ / \\[…\\] and $…$ / \\(…\\) before passing these nodes.
+  expect(renderers[1]!.render(math(), { ...ctx, images: false })).toEqual(TEXT)
+  expect(renderers[1]!.render(math(false), ctx)).toEqual({ segments: TEXT.lines })
   const { renderer } = setup()
   for (const lang of ["math", "latex", "tex", "LaTeX"])
     expect(renderer.render(node(SOURCE, lang), ctx)).toEqual(TEXT)
@@ -71,32 +84,64 @@ test("registers only math, latex and tex fences; other nodes are declined", asyn
 test("auto and image use the browser; source, width and theme distinguish cached pictures", async () => {
   for (const mode of ["auto", "image"] as const) {
     const s = setup({ mode, browser: true, maxWidth: 700 })
-    const result = { image: { data: s.png, mimeType: "image/png" } }
+    const result = { image: { data: s.png, mimeType: "image/png" }, alt: SOURCE, fallback: TEXT.lines }
     expect(await s.renderer.render(node(), ctx)).toEqual(result)
     expect(await s.renderer.render(node(), ctx)).toEqual(result)
     expect(s.renders).toHaveLength(1)
     expect(s.renders[0]).toMatchObject({ width: 700, selector: "#math", timeoutMs: 10_000 })
-    expect(s.renders[0]!.html).toContain("color:#eee")
+    expect(s.renders[0]!.html).toContain('document.body.style.color = "#eee"')
     await s.renderer.render(node(), { ...ctx, width: 30 })
     expect(s.renders[1]!.width).toBe(300)
-    s.theme.value = "light"
-    await s.renderer.render(node(), ctx)
-    expect(s.renders[2]!.html).toContain("color:#111")
+    await s.renderer.render(node(), { ...ctx, theme: { dark: false } })
+    expect(s.renders[2]!.html).toContain('document.body.style.color = "#111"')
     await s.renderer.render(node("y^2"), ctx)
     expect(s.renders).toHaveLength(4)
   }
 })
 
-test("text mode, plain rendering and TERM=dumb never look up the browser", () => {
-  for (const options of [{ mode: "text" as const }, { term: "dumb" }, {}]) {
+test("text mode, print mode (images:false) and TERM=dumb never look up the browser", () => {
+  for (const options of [{ mode: "text" as const }, { term: "dumb" }, {}, { mode: "image" as const }]) {
     const s = setup({ ...options, browser: true })
     const images = options.mode === "text" || options.term === "dumb"
-    expect(s.renderer.render(node(), { ...ctx, images })).toEqual(TEXT)
+    for (const block of [node(), math()]) expect(s.renderer.render(block, { ...ctx, images })).toEqual(TEXT)
+    expect(s.renderer.render(math(false), { ...ctx, images })).toEqual({ segments: TEXT.lines })
     expect(s.lookups()).toBe(0)
     expect(s.renders).toEqual([])
   }
-  // Core's actual --print path bypasses Markdown renderers entirely (documented in README).
   expect(setup().renderer.render(node(), ctx)).toEqual(TEXT)
+  expect(setup().renderer.render(math(), ctx)).toEqual(TEXT)
+})
+
+test("inline math always returns synchronous, unwrapped Unicode segments without image work", () => {
+  for (const mode of ["auto", "text", "image"] as const) {
+    const s = setup({ mode, browser: true })
+    expect(s.renderer.render(math(false), { ...ctx, width: 3 })).toEqual({ segments: TEXT.lines })
+    expect(s.renderer.render(math(false, String.raw`x^2\\y_1`), ctx)).toEqual({
+      segments: [{ text: "x² y₁", kind: "text" }],
+    })
+    expect(s.lookups()).toBe(0)
+    expect(s.renders).toEqual([])
+  }
+})
+
+test("display math uses pictures with source alt and width-wrapped Unicode fallback, like fences", async () => {
+  const s = setup({ browser: true })
+  const context = { ...ctx, width: 3 }
+  const result = await s.renderer.render(math(), context)
+  expect(result).toEqual({
+    image: { data: s.png, mimeType: "image/png" },
+    alt: SOURCE,
+    fallback: [
+      { text: "x² ", kind: "text" },
+      { text: "+ α", kind: "text" },
+      { text: " ≤ ", kind: "text" },
+      { text: "∞", kind: "text" },
+    ],
+  })
+  expect(await s.renderer.render(node(), context)).toEqual(result)
+  expect(s.renders).toHaveLength(1)
+  const failure = setup({ browser: true, fail: "browser unavailable" })
+  expect(await failure.renderer.render(math(), ctx)).toEqual(TEXT)
 })
 
 test("very long sources stay text and never reach the browser", () => {
@@ -153,7 +198,38 @@ test("image cache shares in-flight work, bounds retained entries and catches syn
   expect(calls).toBe(67)
 })
 
-test("theme uses the terminal background hint with a dark default", () => {
+test("context theme overrides the legacy hint; exact colors each distinguish cached pictures", async () => {
+  const s = setup({ browser: true })
+  s.theme.value = "light"
+  await s.renderer.render(math(), ctx)
+  expect(s.renders[0]!.html).toContain('document.body.style.color = "#eee"')
+  expect(s.renders[0]!.html).toContain('document.body.style.backgroundColor = "#181818"')
+  await s.renderer.render(math(), { ...ctx, theme: { dark: false } })
+  expect(s.renders[1]!.html).toContain('document.body.style.backgroundColor = "#fff"')
+  const theme = { dark: true, foreground: "#abcdef", background: "#123456" }
+  await s.renderer.render(math(), { ...ctx, theme })
+  expect(s.renders[2]!.html).toContain('document.body.style.color = "#abcdef"')
+  expect(s.renders[2]!.html).toContain('document.body.style.backgroundColor = "#123456"')
+  await s.renderer.render(math(), { ...ctx, theme: { ...theme, foreground: "#fedcba" } })
+  expect(s.renders[3]!.html).toContain('document.body.style.color = "#fedcba"')
+  await s.renderer.render(math(), { ...ctx, theme: { ...theme, background: "#654321" } })
+  expect(s.renders[4]!.html).toContain('document.body.style.backgroundColor = "#654321"')
+  await s.renderer.render(math(), { ...ctx, theme: { ...theme } })
+  expect(s.renders).toHaveLength(5)
+})
+
+test("legacy fence contexts without a theme use the fallback hint", async () => {
+  const s = setup({ browser: true })
+  const legacy = { width: 80, images: true, maxImageRows: 20 } as MarkdownRenderContext
+  await s.renderer.render(node(), legacy)
+  expect(s.renders[0]!.html).toContain('document.body.style.color = "#eee"')
+  s.theme.value = "light"
+  await s.renderer.render(node(), legacy)
+  expect(s.renders[1]!.html).toContain('document.body.style.color = "#111"')
+  expect(s.renderer.render(node(), { ...legacy, images: false })).toEqual(TEXT)
+})
+
+test("legacy theme uses the terminal background hint with a dark default", () => {
   for (const hint of ["0;7", "0;15", "0;0;15"]) expect(terminalTheme(hint)).toBe("light")
   for (const hint of ["15;0", "7;8", "", "nonsense"]) expect(terminalTheme(hint)).toBe("dark")
 })
@@ -183,6 +259,17 @@ test("the vendored KaTeX renders real math, and rejects invalid input", () => {
   expect(sandbox.katex!.version).toBe("0.16.22")
   expect(sandbox.katex!.renderToString(String.raw`\frac{\alpha}{\sqrt{x^2}}`)).toContain('class="katex"')
   expect(() => sandbox.katex!.renderToString(String.raw`\notACommand`)).toThrow()
+})
+
+test("release metadata requires API 0.1.27 and matches the extension index", async () => {
+  const manifest = await Bun.file(new URL("../package.json", import.meta.url)).json()
+  const index = await Bun.file(new URL("../../../index.json", import.meta.url)).json()
+  expect(manifest.version).toBe("0.2.0")
+  expect(manifest.amira.engines).toEqual({ amira: "^0.1.27" })
+  expect(index.extensions.find((entry: { name: string }) => entry.name === "latex")).toMatchObject({
+    version: manifest.version,
+    engines: manifest.amira.engines,
+  })
 })
 
 test("public exports", async () => {
