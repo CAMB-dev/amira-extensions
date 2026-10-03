@@ -24,16 +24,12 @@ export interface SwarmLimits {
   budget?: Budget
 }
 
-/** Tokens a swarm may spend unless the settings say otherwise: cache reads count too. */
-export const DEFAULT_BUDGET_TOKENS = 3_000_000
-
 export const DEFAULT_LIMITS: SwarmLimits = {
   maxMessagesPerMember: 30,
   maxMessages: 150,
   maxTurnsPerMember: 20,
   noProgressRounds: 3,
   maxPairExchanges: 8,
-  budget: { tokens: DEFAULT_BUDGET_TOKENS },
 }
 
 /** The extension's settings: `extensions.swarm` in settings.json. */

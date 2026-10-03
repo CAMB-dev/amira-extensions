@@ -15,7 +15,6 @@ import { createSwarmSource } from "../src/dashboard.ts"
 import {
   createSwarmExtension,
   DATA_KEY,
-  DEFAULT_BUDGET_TOKENS,
   DEFAULT_LIMITS,
   readSettings,
   type SwarmLimits,
@@ -501,7 +500,7 @@ test("the model may propose a swarm: the confirmation, marked as its proposal, i
   expect(seen[0]!.message).toContain(
     "Agents: 2, all at once; each works up to 20 turns and sends up to 30 messages (150 in all).",
   )
-  expect(seen[0]!.message).toContain("Cost: stops at 3,000,000 tokens.")
+  expect(seen[0]!.message).toContain("Cost: no cost cap.")
   expect(seen[0]!.message).toContain(
     "Files: the members work in your working tree and can change your files.",
   )
@@ -697,8 +696,8 @@ test("settings: bad values are reported and ignored; a start can only lower the 
   expect(s.limits.noProgressRounds).toBe(DEFAULT_LIMITS.noProgressRounds)
   expect(s.limits.budget).toEqual({ tokens: 5000 })
   expect(problems.length).toBe(3)
-  // Without settings a swarm still has a budget.
-  expect(readSettings(undefined).limits.budget).toEqual({ tokens: DEFAULT_BUDGET_TOKENS })
+  // Without settings a swarm has no budget of its own; the session's budget, if any, applies.
+  expect(readSettings(undefined).limits.budget).toBeUndefined()
   expect(readSettings(undefined).enabled).toBe("ask")
   // The older values: "explicit" is "ask"; confirm: false never overrides "never".
   const quiet: string[] = []
