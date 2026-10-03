@@ -29,10 +29,7 @@ side answer arrives later. Completed answers remain available until you leave th
 reload the extension or exit; they are never persisted or included as context for later
 side questions. Errors appear in the panel, not the main transcript.
 
-**Core limitation:** the TUI always echoes the typed slash-command line in its visible
-transcript. The command API has no option to suppress that echo. The extension adds no
-answer/output there, and the echo is not a model-history message. A completely echo-free
-interaction would require a core API change.
+The typed `/btw` line does not appear in the transcript either (Amira 0.1.26 and later; with older Amira the TUI still echoes it, display only).
 
 `clear`, `show` and `history` are reserved when used as the entire argument. To ask about
 one of those words, use a question such as `/btw What does clear mean here?`.

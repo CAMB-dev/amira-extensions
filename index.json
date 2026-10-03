@@ -58,7 +58,7 @@
     {
       "name": "btw",
       "description": "Ask a quick side question while the main agent keeps working, without changing the conversation: /btw <question>",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/btw" },
       "engines": { "amira": "^0.1.24" },
       "tags": ["question", "side-call", "panel"],

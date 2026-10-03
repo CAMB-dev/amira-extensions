@@ -1,7 +1,7 @@
 {
   "name": "btw",
   "license": "Apache-2.0",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Ask a quick side question while the main agent keeps working, without changing the conversation",
   "type": "module",
   "scripts": {
