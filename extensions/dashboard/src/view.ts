@@ -673,7 +673,12 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
                   ? text([{ kind: "muted" as const, text: " 1–4 tabs · o diff · a actions · ? shortcuts" }])
                   : {
                       type: "bar" as const,
-                      left: [part(" o open diff   p pause/resume   r request changes   a actions   x stop", "muted")],
+                      left: [
+                        part(
+                          " o open diff   p pause/resume   r request changes   a actions   x stop",
+                          "muted",
+                        ),
+                      ],
                       right: [part("1–4 tabs · 5 stats (when available) ", "muted")],
                     },
               },
