@@ -189,7 +189,7 @@ describe("public semantic rendering (not terminal raster snapshots)", () => {
       "No agents yet. Start a task with sub-agents, then return here.",
     ])
     expect(words(fixture, "selection-hint")).toEqual([
-      "Select an agent in the timeline. Press e to expand all groups.",
+      "Select an agent in the timeline, then press Enter to open its page.",
     ])
   })
 })

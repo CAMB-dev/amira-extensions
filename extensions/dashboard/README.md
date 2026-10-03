@@ -58,7 +58,7 @@ amira · acme/checkout  │ Implementation  │ 1/3 running  │ cost unknown   
                   │ │Review authorization checks on refund requests.                                                                                                               │
                   │ │━━━━━━━━━━━━━━━━━━ 100%                                                                                                                                       │
 ╭ Details ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│  Select an agent in the timeline. Press e to expand all groups.                                                                                                                  │
+│  Select an agent in the timeline, then press Enter to open its page.                                                                                                             │
 │                                                                                                                                                                                  │
 │                                                                                                                                                                                  │
 │                                                                                                                                                                                  │
@@ -102,7 +102,7 @@ Implementation  │ 1/3 running  │ cost unknown
                 │ │ │partial refunds.                                          │
                 │ │ │━━━━━━━━━━━─────── 60%                                    │
 ╭ Details ─────────────────────────────────────────────────────────────────────╮
-│  Select an agent in the timeline. Press e to expand all groups.              │
+│  Select an agent in the timeline, then press Enter to open its page.         │
 │                                                                              │
 │                                                                              │
 │                                                                              │

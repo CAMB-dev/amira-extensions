@@ -202,7 +202,10 @@ function statsPanel(data: DashboardViewData, agent: DashboardAgent): UiNode {
 
 function details(data: DashboardViewData, agent?: DashboardAgent): UiNode {
   if (!agent)
-    return text([line("Select an agent in the timeline. Press e to expand all groups.")], "selection-hint")
+    return text(
+      [line("Select an agent in the timeline, then press Enter to open its page.")],
+      "selection-hint",
+    )
   const detail = data.source.details(agent.id)
   const diff: ViewLine[] = agent.files.length
     ? agent.files.flatMap((file) => [
