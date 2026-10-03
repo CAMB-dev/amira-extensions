@@ -87,9 +87,11 @@ neither writes to the blackboard are capped too (`maxPairExchanges`); past that,
 `send_message` tells them to write their results down instead. A member that is being
 stopped takes no more messages; sending it one is refused, not dropped.
 
-Without a `budget` in the settings a swarm may spend 3,000,000 tokens (cache reads count).
-That covers the members and their own sub-agents; the main session's turns answering them
-are its own.
+A swarm has no budget of its own unless the settings give one (since 0.1.7; before, it stopped
+at 3,000,000 tokens). Without one, the session's budget (`budget` in settings), if set, still
+applies to the whole agent tree, and the message, turn, no-progress and pair-exchange limits
+above still stop a swarm that runs away. A `budget` covers the members and their own
+sub-agents; the main session's turns answering them are its own.
 
 The blackboard, the messages and the results are kept in the session file, so `/swarm view`
 and `/swarm list` still show a swarm after `amira --resume`. Since 0.1.5, start records also

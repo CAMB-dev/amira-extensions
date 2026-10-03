@@ -27,7 +27,6 @@ import { memberLine, type SwarmViewData, swarmView, timelineLine, VIEW_KIND } fr
 
 export { Blackboard } from "./blackboard.ts"
 export {
-  DEFAULT_BUDGET_TOKENS,
   DEFAULT_LIMITS,
   readSettings,
   type SwarmLimits,
