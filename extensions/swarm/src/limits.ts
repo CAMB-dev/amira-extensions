@@ -1,4 +1,5 @@
 import type { Budget } from "@amira/api"
+import type { MemberWorkflowSettings } from "./workflows.ts"
 
 /** The guardrails of one swarm. */
 export interface SwarmLimits {
@@ -43,6 +44,8 @@ export interface SwarmSettings {
   /** Most members a swarm may have. */
   maxMembers: number
   limits: SwarmLimits
+  /** Optional workflow.runner integration; pending starts count against both limits. */
+  memberWorkflows: MemberWorkflowSettings
 }
 
 const positive = (v: unknown): number | undefined =>
@@ -55,6 +58,7 @@ export function readSettings(raw: unknown, report: (problem: string) => void = (
     enabled: s.confirm === false ? "always" : s.confirm === true ? "ask" : "mode",
     maxMembers: 6,
     limits: { ...DEFAULT_LIMITS },
+    memberWorkflows: { enabled: true, maxRunning: 3, maxPerMember: 1 },
   }
   if (s.enabled !== undefined) {
     if (s.enabled === "mode" || s.enabled === "ask" || s.enabled === "always" || s.enabled === "never")
@@ -87,6 +91,24 @@ export function readSettings(raw: unknown, report: (problem: string) => void = (
     const n = positive(limits[key])
     if (n) out.limits[key] = n
     else report(`"extensions.swarm.limits.${key}" must be a whole number of at least 1`)
+  }
+  if (s.memberWorkflows !== undefined) {
+    const w = s.memberWorkflows
+    if (!w || typeof w !== "object" || Array.isArray(w)) {
+      report('"extensions.swarm.memberWorkflows" must be an object')
+    } else {
+      const values = w as Record<string, unknown>
+      if (values.enabled !== undefined) {
+        if (typeof values.enabled === "boolean") out.memberWorkflows.enabled = values.enabled
+        else report('"extensions.swarm.memberWorkflows.enabled" must be true or false')
+      }
+      for (const key of ["maxRunning", "maxPerMember"] as const) {
+        if (values[key] === undefined) continue
+        const n = positive(values[key])
+        if (n) out.memberWorkflows[key] = n
+        else report(`"extensions.swarm.memberWorkflows.${key}" must be a whole number of at least 1`)
+      }
+    }
   }
   const budget = limits.budget
   if (budget !== undefined) {

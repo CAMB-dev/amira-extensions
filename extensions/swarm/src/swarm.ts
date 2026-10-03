@@ -10,8 +10,9 @@ import {
   type Usage,
   type UserMessage,
 } from "@amira/api"
-import { Blackboard, type BoardEntry, type BoardWrite } from "./blackboard.ts"
+import { Blackboard, type BoardEntry, type BoardWrite, MAX_VALUE_CHARS } from "./blackboard.ts"
 import type { SwarmLimits } from "./limits.ts"
+import { type MemberWorkflowSettings, MemberWorkflows, type WorkflowRunner } from "./workflows.ts"
 
 /** One member of a swarm, as the commander describes it. */
 export interface MemberSpec {
@@ -168,6 +169,8 @@ export interface SwarmOptions {
   /** Added to every member's spawn options: tools to leave out, the calling tool's id. */
   spawn?: Pick<SpawnOptions, "excludeTools" | "toolCallId" | "tools">
   hooks?: SwarmHooks
+  /** Own member tools, only when the workflow.runner service is available and enabled. */
+  workflows?: { runner: WorkflowRunner; limits: MemberWorkflowSettings }
 }
 
 /** Names a member may have. */
@@ -254,6 +257,7 @@ export class Swarm {
   #asking: AbortController | undefined
   /** Messages that could not be handed to their member (it was stopping or ended). */
   #dropped = 0
+  #workflows?: MemberWorkflows
 
   constructor(opts: SwarmOptions) {
     this.id = opts.id
@@ -264,6 +268,29 @@ export class Swarm {
     this.done = new Promise((resolve) => {
       this.#resolve = resolve
     })
+    if (opts.workflows?.limits.enabled) {
+      this.#workflows = new MemberWorkflows(opts.workflows.runner, opts.workflows.limits, {
+        canStart: (owner) => {
+          const m = this.#find(owner)
+          return this.live && !!m && !m.stopping && m.child.state !== "ended"
+        },
+        board: (value) => {
+          value = clip(value, MAX_VALUE_CHARS)
+          const r = this.board.write("swarm", "workflows", value)
+          if (!r.changed) return
+          this.#record({ type: "board", swarm: this.id, write: r.write! })
+          this.#log({ kind: "board", from: "swarm", key: "workflows", text: value })
+        },
+        result: (owner, text) => {
+          const m = this.#find(owner)
+          if (this.live && m && !m.stopping && m.child.state !== "ended") {
+            this.#progress(owner)
+            this.#deliver("workflow", m, text)
+          }
+        },
+        changed: () => this.#check(),
+      })
+    }
     const roster = opts.members
     for (const spec of roster) {
       const child = this.#group.spawn({
@@ -275,7 +302,7 @@ export class Swarm {
         persistent: true,
         maxTurns: this.limits.maxTurnsPerMember,
         ...(spec.model ? { model: spec.model } : {}),
-        extraTools: this.#tools(spec.name),
+        extraTools: [...this.#tools(spec.name), ...(this.#workflows?.tools(spec.name) ?? [])],
       })
       const m: Member = { spec, child, sent: 0, paused: false, held: [] }
       this.#members.set(spec.name.toLowerCase(), m)
@@ -650,6 +677,8 @@ export class Swarm {
     if (!key || key.length > MAX_KEY_CHARS || /[\r\n]/.test(key)) {
       return textResult(`"key" must be one line of 1 to ${MAX_KEY_CHARS} characters.`, true)
     }
+    if (key === "workflows" && this.#workflows)
+      return textResult('"workflows" is maintained by the swarm; use another key for your notes.', true)
     if (typeof p.value !== "string") return textResult('"value" must be text.', true)
     let r: ReturnType<Blackboard["write"]>
     try {
@@ -771,11 +800,11 @@ export class Swarm {
 
   /**
    * Whether something is on its way to a member: a message held for it, one its model has not
-   * seen yet, or a notice it waits for (e.g. the result of a background sub-agent of its own).
+   * seen yet, a notice it waits for, or one of its pending/running workflows.
    */
   #inFlight(m: Member): boolean {
     if (m.child.state === "ended") return false
-    return m.held.length > 0 || m.child.pendingNotices > 0
+    return m.held.length > 0 || m.child.pendingNotices > 0 || !!this.#workflows?.runningFor(m.spec.name)
   }
 
   #check() {
@@ -814,6 +843,7 @@ export class Swarm {
       if (now) m.child.abort(reason)
       else m.child.stop(reason)
     }
+    await this.#workflows?.stop()
     const results = await Promise.all([...this.#members.values()].map((m) => m.child.result()))
     this.#group.end(reason)
     const info = await this.#group.ended()

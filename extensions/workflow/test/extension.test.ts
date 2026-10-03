@@ -15,11 +15,15 @@ import type {
   UserMessage,
   ViewDefinition,
 } from "@amira/api"
+import type { DashboardSource } from "../src/dashboard.ts"
 import { asksForWorkflow, createWorkflowExtension, readSettings } from "../src/index.ts"
+import { readRun } from "../src/journal.ts"
 import { type Answer, type FakeGroup, fakeGroup } from "./fakes.ts"
 
 const dirs: string[] = []
-afterEach(() => {
+const cleanup: (() => unknown)[] = []
+afterEach(async () => {
+  for (const dispose of cleanup.splice(0)) await dispose()
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true })
 })
 
@@ -36,10 +40,34 @@ return await agent("verify " + found.join(", "), { label: "verify" })
 
 type Handler = (e: { sessionId: string; parentSessionId?: string; data: unknown }) => void
 
+type RunnerResult = {
+  runId: string
+  name: string
+  status: string
+  startedBy?: { sessionId: string; label: string }
+  result?: unknown
+  error?: string
+}
+interface Runner {
+  start(
+    request: {
+      script?: string
+      name?: string
+      args?: unknown
+      startedBy: { sessionId: string; label: string }
+    },
+    ctx: ToolContext,
+  ): Promise<{ runId: string } | { error: string }>
+  status(runId: string): RunnerResult | undefined
+  stop(runId: string): boolean
+  onResult(runId: string, listener: (result: RunnerResult) => void): () => void
+}
+
 function setup(
   opts: {
     settings?: Record<string, unknown>
     confirm?: boolean | undefined
+    confirmDialog?: (signal?: AbortSignal) => Promise<boolean | undefined>
     permissionMode?: PermissionMode
     noSession?: boolean
     answer?: (o: { prompt: string }) => Answer | Promise<Answer>
@@ -63,6 +91,15 @@ function setup(
   const told: string[] = []
   const groups: FakeGroup[] = []
   const notices: UserMessage[] = []
+  const services = new Map<string, unknown>()
+  const exits: (() => unknown)[] = []
+  let dashboard!: DashboardSource
+  services.set("dashboard.sources", {
+    register(source: DashboardSource) {
+      dashboard = source
+      return () => {}
+    },
+  })
   let cancelled = 0
   let expected = 0
   let confirmAnswer: boolean | undefined = "confirm" in opts ? opts.confirm : true
@@ -70,6 +107,17 @@ function setup(
   const answer = opts.answer ?? ((o: { prompt: string }) => ({ text: `saw ${o.prompt.split(" ").at(-1)}` }))
   const api = {
     apiVersion: "0.1.0",
+    provideService(name: string, value: unknown) {
+      services.set(name, value)
+      return () => {
+        services.delete(name)
+      }
+    },
+    useService: (name: string) => services.get(name),
+    onExit: (dispose: () => unknown) => {
+      exits.push(dispose)
+      cleanup.push(dispose)
+    },
     cwd,
     home,
     settings: { extensions: { workflow: opts.settings } },
@@ -97,9 +145,9 @@ function setup(
     notify: (t: string) => told.push(t),
     runCommand: async () => ({ output: "", exitCode: 1 }),
     ui: {
-      confirm: async (title: string, message?: string) => {
+      confirm: async (title: string, message?: string, options?: { signal?: AbortSignal }) => {
         confirms.push({ title, message })
-        return confirmAnswer
+        return opts.confirmDialog ? opts.confirmDialog(options?.signal) : confirmAnswer
       },
     },
     on: (type: string, h: Handler) => {
@@ -167,6 +215,19 @@ function setup(
   return {
     cwd,
     home,
+    runner: services.get("workflow.runner") as Runner,
+    async dispose() {
+      for (const exit of exits) await exit()
+    },
+    dashboard,
+    memberContext: (signal = new AbortController().signal) =>
+      ({
+        cwd,
+        toolCallId: "member-call",
+        signal,
+        update: () => {},
+        session: session(1),
+      }) as unknown as ToolContext,
     get tool() {
       return tool
     },
@@ -209,6 +270,228 @@ async function until(cond: () => boolean, what = "condition") {
   }
   throw new Error(`timed out waiting for ${what}`)
 }
+
+const startedBy = { sessionId: "s_child", label: "researcher" }
+
+test("runner auto start shares limits, journal, progress and dashboard attribution; results replay", async () => {
+  const t = setup({ permissionMode: "auto", settings: { maxAgents: 7, maxConcurrent: 2 } })
+  const start = await t.runner.start({ script: SCRIPT, args: { topic: "api" }, startedBy }, t.memberContext())
+  if ("error" in start) throw new Error(start.error)
+  expect(t.confirms).toHaveLength(0)
+  expect(t.groups[0]!.options).toMatchObject({ maxAgents: 7, maxConcurrent: 2 })
+  expect(t.groups[0]!.options.budget).toBeUndefined()
+  expect(t.runner.status(start.runId)).toMatchObject({ runId: start.runId, startedBy })
+  expect(t.runner.status("unknown")).toBeUndefined()
+  const results: RunnerResult[] = []
+  t.runner.onResult(start.runId, (result) => results.push(result))
+  await until(() => results.length === 1)
+  expect(results[0]).toMatchObject({ status: "done", startedBy, result: "saw tui" })
+  const record = readRun(path.join(t.home, "sessions", "workflows", start.runId))!.record
+  expect(record).toMatchObject({ startedBy, args: { topic: "api" }, status: "done" })
+  expect(t.groups[0]!.statuses.some((line) => line.includes("researcher"))).toBe(true)
+  const header = t.view.header!({ id: start.runId }, { now: Date.now(), width: 80 })
+  expect(JSON.stringify(header)).toContain("Started by: researcher (s_child)")
+  const phases = t.dashboard.snapshot().phases
+  expect(phases[0]!.name).toContain("researcher")
+  const agent = phases[0]!.groups[0]!.agents[0]!
+  expect(JSON.stringify(t.dashboard.details(agent.id))).toContain("Started by: researcher (s_child)")
+  // Workflow children cannot inherit orchestration or the member's private tools.
+  for (const spawned of t.groups[0]!.spawned) {
+    expect(spawned.extraTools).toBeUndefined()
+    for (const name of [
+      "swarm",
+      "workflow",
+      "start_workflow",
+      "workflow_status",
+      "stop_workflow",
+      "send_message",
+      "blackboard_read",
+      "blackboard_write",
+      "list_agents",
+      "finish",
+    ])
+      expect(spawned.excludeTools).toContain(name)
+  }
+  t.runner.onResult(start.runId, (result) => results.push(result))
+  const unsubscribe = t.runner.onResult(start.runId, () => {
+    throw new Error("unsubscribed")
+  })
+  unsubscribe()
+  await until(() => results.length === 2)
+  expect(t.errors).toEqual([])
+  expect(t.expected).toBe(0)
+  expect(t.notices).toEqual([])
+  expect(t.runner.stop(start.runId)).toBe(false)
+  // Resuming from the main session retains who originally started the run.
+  await t.call({ resume: start.runId })
+  await until(() => t.notices.length === 1)
+  expect(t.runner.status(start.runId)?.startedBy).toEqual(startedBy)
+})
+
+test("workflow agents exclude orchestrators even in saved sub-workflows with a role allowlist", async () => {
+  const t = setup({ settings: { enabled: "always" } })
+  const agentsDir = path.join(t.cwd, ".amira", "agents")
+  const savedDir = path.join(t.cwd, ".amira", "workflows")
+  mkdirSync(agentsDir, { recursive: true })
+  mkdirSync(savedDir, { recursive: true })
+  const denied = ["swarm", "workflow", "start_workflow", "workflow_status", "stop_workflow", "send_message"]
+  writeFileSync(
+    path.join(agentsDir, "nested.md"),
+    `---\ntools: [read, ${denied.join(", ")}]\n---\nRead files.`,
+  )
+  writeFileSync(
+    path.join(savedDir, "nested.ts"),
+    'export const meta = { name: "nested", description: "Nested", phases: [] }; return await agent("read", { role: "nested" })',
+  )
+  const script =
+    'export const meta = { name: "parent", description: "Parent", phases: [] }; return await workflow("nested", {})'
+  const started = await t.runner.start({ script, startedBy }, t.memberContext())
+  if ("error" in started) throw new Error(started.error)
+  await until(() => t.runner.status(started.runId)?.status === "done")
+  expect(t.groups).toHaveLength(1)
+  const child = t.groups[0]!.spawned[0]!
+  expect(child.tools).toEqual(["read", ...denied])
+  for (const name of denied) expect(child.excludeTools).toContain(name)
+  expect(child.extraTools).toBeUndefined()
+})
+
+test("runner follows D106 for auto, ask, always, never and missing permissions", async () => {
+  for (const entry of [
+    { settings: {}, permissionMode: "auto", asks: false, starts: true },
+    { settings: {}, permissionMode: "edits", asks: true, starts: true },
+    { settings: {}, permissionMode: "plan", asks: true, starts: true },
+    { settings: {}, asks: true, starts: true },
+    { settings: { enabled: "ask" }, permissionMode: "auto", asks: true, starts: true },
+    { settings: { enabled: "always" }, permissionMode: "plan", asks: false, starts: true },
+    { settings: { enabled: "never" }, permissionMode: "auto", asks: false, starts: false },
+  ] as const) {
+    const t = setup({
+      settings: entry.settings,
+      permissionMode: "permissionMode" in entry ? entry.permissionMode : undefined,
+    })
+    const start = await t.runner.start({ script: SCRIPT, startedBy }, t.memberContext())
+    expect("runId" in start).toBe(entry.starts)
+    expect(t.confirms.length).toBe(entry.asks ? 1 : 0)
+    if (entry.asks) expect(t.confirms[0]!.message).toContain("Started by: researcher (s_child)")
+    if ("runId" in start) await until(() => t.runner.status(start.runId)?.status === "done")
+    else expect(start.error).toContain("turned off")
+  }
+})
+
+test("runner shares validation, saved sources, decline suppression and cancellation", async () => {
+  const t = setup({ settings: { enabled: "ask" }, confirm: false })
+  const ctx = t.memberContext()
+  expect(await t.runner.start({ script: "return 1", startedBy }, ctx)).toHaveProperty("error")
+  expect(t.confirms).toHaveLength(0)
+  const dir = path.join(t.cwd, ".amira", "workflows")
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(path.join(dir, "fanout.ts"), SCRIPT)
+  const denied = await t.runner.start({ name: "fanout", startedBy }, ctx)
+  expect(denied).toHaveProperty("error")
+  expect(JSON.stringify(denied)).toContain("declined")
+  t.answerConfirm(true)
+  expect(JSON.stringify(await t.runner.start({ script: SCRIPT, startedBy }, ctx))).toContain(
+    "already declined",
+  )
+  expect(t.confirms).toHaveLength(1)
+  t.say("use a workflow")
+  const started = await t.runner.start({ name: "fanout", startedBy }, ctx)
+  if ("error" in started) throw new Error(started.error)
+  await until(() => t.runner.status(started.runId)?.status === "done")
+  expect(readRun(path.join(t.home, "sessions", "workflows", started.runId))!.record.source).toBe(
+    path.join(dir, "fanout.ts"),
+  )
+  const abort = new AbortController()
+  abort.abort()
+  expect(
+    JSON.stringify(await t.runner.start({ script: SCRIPT, startedBy }, t.memberContext(abort.signal))),
+  ).toContain("cancelled")
+  expect(t.groups).toHaveLength(1)
+})
+
+test("runner waits for user confirmation and cancels an outstanding dialog", async () => {
+  for (const cancel of [false, true]) {
+    let confirm!: (yes: boolean) => void
+    const t = setup({
+      settings: { enabled: "ask" },
+      confirmDialog: (signal) =>
+        new Promise((resolve) => {
+          confirm = resolve
+          signal?.addEventListener("abort", () => resolve(undefined), { once: true })
+        }),
+    })
+    const abort = new AbortController()
+    const pending = t.runner.start({ script: SCRIPT, startedBy }, t.memberContext(abort.signal))
+    expect(t.confirms).toHaveLength(1)
+    expect(t.groups).toHaveLength(0)
+    if (cancel) abort.abort()
+    else confirm(true)
+    const result = await pending
+    if (cancel) {
+      expect(result).toEqual({ error: "The workflow start was cancelled." })
+      expect(t.groups).toHaveLength(0)
+    } else {
+      if ("error" in result) throw new Error(result.error)
+      await until(() => t.runner.status(result.runId)?.status === "done")
+    }
+  }
+})
+
+test("runner stop settles agents and delivers failure without a root notice", async () => {
+  const t = setup({ settings: { enabled: "always" }, answer: () => new Promise(() => {}) })
+  const started = await t.runner.start({ script: SCRIPT, startedBy }, t.memberContext())
+  if ("error" in started) throw new Error(started.error)
+  await until(() => t.groups[0]!.spawned.length > 0)
+  const result = new Promise<RunnerResult>((resolve) => t.runner.onResult(started.runId, resolve))
+  expect(t.runner.stop(started.runId)).toBe(true)
+  expect(await result).toMatchObject({ status: "stopped", startedBy, error: "stopped by the caller" })
+  expect(t.groups[0]!.endReason).toBeDefined()
+  expect(t.runner.stop(started.runId)).toBe(false)
+  expect(t.runner.stop("unknown")).toBe(false)
+  expect(t.notices).toEqual([])
+})
+
+test("extension disposal cancels pending starts and rejects a cached runner", async () => {
+  const t = setup({
+    settings: { enabled: "ask" },
+    confirmDialog: (signal) =>
+      new Promise((resolve) => {
+        signal?.addEventListener("abort", () => resolve(undefined), { once: true })
+      }),
+  })
+  const pending = t.runner.start({ script: SCRIPT, startedBy }, t.memberContext())
+  expect(t.confirms).toHaveLength(1)
+  await t.dispose()
+  expect(await pending).toEqual({ error: "The workflow start was cancelled." })
+  expect(await t.runner.start({ script: SCRIPT, startedBy }, t.memberContext())).toEqual({
+    error: "The workflow start was cancelled.",
+  })
+  expect(t.confirms).toHaveLength(1)
+  expect(t.groups).toHaveLength(0)
+})
+
+test("ending a member's group stops even a script waiting without agents", async () => {
+  const t = setup({ settings: { enabled: "always" } })
+  const script =
+    'export const meta = { name: "wait", description: "Wait", phases: [] }; await new Promise(() => {})'
+  const started = await t.runner.start({ script, startedBy }, t.memberContext())
+  if ("error" in started) throw new Error(started.error)
+  const ended = new Promise<RunnerResult>((resolve) => t.runner.onResult(started.runId, resolve))
+  t.groups[0]!.end("the member ended")
+  expect(await ended).toMatchObject({ status: "stopped", startedBy })
+  expect(t.runner.status(started.runId)?.status).toBe("stopped")
+})
+
+test("runner reports script failures to its subscriber", async () => {
+  const t = setup({ settings: { enabled: "always" } })
+  const script =
+    'export const meta = { name: "fails", description: "Fails", phases: [] }; throw new Error("broken script")'
+  const started = await t.runner.start({ script, startedBy }, t.memberContext())
+  if ("error" in started) throw new Error(started.error)
+  const result = await new Promise<RunnerResult>((resolve) => t.runner.onResult(started.runId, resolve))
+  expect(result.status).toBe("error")
+  expect(result.error).toContain("broken script")
+})
 
 test("the tool is main-session only and refuses sub-agents that reach it anyway", async () => {
   const t = setup({ settings: { enabled: "always" } })

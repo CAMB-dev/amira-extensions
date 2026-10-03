@@ -55,6 +55,36 @@ it gets:
 After each turn a member goes idle. A message wakes it, or, if it is working, reaches it
 before its next model call; messages from one sender arrive in the order they were sent.
 
+### Member workflows
+
+Since 0.1.10, members can start workflows when the workflow extension provides the optional
+`workflow.runner` service and `memberWorkflows.enabled` is true (the default). Without that
+service, or when disabled, these tools are absent; the rest of the swarm works as before.
+The main-session `workflow` tool stays excluded. Members get their own tools instead:
+
+| Tool | What it does |
+|---|---|
+| `start_workflow(script?, name?, args?)` | Start an inline script or a saved workflow; load the workflow skill first |
+| `workflow_status(runId?)` | Show one of the member's runs, or all its runs and pending starts |
+| `stop_workflow(runId)` | Stop one of the member's runs |
+
+Workflow confirmation still follows the workflow extension's own policy. The member's
+session and name identify who started each run; workflow agents use that member's agent
+tree and ancestor budgets. Status and stop cannot access another member's runs.
+
+By default, at most **3 workflows per swarm** and **1 per member** may run at once. Pending
+starts (including confirmation dialogs) reserve a slot too, so concurrent calls cannot
+exceed these limits. A refused start lists the members holding the slots and their run IDs
+(or pending starts), and asks the caller to coordinate using `send_message` or the board.
+
+The swarm maintains the `workflows` blackboard key: pending starts and running workflows
+appear with their owners, and disappear when they end. Changes are recorded in the timeline;
+members cannot overwrite this key while the integration is enabled. Completion and failure
+results arrive as messages to the member that started the workflow, waking it when idle or
+waiting until it is resumed when paused. Members should end their turn rather than poll.
+A pending or running workflow prevents normal idle shutdown. Stopping the swarm cancels all
+member workflows, including outstanding confirmations and starts racing with shutdown.
+
 ## Watching and stepping in
 
 - `/swarm view` opens the live view: members with their states, the blackboard, and the
@@ -164,6 +194,11 @@ In `settings.json`, under `extensions.swarm`:
     "swarm": {
       "enabled": "mode",           // default: follow the session's permission mode (see below)
       "maxMembers": 6,
+      "memberWorkflows": {
+        "enabled": true,          // needs the workflow.runner service
+        "maxRunning": 3,          // across this swarm, including pending starts
+        "maxPerMember": 1
+      },
       "limits": {
         "maxMessagesPerMember": 30,
         "maxMessages": 150,

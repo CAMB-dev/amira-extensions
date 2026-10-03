@@ -39,6 +39,8 @@ export interface RunRecord {
   /** Where the script came from: a saved workflow's file, or "inline". */
   source: string
   status: RunStatus
+  /** The member that requested this run through workflow.runner, when present. */
+  startedBy?: { sessionId: string; label: string }
   startedAt: number
   endedAt?: number
   result?: unknown

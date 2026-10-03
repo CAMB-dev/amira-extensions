@@ -74,7 +74,7 @@ export function createWorkflowSource(workspace: string) {
       for (const name of names) {
         const phase: DashboardPhase = {
           id: `${prefix}:phase:${encodeURIComponent(name)}`,
-          name: `${record.meta.name} · ${name || "Unphased"}`,
+          name: `${record.meta.name}${record.startedBy ? ` · ${record.startedBy.label}` : ""} · ${name || "Unphased"}`,
           groups: [],
         }
         for (const { node, nest } of calls.filter((call) => call.phase === name)) {
@@ -103,6 +103,9 @@ export function createWorkflowSource(workspace: string) {
               line(
                 `Run ${record.id} · attempt ${(record.resumes ?? 0) + 1} · ${runStateText(record.status)}`,
               ),
+              ...(record.startedBy
+                ? [line(`Started by: ${record.startedBy.label} (${record.startedBy.sessionId})`)]
+                : []),
               line(`Phase: ${name || "Unphased"}${nest ? ` · workflow ${nest}` : ""}`),
               line(
                 `Call ${node.call}: ${runStateText(node.status)}${node.status === "cached" ? " (replayed; no new usage)" : ""}`,

@@ -27,6 +27,7 @@ export interface RunOptions {
   /** The script's origin: a saved workflow's file, or "inline". */
   origin: string
   args: unknown
+  startedBy?: { sessionId: string; label: string }
   group: SpawnGroup
   cwd: string
   home: string
@@ -137,6 +138,7 @@ export class WorkflowRun {
       args: this.#opts.args,
       source: this.#opts.origin,
       status: this.status,
+      ...(this.#opts.startedBy ? { startedBy: { ...this.#opts.startedBy } } : {}),
       startedAt: this.startedAt,
       ...(this.endedAt !== undefined ? { endedAt: this.endedAt } : {}),
       ...(this.status === "done" ? { result: this.result } : {}),
@@ -156,6 +158,8 @@ export class WorkflowRun {
     writeRun(this.#opts.dir, this.record, this.#opts.source)
     const worker = (this.#opts.worker ?? sandboxWorker)()
     this.#worker = worker
+    // A member ending (or an ancestor budget) ends its group, even if the script is waiting.
+    void this.#opts.group.ended().then((info) => this.stop(info.endReason ?? "its agent group ended"))
     worker.onmessage = (e) => void this.#handle(e.data)
     worker.onerror = (e) =>
       this.#end("error", undefined, `the script crashed: ${e.message ?? "unknown error"}`)
@@ -355,6 +359,19 @@ export class WorkflowRun {
               ...(opts.role ? { role: opts.role } : {}),
               ...(node.model ? { model: node.model } : {}),
               ...(role?.tools ? { tools: role.tools } : {}),
+              // Workflow agents cannot start orchestrators or inherit a member's private tools.
+              excludeTools: [
+                "swarm",
+                "workflow",
+                "start_workflow",
+                "workflow_status",
+                "stop_workflow",
+                "send_message",
+                "list_agents",
+                "blackboard_read",
+                "blackboard_write",
+                "finish",
+              ],
               ...(opts.schema ? { schema: opts.schema as JSONSchema } : {}),
               ...(tree && !("error" in tree) ? { cwd: tree.cwd } : {}),
               systemPrompt: [
