@@ -1,0 +1,2687 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeline widget contract 1`] = `
+{
+  "contract": "Public UiNode tree; viewport rows are metadata only",
+  "state": {
+    "activeTabs": {
+      "detail": "summary",
+    },
+    "expanded": {
+      "timeline": [
+        "phase:implementation",
+        "group:implementation:workers",
+        "agent:payments",
+        "agent:receipts",
+        "phase:review",
+        "group:review:workers",
+        "agent:audit",
+      ],
+    },
+    "focused": "timeline",
+    "inputValues": {},
+    "scroll": {
+      "logs": {
+        "following": true,
+        "top": 0,
+      },
+    },
+    "selected": {
+      "actions": "open-diff",
+      "timeline": "agent:payments",
+    },
+  },
+  "title": "Dashboard · Checkout run",
+  "tree": {
+    "children": [
+      {
+        "node": {
+          "left": [
+            {
+              "kind": "accent",
+              "text": "amira · ",
+            },
+            {
+              "kind": "text",
+              "text": "acme/checkout  │ Implementation  │ 1/3 running  │ cost unknown",
+            },
+          ],
+          "right": [
+            {
+              "kind": "muted",
+              "text": "? help · b back · q quit",
+            },
+          ],
+          "type": "bar",
+        },
+        "size": 1,
+      },
+      {
+        "node": {
+          "label": "Checkout run",
+          "type": "rule",
+        },
+        "size": 1,
+      },
+      {
+        "node": {
+          "id": "timeline",
+          "items": [
+            {
+              "aside": [
+                {
+                  "kind": "muted",
+                  "text": "▾",
+                },
+              ],
+              "children": [
+                {
+                  "aside": [
+                    {
+                      "kind": "muted",
+                      "text": "checkout-v2  ▾",
+                    },
+                  ],
+                  "children": [
+                    {
+                      "aside": [
+                        {
+                          "kind": "accent",
+                          "text": "running",
+                        },
+                      ],
+                      "detail": {
+                        "aside": "running",
+                        "child": {
+                          "children": [
+                            {
+                              "node": {
+                                "id": undefined,
+                                "lines": [
+                                  {
+                                    "kind": "text",
+                                    "text": "Validate payment amounts and add regression coverage for partial refunds.",
+                                  },
+                                ],
+                                "type": "text",
+                              },
+                              "size": 1,
+                            },
+                            {
+                              "node": {
+                                "label": "60%",
+                                "type": "progress",
+                                "value": 0.6,
+                                "width": 18,
+                              },
+                              "size": 1,
+                            },
+                            {
+                              "node": {
+                                "id": undefined,
+                                "lines": [
+                                  {
+                                    "kind": "muted",
+                                    "text": "2 files reported changed · $0.125",
+                                  },
+                                ],
+                                "type": "text",
+                              },
+                              "size": 1,
+                            },
+                            {
+                              "node": {
+                                "id": undefined,
+                                "lines": [
+                                  {
+                                    "kind": "code",
+                                    "text": "src/payments.ts",
+                                  },
+                                ],
+                                "type": "text",
+                              },
+                              "size": 1,
+                            },
+                            {
+                              "node": {
+                                "id": undefined,
+                                "lines": [
+                                  {
+                                    "kind": "code",
+                                    "text": "test/payments.test.ts",
+                                  },
+                                ],
+                                "type": "text",
+                              },
+                              "size": 1,
+                            },
+                            {
+                              "node": {
+                                "id": undefined,
+                                "lines": [
+                                  {
+                                    "kind": "accent",
+                                    "text": "o Open diff · p Pause · r Request changes · x Stop · a ⋮ Actions",
+                                  },
+                                ],
+                                "type": "text",
+                              },
+                              "size": 1,
+                            },
+                          ],
+                          "type": "column",
+                        },
+                        "title": {
+                          "kind": "segments",
+                          "parts": [
+                            {
+                              "kind": "accent",
+                              "text": "● Payment validation  ",
+                            },
+                            {
+                              "kind": "chip",
+                              "text": "TypeScript",
+                              "tone": "info",
+                            },
+                          ],
+                        },
+                        "type": "box",
+                      },
+                      "key": "agent:payments",
+                      "rail": true,
+                      "row": [
+                        {
+                          "kind": "accent",
+                          "text": "● Payment validation",
+                        },
+                      ],
+                    },
+                    {
+                      "aside": [
+                        {
+                          "kind": "muted",
+                          "text": "paused",
+                        },
+                      ],
+                      "detail": {
+                        "aside": "paused",
+                        "child": {
+                          "children": [
+                            {
+                              "node": {
+                                "id": undefined,
+                                "lines": [
+                                  {
+                                    "kind": "text",
+                                    "text": "Check the receipt template while awaiting product approval.",
+                                  },
+                                ],
+                                "type": "text",
+                              },
+                              "size": 1,
+                            },
+                            {
+                              "node": {
+                                "label": "Progress unknown",
+                                "type": "progress",
+                                "value": 0,
+                                "width": 18,
+                              },
+                              "size": 1,
+                            },
+                            {
+                              "node": {
+                                "id": undefined,
+                                "lines": [
+                                  {
+                                    "kind": "muted",
+                                    "text": "1 file reported changed · cost unknown",
+                                  },
+                                ],
+                                "type": "text",
+                              },
+                              "size": 1,
+                            },
+                            {
+                              "node": {
+                                "id": undefined,
+                                "lines": [
+                                  {
+                                    "kind": "code",
+                                    "text": "templates/receipt.html",
+                                  },
+                                ],
+                                "type": "text",
+                              },
+                              "size": 1,
+                            },
+                            {
+                              "node": {
+                                "id": undefined,
+                                "lines": [
+                                  {
+                                    "kind": "accent",
+                                    "text": "o Open diff · p Resume · x Stop · a ⋮ Actions",
+                                  },
+                                ],
+                                "type": "text",
+                              },
+                              "size": 1,
+                            },
+                          ],
+                          "type": "column",
+                        },
+                        "title": {
+                          "kind": "segments",
+                          "parts": [
+                            {
+                              "kind": "muted",
+                              "text": "‖ Receipt templates  ",
+                            },
+                          ],
+                        },
+                        "type": "box",
+                      },
+                      "key": "agent:receipts",
+                      "rail": true,
+                      "row": [
+                        {
+                          "kind": "muted",
+                          "text": "‖ Receipt templates",
+                        },
+                      ],
+                    },
+                  ],
+                  "key": "group:implementation:workers",
+                  "lead": [
+                    {
+                      "kind": "muted",
+                      "text": "09:00:30  ●",
+                    },
+                  ],
+                  "node": [
+                    {
+                      "kind": "accent",
+                      "text": "◉",
+                    },
+                  ],
+                  "rail": true,
+                  "row": [
+                    {
+                      "kind": "text",
+                      "text": "Checkout workers ×2",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "  1 running",
+                    },
+                  ],
+                  "underline": true,
+                },
+              ],
+              "key": "phase:implementation",
+              "node": [
+                {
+                  "kind": "accent",
+                  "text": "◉",
+                },
+              ],
+              "rail": true,
+              "row": [
+                {
+                  "kind": "accent",
+                  "text": "Implementation",
+                },
+              ],
+              "underline": true,
+            },
+            {
+              "aside": [
+                {
+                  "kind": "muted",
+                  "text": "▾",
+                },
+              ],
+              "children": [
+                {
+                  "aside": [
+                    {
+                      "kind": "muted",
+                      "text": "workers  ▾",
+                    },
+                  ],
+                  "children": [
+                    {
+                      "aside": [
+                        {
+                          "kind": "success",
+                          "text": "done",
+                        },
+                      ],
+                      "detail": {
+                        "aside": "done",
+                        "child": {
+                          "children": [
+                            {
+                              "node": {
+                                "id": undefined,
+                                "lines": [
+                                  {
+                                    "kind": "text",
+                                    "text": "Review authorization checks on refund requests.",
+                                  },
+                                ],
+                                "type": "text",
+                              },
+                              "size": 1,
+                            },
+                            {
+                              "node": {
+                                "label": "100%",
+                                "type": "progress",
+                                "value": 1,
+                                "width": 18,
+                              },
+                              "size": 1,
+                            },
+                            {
+                              "node": {
+                                "id": undefined,
+                                "lines": [
+                                  {
+                                    "kind": "muted",
+                                    "text": "0 files reported changed · $0.040",
+                                  },
+                                ],
+                                "type": "text",
+                              },
+                              "size": 1,
+                            },
+                            {
+                              "node": {
+                                "id": undefined,
+                                "lines": [
+                                  {
+                                    "kind": "accent",
+                                    "text": "o Open diff · a ⋮ Actions",
+                                  },
+                                ],
+                                "type": "text",
+                              },
+                              "size": 1,
+                            },
+                          ],
+                          "type": "column",
+                        },
+                        "title": {
+                          "kind": "segments",
+                          "parts": [
+                            {
+                              "kind": "success",
+                              "text": "✓ Refund audit  ",
+                            },
+                          ],
+                        },
+                        "type": "box",
+                      },
+                      "key": "agent:audit",
+                      "rail": true,
+                      "row": [
+                        {
+                          "kind": "success",
+                          "text": "✓ Refund audit",
+                        },
+                      ],
+                    },
+                  ],
+                  "key": "group:review:workers",
+                  "lead": [
+                    {
+                      "kind": "muted",
+                      "text": "09:00:00  ✓",
+                    },
+                  ],
+                  "node": [
+                    {
+                      "kind": "muted",
+                      "text": "○",
+                    },
+                  ],
+                  "rail": true,
+                  "row": [
+                    {
+                      "kind": "text",
+                      "text": "Security review ×1",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "  0 running",
+                    },
+                  ],
+                  "underline": true,
+                },
+              ],
+              "key": "phase:review",
+              "node": [
+                {
+                  "kind": "accent",
+                  "text": "◉",
+                },
+              ],
+              "rail": true,
+              "row": [
+                {
+                  "kind": "accent",
+                  "text": "Review",
+                },
+              ],
+              "underline": true,
+            },
+          ],
+          "type": "tree",
+        },
+      },
+      {
+        "node": {
+          "child": {
+            "id": "detail",
+            "tabs": [
+              {
+                "body": {
+                  "id": "summary",
+                  "lines": [
+                    {
+                      "kind": "text",
+                      "text": "● Payment validation · running · $0.125",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Validate payment amounts and add regression coverage for partial refunds.",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Amount validation is implemented; regression tests are in progress.",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "Own reported usage only; missing costs are unknown.",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "summary",
+                "label": "Summary",
+              },
+              {
+                "body": {
+                  "id": "diff",
+                  "lines": [
+                    {
+                      "kind": "accent",
+                      "text": "src/payments.ts",
+                    },
+                    {
+                      "kind": "diff-hunk",
+                      "text": "@@ -1 +1 @@",
+                    },
+                    {
+                      "kind": "diff-remove",
+                      "text": "return amount >= 0",
+                    },
+                    {
+                      "kind": "diff-add",
+                      "text": "return Number.isFinite(amount) && amount >= 0",
+                    },
+                    {
+                      "kind": "accent",
+                      "text": "test/payments.test.ts",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "No diff available for this file (only its path was reported).",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "diff",
+                "label": "Diff",
+              },
+              {
+                "body": {
+                  "follow": true,
+                  "id": "logs",
+                  "lines": [
+                    {
+                      "kind": "text",
+                      "text": "Read src/payments.ts",
+                    },
+                    {
+                      "kind": "error",
+                      "text": "Refund regression failed before the fix.",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "logs",
+                "label": "Logs",
+              },
+              {
+                "body": {
+                  "columns": [
+                    {
+                      "key": "action",
+                      "label": "Action",
+                    },
+                    {
+                      "key": "key",
+                      "label": "Key",
+                      "size": 5,
+                    },
+                    {
+                      "key": "available",
+                      "label": "Availability",
+                    },
+                  ],
+                  "id": "actions",
+                  "rows": [
+                    {
+                      "cells": {
+                        "action": "Open diff · Payment validation",
+                        "available": "View reported files",
+                        "key": "o",
+                      },
+                      "key": "["payments","open-diff"]",
+                    },
+                    {
+                      "cells": {
+                        "action": "Pause · Payment validation",
+                        "available": "Available",
+                        "key": "p",
+                      },
+                      "key": "["payments","pause"]",
+                    },
+                    {
+                      "cells": {
+                        "action": "Request changes · Payment validation",
+                        "available": "Available",
+                        "key": "r",
+                      },
+                      "key": "["payments","request-changes"]",
+                    },
+                    {
+                      "cells": {
+                        "action": "Stop agent · Payment validation",
+                        "available": "Available",
+                        "key": "x",
+                      },
+                      "key": "["payments","stop"]",
+                    },
+                  ],
+                  "type": "table",
+                },
+                "key": "actions",
+                "label": "Actions",
+              },
+              {
+                "body": {
+                  "id": "stats",
+                  "lines": [
+                    {
+                      "kind": "text",
+                      "text": "Time split · wall 90.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "First token wait           4.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Streaming                  25.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Model time (unclassified)  1.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Tools (interval union)     20.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Approval wait              5.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Idle                       3.00s",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "Intervals may overlap; these metrics do not add up to wall time.",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Per-tool table · count / total / average / maximum / outcomes",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "bash  2  25.00s / 12.50s / 15.00s  ok:1 error:1",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Failures",
+                    },
+                    {
+                      "kind": "error",
+                      "text": "09:01:40 bash: error Refund regression failed before the fix.",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Cost per agent · own usage only, no recursive totals",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Payment validation: $0.125",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Receipt templates: cost unknown",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Refund audit: $0.040",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "stats",
+                "label": "Stats",
+              },
+            ],
+            "type": "tabs",
+          },
+          "title": "Details · Payment validation",
+          "type": "box",
+        },
+        "size": 14,
+      },
+      {
+        "node": {
+          "id": undefined,
+          "lines": [
+            {
+              "kind": "muted",
+              "text": "Own reported usage only; missing costs are unknown.",
+            },
+            {
+              "kind": "muted",
+              "text": "o Open diff · p Pause · r Request changes · x Stop · a ⋮ Actions · Esc/q close",
+            },
+          ],
+          "type": "text",
+        },
+        "size": 2,
+      },
+    ],
+    "type": "column",
+  },
+  "viewport": {
+    "columns": 180,
+    "rows": 52,
+  },
+}
+`;
+
+exports[`public semantic rendering (not terminal raster snapshots) 180x52 agent widget contract 1`] = `
+{
+  "contract": "Public UiNode tree; viewport rows are metadata only",
+  "state": {
+    "activeTabs": {
+      "detail": "summary",
+    },
+    "expanded": {
+      "timeline": [
+        "phase:implementation",
+        "group:implementation:workers",
+        "agent:payments",
+        "agent:receipts",
+        "phase:review",
+        "group:review:workers",
+        "agent:audit",
+      ],
+    },
+    "focused": "detail",
+    "inputValues": {},
+    "scroll": {
+      "logs": {
+        "following": true,
+        "top": 0,
+      },
+    },
+    "selected": {
+      "actions": "open-diff",
+      "timeline": "agent:payments",
+    },
+  },
+  "title": "Dashboard · Agent",
+  "tree": {
+    "children": [
+      {
+        "node": {
+          "left": [
+            {
+              "kind": "accent",
+              "text": "amira · ",
+            },
+            {
+              "kind": "text",
+              "text": "acme/checkout  │ Implementation  │ 1/3 running  │ cost unknown",
+            },
+          ],
+          "right": [
+            {
+              "kind": "muted",
+              "text": "? help · b back · q quit",
+            },
+          ],
+          "type": "bar",
+        },
+        "size": 1,
+      },
+      {
+        "node": {
+          "label": "Payment validation · Checkout run",
+          "type": "rule",
+        },
+        "size": 1,
+      },
+      {
+        "node": {
+          "child": {
+            "id": "detail",
+            "tabs": [
+              {
+                "body": {
+                  "id": "summary",
+                  "lines": [
+                    {
+                      "kind": "text",
+                      "text": "● Payment validation · running · $0.125",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Validate payment amounts and add regression coverage for partial refunds.",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Amount validation is implemented; regression tests are in progress.",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "Own reported usage only; missing costs are unknown.",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "summary",
+                "label": "Summary",
+              },
+              {
+                "body": {
+                  "id": "diff",
+                  "lines": [
+                    {
+                      "kind": "accent",
+                      "text": "src/payments.ts",
+                    },
+                    {
+                      "kind": "diff-hunk",
+                      "text": "@@ -1 +1 @@",
+                    },
+                    {
+                      "kind": "diff-remove",
+                      "text": "return amount >= 0",
+                    },
+                    {
+                      "kind": "diff-add",
+                      "text": "return Number.isFinite(amount) && amount >= 0",
+                    },
+                    {
+                      "kind": "accent",
+                      "text": "test/payments.test.ts",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "No diff available for this file (only its path was reported).",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "diff",
+                "label": "Diff",
+              },
+              {
+                "body": {
+                  "follow": true,
+                  "id": "logs",
+                  "lines": [
+                    {
+                      "kind": "text",
+                      "text": "Read src/payments.ts",
+                    },
+                    {
+                      "kind": "error",
+                      "text": "Refund regression failed before the fix.",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "logs",
+                "label": "Logs",
+              },
+              {
+                "body": {
+                  "columns": [
+                    {
+                      "key": "action",
+                      "label": "Action",
+                    },
+                    {
+                      "key": "key",
+                      "label": "Key",
+                      "size": 5,
+                    },
+                    {
+                      "key": "available",
+                      "label": "Availability",
+                    },
+                  ],
+                  "id": "actions",
+                  "rows": [
+                    {
+                      "cells": {
+                        "action": "Open diff · Payment validation",
+                        "available": "View reported files",
+                        "key": "o",
+                      },
+                      "key": "["payments","open-diff"]",
+                    },
+                    {
+                      "cells": {
+                        "action": "Pause · Payment validation",
+                        "available": "Available",
+                        "key": "p",
+                      },
+                      "key": "["payments","pause"]",
+                    },
+                    {
+                      "cells": {
+                        "action": "Request changes · Payment validation",
+                        "available": "Available",
+                        "key": "r",
+                      },
+                      "key": "["payments","request-changes"]",
+                    },
+                    {
+                      "cells": {
+                        "action": "Stop agent · Payment validation",
+                        "available": "Available",
+                        "key": "x",
+                      },
+                      "key": "["payments","stop"]",
+                    },
+                  ],
+                  "type": "table",
+                },
+                "key": "actions",
+                "label": "Actions",
+              },
+              {
+                "body": {
+                  "id": "stats",
+                  "lines": [
+                    {
+                      "kind": "text",
+                      "text": "Time split · wall 90.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "First token wait           4.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Streaming                  25.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Model time (unclassified)  1.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Tools (interval union)     20.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Approval wait              5.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Idle                       3.00s",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "Intervals may overlap; these metrics do not add up to wall time.",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Per-tool table · count / total / average / maximum / outcomes",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "bash  2  25.00s / 12.50s / 15.00s  ok:1 error:1",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Failures",
+                    },
+                    {
+                      "kind": "error",
+                      "text": "09:01:40 bash: error Refund regression failed before the fix.",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Cost per agent · own usage only, no recursive totals",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Payment validation: $0.125",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Receipt templates: cost unknown",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Refund audit: $0.040",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "stats",
+                "label": "Stats",
+              },
+            ],
+            "type": "tabs",
+          },
+          "title": "Details · Payment validation",
+          "type": "box",
+        },
+      },
+      {
+        "node": {
+          "id": undefined,
+          "lines": [
+            {
+              "kind": "muted",
+              "text": "Own reported usage only; missing costs are unknown.",
+            },
+            {
+              "kind": "muted",
+              "text": "←→ tabs · b back to dashboard · Esc/q closes dashboard",
+            },
+          ],
+          "type": "text",
+        },
+        "size": 2,
+      },
+    ],
+    "type": "column",
+  },
+  "viewport": {
+    "columns": 180,
+    "rows": 52,
+  },
+}
+`;
+
+exports[`public semantic rendering (not terminal raster snapshots) 180x52 stats widget contract 1`] = `
+{
+  "contract": "Public UiNode tree; viewport rows are metadata only",
+  "state": {
+    "activeTabs": {
+      "detail": "stats",
+    },
+    "expanded": {
+      "timeline": [
+        "phase:implementation",
+        "group:implementation:workers",
+        "agent:payments",
+        "agent:receipts",
+        "phase:review",
+        "group:review:workers",
+        "agent:audit",
+      ],
+    },
+    "focused": "detail",
+    "inputValues": {},
+    "scroll": {
+      "logs": {
+        "following": true,
+        "top": 0,
+      },
+    },
+    "selected": {
+      "actions": "open-diff",
+      "timeline": "agent:payments",
+    },
+  },
+  "title": "Dashboard · Agent",
+  "tree": {
+    "children": [
+      {
+        "node": {
+          "left": [
+            {
+              "kind": "accent",
+              "text": "amira · ",
+            },
+            {
+              "kind": "text",
+              "text": "acme/checkout  │ Implementation  │ 1/3 running  │ cost unknown",
+            },
+          ],
+          "right": [
+            {
+              "kind": "muted",
+              "text": "? help · b back · q quit",
+            },
+          ],
+          "type": "bar",
+        },
+        "size": 1,
+      },
+      {
+        "node": {
+          "label": "Payment validation · Checkout run",
+          "type": "rule",
+        },
+        "size": 1,
+      },
+      {
+        "node": {
+          "child": {
+            "id": "detail",
+            "tabs": [
+              {
+                "body": {
+                  "id": "summary",
+                  "lines": [
+                    {
+                      "kind": "text",
+                      "text": "● Payment validation · running · $0.125",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Validate payment amounts and add regression coverage for partial refunds.",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Amount validation is implemented; regression tests are in progress.",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "Own reported usage only; missing costs are unknown.",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "summary",
+                "label": "Summary",
+              },
+              {
+                "body": {
+                  "id": "diff",
+                  "lines": [
+                    {
+                      "kind": "accent",
+                      "text": "src/payments.ts",
+                    },
+                    {
+                      "kind": "diff-hunk",
+                      "text": "@@ -1 +1 @@",
+                    },
+                    {
+                      "kind": "diff-remove",
+                      "text": "return amount >= 0",
+                    },
+                    {
+                      "kind": "diff-add",
+                      "text": "return Number.isFinite(amount) && amount >= 0",
+                    },
+                    {
+                      "kind": "accent",
+                      "text": "test/payments.test.ts",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "No diff available for this file (only its path was reported).",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "diff",
+                "label": "Diff",
+              },
+              {
+                "body": {
+                  "follow": true,
+                  "id": "logs",
+                  "lines": [
+                    {
+                      "kind": "text",
+                      "text": "Read src/payments.ts",
+                    },
+                    {
+                      "kind": "error",
+                      "text": "Refund regression failed before the fix.",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "logs",
+                "label": "Logs",
+              },
+              {
+                "body": {
+                  "columns": [
+                    {
+                      "key": "action",
+                      "label": "Action",
+                    },
+                    {
+                      "key": "key",
+                      "label": "Key",
+                      "size": 5,
+                    },
+                    {
+                      "key": "available",
+                      "label": "Availability",
+                    },
+                  ],
+                  "id": "actions",
+                  "rows": [
+                    {
+                      "cells": {
+                        "action": "Open diff · Payment validation",
+                        "available": "View reported files",
+                        "key": "o",
+                      },
+                      "key": "["payments","open-diff"]",
+                    },
+                    {
+                      "cells": {
+                        "action": "Pause · Payment validation",
+                        "available": "Available",
+                        "key": "p",
+                      },
+                      "key": "["payments","pause"]",
+                    },
+                    {
+                      "cells": {
+                        "action": "Request changes · Payment validation",
+                        "available": "Available",
+                        "key": "r",
+                      },
+                      "key": "["payments","request-changes"]",
+                    },
+                    {
+                      "cells": {
+                        "action": "Stop agent · Payment validation",
+                        "available": "Available",
+                        "key": "x",
+                      },
+                      "key": "["payments","stop"]",
+                    },
+                  ],
+                  "type": "table",
+                },
+                "key": "actions",
+                "label": "Actions",
+              },
+              {
+                "body": {
+                  "id": "stats",
+                  "lines": [
+                    {
+                      "kind": "text",
+                      "text": "Time split · wall 90.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "First token wait           4.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Streaming                  25.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Model time (unclassified)  1.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Tools (interval union)     20.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Approval wait              5.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Idle                       3.00s",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "Intervals may overlap; these metrics do not add up to wall time.",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Per-tool table · count / total / average / maximum / outcomes",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "bash  2  25.00s / 12.50s / 15.00s  ok:1 error:1",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Failures",
+                    },
+                    {
+                      "kind": "error",
+                      "text": "09:01:40 bash: error Refund regression failed before the fix.",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Cost per agent · own usage only, no recursive totals",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Payment validation: $0.125",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Receipt templates: cost unknown",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Refund audit: $0.040",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "stats",
+                "label": "Stats",
+              },
+            ],
+            "type": "tabs",
+          },
+          "title": "Details · Payment validation",
+          "type": "box",
+        },
+      },
+      {
+        "node": {
+          "id": undefined,
+          "lines": [
+            {
+              "kind": "muted",
+              "text": "Own reported usage only; missing costs are unknown.",
+            },
+            {
+              "kind": "muted",
+              "text": "←→ tabs · b back to dashboard · Esc/q closes dashboard",
+            },
+          ],
+          "type": "text",
+        },
+        "size": 2,
+      },
+    ],
+    "type": "column",
+  },
+  "viewport": {
+    "columns": 180,
+    "rows": 52,
+  },
+}
+`;
+
+exports[`public semantic rendering (not terminal raster snapshots) 80x24 timeline widget contract 1`] = `
+{
+  "contract": "Public UiNode tree; viewport rows are metadata only",
+  "state": {
+    "activeTabs": {
+      "detail": "summary",
+    },
+    "expanded": {
+      "timeline": [
+        "phase:implementation",
+        "group:implementation:workers",
+        "agent:payments",
+        "agent:receipts",
+        "phase:review",
+        "group:review:workers",
+        "agent:audit",
+      ],
+    },
+    "focused": "timeline",
+    "inputValues": {},
+    "scroll": {
+      "logs": {
+        "following": true,
+        "top": 0,
+      },
+    },
+    "selected": {
+      "actions": "open-diff",
+      "timeline": "agent:payments",
+    },
+  },
+  "title": "Dashboard · Checkout run",
+  "tree": {
+    "children": [
+      {
+        "node": {
+          "children": [
+            {
+              "node": {
+                "left": [
+                  {
+                    "kind": "accent",
+                    "text": "amira · ",
+                  },
+                  {
+                    "kind": "text",
+                    "text": "acme/checkout",
+                  },
+                ],
+                "right": [
+                  {
+                    "kind": "muted",
+                    "text": "? help",
+                  },
+                ],
+                "type": "bar",
+              },
+              "size": 1,
+            },
+            {
+              "node": {
+                "left": [
+                  {
+                    "kind": "text",
+                    "text": "Implementation  │ 1/3 running  │ cost unknown",
+                  },
+                ],
+                "type": "bar",
+              },
+              "size": 1,
+            },
+          ],
+          "type": "column",
+        },
+        "size": 2,
+      },
+      {
+        "node": {
+          "label": "Checkout run",
+          "type": "rule",
+        },
+        "size": 1,
+      },
+      {
+        "node": {
+          "id": "timeline",
+          "items": [
+            {
+              "aside": [
+                {
+                  "kind": "muted",
+                  "text": "▾",
+                },
+              ],
+              "children": [
+                {
+                  "aside": [
+                    {
+                      "kind": "muted",
+                      "text": "checkout-v2  ▾",
+                    },
+                  ],
+                  "children": [
+                    {
+                      "aside": [
+                        {
+                          "kind": "accent",
+                          "text": "running",
+                        },
+                      ],
+                      "detail": {
+                        "aside": "running",
+                        "child": {
+                          "children": [
+                            {
+                              "node": {
+                                "id": undefined,
+                                "lines": [
+                                  {
+                                    "kind": "text",
+                                    "text": "Validate payment amounts and add regression coverage for partial refunds.",
+                                  },
+                                ],
+                                "type": "text",
+                              },
+                              "size": 2,
+                            },
+                            {
+                              "node": {
+                                "label": "60%",
+                                "type": "progress",
+                                "value": 0.6,
+                                "width": 18,
+                              },
+                              "size": 1,
+                            },
+                            {
+                              "node": {
+                                "id": undefined,
+                                "lines": [
+                                  {
+                                    "kind": "muted",
+                                    "text": "2 files reported changed · $0.125",
+                                  },
+                                ],
+                                "type": "text",
+                              },
+                              "size": 1,
+                            },
+                            {
+                              "node": {
+                                "id": undefined,
+                                "lines": [
+                                  {
+                                    "kind": "code",
+                                    "text": "src/payments.ts",
+                                  },
+                                ],
+                                "type": "text",
+                              },
+                              "size": 1,
+                            },
+                            {
+                              "node": {
+                                "id": undefined,
+                                "lines": [
+                                  {
+                                    "kind": "accent",
+                                    "text": "o Open diff · p Pause · r Request changes · x Stop · a ⋮ Actions",
+                                  },
+                                ],
+                                "type": "text",
+                              },
+                              "size": 2,
+                            },
+                          ],
+                          "type": "column",
+                        },
+                        "title": {
+                          "kind": "segments",
+                          "parts": [
+                            {
+                              "kind": "accent",
+                              "text": "● Payment validation  ",
+                            },
+                            {
+                              "kind": "chip",
+                              "text": "TypeScript",
+                              "tone": "info",
+                            },
+                          ],
+                        },
+                        "type": "box",
+                      },
+                      "key": "agent:payments",
+                      "rail": true,
+                      "row": [
+                        {
+                          "kind": "accent",
+                          "text": "● Payment validation",
+                        },
+                      ],
+                    },
+                    {
+                      "aside": [
+                        {
+                          "kind": "muted",
+                          "text": "paused",
+                        },
+                      ],
+                      "detail": undefined,
+                      "key": "agent:receipts",
+                      "rail": true,
+                      "row": [
+                        {
+                          "kind": "muted",
+                          "text": "‖ Receipt templates",
+                        },
+                      ],
+                    },
+                  ],
+                  "key": "group:implementation:workers",
+                  "lead": [
+                    {
+                      "kind": "muted",
+                      "text": "09:00:30  ●",
+                    },
+                  ],
+                  "node": [
+                    {
+                      "kind": "accent",
+                      "text": "◉",
+                    },
+                  ],
+                  "rail": true,
+                  "row": [
+                    {
+                      "kind": "text",
+                      "text": "Checkout workers ×2",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "  1 running",
+                    },
+                  ],
+                  "underline": true,
+                },
+              ],
+              "key": "phase:implementation",
+              "node": [
+                {
+                  "kind": "accent",
+                  "text": "◉",
+                },
+              ],
+              "rail": true,
+              "row": [
+                {
+                  "kind": "accent",
+                  "text": "Implementation",
+                },
+              ],
+              "underline": true,
+            },
+            {
+              "aside": [
+                {
+                  "kind": "muted",
+                  "text": "▾",
+                },
+              ],
+              "children": [
+                {
+                  "aside": [
+                    {
+                      "kind": "muted",
+                      "text": "workers  ▾",
+                    },
+                  ],
+                  "children": [
+                    {
+                      "aside": [
+                        {
+                          "kind": "success",
+                          "text": "done",
+                        },
+                      ],
+                      "detail": undefined,
+                      "key": "agent:audit",
+                      "rail": true,
+                      "row": [
+                        {
+                          "kind": "success",
+                          "text": "✓ Refund audit",
+                        },
+                      ],
+                    },
+                  ],
+                  "key": "group:review:workers",
+                  "lead": [
+                    {
+                      "kind": "muted",
+                      "text": "09:00:00  ✓",
+                    },
+                  ],
+                  "node": [
+                    {
+                      "kind": "muted",
+                      "text": "○",
+                    },
+                  ],
+                  "rail": true,
+                  "row": [
+                    {
+                      "kind": "text",
+                      "text": "Security review ×1",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "  0 running",
+                    },
+                  ],
+                  "underline": true,
+                },
+              ],
+              "key": "phase:review",
+              "node": [
+                {
+                  "kind": "accent",
+                  "text": "◉",
+                },
+              ],
+              "rail": true,
+              "row": [
+                {
+                  "kind": "accent",
+                  "text": "Review",
+                },
+              ],
+              "underline": true,
+            },
+          ],
+          "type": "tree",
+        },
+      },
+      {
+        "node": {
+          "child": {
+            "id": "detail",
+            "tabs": [
+              {
+                "body": {
+                  "id": "summary",
+                  "lines": [
+                    {
+                      "kind": "text",
+                      "text": "● Payment validation · running · $0.125",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Validate payment amounts and add regression coverage for partial refunds.",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Amount validation is implemented; regression tests are in progress.",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "Own reported usage only; missing costs are unknown.",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "summary",
+                "label": "Summary",
+              },
+              {
+                "body": {
+                  "id": "diff",
+                  "lines": [
+                    {
+                      "kind": "accent",
+                      "text": "src/payments.ts",
+                    },
+                    {
+                      "kind": "diff-hunk",
+                      "text": "@@ -1 +1 @@",
+                    },
+                    {
+                      "kind": "diff-remove",
+                      "text": "return amount >= 0",
+                    },
+                    {
+                      "kind": "diff-add",
+                      "text": "return Number.isFinite(amount) && amount >= 0",
+                    },
+                    {
+                      "kind": "accent",
+                      "text": "test/payments.test.ts",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "No diff available for this file (only its path was reported).",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "diff",
+                "label": "Diff",
+              },
+              {
+                "body": {
+                  "follow": true,
+                  "id": "logs",
+                  "lines": [
+                    {
+                      "kind": "text",
+                      "text": "Read src/payments.ts",
+                    },
+                    {
+                      "kind": "error",
+                      "text": "Refund regression failed before the fix.",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "logs",
+                "label": "Logs",
+              },
+              {
+                "body": {
+                  "columns": [
+                    {
+                      "key": "action",
+                      "label": "Action",
+                    },
+                    {
+                      "key": "key",
+                      "label": "Key",
+                      "size": 5,
+                    },
+                    {
+                      "key": "available",
+                      "label": "Availability",
+                    },
+                  ],
+                  "id": "actions",
+                  "rows": [
+                    {
+                      "cells": {
+                        "action": "Open diff · Payment validation",
+                        "available": "View reported files",
+                        "key": "o",
+                      },
+                      "key": "["payments","open-diff"]",
+                    },
+                    {
+                      "cells": {
+                        "action": "Pause · Payment validation",
+                        "available": "Available",
+                        "key": "p",
+                      },
+                      "key": "["payments","pause"]",
+                    },
+                    {
+                      "cells": {
+                        "action": "Request changes · Payment validation",
+                        "available": "Available",
+                        "key": "r",
+                      },
+                      "key": "["payments","request-changes"]",
+                    },
+                    {
+                      "cells": {
+                        "action": "Stop agent · Payment validation",
+                        "available": "Available",
+                        "key": "x",
+                      },
+                      "key": "["payments","stop"]",
+                    },
+                  ],
+                  "type": "table",
+                },
+                "key": "actions",
+                "label": "Actions",
+              },
+              {
+                "body": {
+                  "id": "stats",
+                  "lines": [
+                    {
+                      "kind": "text",
+                      "text": "Time split · wall 90.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "First token wait           4.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Streaming                  25.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Model time (unclassified)  1.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Tools (interval union)     20.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Approval wait              5.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Idle                       3.00s",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "Intervals may overlap; these metrics do not add up to wall time.",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Per-tool table · count / total / average / maximum / outcomes",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "bash  2  25.00s / 12.50s / 15.00s  ok:1 error:1",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Failures",
+                    },
+                    {
+                      "kind": "error",
+                      "text": "09:01:40 bash: error Refund regression failed before the fix.",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Cost per agent · own usage only, no recursive totals",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Payment validation: $0.125",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Receipt templates: cost unknown",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Refund audit: $0.040",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "stats",
+                "label": "Stats",
+              },
+            ],
+            "type": "tabs",
+          },
+          "title": "Details · Payment validation",
+          "type": "box",
+        },
+        "size": 7,
+      },
+      {
+        "node": {
+          "id": undefined,
+          "lines": [
+            {
+              "kind": "muted",
+              "text": "Own reported usage only; missing costs are unknown.",
+            },
+            {
+              "kind": "muted",
+              "text": "o Open diff · p Pause · r Request changes · x Stop · a ⋮ Actions · Esc/q close",
+            },
+          ],
+          "type": "text",
+        },
+        "size": 3,
+      },
+    ],
+    "type": "column",
+  },
+  "viewport": {
+    "columns": 80,
+    "rows": 24,
+  },
+}
+`;
+
+exports[`public semantic rendering (not terminal raster snapshots) 80x24 agent widget contract 1`] = `
+{
+  "contract": "Public UiNode tree; viewport rows are metadata only",
+  "state": {
+    "activeTabs": {
+      "detail": "summary",
+    },
+    "expanded": {
+      "timeline": [
+        "phase:implementation",
+        "group:implementation:workers",
+        "agent:payments",
+        "agent:receipts",
+        "phase:review",
+        "group:review:workers",
+        "agent:audit",
+      ],
+    },
+    "focused": "detail",
+    "inputValues": {},
+    "scroll": {
+      "logs": {
+        "following": true,
+        "top": 0,
+      },
+    },
+    "selected": {
+      "actions": "open-diff",
+      "timeline": "agent:payments",
+    },
+  },
+  "title": "Dashboard · Agent",
+  "tree": {
+    "children": [
+      {
+        "node": {
+          "children": [
+            {
+              "node": {
+                "left": [
+                  {
+                    "kind": "accent",
+                    "text": "amira · ",
+                  },
+                  {
+                    "kind": "text",
+                    "text": "acme/checkout",
+                  },
+                ],
+                "right": [
+                  {
+                    "kind": "muted",
+                    "text": "? help",
+                  },
+                ],
+                "type": "bar",
+              },
+              "size": 1,
+            },
+            {
+              "node": {
+                "left": [
+                  {
+                    "kind": "text",
+                    "text": "Implementation  │ 1/3 running  │ cost unknown",
+                  },
+                ],
+                "type": "bar",
+              },
+              "size": 1,
+            },
+          ],
+          "type": "column",
+        },
+        "size": 2,
+      },
+      {
+        "node": {
+          "label": "Payment validation · Checkout run",
+          "type": "rule",
+        },
+        "size": 1,
+      },
+      {
+        "node": {
+          "child": {
+            "id": "detail",
+            "tabs": [
+              {
+                "body": {
+                  "id": "summary",
+                  "lines": [
+                    {
+                      "kind": "text",
+                      "text": "● Payment validation · running · $0.125",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Validate payment amounts and add regression coverage for partial refunds.",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Amount validation is implemented; regression tests are in progress.",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "Own reported usage only; missing costs are unknown.",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "summary",
+                "label": "Summary",
+              },
+              {
+                "body": {
+                  "id": "diff",
+                  "lines": [
+                    {
+                      "kind": "accent",
+                      "text": "src/payments.ts",
+                    },
+                    {
+                      "kind": "diff-hunk",
+                      "text": "@@ -1 +1 @@",
+                    },
+                    {
+                      "kind": "diff-remove",
+                      "text": "return amount >= 0",
+                    },
+                    {
+                      "kind": "diff-add",
+                      "text": "return Number.isFinite(amount) && amount >= 0",
+                    },
+                    {
+                      "kind": "accent",
+                      "text": "test/payments.test.ts",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "No diff available for this file (only its path was reported).",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "diff",
+                "label": "Diff",
+              },
+              {
+                "body": {
+                  "follow": true,
+                  "id": "logs",
+                  "lines": [
+                    {
+                      "kind": "text",
+                      "text": "Read src/payments.ts",
+                    },
+                    {
+                      "kind": "error",
+                      "text": "Refund regression failed before the fix.",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "logs",
+                "label": "Logs",
+              },
+              {
+                "body": {
+                  "columns": [
+                    {
+                      "key": "action",
+                      "label": "Action",
+                    },
+                    {
+                      "key": "key",
+                      "label": "Key",
+                      "size": 5,
+                    },
+                    {
+                      "key": "available",
+                      "label": "Availability",
+                    },
+                  ],
+                  "id": "actions",
+                  "rows": [
+                    {
+                      "cells": {
+                        "action": "Open diff · Payment validation",
+                        "available": "View reported files",
+                        "key": "o",
+                      },
+                      "key": "["payments","open-diff"]",
+                    },
+                    {
+                      "cells": {
+                        "action": "Pause · Payment validation",
+                        "available": "Available",
+                        "key": "p",
+                      },
+                      "key": "["payments","pause"]",
+                    },
+                    {
+                      "cells": {
+                        "action": "Request changes · Payment validation",
+                        "available": "Available",
+                        "key": "r",
+                      },
+                      "key": "["payments","request-changes"]",
+                    },
+                    {
+                      "cells": {
+                        "action": "Stop agent · Payment validation",
+                        "available": "Available",
+                        "key": "x",
+                      },
+                      "key": "["payments","stop"]",
+                    },
+                  ],
+                  "type": "table",
+                },
+                "key": "actions",
+                "label": "Actions",
+              },
+              {
+                "body": {
+                  "id": "stats",
+                  "lines": [
+                    {
+                      "kind": "text",
+                      "text": "Time split · wall 90.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "First token wait           4.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Streaming                  25.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Model time (unclassified)  1.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Tools (interval union)     20.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Approval wait              5.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Idle                       3.00s",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "Intervals may overlap; these metrics do not add up to wall time.",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Per-tool table · count / total / average / maximum / outcomes",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "bash  2  25.00s / 12.50s / 15.00s  ok:1 error:1",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Failures",
+                    },
+                    {
+                      "kind": "error",
+                      "text": "09:01:40 bash: error Refund regression failed before the fix.",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Cost per agent · own usage only, no recursive totals",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Payment validation: $0.125",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Receipt templates: cost unknown",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Refund audit: $0.040",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "stats",
+                "label": "Stats",
+              },
+            ],
+            "type": "tabs",
+          },
+          "title": "Details · Payment validation",
+          "type": "box",
+        },
+      },
+      {
+        "node": {
+          "id": undefined,
+          "lines": [
+            {
+              "kind": "muted",
+              "text": "Own reported usage only; missing costs are unknown.",
+            },
+            {
+              "kind": "muted",
+              "text": "←→ tabs · b back to dashboard · Esc/q closes dashboard",
+            },
+          ],
+          "type": "text",
+        },
+        "size": 3,
+      },
+    ],
+    "type": "column",
+  },
+  "viewport": {
+    "columns": 80,
+    "rows": 24,
+  },
+}
+`;
+
+exports[`public semantic rendering (not terminal raster snapshots) 80x24 stats widget contract 1`] = `
+{
+  "contract": "Public UiNode tree; viewport rows are metadata only",
+  "state": {
+    "activeTabs": {
+      "detail": "stats",
+    },
+    "expanded": {
+      "timeline": [
+        "phase:implementation",
+        "group:implementation:workers",
+        "agent:payments",
+        "agent:receipts",
+        "phase:review",
+        "group:review:workers",
+        "agent:audit",
+      ],
+    },
+    "focused": "detail",
+    "inputValues": {},
+    "scroll": {
+      "logs": {
+        "following": true,
+        "top": 0,
+      },
+    },
+    "selected": {
+      "actions": "open-diff",
+      "timeline": "agent:payments",
+    },
+  },
+  "title": "Dashboard · Agent",
+  "tree": {
+    "children": [
+      {
+        "node": {
+          "children": [
+            {
+              "node": {
+                "left": [
+                  {
+                    "kind": "accent",
+                    "text": "amira · ",
+                  },
+                  {
+                    "kind": "text",
+                    "text": "acme/checkout",
+                  },
+                ],
+                "right": [
+                  {
+                    "kind": "muted",
+                    "text": "? help",
+                  },
+                ],
+                "type": "bar",
+              },
+              "size": 1,
+            },
+            {
+              "node": {
+                "left": [
+                  {
+                    "kind": "text",
+                    "text": "Implementation  │ 1/3 running  │ cost unknown",
+                  },
+                ],
+                "type": "bar",
+              },
+              "size": 1,
+            },
+          ],
+          "type": "column",
+        },
+        "size": 2,
+      },
+      {
+        "node": {
+          "label": "Payment validation · Checkout run",
+          "type": "rule",
+        },
+        "size": 1,
+      },
+      {
+        "node": {
+          "child": {
+            "id": "detail",
+            "tabs": [
+              {
+                "body": {
+                  "id": "summary",
+                  "lines": [
+                    {
+                      "kind": "text",
+                      "text": "● Payment validation · running · $0.125",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Validate payment amounts and add regression coverage for partial refunds.",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Amount validation is implemented; regression tests are in progress.",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "Own reported usage only; missing costs are unknown.",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "summary",
+                "label": "Summary",
+              },
+              {
+                "body": {
+                  "id": "diff",
+                  "lines": [
+                    {
+                      "kind": "accent",
+                      "text": "src/payments.ts",
+                    },
+                    {
+                      "kind": "diff-hunk",
+                      "text": "@@ -1 +1 @@",
+                    },
+                    {
+                      "kind": "diff-remove",
+                      "text": "return amount >= 0",
+                    },
+                    {
+                      "kind": "diff-add",
+                      "text": "return Number.isFinite(amount) && amount >= 0",
+                    },
+                    {
+                      "kind": "accent",
+                      "text": "test/payments.test.ts",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "No diff available for this file (only its path was reported).",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "diff",
+                "label": "Diff",
+              },
+              {
+                "body": {
+                  "follow": true,
+                  "id": "logs",
+                  "lines": [
+                    {
+                      "kind": "text",
+                      "text": "Read src/payments.ts",
+                    },
+                    {
+                      "kind": "error",
+                      "text": "Refund regression failed before the fix.",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "logs",
+                "label": "Logs",
+              },
+              {
+                "body": {
+                  "columns": [
+                    {
+                      "key": "action",
+                      "label": "Action",
+                    },
+                    {
+                      "key": "key",
+                      "label": "Key",
+                      "size": 5,
+                    },
+                    {
+                      "key": "available",
+                      "label": "Availability",
+                    },
+                  ],
+                  "id": "actions",
+                  "rows": [
+                    {
+                      "cells": {
+                        "action": "Open diff · Payment validation",
+                        "available": "View reported files",
+                        "key": "o",
+                      },
+                      "key": "["payments","open-diff"]",
+                    },
+                    {
+                      "cells": {
+                        "action": "Pause · Payment validation",
+                        "available": "Available",
+                        "key": "p",
+                      },
+                      "key": "["payments","pause"]",
+                    },
+                    {
+                      "cells": {
+                        "action": "Request changes · Payment validation",
+                        "available": "Available",
+                        "key": "r",
+                      },
+                      "key": "["payments","request-changes"]",
+                    },
+                    {
+                      "cells": {
+                        "action": "Stop agent · Payment validation",
+                        "available": "Available",
+                        "key": "x",
+                      },
+                      "key": "["payments","stop"]",
+                    },
+                  ],
+                  "type": "table",
+                },
+                "key": "actions",
+                "label": "Actions",
+              },
+              {
+                "body": {
+                  "id": "stats",
+                  "lines": [
+                    {
+                      "kind": "text",
+                      "text": "Time split · wall 90.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "First token wait           4.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Streaming                  25.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Model time (unclassified)  1.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Tools (interval union)     20.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Approval wait              5.00s",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Idle                       3.00s",
+                    },
+                    {
+                      "kind": "muted",
+                      "text": "Intervals may overlap; these metrics do not add up to wall time.",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Per-tool table · count / total / average / maximum / outcomes",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "bash  2  25.00s / 12.50s / 15.00s  ok:1 error:1",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Failures",
+                    },
+                    {
+                      "kind": "error",
+                      "text": "09:01:40 bash: error Refund regression failed before the fix.",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Cost per agent · own usage only, no recursive totals",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Payment validation: $0.125",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Receipt templates: cost unknown",
+                    },
+                    {
+                      "kind": "text",
+                      "text": "Refund audit: $0.040",
+                    },
+                  ],
+                  "type": "text",
+                },
+                "key": "stats",
+                "label": "Stats",
+              },
+            ],
+            "type": "tabs",
+          },
+          "title": "Details · Payment validation",
+          "type": "box",
+        },
+      },
+      {
+        "node": {
+          "id": undefined,
+          "lines": [
+            {
+              "kind": "muted",
+              "text": "Own reported usage only; missing costs are unknown.",
+            },
+            {
+              "kind": "muted",
+              "text": "←→ tabs · b back to dashboard · Esc/q closes dashboard",
+            },
+          ],
+          "type": "text",
+        },
+        "size": 3,
+      },
+    ],
+    "type": "column",
+  },
+  "viewport": {
+    "columns": 80,
+    "rows": 24,
+  },
+}
+`;
