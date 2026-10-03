@@ -126,6 +126,15 @@
       "engines": { "amira": "^0.1.3" },
       "tags": ["mermaid", "diagrams", "flowchart", "sequence", "markdown"],
       "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/mermaid"
+    },
+    {
+      "name": "latex",
+      "description": "LaTeX math, latex and tex fences as Unicode text or offline KaTeX pictures with the browser and images extensions",
+      "version": "0.1.0",
+      "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/latex" },
+      "engines": { "amira": "^0.1.3" },
+      "tags": ["latex", "math", "katex", "markdown"],
+      "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/latex"
     }
   ]
 }
