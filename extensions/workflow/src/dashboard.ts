@@ -1,5 +1,5 @@
 import path from "node:path"
-import type { ExtensionAPI, TraceSummary, ViewLine } from "@amira/api"
+import type { ExtensionAPI, TraceSummary, UiNode, ViewLine } from "@amira/api"
 import { type JournalEntry, listRuns, type RunRecord, readJournal } from "./journal.ts"
 import { type AgentNode, type FlowNode, formatTokens, runStateText } from "./progress.ts"
 import type { WorkflowRun } from "./run.ts"
@@ -8,6 +8,7 @@ import type { WorkflowRun } from "./run.ts"
 // AmiraServices augmentation: installing two adapters must not conflict during declaration merging.
 export interface DashboardAgent {
   id: string
+  sessionId?: string
   name: string
   task: string
   status: "queued" | "running" | "idle" | "paused" | "done" | "failed" | "stopped"
@@ -28,6 +29,7 @@ export interface DashboardDetails {
   summary: ViewLine[]
   logs: ViewLine[]
   stats?: TraceSummary
+  tabs?: { key: string; label: string; render(): UiNode | ViewLine[] }[]
 }
 export interface DashboardSource {
   id: string
@@ -85,6 +87,7 @@ export function createWorkflowSource(workspace: string) {
           const id = `${prefix}:call:${node.call}`
           group.agents.push({
             id,
+            ...(node.childId !== undefined ? { sessionId: node.childId } : {}),
             name: node.label,
             task: node.prompt ?? node.label,
             status: dashboardStatus(node.status),
@@ -191,7 +194,7 @@ export function createWorkflowSource(workspace: string) {
     snapshot: () => ({
       workspace,
       phases,
-      note: "Own agent usage only; unknown cost stays unknown. Cached calls spend no new tokens or cost. Child session IDs are informational, not navigation links.",
+      note: "Own agent usage only; unknown cost stays unknown. Cached calls spend no new tokens or cost.",
     }),
     details: (id) => details.get(id),
     subscribe(changed) {

@@ -48,10 +48,14 @@ test("the estimate counts agent() calls, and says dynamic for loops, maps and pi
   expect(sizeLine(estimate(loop))).toBe("1 or more (some run in loops)")
   // Whether the run changes the user's files directly or through worktrees merged back.
   expect(workspaceLine(loop)).toContain("can change your files")
-  expect(workspaceLine(`${loop}
-agent("x", { isolation: "worktree" })`)).toContain("their own git worktrees")
-  expect(workspaceLine(`${loop}
-// agent("x", { isolation: "worktree" })`)).not.toContain("worktrees")
+  expect(
+    workspaceLine(`${loop}
+agent("x", { isolation: "worktree" })`),
+  ).toContain("their own git worktrees")
+  expect(
+    workspaceLine(`${loop}
+// agent("x", { isolation: "worktree" })`),
+  ).not.toContain("worktrees")
   expect(
     estimate(`export const meta = { name: "a", description: "d", phases: [] }\nreturn workflow("x")`).dynamic,
   ).toBe(true)

@@ -9,7 +9,7 @@ import {
   type DashboardSource,
   type DashboardSources,
 } from "../src/dashboard.ts"
-import { Journal, type RunRecord, writeRun } from "../src/journal.ts"
+import { callHash, Journal, type RunRecord, writeRun } from "../src/journal.ts"
 import { WorkflowRun } from "../src/run.ts"
 import { fakeGroup } from "./fakes.ts"
 
@@ -137,7 +137,7 @@ test("a replacement workflow instance retries registration after the old owner r
   expect(dashboard.sources.get("workflow")).toBe(source)
 })
 
-test("finished run loading exposes script phases and call details without fabricated navigation", () => {
+test("finished run loading exposes script phases, call details, and original child session IDs", () => {
   const root = tmp()
   const dir = path.join(root, "wf_saved")
   const record: RunRecord = {
@@ -209,7 +209,8 @@ test("finished run loading exposes script phases and call details without fabric
   })
   expect(agents[1]!.cost).toBeUndefined()
   expect(agents[1]!.progress).toBeUndefined()
-  expect(agents[1]).not.toHaveProperty("sessionId")
+  expect(agents.map((agent) => agent.sessionId)).toEqual(["original-child", "child-2"])
+  expect(snapshot.note).not.toContain("informational")
   expect(agents[1]).not.toHaveProperty("tokens")
   const details = adapter.source.details(agents[1]!.id)!
   expect(details.summary.map(lineText).join("\n")).toContain("Child session: child-2")
@@ -249,7 +250,91 @@ test("legacy resumed runs retain calls without attempt metadata", () => {
   adapter.load([root])
   const agent = adapter.source.snapshot().phases[0]!.groups[0]!.agents[0]!
   expect(agent.status).toBe("done")
+  expect(agent.sessionId).toBe("old-child")
   expect(adapter.source.details(agent.id)!.summary.map(lineText)).toContain("Child session: old-child")
+})
+
+test.each(["original-child", undefined])(
+  "cached calls preserve child session ID %s live and after reload",
+  async (sessionId) => {
+    const root = tmp()
+    const adapter = createWorkflowSource(root)
+    const group = fakeGroup({ name: "cached" }, () => ({ text: "must not spawn" }))
+    const run = new WorkflowRun({
+      id: "wf_cached",
+      dir: path.join(root, "wf_cached"),
+      source: `export const meta = { name: "cached", description: "Replay", phases: [] }
+        return await agent("Read files")`,
+      origin: "inline",
+      args: null,
+      group,
+      cwd: root,
+      home: root,
+      previous: [
+        {
+          key: `${callHash("Read files", {})}#0`,
+          label: "Read files",
+          text: "Saved result",
+          durationMs: 5,
+          sessionId,
+        },
+      ],
+      resumes: 1,
+      roles: () => new Map(),
+      git: async () => ({ ok: false, output: "" }),
+      loadWorkflow: () => undefined,
+      onChange: () => adapter.update(run),
+    })
+    run.start()
+    await run.done
+    expect(run.error).toBeUndefined()
+    expect(run.result).toBe("Saved result")
+    expect(group.spawned).toHaveLength(0)
+    const saved = createWorkflowSource(root)
+    saved.load([root])
+    for (const source of [adapter.source, saved.source]) {
+      const agent = source.snapshot().phases[0]!.groups[0]!.agents[0]!
+      expect(agent.sessionId).toBe(sessionId)
+      if (sessionId === undefined) expect(agent).not.toHaveProperty("sessionId")
+      expect(agent).toMatchObject({ status: "done", cost: 0, progress: 1 })
+      expect(source.details(agent.id)!.summary.map(lineText).join("\n")).toContain("cached")
+    }
+    expect(saved.source.snapshot().phases).toEqual(adapter.source.snapshot().phases)
+  },
+)
+
+test("pre-spawn failures have no child session ID live or after reload", async () => {
+  const root = tmp()
+  const adapter = createWorkflowSource(root)
+  const group = fakeGroup({ name: "invalid" }, () => ({ text: "must not spawn" }))
+  const run = new WorkflowRun({
+    id: "wf_invalid",
+    dir: path.join(root, "wf_invalid"),
+    source: `export const meta = { name: "invalid", description: "Invalid call", phases: [] }
+      return await agent("Read files", { model: "invalid" })`,
+    origin: "inline",
+    args: null,
+    group,
+    cwd: root,
+    home: root,
+    roles: () => new Map(),
+    git: async () => ({ ok: false, output: "" }),
+    loadWorkflow: () => undefined,
+    onChange: () => adapter.update(run),
+  })
+  run.start()
+  await run.done
+  expect(run.error).toContain("provider/model")
+  expect(group.spawned).toHaveLength(0)
+  const saved = createWorkflowSource(root)
+  saved.load([root])
+  for (const source of [adapter.source, saved.source]) {
+    const agent = source.snapshot().phases[0]!.groups[0]!.agents[0]!
+    expect(agent.status).toBe("failed")
+    expect(agent).not.toHaveProperty("sessionId")
+    expect(source.details(agent.id)!.summary.map(lineText)).toContain("Child session: none")
+  }
+  expect(saved.source.snapshot().phases).toEqual(adapter.source.snapshot().phases)
 })
 
 test("nested invocations keep separate groups and stable identities after reload", async () => {
@@ -321,6 +406,7 @@ test("live call and completion changes notify the registry with coherent details
     .phases.flatMap((phase) => phase.groups.flatMap((item) => item.agents))[0]!
   expect(["queued", "running"]).toContain(before.status)
   expect(before.cost).toBeUndefined()
+  expect(before.sessionId).toBe("s_child1")
   expect(adapter.source.details(before.id)!.summary.map(lineText)).toContain("Child session: s_child1")
   const changes = dashboard.changes
   release()
@@ -328,7 +414,13 @@ test("live call and completion changes notify the registry with coherent details
   const after = adapter.source
     .snapshot()
     .phases.flatMap((phase) => phase.groups.flatMap((item) => item.agents))[0]!
-  expect(after).toMatchObject({ id: before.id, status: "done", cost: 0.03, progress: 1 })
+  expect(after).toMatchObject({
+    id: before.id,
+    sessionId: "s_child1",
+    status: "done",
+    cost: 0.03,
+    progress: 1,
+  })
   expect(dashboard.changes).toBeGreaterThan(changes)
   expect(adapter.source.details(after.id)!.logs.map(lineText)).toContain("Checked")
   expect(adapter.source.details(after.id)!.summary.map(lineText).join("\n")).toContain("Tokens: 25")

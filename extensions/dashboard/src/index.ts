@@ -169,7 +169,7 @@ export default defineExtension((api) => {
                 : "This dashboard source is no longer available.",
           }
         : source
-      const data: DashboardViewData = { source: guarded }
+      const data: DashboardViewData = { source: guarded, session: ctx.session }
       if (live) liveSources.set(live, { sessionId, dispose: () => live.dispose() })
       if (!ctx.openView({ kind: VIEW_KIND, data })) {
         live?.dispose()

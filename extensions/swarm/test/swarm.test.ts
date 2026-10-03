@@ -1159,6 +1159,10 @@ test("start maps child sessions and end records round-trip each member's own tot
   )
   expect(new Set(start.members.map((member) => member.sessionId)).size).toBe(2)
   expect(start.members.every((member) => !!member.sessionId)).toBe(true)
+  const source = createSwarmSource("workspace", () => [swarm.snapshot()]).source
+  expect(source.snapshot().phases[0]!.groups[0]!.agents.map((agent) => agent.sessionId)).toEqual(
+    start.members.map((member) => member.sessionId),
+  )
   const report = await swarm.done
   const end = records.at(-1)!
   expect(end.type).toBe("end")

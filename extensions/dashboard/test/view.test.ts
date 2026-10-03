@@ -168,6 +168,19 @@ describe("public semantic rendering (not terminal raster snapshots)", () => {
     }
   })
 
+  test("unselected and phase-selected details stay at minimum height", () => {
+    const fixture = viewFixture()
+    fixture.data.selected = undefined
+    for (const selected of [undefined, "phase:implementation", "group:implementation:workers"]) {
+      fixture.state.selected = selected ? { timeline: selected } : {}
+      for (const width of [80, 180]) {
+        const tree = dashboardView.ui!(fixture.data, fixture.context(width, 51))
+        if (tree.type !== "column") throw new Error("Missing layout")
+        expect(tree.children.find(({ node }) => node.type === "box")?.size).toBe(7)
+      }
+    }
+  })
+
   test("timeline defaults expanded and hints match each agent's capabilities", () => {
     const fixture = viewFixture()
     fixture.state.expanded = {}
@@ -279,19 +292,13 @@ describe("public events and host-owned navigation", () => {
     expect(tabs.tabs.map((tab) => tab.key)).toEqual(["summary", "diff", "logs", "actions"])
   })
 
-  test("e expands stable phase/group/agent keys and a focuses actions", () => {
+  test("e restores expand-all mode and a focuses actions", () => {
     const fixture = viewFixture()
     fixture.state.expanded = {}
     key(fixture, "e")
-    expect(fixture.state.expanded.timeline).toEqual([
-      "phase:implementation",
-      "group:implementation:workers",
-      "agent:payments",
-      "agent:receipts",
-      "phase:review",
-      "group:review:workers",
-      "agent:audit",
-    ])
+    expect(fixture.state.expanded).toEqual({})
+    const tree = widget(fixture, "timeline")
+    expect(tree.type === "tree" && tree.expanded).toBe("all")
     key(fixture, "a")
     expect(fixture.data.tab).toBe("actions")
     expect(fixture.state.focused).toBe("actions")

@@ -108,17 +108,22 @@ The dashboard itself requires its newer Amira API; this adapter uses the optiona
 
 - **Summary** shows the brief, last model reply, result, token usage, known cost, duration,
   child session ID and error. Unknown costs are not displayed as zero; known zero cost is.
-- **Logs** shows the shared blackboard and the last 200 timeline entries, including
-  messages, writes and finishes. Long text is clipped for display; saved records remain intact.
+- **Board** shows the shared blackboard; **Messages** shows the last 200 timeline entries,
+  including messages, writes and finishes. Both tabs show an empty state before anything is
+  recorded. Long text is clipped for display; saved records remain intact. **Logs** points
+  to these tabs rather than repeating their contents.
 - Changes appear while the swarm runs. Ended swarms reconstruct from the session records
   after resume or extension reload; an interrupted swarm or old member without a recorded
   outcome is shown as stopped, not assumed successful.
 
+Since 0.1.6, the adapter supplies dedicated Board and Messages tabs and each member's
+recorded child session ID. With a dashboard that supports these optional fields, its session
+navigation opens the member's conversation. Old records without a session ID still show
+Summary and the shared tabs, but cannot offer session navigation; no ID is invented.
+Older dashboards can ignore the optional fields and still read Summary and Logs.
+
 This source is read-only. Use `/swarm` commands to message, pause, resume or stop members.
-The current dashboard contract has no custom tabs, token or session-ID fields, or transcript
-navigation action, so these details use its existing Summary and Logs tabs. Session IDs
-are displayed for identification, not as invented transcript links. No file changes or
-progress percentages are inferred.
+No file changes or progress percentages are inferred.
 
 Registration tolerates dashboard being absent, loaded later or reloaded. The API has no
 extension-unload callback or service-change event: a host-owned `swarm.dashboardSource`

@@ -222,6 +222,7 @@ test("uses authoritative statuses and costs without estimated progress or durati
     ),
   )
   const listed = agentsOf(s.source.snapshot())
+  expect(listed.map((agent) => agent.sessionId)).toEqual(listed.map((agent) => agent.id))
   expect(listed.map((a) => a.status)).toEqual([
     "queued",
     "running",
@@ -528,6 +529,7 @@ test("streaming, logs, paths and active detail caches are bounded", () => {
   s.setAgents(Array.from({ length: 129 }, (_, i) => agent(`child-${i}`)))
   for (let i = 0; i < 129; i++) writeEvent(s, `child-${i}`)
   const listed = agentsOf(s.source.snapshot())
+  expect(listed.map((agent) => agent.sessionId)).toEqual(listed.map((agent) => agent.id))
   expect(listed[0]?.files).toEqual([])
   expect(listed.at(-1)?.files).toEqual([{ path: "src/result.ts" }])
   s.source.dispose()
