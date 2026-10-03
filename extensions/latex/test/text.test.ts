@@ -213,7 +213,9 @@ describe("latexToText", () => {
   })
 
   test("applies a script to the whole fraction before it", () => {
-    expect(latexToText(String.raw`\frac{a}{b}^2 + \frac{a}{b}_i + \frac{a}{b} x`)).toBe("(a/b)² + (a/b)ᵢ + a/b x")
+    expect(latexToText(String.raw`\frac{a}{b}^2 + \frac{a}{b}_i + \frac{a}{b} x`)).toBe(
+      "(a/b)² + (a/b)ᵢ + a/b x",
+    )
   })
 
   test("drops layout environment wrappers but keeps rows", () => {

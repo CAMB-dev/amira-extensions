@@ -169,7 +169,8 @@ const symbols: Record<string, string> = {
   "\\": "\n",
 }
 
-const ENVIRONMENTS = /^(?:aligned|align|alignat|split|gather|gathered|equation|array|cases|[pbBvV]?matrix|smallmatrix)\*?$/
+const ENVIRONMENTS =
+  /^(?:aligned|align|alignat|split|gather|gathered|equation|array|cases|[pbBvV]?matrix|smallmatrix)\*?$/
 
 function characterMap(from: string, to: string): Map<string, string> {
   const values = [...to]
