@@ -11,6 +11,7 @@ import {
 } from "@amira/api"
 import { Agent, AgentTree, EventBus, ExtensionHost, InterceptorRegistry, ToolRegistry } from "@amira/core"
 import { Blackboard } from "../src/blackboard.ts"
+import { createSwarmSource } from "../src/dashboard.ts"
 import {
   createSwarmExtension,
   DATA_KEY,
@@ -501,7 +502,9 @@ test("the model may propose a swarm: the confirmation, marked as its proposal, i
     "Agents: 2, all at once; each works up to 20 turns and sends up to 30 messages (150 in all).",
   )
   expect(seen[0]!.message).toContain("Cost: stops at 3,000,000 tokens.")
-  expect(seen[0]!.message).toContain("Files: the members work in your working tree and can change your files.")
+  expect(seen[0]!.message).toContain(
+    "Files: the members work in your working tree and can change your files.",
+  )
   await until(() => root.messages.some((m) => m.role === "user" && m.display?.origin === "swarm"))
 })
 
@@ -1117,4 +1120,188 @@ test("a message to all goes to the members that can still get it, and says when 
   expect(records.filter((r) => r.type === "message")).toMatchObject([
     { from: "user", to: "all", text: "only b" },
   ])
+})
+
+test("explicitly stopping a queued member stays stopped live and after reconstruction", async () => {
+  const { swarm, records, mock } = direct(
+    () => ({ text: "done", delayMs: 50 }),
+    pair,
+    {},
+    {},
+    { maxConcurrent: 1 },
+  )
+  expect(swarm.member("b")!.status).toBe("queued")
+  expect(swarm.stopMember("b")).toBeUndefined()
+  const source = createSwarmSource("workspace", () => [swarm.snapshot()]).source
+  expect(source.snapshot().phases[0]!.groups[0]!.agents[1]!.status).toBe("stopped")
+  const interrupted = swarmsFromRecords(JSON.parse(JSON.stringify(records)))
+  expect(interrupted[0]!.members[1]!.stopReason).toBe("stopped by the user")
+  const report = await swarm.done
+  expect(mock.requests.some((req) => who(req) === "b")).toBe(false)
+  expect(report.members[1]).toMatchObject({ status: "done", turns: 0, stopReason: "stopped by the user" })
+  const restored = swarmsFromRecords(JSON.parse(JSON.stringify(records)))
+  const historical = createSwarmSource("workspace", () => restored).source
+  expect(historical.snapshot().phases[0]!.groups[0]!.agents.map((agent) => agent.status)).toEqual([
+    "done",
+    "stopped",
+  ])
+  expect(swarm.member("a")!.stopReason).toBeUndefined()
+})
+
+test("start maps child sessions and end records round-trip each member's own totals", async () => {
+  const usage = { input: 12, output: 7, cacheRead: 3, cacheWrite: 2, cost: 0.025 }
+  const { swarm, records } = direct(() => ({ text: "completed reply", usage }), pair)
+  const start = records[0]!
+  expect(start.type).toBe("start")
+  if (start.type !== "start") throw new Error("missing start")
+  expect(start.members.map((member) => member.sessionId)).toEqual(
+    swarm.snapshot().members.map((member) => member.sessionId),
+  )
+  expect(new Set(start.members.map((member) => member.sessionId)).size).toBe(2)
+  expect(start.members.every((member) => !!member.sessionId)).toBe(true)
+  const report = await swarm.done
+  const end = records.at(-1)!
+  expect(end.type).toBe("end")
+  if (end.type !== "end") throw new Error("missing end")
+  expect(end.members).toEqual(report.members)
+  for (const member of report.members) {
+    expect(member.usage).toEqual(usage)
+    expect(member.tokens).toBe(24)
+    expect(member.cost).toBe(0.025)
+    expect(member.durationMs).toBeGreaterThanOrEqual(0)
+    expect(member.text).toBe("completed reply")
+  }
+  const restored = swarmsFromRecords(JSON.parse(JSON.stringify(records)))[0]!
+  expect(restored.members).toEqual(swarm.snapshot().members)
+  expect(restored.tokens).toBe(report.tokens)
+  expect(restored.messages).toBe(report.messages)
+})
+
+test("failed member errors and unknown prices survive record serialization", async () => {
+  const { swarm, records } = direct(
+    (req) =>
+      who(req) === "a"
+        ? { error: { message: "model unavailable" } }
+        : { text: "ok", usage: { input: 2, output: 1 } },
+    pair,
+  )
+  await swarm.done
+  const restored = swarmsFromRecords(JSON.parse(JSON.stringify(records)))[0]!
+  expect(restored.members[0]!.outcome).toBe("error")
+  expect(restored.members[0]!.error).toContain("model unavailable")
+  expect(restored.members[0]!.error).toBe(swarm.member("a")!.error)
+  expect(restored.members[0]!.sessionId).toBe(swarm.member("a")!.sessionId)
+  expect(restored.members[1]!.cost).toBeUndefined()
+  expect(restored.members[1]!.usage?.cost).toBeUndefined()
+  expect(restored.members[1]!.tokens).toBe(3)
+})
+
+test("live member metrics exclude descendants and never total a partly unknown price", async () => {
+  const ownTokens: number[] = []
+  let running: Swarm | undefined
+  const childWork: ToolDefinition = {
+    name: "child_work",
+    description: "Run one child",
+    parameters: { type: "object", properties: {} },
+    async execute(_params, ctx) {
+      await ctx.session!.spawn!({ prompt: "Do the nested work" }).result()
+      return textResult("Child finished")
+    },
+  }
+  const { swarm, records } = direct(
+    (req) => {
+      if (who(req) === "commander") return { text: "nested reply", usage: { input: 1000, cost: 1 } }
+      if (who(req) === "b") return { text: "b reply", usage: { input: 1, cost: 0 } }
+      if (lastIsResult(req)) return { text: "a reply", usage: { input: 2, cost: 0.02 } }
+      return { toolCalls: [{ name: "child_work", args: {} }], usage: { input: 1 } }
+    },
+    pair,
+    {},
+    {
+      changed() {
+        const tokens = running?.member("a")?.tokens
+        if (tokens !== undefined) ownTokens.push(tokens)
+      },
+    },
+    { tools: [childWork] },
+  )
+  running = swarm
+  const report = await swarm.done
+  expect(ownTokens.length).toBeGreaterThan(0)
+  expect(ownTokens.every((tokens) => tokens <= 3)).toBe(true)
+  expect(report.members[0]!.tokens).toBe(3)
+  expect(report.members[0]!.cost).toBeUndefined()
+  expect(report.members[0]!.usage?.cost).toBeUndefined()
+  expect(report.members[1]!.cost).toBe(0)
+  expect(report.tokens).toBe(1004)
+  expect(swarmsFromRecords(JSON.parse(JSON.stringify(records)))[0]!.members[0]!.cost).toBeUndefined()
+})
+
+test("unobserved commander consultations update live tokens but never invent a complete price", async () => {
+  const childWork: ToolDefinition = {
+    name: "consult_child",
+    description: "Run a child that consults its commander",
+    parameters: { type: "object", properties: {} },
+    async execute(_params, ctx) {
+      if (ctx.session!.depth === 1) {
+        await ctx.session!.spawn!({ prompt: "Ask your commander" }).result()
+      } else {
+        await ctx.session!.askUser!(
+          [{ question: "Which approach?", options: [{ label: "Safe" }] }],
+          ctx.signal,
+        )
+      }
+      return textResult("Finished")
+    },
+  }
+  for (const authoritative of [false, true]) {
+    let running: Swarm | undefined
+    let tree: AgentTree | undefined
+    let reads = 0
+    const liveTokens: number[] = []
+    const run = direct(
+      (req) => {
+        if (/asks you (?:this question|these questions)/.test(lastText(req))) {
+          return { text: "1: Safe", usage: { input: 9 } }
+        }
+        if (who(req) === "b") return { text: "b done", usage: { input: 1, cost: 0 } }
+        if (lastIsResult(req)) return { text: "done", usage: { input: 2, cost: 0.02 } }
+        return { toolCalls: [{ name: "consult_child", args: {} }], usage: { input: 1, cost: 0.01 } }
+      },
+      pair,
+      {},
+      {
+        ...(authoritative
+          ? {
+              ownUsage: (id: string) => {
+                reads++
+                return tree?.subagent(id)?.info.usage
+              },
+            }
+          : {}),
+        changed() {
+          const member = running?.member("a")
+          if (member?.tokens !== undefined) liveTokens.push(member.tokens)
+          const before = reads
+          running?.snapshot()
+          expect(reads).toBe(before)
+        },
+      },
+      { tools: [childWork] },
+    )
+    running = run.swarm
+    tree = run.tree
+    const report = await run.swarm.done
+    expect(report.members[0]!.tokens).toBe(12)
+    expect(report.members[0]!.cost).toBeUndefined()
+    expect(report.members[0]!.usage?.cost).toBeUndefined()
+    expect(report.members[1]!.cost).toBe(0)
+    const restored = swarmsFromRecords(JSON.parse(JSON.stringify(run.records)))[0]!
+    expect(restored.members[0]!.tokens).toBe(12)
+    expect(restored.members[0]!.cost).toBeUndefined()
+    if (authoritative) {
+      expect(reads).toBeGreaterThan(0)
+      expect(liveTokens).toContain(10)
+    }
+  }
 })

@@ -231,7 +231,9 @@ test("a user message asking for a workflow marks the confirmation as asked for",
   expect(t.confirms[0]!.message).toContain("Phases: Explore → Verify")
   expect(t.confirms[0]!.message).toContain("Agents: 4, at most 30, 6 at a time.")
   expect(t.confirms[0]!.message).toContain("Cost: no cost cap.")
-  expect(t.confirms[0]!.message).toContain("Files: its agents work in your working tree and can change your files.")
+  expect(t.confirms[0]!.message).toContain(
+    "Files: its agents work in your working tree and can change your files.",
+  )
   // The result comes back as a notice with a short display line.
   await until(() => t.notices.length === 1, "the notice")
   const notice = t.notices[0]!
@@ -499,7 +501,10 @@ test("progress: the group's status line follows the phases and counts, and the v
   const statuses = t.groups[0]!.statuses
   expect(statuses.some((s) => s.startsWith(`${id} · Explore · `))).toBe(true)
   expect(statuses.at(-1)).toMatch(new RegExp(`^${id} · Verify · 4/4 agents · 400 tok$`))
-  const lines = t.view.render({ id }, { now: Date.now(), width: 80 } as never).map((l) => l.text)
+  const renderOptions = { now: Date.now(), width: 80 }
+  const lines = t.view.render!({ id }, renderOptions).map((line) =>
+    line.kind === "segments" ? line.parts.map((part) => part.text).join("") : line.text,
+  )
   expect(lines[0]).toBe("├ ✓ Explore")
   expect(lines.slice(1, 4).map((l) => l.replace(/ · \d+s$/, ""))).toEqual([
     "│ ├ ✓ api · 100 tok",
@@ -507,7 +512,7 @@ test("progress: the group's status line follows the phases and counts, and the v
     "│ └ ✓ tui · 100 tok",
   ])
   expect(lines[4]).toBe("└ ✓ Verify")
-  expect(t.view.title({ id })).toBe(`Workflow fanout · ${id} · done`)
+  expect(t.view.title({ id }, renderOptions)).toBe(`Workflow fanout · ${id} · done`)
 })
 
 test("/workflow <name> runs a saved workflow with args, and marks the start as asked for", async () => {
@@ -561,6 +566,9 @@ test("x in the view asks before it stops the run; no keeps it running", async ()
   let yes = false
   const control = {
     close: () => {},
+    pushPage: () => {},
+    popPage: () => {},
+    print: () => {},
     requestRender: () => {},
     prompt: async () => undefined,
     confirm: async (q: string, o?: { yes?: string; no?: string }) => {
@@ -569,17 +577,17 @@ test("x in the view asks before it stops the run; no keeps it running", async ()
     },
   }
   const x = t.view.keys!.find((k) => k.key === "x")!
-  x.run({ id }, control)
+  x.run!({ id }, control)
   await until(() => asked.length === 1)
   expect(asked[0]).toBe("Stop the workflow run slow? y stops it · keeps it running")
   await Bun.sleep(20)
   expect(t.notices).toHaveLength(0)
   yes = true
-  x.run({ id }, control)
+  x.run!({ id }, control)
   await until(() => t.notices.length === 1, "stopped")
   expect(t.notices[0]!.display?.text).toMatch(/^◆ workflow slow ⊘ /)
   // Once it has ended, x has nothing to stop and asks nothing.
-  x.run({ id }, control)
+  x.run!({ id }, control)
   await Bun.sleep(20)
   expect(asked).toHaveLength(2)
 })
@@ -593,7 +601,7 @@ test("resume by id replays the journal: no agent runs again", async () => {
   const again = await t.call({ resume: id })
   expect(t.text(again)).toContain(`Started workflow run ${id}`)
   expect(t.confirms.at(-1)!.title).toBe('Resume workflow "fanout"?')
-  expect(t.confirms.at(-1)!.message).toContain("4 journaled results")
+  expect(t.confirms.at(-1)!.message).toContain("4 successful journaled results")
   await until(() => t.notices.length === 2)
   expect(t.groups[1]!.spawned).toHaveLength(0)
   expect(JSON.stringify(t.notices[1]!.content)).toContain("saw tui")

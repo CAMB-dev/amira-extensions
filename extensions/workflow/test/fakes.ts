@@ -6,10 +6,18 @@ import type {
   SpawnGroupOptions,
   SpawnOptions,
   SubagentResult,
+  Usage,
 } from "@amira/api"
 
 /** What a fake sub-agent answers: its text (and value, with a schema), or an error. */
-export type Answer = { text?: string; value?: unknown; error?: string; tokens?: number }
+export type Answer = {
+  text?: string
+  value?: unknown
+  error?: string
+  tokens?: number
+  cost?: number
+  messageUsages?: Usage[]
+}
 
 export interface FakeGroup extends SpawnGroup {
   readonly options: SpawnGroupOptions
@@ -80,15 +88,20 @@ export function fakeGroup(
             a = { error: String(err) }
           }
           const tokens = a.tokens ?? 100
-          push({
-            type: "message.end",
-            sessionId: id,
-            ts: 2,
-            data: { message: { usage: { input: tokens, output: 0, cacheRead: 0, cacheWrite: 0 } } },
-          } as unknown as AnyEvent)
+          const messages = a.messageUsages ?? [
+            { input: tokens, output: 0, cacheRead: 0, cacheWrite: 0, cost: a.cost },
+          ]
+          for (const usage of messages) {
+            push({
+              type: "message.end",
+              sessionId: id,
+              ts: 2,
+              data: { message: { usage } },
+            } as unknown as AnyEvent)
+          }
           running--
           waiting.shift()?.()
-          const usage = { input: tokens, output: 0, cacheRead: 0, cacheWrite: 0 }
+          const usage = { input: tokens, output: 0, cacheRead: 0, cacheWrite: 0, cost: a.cost }
           resolve(
             a.error !== undefined
               ? { ...base, usage, status: "error", text: "", error: a.error }
@@ -119,7 +132,7 @@ export function fakeGroup(
         state: "working",
         turns: 1,
         groupId: "g1",
-        model: { provider: "x", id: "y" },
+        model: { provider: "x", model: "y" },
         events: {
           async *[Symbol.asyncIterator]() {
             let i = 0

@@ -18,7 +18,8 @@ import type {
   ViewLine,
 } from "@amira/api"
 import { compileScript } from "./compile.ts"
-import { type JournalEntry, listRuns, readJournal, readRun } from "./journal.ts"
+import { bindWorkflowSource, createWorkflowSource } from "./dashboard.ts"
+import { type JournalEntry, listRuns, readJournal, readRun, successful } from "./journal.ts"
 import { estimate, readMeta, sizeLine, type WorkflowMeta, workspaceLine } from "./meta.ts"
 import { countsLine, formatDuration, formatTokens, runStateText, totals, treeLines } from "./progress.ts"
 import { loadRoles } from "./roles.ts"
@@ -241,6 +242,22 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       }
     }
 
+    const dashboard = createWorkflowSource(api.cwd)
+    const dashboardBinding = bindWorkflowSource(api, dashboard.source, () => {
+      for (const run of runs.values()) run.stop("the workflow extension was unloaded")
+      dashboard.dispose()
+    })
+    const loadDashboard = () => {
+      dashboard.load([...new Set([runsRoot(), path.join(api.home, "workflow-runs")])])
+      dashboardBinding.resume()
+    }
+    loadDashboard()
+    api.on("extension.loaded", loadDashboard)
+    api.onExit?.(async () => {
+      dashboardBinding.dispose()
+      await Promise.all([...runs.values()].map((run) => run.done))
+    })
+
     const latest = (): WorkflowRun | undefined => [...runs.values()].at(-1)
 
     const noticeFor = (run: WorkflowRun): UserMessage => {
@@ -278,6 +295,9 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         budget?.tokens !== undefined ? `${formatTokens(budget.tokens)} tokens` : "",
         budget?.costUsd !== undefined ? `$${budget.costUsd}` : "",
       ].filter(Boolean)
+      const replayable = [...new Map(resume?.previous.map((entry) => [entry.key, entry])).values()].filter(
+        successful,
+      ).length
       return [
         initiator === "user" ? "You asked for this workflow." : "The model proposes this workflow.",
         meta.description,
@@ -287,7 +307,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         `Files: ${workspaceLine(source)}`,
         ...(resume
           ? [
-              `Resumes run ${resume.id}: ${resume.previous.length} journaled results are reused where the script is unchanged.`,
+              `Resumes run ${resume.id}: ${replayable} successful journaled results are reused where the script is unchanged.`,
             ]
           : []),
       ].join("\n")
@@ -372,6 +392,8 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
           ...(opts.worker ? { worker: opts.worker } : {}),
           onChange: () => {
             setStatus(run)
+            dashboard.update(run)
+            dashboardBinding.refresh()
             api.requestRender()
           },
         })
@@ -390,6 +412,8 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         else l.send?.(message)
       })
       run.start()
+      dashboard.update(run)
+      dashboardBinding.refresh()
       setStatus(run)
       return run
     }
@@ -405,7 +429,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       id: string,
     ): { dir: string; source: string; args: unknown; previous: JournalEntry[]; resumes: number } | string => {
       const live = runs.get(id)
-      if (live?.status === "running") return `Run ${id} is still running.`
+      if (live && !live.settled) return `Run ${id} is still running or settling its agents.`
       const dir = [path.join(runsRoot(), id), path.join(api.home, "workflow-runs", id)].find((d) =>
         existsSync(d),
       )
@@ -536,7 +560,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
           run(d, v) {
             const run = runOf(d)
             // A run that has ended has nothing left to stop: no question for it.
-            if (!run || run.status !== "running") return
+            if (run?.status !== "running") return
             // Stopping ends every agent of the run: the user says so first, as for a sub-agent.
             void confirmStop(v, `Stop the workflow run ${run.meta.name}?`).then((yes) => {
               if (yes) run.stop()
@@ -710,12 +734,15 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
           if (owner !== e.sessionId) runs.get(id)?.stop("its session was closed")
       }
       root = e.sessionId
-      if (e.data.sessionFile) sessionFile = e.data.sessionFile
+      sessionFile = e.data.sessionFile
+      loadDashboard()
       explicit = false
       declined.clear()
     })
-    api.on("session.end", () => {
+    api.on("session.end", (e) => {
+      if (e.sessionId !== root || e.parentSessionId !== undefined) return
       for (const r of runs.values()) r.stop("the session ended")
+      dashboardBinding.pause()
     })
     api.on("turn.start", (e) => {
       if (e.parentSessionId !== undefined || e.sessionId !== root) return

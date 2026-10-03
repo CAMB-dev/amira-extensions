@@ -1,4 +1,5 @@
 import {
+  addUsage,
   type ChildSession,
   type ChildState,
   type SpawnGroup,
@@ -6,6 +7,7 @@ import {
   type SubagentResult,
   type ToolDefinition,
   textResult,
+  type Usage,
   type UserMessage,
 } from "@amira/api"
 import { Blackboard, type BoardEntry, type BoardWrite } from "./blackboard.ts"
@@ -41,20 +43,54 @@ export interface TimelineEntry {
 
 /** What a swarm keeps in the session (SessionData, under the key "swarm"), in order. */
 export type SwarmRecord =
-  | { type: "start"; swarm: string; goal: string; members: MemberSpec[]; at: number }
+  | {
+      type: "start"
+      swarm: string
+      goal: string
+      members: (MemberSpec & { sessionId?: string })[]
+      at: number
+    }
   | { type: "board"; swarm: string; write: BoardWrite }
   | { type: "message"; swarm: string; from: string; to: string; text: string; at: number }
   | { type: "finish"; swarm: string; member: string; result: string; at: number }
-  | { type: "end"; swarm: string; reason: string; at: number; report: string }
+  | { type: "stop-member"; swarm: string; member: string; reason: string; at: number }
+  | {
+      type: "end"
+      swarm: string
+      reason: string
+      at: number
+      report: string
+      /** Optional for records written before 0.1.5. Own usage, not descendants'. */
+      members?: MemberReport[]
+      tokens?: number
+      messages?: number
+    }
+
+/** Own reported usage only; omitted fields are unknown, not zero. */
+export interface MemberMetrics {
+  sessionId?: string
+  startedAt?: number
+  usage?: Usage
+  tokens?: number
+  cost?: number
+  durationMs?: number
+  error?: string
+  /** Explicit member termination, unlike the swarm's normal idle shutdown. */
+  stopReason?: string
+}
 
 /** A member as views and list_agents show it. */
-export interface MemberView {
+export interface MemberView extends MemberMetrics {
   name: string
   role: string
   /** Its sub-agent's state, or "paused" while the user holds its messages. */
   status: ChildState | "paused"
   turns: number
   messagesSent: number
+  brief?: string
+  outcome?: SubagentResult["status"]
+  /** The member's most recent model reply, when observed. */
+  lastMessage?: string
   /** What it handed in with finish, if it did. */
   result?: string
   /** Why it ended, once it did. */
@@ -80,7 +116,7 @@ export interface SwarmSnapshot {
   tokens?: number
 }
 
-export interface MemberReport {
+export interface MemberReport extends MemberMetrics {
   name: string
   role: string
   status: SubagentResult["status"]
@@ -88,7 +124,7 @@ export interface MemberReport {
   /** Its last reply. */
   text: string
   turns: number
-  error?: string
+  messagesSent?: number
   note?: string
 }
 
@@ -113,6 +149,8 @@ export interface SwarmHooks {
   changed?(): void
   /** Keeps a record in the session. */
   record?(rec: SwarmRecord): void
+  /** Authoritative own usage from the public session listing, read only on usage events. */
+  ownUsage?(sessionId: string): Usage | undefined
   /**
    * The swarm went round without progress and is paused: what to do. Undefined (nobody could
    * answer) stops it.
@@ -152,8 +190,15 @@ interface Member {
   held: UserMessage[]
   /** Asked to stop (by the user, or as the swarm ends): it takes no more messages. */
   stopping?: boolean
+  stopReason?: string
   result?: string
   ended?: SubagentResult
+  startedAt?: number
+  /** Usage seen in this member's message events, for checking price completeness. */
+  usage?: Usage
+  authoritativeUsage?: Usage
+  unknownCost?: boolean
+  lastMessage?: string
 }
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`
@@ -219,11 +264,6 @@ export class Swarm {
     this.done = new Promise((resolve) => {
       this.#resolve = resolve
     })
-    this.#record({ type: "start", swarm: this.id, goal: this.goal, members: opts.members, at: Date.now() })
-    this.#log({
-      kind: "start",
-      text: `${plural(opts.members.length, "member")}: ${opts.members.map((m) => m.name).join(", ")}`,
-    })
     const roster = opts.members
     for (const spec of roster) {
       const child = this.#group.spawn({
@@ -241,6 +281,17 @@ export class Swarm {
       this.#members.set(spec.name.toLowerCase(), m)
       void this.#watch(m)
     }
+    this.#record({
+      type: "start",
+      swarm: this.id,
+      goal: this.goal,
+      members: [...this.#members.values()].map((m) => ({ ...m.spec, sessionId: m.child.id })),
+      at: this.startedAt,
+    })
+    this.#log({
+      kind: "start",
+      text: `${plural(roster.length, "member")}: ${roster.map((m) => m.name).join(", ")}`,
+    })
   }
 
   get state(): SwarmState {
@@ -376,6 +427,8 @@ export class Swarm {
     if (m.child.state === "ended") return `${m.spec.name} has ended already.`
     if (m.stopping) return `${m.spec.name} is stopping already.`
     m.stopping = true
+    m.stopReason = reason
+    this.#record({ type: "stop-member", swarm: this.id, member: m.spec.name, reason, at: Date.now() })
     // What was held for it would never reach it.
     this.#dropped += m.held.splice(0).length
     m.child.stop(reason)
@@ -633,7 +686,32 @@ export class Swarm {
   async #watch(m: Member) {
     try {
       for await (const e of m.child.events) {
-        if (e.type === "turn.end" && e.sessionId === m.child.id) this.#turnEnded()
+        // The stream includes descendants: they must not count as the member's own work.
+        if (e.sessionId === m.child.id) {
+          if (e.type === "turn.start") m.startedAt ??= e.ts
+          if (e.type === "message.end") {
+            m.lastMessage = e.data.message.content
+              .flatMap((b) => (b.type === "text" ? [b.text] : []))
+              .join("\n")
+            const usage = e.data.message.usage
+            if (usage?.cost === undefined) m.unknownCost = true
+            if (usage) {
+              const sum = m.usage ? addUsage(m.usage, usage) : { ...usage }
+              if (m.usage && (m.usage.cost === undefined || usage.cost === undefined)) delete sum.cost
+              m.usage = sum
+            }
+          }
+          // Consultations can add usage without message.end. Refresh outside view reads.
+          if (e.type === "message.end" || e.type === "budget.update" || e.type === "turn.end") {
+            try {
+              const usage = this.#hooks.ownUsage?.(m.child.id)
+              if (usage) m.authoritativeUsage = { ...usage }
+            } catch {
+              // Older hosts and closed sessions may have no listing; observed usage still works.
+            }
+          }
+          if (e.type === "turn.end") this.#turnEnded()
+        }
         this.#hooks.changed?.()
         this.#check()
       }
@@ -733,8 +811,11 @@ export class Swarm {
       reason: info.exceeded ? (info.endReason ?? reason) : reason,
       members: members.map((m, i) => {
         const r = results[i]!
+        m.ended = r
         undelivered += r.undelivered?.length ?? 0
         return {
+          ...this.#metrics(m),
+          messagesSent: m.sent,
           name: m.spec.name,
           role: m.spec.role,
           status: r.status,
@@ -751,9 +832,19 @@ export class Swarm {
       durationMs: this.#endedAt - this.startedAt,
       undelivered,
     }
+    this.#endReason = report.reason
     const text = reportText(report)
     this.#log({ kind: "end", text: report.reason })
-    this.#record({ type: "end", swarm: this.id, reason: report.reason, at: this.#endedAt, report: text })
+    this.#record({
+      type: "end",
+      swarm: this.id,
+      reason: report.reason,
+      at: this.#endedAt,
+      report: text,
+      members: report.members,
+      tokens: report.tokens,
+      messages: report.messages,
+    })
     this.#hooks.changed?.()
     this.#resolve(report)
   }
@@ -764,15 +855,39 @@ export class Swarm {
     return this.#members.get(name.trim().replace(/^@/, "").toLowerCase())
   }
 
+  #metrics(m: Member): MemberMetrics {
+    const reported = m.ended?.usage ?? m.authoritativeUsage ?? m.usage
+    const usage = reported ? { ...reported } : undefined
+    // Host totals may sum priced replies and unpriced consultations. A price is complete
+    // only when every token component matches the fully observed messages (or known zero).
+    if (usage && (m.unknownCost || !sameTokens(usage, m.usage))) delete usage.cost
+    const durationMs =
+      m.ended?.durationMs ?? (m.startedAt === undefined ? undefined : Date.now() - m.startedAt)
+    return {
+      sessionId: m.child.id,
+      ...(m.stopReason !== undefined ? { stopReason: m.stopReason } : {}),
+      ...(m.startedAt !== undefined ? { startedAt: m.startedAt } : {}),
+      ...(usage ? { usage, tokens: usage.input + usage.output + usage.cacheRead + usage.cacheWrite } : {}),
+      ...(usage?.cost !== undefined ? { cost: usage.cost } : {}),
+      ...(durationMs !== undefined ? { durationMs } : {}),
+      ...(m.ended?.error !== undefined ? { error: m.ended.error } : {}),
+    }
+  }
+
   #view(m: Member): MemberView {
     const status =
       m.child.state !== "ended" && (m.paused || (this.#state === "paused" && m.child.state === "idle"))
         ? "paused"
         : m.child.state
     const note = m.ended ? (m.ended.error ?? m.ended.note) : undefined
+    const lastMessage = m.ended?.text ?? m.lastMessage
     return {
+      ...this.#metrics(m),
       name: m.spec.name,
       role: m.spec.role,
+      brief: m.spec.brief,
+      ...(m.ended ? { outcome: m.ended.status } : {}),
+      ...(lastMessage !== undefined ? { lastMessage } : {}),
       status,
       turns: m.child.turns,
       messagesSent: m.sent,
@@ -794,6 +909,12 @@ export class Swarm {
     }
   }
 }
+
+const sameTokens = (a: Usage, b: Usage | undefined) =>
+  a.input === (b?.input ?? 0) &&
+  a.output === (b?.output ?? 0) &&
+  a.cacheRead === (b?.cacheRead ?? 0) &&
+  a.cacheWrite === (b?.cacheWrite ?? 0)
 
 const pairKey = (a: string, b: string) => [a, b].sort().join("\n")
 
@@ -870,20 +991,30 @@ export function swarmsFromRecords(records: readonly unknown[]): SwarmSnapshot[] 
     const rec = raw as SwarmRecord
     if (!rec || typeof rec !== "object" || typeof rec.swarm !== "string") continue
     if (rec.type === "start") {
+      const members = rec.members ?? []
       out.set(rec.swarm, {
         id: rec.swarm,
         goal: rec.goal,
         state: "ended",
         startedAt: rec.at,
-        members: (rec.members ?? []).map((m) => ({
+        members: members.map((m) => ({
           name: m.name,
           role: m.role,
+          brief: m.brief,
+          ...(m.sessionId !== undefined ? { sessionId: m.sessionId } : {}),
           status: "ended",
           turns: 0,
           messagesSent: 0,
         })),
         board: [],
-        timeline: [],
+        timeline: [
+          {
+            seq: 1,
+            at: rec.at,
+            kind: "start",
+            text: `${plural(members.length, "member")}: ${members.map((m) => m.name).join(", ")}`,
+          },
+        ],
         messages: 0,
         writes: [],
       })
@@ -897,18 +1028,34 @@ export function swarmsFromRecords(records: readonly unknown[]): SwarmSnapshot[] 
       push({ at: rec.write.at, kind: "board", from: rec.write.by, key: rec.write.key, text: rec.write.value })
     } else if (rec.type === "message") {
       const m = s.members.find((x) => x.name === rec.from)
-      if (m) {
-        m.messagesSent++
-        s.messages++
-      }
+      if (m) m.messagesSent++
+      if (m || rec.from === "commander") s.messages++
       push({ at: rec.at, kind: "message", from: rec.from, to: rec.to, text: rec.text })
     } else if (rec.type === "finish") {
       const m = s.members.find((x) => x.name === rec.member)
       if (m) m.result = rec.result
       push({ at: rec.at, kind: "finish", from: rec.member, text: rec.result })
+    } else if (rec.type === "stop-member") {
+      const m = s.members.find((x) => x.name === rec.member)
+      if (m) m.stopReason = rec.reason
+      push({ at: rec.at, kind: "note", text: `${rec.member}: ${rec.reason}` })
     } else if (rec.type === "end") {
       s.endReason = rec.reason
       s.endedAt = rec.at
+      if (rec.tokens !== undefined) s.tokens = rec.tokens
+      if (rec.messages !== undefined) s.messages = rec.messages
+      for (const report of rec.members ?? []) {
+        const m = s.members.find((member) => member.name === report.name)
+        if (!m) continue
+        const { name: _name, role: _role, status, text, messagesSent, ...totals } = report
+        Object.assign(m, totals, {
+          status: "ended",
+          outcome: status,
+          lastMessage: text,
+          messagesSent: messagesSent ?? m.messagesSent,
+          ...(report.error !== undefined ? { note: report.error } : {}),
+        })
+      }
       push({ at: rec.at, kind: "end", text: rec.reason })
     }
   }

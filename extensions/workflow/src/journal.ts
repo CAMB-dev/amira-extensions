@@ -8,13 +8,22 @@ export interface JournalEntry {
   /** hash(prompt, opts) and how many calls with that hash came before it: `<hash>#<n>`. */
   key: string
   label: string
+  /** Missing on journals written before 0.1.5, which recorded only successes. */
+  status?: "done" | "error" | "aborted" | "cached"
+  error?: string
+  startedAt?: number
+  /** Script call order (journal lines retain completion order). */
+  call?: number
+  attempt?: number
+  prompt?: string
+  model?: string
   phase?: string
   nest?: string
   /** The agent's final answer. */
   text: string
   /** With a schema: the value it returned. */
   value?: unknown
-  tokens: number
+  tokens?: number
   cost?: number
   durationMs: number
   sessionId?: string
@@ -36,6 +45,14 @@ export interface RunRecord {
   error?: string
   /** Earlier attempts this run resumed from, oldest first. */
   resumes?: number
+  /** This attempt only; cached calls spend no new tokens or cost. Null means unknown. */
+  totals?: {
+    tokens: number | null
+    cost: number | null
+    durationMs: number
+    agents: number
+    byStatus: Record<"queued" | "working" | "done" | "error" | "aborted" | "cached", number>
+  }
 }
 
 function canonical(v: unknown): unknown {
@@ -94,7 +111,9 @@ export class Journal {
    */
   replay(key: string, seen: number, delivered: number): JournalEntry | undefined {
     if (this.#frontier !== undefined && seen > this.#frontier) return undefined
-    const hit = this.#cache.get(key)
+    const entry = this.#cache.get(key)
+    // The latest outcome wins: an error must not uncover a stale success from an older attempt.
+    const hit = entry && successful(entry) ? entry : undefined
     if (!hit) this.#frontier ??= delivered
     return hit
   }
@@ -114,6 +133,10 @@ export class Journal {
       appendFileSync(this.file, `${JSON.stringify(entry)}\n`)
     } catch {}
   }
+}
+
+export function successful(entry: JournalEntry): boolean {
+  return entry.status === undefined || entry.status === "done" || entry.status === "cached"
 }
 
 /** Reads a run's journal; lines that do not parse (a write cut short) are skipped. */
@@ -143,9 +166,31 @@ export function writeRun(dir: string, record: RunRecord, script?: string): void 
   } catch {}
 }
 
-export function readRun(dir: string): { record: RunRecord; script: string } | undefined {
+/** A finished run can be inspected even when its script is no longer available to resume. */
+export function readRunRecord(dir: string): RunRecord | undefined {
   try {
     const record = JSON.parse(readFileSync(path.join(dir, "run.json"), "utf8")) as RunRecord
+    if (
+      !record ||
+      typeof record.id !== "string" ||
+      !record.meta ||
+      typeof record.meta.name !== "string" ||
+      !Array.isArray(record.meta.phases) ||
+      !record.meta.phases.every((phase) => typeof phase === "string") ||
+      !["running", "done", "error", "stopped"].includes(record.status) ||
+      !Number.isFinite(record.startedAt)
+    )
+      return undefined
+    return record
+  } catch {
+    return undefined
+  }
+}
+
+export function readRun(dir: string): { record: RunRecord; script: string } | undefined {
+  try {
+    const record = readRunRecord(dir)
+    if (!record) return undefined
     const script = readFileSync(path.join(dir, "script.ts"), "utf8")
     return { record, script }
   } catch {
@@ -165,8 +210,8 @@ export function listRuns(root: string): RunRecord[] {
   for (const n of names) {
     const dir = path.join(root, n)
     if (!existsSync(path.join(dir, "run.json"))) continue
-    const r = readRun(dir)
-    if (r) out.push(r.record)
+    const record = readRunRecord(dir)
+    if (record) out.push(record)
   }
   return out.sort((a, b) => b.startedAt - a.startedAt)
 }

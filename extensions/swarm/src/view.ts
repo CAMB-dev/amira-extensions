@@ -36,7 +36,7 @@ function elapsed(ms: number): string {
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`
 }
 
-export function timelineLine(e: TimelineEntry): ViewLine {
+export function timelineLine(e: TimelineEntry): Exclude<ViewLine, { kind: "segments" }> {
   const t = clock(e.at)
   switch (e.kind) {
     case "message":
@@ -56,7 +56,7 @@ export function timelineLine(e: TimelineEntry): ViewLine {
   }
 }
 
-export function memberLine(m: MemberView): ViewLine {
+export function memberLine(m: MemberView): Exclude<ViewLine, { kind: "segments" }> {
   const done = m.result !== undefined ? " · finished" : ""
   const note = m.status === "ended" && m.note ? ` · ${oneLine(m.note)}` : ""
   return {

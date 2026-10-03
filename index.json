@@ -14,7 +14,10 @@
       "name": "mcp-server",
       "description": "Serve Amira over MCP (stdio) so other coding agents can delegate tasks to it: amira mcp serve",
       "version": "0.1.0",
-      "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/mcp-server" },
+      "source": {
+        "git": "https://github.com/CAMB-dev/amira-extensions.git",
+        "path": "extensions/mcp-server"
+      },
       "engines": { "amira": "^0.1" },
       "tags": ["mcp", "integration", "delegation"],
       "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/mcp-server"
@@ -22,7 +25,7 @@
     {
       "name": "workflow",
       "description": "Dynamic workflows: TypeScript scripts that orchestrate many sub-agents in the background, with limits, a progress view and resume",
-      "version": "0.1.4",
+      "version": "0.1.5",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/workflow" },
       "engines": { "amira": "^0.1.1" },
       "tags": ["workflow", "orchestration", "sub-agents", "automation"],
@@ -31,7 +34,7 @@
     {
       "name": "swarm",
       "description": "Swarm mode: long-lived sub-agents that work on one goal together through a shared blackboard and direct messages: /swarm <goal>",
-      "version": "0.1.4",
+      "version": "0.1.5",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/swarm" },
       "engines": { "amira": "^0.1.1" },
       "tags": ["agents", "swarm", "multi-agent", "orchestration"],
@@ -95,7 +98,10 @@
       "name": "checkpoints",
       "description": "Checkpoints and /rewind: a snapshot of the files before each turn, in private git refs, and a way back to any of them (files, or files and conversation)",
       "version": "0.1.0",
-      "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/checkpoints" },
+      "source": {
+        "git": "https://github.com/CAMB-dev/amira-extensions.git",
+        "path": "extensions/checkpoints"
+      },
       "engines": { "amira": "^0.1.2" },
       "tags": ["checkpoints", "rewind", "undo", "git", "snapshots"],
       "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/checkpoints"

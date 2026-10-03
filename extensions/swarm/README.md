@@ -92,7 +92,38 @@ That covers the members and their own sub-agents; the main session's turns answe
 are its own.
 
 The blackboard, the messages and the results are kept in the session file, so `/swarm view`
-and `/swarm list` still show a swarm after `amira --resume`.
+and `/swarm list` still show a swarm after `amira --resume`. Since 0.1.5, start records also
+map member names to child session IDs, and end records include each member's own usage,
+tokens, known cost, duration, final reply and error. Ended snapshots reconstruct those
+values after resume. Old records still work; unrecorded metrics and session IDs stay unknown.
+The swarm's total token count includes descendants; per-member totals do not.
+
+## Optional dashboard
+
+With the dashboard extension installed, `/dashboard swarm` shows one phase per swarm in
+the current session and one agent per member, including its role and live state (queued,
+running, idle, paused, done, failed or stopped). Swarm operation does not require dashboard.
+The dashboard itself requires its newer Amira API; this adapter uses the optional
+`dashboard.sources` service and public API types only.
+
+- **Summary** shows the brief, last model reply, result, token usage, known cost, duration,
+  child session ID and error. Unknown costs are not displayed as zero; known zero cost is.
+- **Logs** shows the shared blackboard and the last 200 timeline entries, including
+  messages, writes and finishes. Long text is clipped for display; saved records remain intact.
+- Changes appear while the swarm runs. Ended swarms reconstruct from the session records
+  after resume or extension reload; an interrupted swarm or old member without a recorded
+  outcome is shown as stopped, not assumed successful.
+
+This source is read-only. Use `/swarm` commands to message, pause, resume or stop members.
+The current dashboard contract has no custom tabs, token or session-ID fields, or transcript
+navigation action, so these details use its existing Summary and Logs tabs. Session IDs
+are displayed for identification, not as invented transcript links. No file changes or
+progress percentages are inferred.
+
+Registration tolerates dashboard being absent, loaded later or reloaded. The API has no
+extension-unload callback or service-change event: a host-owned `swarm.dashboardSource`
+lease immediately disables stale source reads on swarm unload, and an unref'ed one-second
+check releases its registration and detects dashboard replacement. Exit releases it too.
 
 ## Settings
 

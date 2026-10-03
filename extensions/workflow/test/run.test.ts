@@ -6,6 +6,7 @@ import type { SpawnGroupOptions, SpawnOptions } from "@amira/api"
 import { readJournal } from "../src/journal.ts"
 import { BUILTIN_ROLES } from "../src/roles.ts"
 import { WorkflowRun } from "../src/run.ts"
+import type { RunGit } from "../src/worktree.ts"
 import { type Answer, fakeGroup } from "./fakes.ts"
 
 const dirs: string[] = []
@@ -26,8 +27,10 @@ interface Setup {
   group?: Partial<SpawnGroupOptions>
   dir?: string
   previous?: ReturnType<typeof readJournal>
+  resumes?: number
   saved?: Record<string, string>
   budgetTokens?: number
+  git?: RunGit
 }
 
 function start(s: Setup) {
@@ -43,9 +46,10 @@ function start(s: Setup) {
     cwd: "/work",
     home: "/home",
     ...(s.previous ? { previous: s.previous } : {}),
+    ...(s.resumes !== undefined ? { resumes: s.resumes } : {}),
     ...(s.budgetTokens !== undefined ? { budgetTokens: s.budgetTokens } : {}),
     roles: () => new Map(BUILTIN_ROLES.map((r) => [r.name, r])),
-    git: async () => ({ output: "", ok: false }),
+    git: s.git ?? (async () => ({ output: "", ok: false })),
     loadWorkflow: (name) => s.saved?.[name],
     onChange: () => {},
   })
@@ -242,7 +246,7 @@ test("stop ends the script and aborts its running agents", async () => {
   const gate = new Promise<void>((r) => {
     release = r
   })
-  const { run, group } = start({
+  const { run, group, dir } = start({
     source: `${META}return await agent("slow")`,
     answer: async () => {
       await gate
@@ -256,6 +260,17 @@ test("stop ends the script and aborts its running agents", async () => {
   expect(run.status).toBe("stopped")
   expect(group.endReason).toBe("the workflow was stopped")
   expect(run.stop()).toBe(false)
+  expect(run.settled).toBe(true)
+  expect(readJournal(dir)).toMatchObject([{ status: "aborted", sessionId: "s_child1" }])
+  const record = JSON.parse(readFileSync(path.join(dir, "run.json"), "utf8"))
+  expect(record.totals).toMatchObject({
+    agents: 1,
+    tokens: 0,
+    cost: null,
+    byStatus: { aborted: 1, working: 0, queued: 0 },
+  })
+  expect(record.endedAt).toBeGreaterThanOrEqual(record.startedAt)
+  expect(record.totals.durationMs).toBe(record.endedAt - record.startedAt)
 })
 
 test("agents queue behind the group's maxConcurrent, and maxAgents fails the call past it", async () => {
@@ -402,6 +417,154 @@ test("two identical calls are journaled apart and replay in order", async () => 
   await again.run.done
   expect(again.group.spawned).toHaveLength(0)
   expect(again.run.result).toEqual(["answer 1", "answer 2"])
+})
+
+test("failures, validation errors, and spawn failures all have journal outcomes", async () => {
+  const { run, dir } = start({
+    source: `${META}
+      return await parallel([
+        () => agent("bad", { phase: "Explore", model: "provider/model" }),
+        () => agent("invalid", { model: "invalid" }),
+        () => agent("role", { role: "missing" }),
+        () => agent("capped"),
+      ])`,
+    answer: () => ({ error: "provider failed", tokens: 15, cost: 0.02 }),
+    group: { maxAgents: 1 },
+  })
+  await run.done
+  const entries = readJournal(dir).sort((a, b) => a.call! - b.call!)
+  expect(entries.map((entry) => entry.status)).toEqual(["error", "error", "error", "error"])
+  expect(entries.every((entry) => typeof entry.startedAt === "number" && !!entry.error)).toBe(true)
+  expect(entries[0]).toMatchObject({ phase: "Explore", sessionId: "s_child1", model: "x/y", tokens: 15 })
+  expect(
+    entries
+      .slice(1)
+      .every((entry) => entry.sessionId === undefined && entry.tokens === 0 && entry.cost === 0),
+  ).toBe(true)
+  expect(run.record.totals).toMatchObject({ tokens: 15, cost: 0.02, agents: 4, byStatus: { error: 4 } })
+})
+
+test("a caught failure ends the replay prefix even when later prompts are unchanged", async () => {
+  const source = `${META}
+    await agent("before")
+    try { await agent("fails") } catch {}
+    return await agent("after")`
+  const first = start({
+    source,
+    answer: (o) => (o.prompt === "fails" ? { error: "no" } : { text: o.prompt }),
+  })
+  await first.run.done
+  const again = start({ source, dir: first.dir, previous: readJournal(first.dir), resumes: 1 })
+  await again.run.done
+  expect(again.group.spawned.map((o) => o.prompt)).toEqual(["fails", "after"])
+  const entries = readJournal(first.dir).filter((entry) => entry.attempt === 1)
+  expect(entries.map((entry) => entry.status)).toEqual(["cached", "done", "done"])
+  expect(entries[0]).toMatchObject({ tokens: 0, cost: 0, text: "before" })
+  expect(entries[0]!.sessionId).toBe("s_child1")
+  expect(again.run.record.totals).toMatchObject({ tokens: 200, cost: null, byStatus: { cached: 1, done: 2 } })
+})
+
+test("mixed reported costs stay unknown, and an all-cached attempt costs zero", async () => {
+  const source = `${META}return await parallel([() => agent("known"), () => agent("unknown")])`
+  const first = start({
+    source,
+    answer: (o) => ({ text: o.prompt, cost: o.prompt === "known" ? 0.1 : undefined }),
+  })
+  await first.run.done
+  expect(first.run.record.totals).toMatchObject({ tokens: 200, cost: null })
+  const again = start({ source, dir: first.dir, previous: readJournal(first.dir), resumes: 1 })
+  await again.run.done
+  expect(again.run.record.totals).toMatchObject({ tokens: 0, cost: 0, agents: 2, byStatus: { cached: 2 } })
+  expect(
+    readJournal(first.dir)
+      .filter((entry) => entry.attempt === 1)
+      .map((entry) => entry.sessionId)
+      .sort(),
+  ).toEqual(["s_child1", "s_child2"])
+  const third = start({ source, dir: first.dir, previous: readJournal(first.dir), resumes: 2 })
+  await third.run.done
+  expect(third.group.spawned).toHaveLength(0)
+  expect(
+    readJournal(first.dir)
+      .filter((entry) => entry.attempt === 2)
+      .map((entry) => entry.sessionId)
+      .sort(),
+  ).toEqual(["s_child1", "s_child2"])
+})
+
+test("one child's unpriced or unobserved usage never becomes a known partial total", async () => {
+  for (const messageUsages of [
+    [
+      { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 },
+      { input: 10, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0.1 },
+    ],
+    [{ input: 10, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0.1 }],
+  ]) {
+    const { run, dir } = start({
+      source: `${META}return await agent("mixed usage")`,
+      answer: () => ({ text: "done", tokens: 20, cost: 0.1, messageUsages }),
+    })
+    await run.done
+    expect(run.record.totals).toMatchObject({ tokens: 20, cost: null })
+    expect(readJournal(dir)[0]!.cost).toBeUndefined()
+  }
+})
+
+test("stop settles queued and working calls before writing final totals", async () => {
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const { run, group, dir } = start({
+    source: `${META}return await parallel([() => agent("slow"), () => agent("queued")])`,
+    group: { maxConcurrent: 1 },
+    answer: async () => {
+      await gate
+      return { text: "late" }
+    },
+  })
+  while (group.spawned.length < 2) await Bun.sleep(2)
+  run.stop()
+  await run.done
+  const before = readFileSync(path.join(dir, "run.json"), "utf8")
+  expect(readJournal(dir).map((entry) => entry.status)).toEqual(["aborted", "aborted"])
+  expect(run.record.totals?.byStatus).toEqual({
+    queued: 0,
+    working: 0,
+    done: 0,
+    error: 0,
+    aborted: 2,
+    cached: 0,
+  })
+  release()
+  await Bun.sleep(10)
+  expect(readFileSync(path.join(dir, "run.json"), "utf8")).toBe(before)
+})
+
+test("stop during worktree preparation journals the call without inventing a child", async () => {
+  let preparing = false
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const { run, group, dir } = start({
+    source: `${META}return await agent("prepare", { isolation: "worktree" })`,
+    git: async () => {
+      preparing = true
+      await gate
+      return { ok: false, output: "" }
+    },
+  })
+  while (!preparing) await Bun.sleep(2)
+  run.stop()
+  await Bun.sleep(2)
+  expect(run.settled).toBe(false)
+  release()
+  await run.done
+  expect(group.spawned).toHaveLength(0)
+  expect(readJournal(dir)).toMatchObject([{ status: "aborted", tokens: 0, cost: 0 }])
+  expect(readJournal(dir)[0]!.sessionId).toBeUndefined()
+  expect(run.record.totals).toMatchObject({ tokens: 0, cost: 0, byStatus: { aborted: 1 } })
 })
 
 // ---- nesting ----
