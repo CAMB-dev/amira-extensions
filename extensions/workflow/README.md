@@ -68,11 +68,52 @@ The package's `workflow` skill teaches the model to write scripts.
 
 ## Journal and resume
 
-Each finished `agent()` call is journaled under the session directory
+Since **0.1.5**, every settled `agent()` call is journaled under the session directory
 (`<sessions>/workflows/<run id>/journal.jsonl`, keyed by a hash of its prompt and options),
-with the script and the run's state. Resuming a run replays the calls up to the first one
-that changed or never finished, and runs the rest again; calls made after the script saw a
-changed result run again too, since they may depend on it.
+including validation and spawn errors, failed children, stopped calls, and cached results.
+Each new entry includes `status` (`done`, `error`, `aborted`, or `cached`), `startedAt`,
+`durationMs`, call and attempt numbers, and the prompt and phase. `error`, `model`, tokens,
+and cost are included when known. `sessionId` is the **child** session ID, never the parent:
+cached calls retain the original child ID; pre-spawn failures have no child ID. Journal lines
+retain completion order; `call` records script-call order, including parallel calls.
+
+The script and the run's state are kept alongside the journal. Resuming replays only
+successful entries (including cached successes and older journals without a status).
+A failure, stop, or changed call ends the replay prefix: calls made after the script saw a
+new result run again, since they may depend on it. Independent calls in the same parallel
+batch can still replay. A later failed attempt never uncovers an older success for the same
+call. Stopping waits for in-flight agents and worktree preparation/cleanup to settle before
+the final `run.json` and result notice are written; a settling run cannot be resumed yet.
+
+Final `run.json` includes `totals`: `tokens`, `cost` (USD), `durationMs`, `agents`, and
+`byStatus` counts for `queued`, `working`, `done`, `error`, `aborted`, and `cached`.
+These totals describe the **current attempt**, not the sum of previous attempts. Cached
+calls and pre-spawn failures spend zero new tokens/cost. Usage covers each directly spawned
+child's own usage, not its descendants; an unknown contribution makes that total `null`,
+not a partial sum. Call duration includes queueing and cleanup; run duration is elapsed wall
+time through settlement, not the sum of overlapping agents' durations.
+
+## Optional dashboard
+
+With the dashboard extension installed, `/dashboard workflow` shows live workflow runs and
+finished runs loaded from `run.json` and `journal.jsonl` beside this session's files (or
+`~/.amira/workflow-runs` when the session has no file). It shows declared script phases,
+call status and duration, known cost, and prompt/result/error details. Finished runs show
+the last attempt, in script-call order. Legacy journals without attempt numbers show the
+latest recorded outcome of each call instead. Live updates notify the dashboard without
+doing filesystem work during rendering.
+
+The dashboard source contract has no token or child-session fields, custom tabs, or session
+navigation. Tokens, model, and child session ID therefore appear as **Summary** text, with
+results and errors in **Logs**. IDs are informational, not links; the adapter advertises no
+actions or inferred file changes/diffs. Use `/workflow stop` to stop a run.
+
+Dashboard is optional: workflow still runs when its service is absent. The adapter mirrors
+its structural contract locally and imports no dashboard code. It re-registers when the
+service is replaced, releases subscriptions on session end/exit, and uses a host-owned
+service lease with a one-second, unref'ed check to release its registration and stop runs
+after workflow unload/reload. This check is needed because the public API has no service
+removal or extension unload event.
 
 ## Settings
 
@@ -92,8 +133,8 @@ changed result run again too, since they may depend on it.
 
 ## Tests
 
-The tests run workflows on a real agent tree with a scripted model, so they need Amira's
-packages:
+The tests run sandboxed workflow scripts with fake spawn groups and a fake dashboard service
+registry, without model or network calls. Link Amira's public API packages for development:
 
 ```sh
 bun run link-amira <path to an Amira checkout>   # after `bun install` there

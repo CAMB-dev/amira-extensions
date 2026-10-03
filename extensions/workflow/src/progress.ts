@@ -1,5 +1,7 @@
 import type { ViewLine } from "@amira/api"
 
+type TextLine = Exclude<ViewLine, { kind: "segments" }>
+
 /** Where one agent() call of a run is. `cached` replayed from the journal. */
 export type AgentStatus = "queued" | "working" | "done" | "error" | "aborted" | "cached"
 
@@ -9,8 +11,11 @@ export interface AgentNode {
   call: number
   label: string
   status: AgentStatus
-  tokens: number
+  tokens?: number
   cost?: number
+  prompt?: string
+  model?: string
+  text?: string
   startedAt?: number
   durationMs?: number
   childId?: string
@@ -27,6 +32,8 @@ export interface PhaseNode {
 export interface FlowNode {
   kind: "workflow"
   name: string
+  /** Unique invocation identity, shared with journal entries for a nested workflow. */
+  nest?: string
   /** Phases in order: the ones meta names first, then others as the script uses them. */
   phases: PhaseNode[]
   /** The phase the script is in (phase(title)); agents without a phase of their own go there. */
@@ -62,16 +69,28 @@ export interface Totals {
   queued: number
   failed: number
   cached: number
-  tokens: number
+  tokens?: number
   cost?: number
+  byStatus: Record<AgentStatus, number>
 }
 
 export function totals(flow: FlowNode): Totals {
-  const t: Totals = { agents: 0, finished: 0, working: 0, queued: 0, failed: 0, cached: 0, tokens: 0 }
+  const t: Totals = {
+    agents: 0,
+    finished: 0,
+    working: 0,
+    queued: 0,
+    failed: 0,
+    cached: 0,
+    tokens: 0,
+    cost: 0,
+    byStatus: { queued: 0, working: 0, done: 0, error: 0, aborted: 0, cached: 0 },
+  }
   for (const a of agentsOf(flow)) {
     t.agents++
-    t.tokens += a.tokens
-    if (a.cost !== undefined) t.cost = (t.cost ?? 0) + a.cost
+    t.byStatus[a.status]++
+    t.tokens = t.tokens !== undefined && a.tokens !== undefined ? t.tokens + a.tokens : undefined
+    t.cost = t.cost !== undefined && a.cost !== undefined ? t.cost + a.cost : undefined
     if (a.status === "working") t.working++
     else if (a.status === "queued") t.queued++
     else {
@@ -83,7 +102,8 @@ export function totals(flow: FlowNode): Totals {
   return t
 }
 
-export function formatTokens(n: number): string {
+export function formatTokens(n: number | undefined): string {
+  if (n === undefined) return "unknown"
   if (n < 1000) return String(n)
   if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k`
   return `${(n / 1_000_000).toFixed(1)}M`
@@ -117,7 +137,7 @@ const MARK: Record<AgentStatus, string> = {
   cached: "↺",
 }
 
-const KIND: Record<AgentStatus, ViewLine["kind"]> = {
+const KIND: Record<AgentStatus, TextLine["kind"]> = {
   queued: "muted",
   working: "accent",
   done: "success",
@@ -159,7 +179,7 @@ function phaseState(flow: FlowNode, p: PhaseNode): "pending" | "current" | "done
 }
 
 /** A phase's mark and line kind, in the marks every screen uses: ● ✓ ✗ ⊘, and ◌ not reached yet. */
-const PHASE: Record<ReturnType<typeof phaseState>, { mark: string; kind: ViewLine["kind"] }> = {
+const PHASE: Record<ReturnType<typeof phaseState>, { mark: string; kind: TextLine["kind"] }> = {
   current: { mark: "●", kind: "accent" },
   done: { mark: "✓", kind: "text" },
   failed: { mark: "✗", kind: "error" },
@@ -168,8 +188,8 @@ const PHASE: Record<ReturnType<typeof phaseState>, { mark: string; kind: ViewLin
 }
 
 /** The progress tree: phases, and under them agents (and nested workflows) with status, tokens and cost. */
-export function treeLines(flow: FlowNode, now: number, prefix = ""): ViewLine[] {
-  const out: ViewLine[] = []
+export function treeLines(flow: FlowNode, now: number, prefix = ""): TextLine[] {
+  const out: TextLine[] = []
   const phases = flow.phases.filter((p) => p.title !== "" || p.items.length)
   for (const [pi, p] of phases.entries()) {
     const lastPhase = pi === phases.length - 1

@@ -13,6 +13,7 @@ import type {
   UserMessage,
 } from "@amira/api"
 import { textResult } from "@amira/api"
+import { connectDashboardSource, createSwarmSource } from "./dashboard.ts"
 import { readSettings, type SwarmSettings, withOverrides } from "./limits.ts"
 import {
   checkRoster,
@@ -111,7 +112,7 @@ export function createSwarmExtension(): Extension {
     let requested = false
     /** Goals the user turned down in this session: the model may not propose them again unasked. */
     const declined = new Set<string>()
-    let lastData: SessionData | undefined
+    let historical: SwarmSnapshot[] = []
     let seq = 0
 
     const settings = (): SwarmSettings =>
@@ -120,6 +121,18 @@ export function createSwarmExtension(): Extension {
       )
 
     const live = (): Live | undefined => [...swarms.values()].reverse().find((l) => l.swarm.live)
+
+    const dashboard = createSwarmSource(api.cwd, () => {
+      const current = [...swarms.values()].filter((entry) => !entry.orphaned && entry.owner === (root ?? ""))
+      const snapshots = current.map((entry) => entry.swarm.snapshot())
+      const ids = new Set(snapshots.map((snapshot) => snapshot.id))
+      return [...historical.filter((snapshot) => !ids.has(snapshot.id)), ...snapshots]
+    })
+    // Connect after the read helpers below are initialized: registration can synchronously render.
+    const changed = () => {
+      dashboard.changed()
+      api.requestRender()
+    }
 
     const launch = async (l: Launch): Promise<Swarm | string> => {
       const s = settings()
@@ -198,7 +211,7 @@ export function createSwarmExtension(): Extension {
       const id = `sw${Date.now().toString(36).slice(-5)}${++seq}`
       const final = l.expectNotice?.()
       const data = l.data
-      if (data) lastData = data
+      const owner = root ?? ""
       let entry: Live | undefined
       let swarm: Swarm
       try {
@@ -210,8 +223,16 @@ export function createSwarmExtension(): Extension {
           group,
           spawn: { excludeTools: MEMBER_EXCLUDED, ...(l.toolCallId ? { toolCallId: l.toolCallId } : {}) },
           hooks: {
-            changed: () => api.requestRender(),
-            record: (rec) => data?.append(DATA_KEY, rec),
+            changed,
+            record: (rec) => {
+              data?.append(DATA_KEY, rec)
+              if (owner === (root ?? "") && !entry?.orphaned) historical = pastSwarms(data)
+            },
+            ownUsage: (id) => {
+              const session = api.session?.()
+              if (session?.info().id !== owner) return undefined
+              return session.subagents?.().find((child) => child.id === id)?.usage
+            },
             toCommander: (from, text) => {
               if (entry?.orphaned) return
               l.expectNotice?.()?.deliver(
@@ -233,15 +254,15 @@ export function createSwarmExtension(): Extension {
         return `The swarm could not start: ${err instanceof Error ? err.message : String(err)}`
       }
       requested = false
-      const started: Live = { swarm, owner: root ?? "", ...(final ? { final } : {}) }
+      const started: Live = { swarm, owner, ...(final ? { final } : {}) }
       entry = started
       swarms.set(id, started)
       void swarm.done.then((report) => {
-        api.requestRender()
+        changed()
         if (started.orphaned) return
         final?.deliver(notice(reportText(report), `◆ swarm ${id} ended: ${clip(report.reason, 80)}`))
       })
-      api.requestRender()
+      changed()
       return swarm
     }
 
@@ -347,11 +368,17 @@ export function createSwarmExtension(): Extension {
 
     const pastSwarms = (data: SessionData | undefined): SwarmSnapshot[] => {
       try {
-        return swarmsFromRecords((data ?? lastData)?.read(DATA_KEY) ?? [])
+        return swarmsFromRecords(data?.read(DATA_KEY) ?? [])
       } catch {
         return []
       }
     }
+
+    // Registration can synchronously render. Reconstruct once, never from source reads.
+    const initialSession = api.session?.()
+    root = initialSession?.info().id
+    historical = pastSwarms(initialSession?.data)
+    connectDashboardSource(api, dashboard.source)
 
     /** A swarm by id (or the newest one): live, or read back from the session. */
     const find = (ctx: CommandContext, id?: string): SwarmViewData | undefined => {
@@ -527,18 +554,21 @@ export function createSwarmExtension(): Extension {
     }
     api.on("session.start", (e) => {
       if (e.parentSessionId !== undefined) return
-      if (root && root !== e.sessionId) {
-        // Another conversation took over (/clear, /resume): its swarms have nobody to report to.
-        for (const l of swarms.values()) if (l.owner !== e.sessionId) orphan(l, "its session was closed")
-      }
       root = e.sessionId
+      const session = api.session?.()
+      historical = pastSwarms(session?.info().id === root ? session.data : undefined)
+      // Switch the cached session before orphaning: stopping can synchronously notify views.
+      for (const l of swarms.values()) if (l.owner !== root) orphan(l, "its session was closed")
+      changed()
       explicit = false
       requested = false
       declined.clear()
     })
     api.on("session.end", (e) => {
       if (e.parentSessionId !== undefined) return
+      historical = []
       for (const l of swarms.values()) orphan(l, "the session ended")
+      changed()
     })
     api.on("turn.end", (e) => {
       // `/swarm <goal>` lets the start of the turn it asked for through, not a later one.
