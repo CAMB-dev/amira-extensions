@@ -179,12 +179,13 @@ export function timeline(source: DashboardSource, ctx: UiContext, selected?: str
       const bar = "━".repeat(filled) + "─".repeat((narrow ? 6 : 14) - filled)
       const can = (action: DashboardAgent["actions"][number]) =>
         !!source.act && agent.actions.includes(action)
-      const actions = [
-        part("Open diff", "accent"),
-        ...(can("pause") || can("resume") ? [part(can("resume") ? "   Resume" : "   Pause")] : []),
-        ...(can("request-changes") ? [part("   Request changes")] : []),
-        part("  ⋮", "muted"),
+      const labels = [
+        ...(agent.files.length ? [part("Open diff", "accent")] : []),
+        ...(can("pause") || can("resume") ? [part(can("resume") ? "Resume" : "Pause")] : []),
+        ...(can("request-changes") ? [part("Request changes")] : []),
+        part("⋮", "muted"),
       ]
+      const actions = labels.flatMap((label, index) => (index ? [part("   "), label] : [label]))
       const changed = `${agent.files.length} ${agent.files.length === 1 ? "file" : "files"} changed ▸`
       const children: { size?: number; node: UiNode }[] = [
         {
@@ -266,7 +267,7 @@ export function timeline(source: DashboardSource, ctx: UiContext, selected?: str
           ...(foldedFooter
             ? [part(`${count} · e expand all`, "muted")]
             : !narrow
-              ? [part(`${agent.files.length ? changed : "no reported changes"}  │  `, "muted"), ...actions]
+              ? [part(`${agent.files.length ? changed : "no changes"}  │  `, "muted"), ...actions]
               : [part(" o diff", "accent")]),
           part(foldedFooter ? " ╯ " : " │ ", "muted"),
         ],

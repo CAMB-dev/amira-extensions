@@ -30,14 +30,14 @@ Phases and cards start expanded, with the first active phase’s agent selected.
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 » 09:00:30  ● ◉ Implementation… Validate payment amounts and add regression coverage for partial refunds.   ▏running 90s▕                                             checkout-v2  ▾
               │  ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-❯             ├──▶ ● Payment val…  Validate payment amou…  [TypeScript]    ━━━━━━━━──────  60%                       2 files changed ▸  │  Open diff   Pause   Request changes  ⋮ │
+❯             ├──▶ ● Payment val…  Validate payment amou…  [TypeScript]    ━━━━━━━━──────  60%                      2 files changed ▸  │  Open diff   Pause   Request changes   ⋮ │
               │  │   Amount validation is implemented; regression tests are in progress.                                                                                          │
               │  │                                                                                                                                                                │
               │  │   Changed files                                                                                                                                                │
               │  │   src/payments.ts                                                                                                                                              │
               │  │   test/payments.test.ts                                                                                                                                        │
               │  │ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── │
-              ├──▶ ‖ Receipt tem…  Check the receipt tem…                  ──────────────  —                                           1 file changed ▸  │  Open diff   Resume  ⋮ │
+              ├──▶ ‖ Receipt tem…  Check the receipt tem…                  ──────────────  —                                          1 file changed ▸  │  Open diff   Resume   ⋮ │
               │  │   Waiting for approval.                                                                                                                                        │
               │  │                                                                                                                                                                │
               │  │   Changed files                                                                                                                                                │
@@ -48,7 +48,7 @@ Phases and cards start expanded, with the first active phase’s agent selected.
               │ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   09:00:00  ✓ ○ Review          1 agent · 45s                                                                                                                              review  ▾
               │  ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-              └──▶ ✓ Refund audit  Review authorization …                  ━━━━━━━━━━━━━━  100%                                              no reported changes  │  Open diff  ⋮ │
+              └──▶ ✓ Refund audit  Review authorization …                  ━━━━━━━━━━━━━━  100%                                                                  no changes  │  ⋮ │
               │  │   No authorization issues found.                                                                                                                               │
               │  │   done in 45s                                                                                                                                                  │
               │  │                                                                                                                                                                │

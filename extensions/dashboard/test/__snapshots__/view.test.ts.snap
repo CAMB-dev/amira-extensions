@@ -133,15 +133,27 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
                       },
                       {
                         "kind": "text",
-                        "text": "   Pause",
+                        "text": "   ",
                       },
                       {
                         "kind": "text",
-                        "text": "   Request changes",
+                        "text": "Pause",
+                      },
+                      {
+                        "kind": "text",
+                        "text": "   ",
+                      },
+                      {
+                        "kind": "text",
+                        "text": "Request changes",
+                      },
+                      {
+                        "kind": "text",
+                        "text": "   ",
                       },
                       {
                         "kind": "muted",
-                        "text": "  ⋮",
+                        "text": "⋮",
                       },
                       {
                         "kind": "muted",
@@ -558,11 +570,19 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
                       },
                       {
                         "kind": "text",
-                        "text": "   Resume",
+                        "text": "   ",
+                      },
+                      {
+                        "kind": "text",
+                        "text": "Resume",
+                      },
+                      {
+                        "kind": "text",
+                        "text": "   ",
                       },
                       {
                         "kind": "muted",
-                        "text": "  ⋮",
+                        "text": "⋮",
                       },
                       {
                         "kind": "muted",
@@ -1031,15 +1051,11 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
                     "aside": [
                       {
                         "kind": "muted",
-                        "text": "no reported changes  │  ",
-                      },
-                      {
-                        "kind": "accent",
-                        "text": "Open diff",
+                        "text": "no changes  │  ",
                       },
                       {
                         "kind": "muted",
-                        "text": "  ⋮",
+                        "text": "⋮",
                       },
                       {
                         "kind": "muted",
