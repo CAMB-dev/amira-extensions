@@ -55,13 +55,16 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
     [180, 52],
     [80, 24],
   ] as const) {
-    test(`${width}x${height}: first frame shows expanded cards without input`, async () => {
+    test(`${width}x${height}: first frame shows a shared phase box and selected details without input`, async () => {
       const { first, viewer } = open(width, height)
       const text = first.join("\n")
-      expect(text).toContain("◉ Implementation")
-      expect(text).toMatch(/09:00:30\s+●\s+└─◉ Checkout workers ×2/)
-      expect(text).toContain("╭ ● Payment validation  [TypeScript]")
-      expect(text).toContain("╭ Details")
+      expect(text).toContain(width === 180 ? "◉ Implementation" : "◉ Implementatio")
+      expect(text).toMatch(/09:00:30\s+●\s+◉ Implementatio/)
+      expect(text).toContain("├──▶ ● Payment")
+      if (width === 180) expect(text).toContain("[TypeScript]")
+      expect(text).toContain("≡")
+      expect(text).toContain("[Summary]")
+      expect(text).not.toContain("Checkout run ─")
       expect(text).toContain("Esc close")
       expect(text).not.toContain("b back")
       await capture(`${width}x${height}`, first)
@@ -70,7 +73,7 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
 
     test(`${width}x${height}: every row fits the terminal on both pages`, () => {
       const { render, press, viewer } = open(width, height)
-      for (const keys of [[], ["down", "down"], ["enter"], ["5"], ["escape"]]) {
+      for (const keys of [[], ["down"], ["enter"], ["5"], ["escape"]]) {
         press(...keys)
         const rows = render()
         expect(rows.length).toBeLessThanOrEqual(height)
@@ -79,6 +82,48 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
       viewer.dispose()
     })
   }
+
+  test("new workers expand without e, and a folded last card keeps a closed frame and count", () => {
+    const { render, press, fixture, viewer } = open(180, 100)
+    press("down", "left")
+    expect(render().join("\n")).toMatch(/╰.*Receipt.*2 agents · 1 running.*╯/)
+    press("right")
+    fixture.snapshot.phases[0]!.groups[0]!.agents.push({
+      id: "new-worker",
+      name: "New worker",
+      task: "New worker summary",
+      status: "running",
+      files: [],
+      actions: [],
+    })
+    const rows = render().join("\n")
+    expect(rows).toContain("├──▶ ● New worker")
+    expect(rows).toContain("New worker summary")
+    expect(rows).toContain("3 agents · 2 running")
+    expect(rows).toContain("e expand all")
+    viewer.dispose()
+  })
+
+  test("narrow shortcut help exposes actions omitted from compact card headers", () => {
+    const { render, press, viewer } = open(80, 24)
+    press("?")
+    const rows = render().join("\n")
+    for (const hint of ["e expand all", "p pause/resume", "r request changes", "x stop", "5 stats"])
+      expect(rows).toContain(hint)
+    viewer.dispose()
+  })
+
+  test("narrow Summary retains notes and metadata in its scrollable body", () => {
+    const { render, press, fixture, viewer } = open(80, 24)
+    fixture.details.payments!.notes = [{ kind: "text", text: "A durable agent note" }]
+    fixture.snapshot.warning = "Some older files may be omitted."
+    press("enter", "tab", "end")
+    const rows = render().join("\n")
+    expect(rows).toContain("A durable agent note")
+    expect(rows).toContain("Some older files may be omitted.")
+    expect(rows).toContain("0.1250")
+    viewer.dispose()
+  })
 
   test("custom tabs, transcript and trace navigate through real host pages and restore on Esc", async () => {
     const { render, press, fixture, viewer } = open(80, 24)
@@ -106,7 +151,7 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
         }),
       },
     ]
-    press("down", "down", "enter", "5", "right")
+    press("enter", "5", "right")
     expect(render().join("\n")).toContain("Shared board contents")
     press("tab", "right")
     expect(render().join("\n")).toContain("Member messages")
@@ -131,7 +176,6 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
       { key: "board", label: "Board", render: () => [{ kind: "text", text: "Retained board" }] },
       { key: "messages", label: "Messages", render: () => [{ kind: "text", text: "Retained messages" }] },
     ]
-    press("down", "down")
     viewer.show({ source: fixture.data.source })
     render()
     // Select Board in the tab bar, then focus its text before cycling.
@@ -166,7 +210,7 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
         }),
       },
     ]
-    press("down", "down", "enter", "5", "right", "tab", "right")
+    press("enter", "5", "right", "tab", "right")
     expect(render().join("\n")).toContain("Second inner body")
     press("1", "5", "right")
     expect(render().join("\n")).toContain("Second inner body")
@@ -185,7 +229,7 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
           finish = resolve
         }),
     } as unknown as SessionControl
-    press("down", "down", "enter", "a", "down", "down", "enter")
+    press("enter", "a", "down", "down", "enter")
     expect(render().join("\n")).toContain("Loading")
     viewer.show({ source: { ...fixture.data.source, id: "other" }, session: fixture.data.session })
     expect(render().join("\n")).toContain("Dashboard source or session changed")
@@ -199,7 +243,7 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
 
   test("expand-all mode also expands agents and groups arriving after e", () => {
     const { render, press, fixture, viewer } = open(180, 100)
-    press("left", "e")
+    press("up", "left", "e")
     fixture.snapshot.phases[0]!.groups.push({
       id: "late",
       name: "Late workers",
@@ -214,17 +258,17 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
         },
       ],
     })
-    expect(render().join("\n")).toContain("╭ ● Late agent")
+    expect(render().join("\n")).toContain("├──▶ ● Late agent")
     press("left")
-    expect(render().join("\n")).not.toContain("╭ ● Late agent")
+    expect(render().join("\n")).not.toContain("├──▶ ● Late agent")
     press("e")
-    expect(render().join("\n")).toContain("╭ ● Late agent")
+    expect(render().join("\n")).toContain("├──▶ ● Late agent")
     viewer.dispose()
   })
 
   test("Enter pushes an agent page; Esc restores selection, expansion, tabs and scroll before closing", () => {
     const { render, press, closed } = open(180, 52)
-    press("down", "down", "left", "3", "end")
+    press("left", "3", "end")
     const root = render()
     expect(root.join("\n")).toContain("[Logs]")
     press("enter")
@@ -241,7 +285,7 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
 
   test("an opened agent page shows Stats on 5 and prompts cancel before Esc goes back", async () => {
     const { render, press, fixture, viewer, closed } = open(80, 24)
-    press("down", "down", "enter", "5")
+    press("enter", "5")
     const stats = render().join("\n")
     expect(stats).toContain("First token wait")
     expect(stats).toContain("bash  2  25.00s / 12.50s / 15.00s")
@@ -259,7 +303,6 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
 
   test("Stats uses retained host selection after same-kind data replacement and repairs absent tabs", () => {
     const { render, press, fixture, viewer } = open(180, 52)
-    press("down", "down")
     viewer.show({ source: fixture.data.source })
     render()
     press("5")
@@ -273,7 +316,7 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
 
   test("page shortcuts do not retain an agent target after Esc returns to the timeline", async () => {
     const { render, press, fixture, viewer } = open(180, 52)
-    press("down", "down", "enter", "p")
+    press("enter", "p")
     await Promise.resolve()
     expect(fixture.act).toHaveBeenLastCalledWith("payments", "pause", undefined)
     press("escape", "down", "p")

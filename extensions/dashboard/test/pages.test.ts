@@ -46,7 +46,12 @@ function setup() {
   }
   fixture.data.session = session as unknown as SessionControl
   const render = () => dashboardView.ui!(fixture.data, fixture.context())
-  return { ...fixture, session, info, records, render }
+  const selectTab = (key: string) => {
+    const id = fixture.widgetId("detail")
+    fixture.state.activeTabs[id] = key
+    dashboardView.onEvent!({ type: "tab", id, key }, fixture.data, fixture.control)
+  }
+  return { ...fixture, session, info, records, render, selectTab }
 }
 
 function nodes(node: UiNode): UiNode[] {
@@ -63,6 +68,7 @@ function nodes(node: UiNode): UiNode[] {
 
 test("session actions are additive and target sessionId, not the source agent ID", async () => {
   const s = setup()
+  s.selectTab("actions")
   expect(JSON.stringify(s.render())).toContain("Open transcript")
   expect(JSON.stringify(s.render())).toContain("Open trace")
   dashboardView.onEvent!({ type: "activate", id: "timeline", key: "agent:payments" }, s.data, s.control)
@@ -82,6 +88,9 @@ test("session actions are additive and target sessionId, not the source agent ID
 test("old sources without session IDs retain their original actions", async () => {
   const s = setup()
   delete agentsOf(s.snapshot)[0]!.sessionId
+  s.selectTab("actions")
+  expect(JSON.stringify(s.render())).toContain("Open diff")
+  expect(JSON.stringify(s.render())).toContain("Request changes")
   expect(JSON.stringify(s.render())).not.toContain("Open transcript")
   expect(JSON.stringify(s.render())).not.toContain("Open trace")
   await performAction(s.data, s.control, "open-transcript", "payments")
@@ -187,25 +196,38 @@ test("custom line and nested widget tabs are namespaced, navigable and backward 
     "board",
     "messages",
   ])
-  const ids = nodes(tree).flatMap((node) => ("id" in node && node.id ? [node.id] : []))
-  expect(new Set(ids).size).toBe(ids.length)
-  const board = JSON.stringify([
-    "agent-page",
-    "payments",
-    JSON.stringify(["source-tab", "board", "body", "payments"]),
-  ])
-  expect(ids).toContain(board)
+  const board = s.widgetId(JSON.stringify(["source-tab", "board", "body", "payments"]))
+  const messages = s.widgetId(JSON.stringify(["source-tab", "messages", "summary", "payments"]))
+  for (const active of ["summary", "diff", "logs", "actions", "stats", "board", "messages"]) {
+    s.selectTab(active)
+    const current = s.render()
+    const ids = nodes(current).flatMap((node) => ("id" in node && node.id ? [node.id] : []))
+    expect(new Set(ids).size).toBe(ids.length)
+    expect(ids).toContain(s.widgetId("detail"))
+    expect(ids).toContain(active === "board" ? board : active === "messages" ? messages : s.widgetId(active))
+    for (const inactive of ["summary", "diff", "logs", "actions", "stats"].filter((key) => key !== active))
+      expect(ids).not.toContain(s.widgetId(inactive))
+    if (active !== "board") expect(ids).not.toContain(board)
+    if (active !== "messages") expect(ids).not.toContain(messages)
+    expect(JSON.stringify(current)).not.toContain("Invalid override")
+    expect(JSON.stringify(current)).not.toContain("Duplicate")
+  }
+  s.selectTab("board")
+  expect(JSON.stringify(s.render())).toContain("Board contents")
+  expect(JSON.stringify(s.render())).not.toContain("Message contents")
   dashboardView.onEvent!({ type: "key", key: "right", focused: board }, s.data, s.control)
   expect(s.state.activeTabs[s.widgetId("detail")]).toBe("messages")
-  expect(JSON.stringify(tree)).toContain("Board contents")
-  expect(JSON.stringify(tree)).toContain("Message contents")
-  expect(JSON.stringify(tree)).not.toContain("Invalid override")
+  expect(JSON.stringify(s.render())).toContain("Message contents")
+  expect(JSON.stringify(s.render())).not.toContain("Board contents")
 })
 
 test("session actions are hidden for sessions the host does not list, and a throwing tab is contained", () => {
   const s = setup()
   s.session.subagents = () => []
+  s.selectTab("actions")
+  expect(JSON.stringify(s.render())).toContain("Open diff")
   expect(JSON.stringify(s.render())).not.toContain("Open transcript")
+  expect(JSON.stringify(s.render())).not.toContain("Open trace")
   s.session.subagents = () => [{ id: "child-session" }]
   s.details.payments!.tabs = [
     {
@@ -217,6 +239,8 @@ test("session actions are hidden for sessions the host does not list, and a thro
     },
   ]
   dashboardView.onEvent!({ type: "activate", id: "timeline", key: "agent:payments" }, s.data, s.control)
+  expect(JSON.stringify(s.render())).not.toContain("This tab failed to render: bad tab")
+  s.selectTab("boom")
   const body = JSON.stringify(s.render())
   expect(body).toContain("This tab failed to render: bad tab")
   expect(body).toContain("Summary")

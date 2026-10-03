@@ -1,6 +1,6 @@
 {
   "name": "dashboard",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "license": "Apache-2.0",
   "description": "Experimental agent timeline, detail pages and trace replay statistics for Amira",
   "type": "module",

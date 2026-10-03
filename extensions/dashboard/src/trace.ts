@@ -292,6 +292,7 @@ export async function createTraceSource(
     workspace: info.cwd,
     phases: [{ id: "agents", name: "Agents", groups: [...groups.values()] }],
     note: `Read-only snapshot of completed intervals only. Missing data and unreported usage are unknown; costs are per session, not combined.${unavailable.size ? ` No trace records for ${unavailable.size} session(s).` : ""}`,
+    warning: `Read-only snapshot of completed intervals only.${unavailable.size ? ` No trace records for ${unavailable.size} session(s).` : ""}`,
   })
   return freeze({
     id: "trace",

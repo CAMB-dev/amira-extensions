@@ -12,36 +12,18 @@ import type {
   ViewSegment,
 } from "@amira/api"
 import { summarizeTrace } from "@amira/api"
-import {
-  agentsOf,
-  type DashboardAction,
-  type DashboardAgent,
-  type DashboardSource,
-  type DashboardStatus,
-  type DashboardTab,
-} from "./source.ts"
+import { clock, phaseInfo, summary, timeline } from "./layout.ts"
+import { agentsOf, type DashboardAgent, type DashboardSource, type DashboardTab } from "./source.ts"
 import { ownCost, traceLogLines } from "./trace.ts"
 
 export const VIEW_KIND = "dashboard"
 const TABS = ["summary", "diff", "logs", "actions", "stats"]
-const mark: Record<DashboardStatus, string> = {
-  queued: "◌",
-  running: "●",
-  idle: "○",
-  paused: "‖",
-  done: "✓",
-  failed: "✗",
-  stopped: "⊘",
-}
 const part = (text: string, kind: ViewSegment["kind"] = "text"): ViewSegment => ({ text, kind })
 const text = (lines: ViewLine[], id?: string): UiNode => ({ type: "text", id, lines })
 const line = (value: string): ViewLine => ({ kind: "text", text: value })
 const money = (cost?: number) => (cost === undefined ? "cost unknown" : `$${cost.toFixed(3)}`)
 const seconds = (ms: number) => `${(ms / 1000).toFixed(2)}s`
-const clock = (at?: number) => (at === undefined ? "--:--:--" : new Date(at).toISOString().slice(11, 19))
 const agentKey = (id: string) => `agent:${id}`
-const tone = (status: DashboardStatus): ViewSegment["kind"] =>
-  status === "failed" ? "error" : status === "done" ? "success" : status === "running" ? "accent" : "muted"
 
 export interface DashboardViewData {
   source: DashboardSource
@@ -56,117 +38,7 @@ export interface DashboardViewData {
   pendingAction?: string
 }
 
-/** Key hints name only what this agent's source can do; Open diff and Actions always work. */
-function hints(agent: DashboardAgent): string {
-  const can = (action: DashboardAction) => agent.actions.includes(action)
-  return [
-    "o Open diff",
-    ...(can("pause") || can("resume") ? [`p ${can("resume") ? "Resume" : "Pause"}`] : []),
-    ...(can("request-changes") ? ["r Request changes"] : []),
-    ...(can("stop") ? ["x Stop"] : []),
-    "a ⋮ Actions",
-  ].join(" · ")
-}
-
-function card(agent: DashboardAgent, narrow: boolean): UiNode {
-  return {
-    type: "box",
-    title: {
-      kind: "segments",
-      parts: [
-        part(`${mark[agent.status]} ${agent.name}  `, tone(agent.status)),
-        ...(agent.language ? [{ kind: "chip" as const, text: agent.language, tone: "info" as const }] : []),
-      ],
-    },
-    aside: agent.status,
-    child: {
-      type: "column",
-      children: [
-        { size: narrow ? 2 : 1, node: text([line(agent.task)]) },
-        {
-          size: 1,
-          node: {
-            type: "progress",
-            value: agent.progress ?? 0,
-            width: 18,
-            label: agent.progress === undefined ? "Progress unknown" : `${Math.round(agent.progress * 100)}%`,
-          },
-        },
-        {
-          size: 1,
-          node: text([
-            {
-              kind: "muted",
-              text: `${agent.files.length} ${agent.files.length === 1 ? "file" : "files"} reported changed · ${money(agent.cost)}`,
-            },
-          ]),
-        },
-        ...agent.files
-          .slice(0, narrow ? 1 : 3)
-          .map((file) => ({ size: 1, node: text([{ kind: "code" as const, text: file.path }]) })),
-        {
-          size: narrow ? 2 : 1,
-          node: text([
-            {
-              kind: "accent",
-              text: hints(agent),
-            },
-          ]),
-        },
-      ],
-    },
-  }
-}
-
-function timeline(data: DashboardViewData, ctx: UiContext, selected?: string): UiNode {
-  const expanded = ctx.state.expanded.timeline
-  const isExpanded = (key: string) => expanded === undefined || expanded.includes(key)
-  const items: UiTreeItem[] = data.source.snapshot().phases.map((phase) => ({
-    key: `phase:${phase.id}`,
-    row: [part(phase.name, "accent")],
-    rail: true,
-    underline: true,
-    node: [part("◉", "accent")],
-    aside: [part(isExpanded(`phase:${phase.id}`) ? "▾" : "▸", "muted")],
-    children: phase.groups.map((group) => {
-      const running = group.agents.filter((agent) => agent.status === "running").length
-      const times = group.agents.flatMap((agent) => (agent.startedAt === undefined ? [] : [agent.startedAt]))
-      const failed = group.agents.some((agent) => agent.status === "failed")
-      const done = group.agents.length > 0 && group.agents.every((agent) => agent.status === "done")
-      return {
-        key: `group:${phase.id}:${group.id}`,
-        lead: [
-          part(
-            `${clock(times.length ? Math.min(...times) : undefined)}  ${running ? "●" : failed ? "✗" : done ? "✓" : "○"}`,
-            failed ? "error" : "muted",
-          ),
-        ],
-        node: [part(running ? "◉" : "○", running ? "accent" : "muted")],
-        row: [part(`${group.name} ×${group.agents.length}`), part(`  ${running} running`, "muted")],
-        aside: [
-          part(
-            `${group.ref ?? group.id}  ${isExpanded(`group:${phase.id}:${group.id}`) ? "▾" : "▸"}`,
-            "muted",
-          ),
-        ],
-        rail: true,
-        underline: true,
-        children: group.agents.map((agent) => ({
-          key: agentKey(agent.id),
-          row: [part(`${mark[agent.status]} ${agent.name}`, tone(agent.status))],
-          aside: [part(agent.status, tone(agent.status))],
-          rail: true,
-          detail: ctx.width >= 110 || agent.id === selected ? card(agent, ctx.width < 110) : undefined,
-        })),
-      }
-    }),
-  }))
-  return agentsOf(data.source.snapshot()).length
-    ? { type: "tree", id: "timeline", expanded: "all", items }
-    : text([line("No agents yet. Start a task with sub-agents, then return here.")], "empty")
-}
-
-function statsPanel(stats: TraceSummary | undefined, agents: DashboardAgent[]): UiNode {
+function statsPanel(stats: TraceSummary | undefined, agents: DashboardAgent[], note?: string): UiNode {
   if (!stats) return text([line("No trace statistics available.")], "stats-empty")
   const rows = [
     ["First token wait", stats.modelWaitMs],
@@ -203,12 +75,14 @@ function statsPanel(stats: TraceSummary | undefined, agents: DashboardAgent[]): 
       : [line("No recorded failures.")]),
     line(""),
     line("Cost per agent · own usage only, no recursive totals"),
+    { kind: "muted", text: "ⓘ Missing reported costs are unknown, not zero." },
     ...agents.map((item) => line(`${item.name}: ${money(item.cost)}`)),
+    ...(note ? [{ kind: "muted" as const, text: `ⓘ ${note}` }] : []),
   ]
   return text(lines, "stats")
 }
 
-function details(data: DashboardViewData, agent?: DashboardAgent): UiNode {
+function details(data: DashboardViewData, ctx: UiContext, agent?: DashboardAgent): UiNode {
   if (!agent)
     return text(
       [line("Select an agent in the timeline, then press Enter to open its page.")],
@@ -250,17 +124,7 @@ function details(data: DashboardViewData, agent?: DashboardAgent): UiNode {
     {
       key: "summary",
       label: "Summary",
-      body: text(
-        [
-          line(`${mark[agent.status]} ${agent.name} · ${agent.status} · ${money(agent.cost)}`),
-          line(agent.task),
-          ...(detail?.summary ?? []),
-          ...(data.source.snapshot().note
-            ? [{ kind: "muted" as const, text: data.source.snapshot().note! }]
-            : []),
-        ],
-        "summary",
-      ),
+      body: summary(data.source, agent, ctx),
     },
     { key: "diff", label: "Diff", body: text(diff, "diff") },
     {
@@ -306,7 +170,7 @@ function details(data: DashboardViewData, agent?: DashboardAgent): UiNode {
     tabs.push({
       key: "stats",
       label: "Stats",
-      body: statsPanel(detail.stats, agentsOf(data.source.snapshot())),
+      body: statsPanel(detail.stats, agentsOf(data.source.snapshot()), data.source.snapshot().note),
     })
   for (const tab of sourceTabs(detail?.tabs)) {
     let body: UiNode | ViewLine[]
@@ -328,7 +192,42 @@ function details(data: DashboardViewData, agent?: DashboardAgent): UiNode {
       ),
     })
   }
-  return { type: "tabs", id: "detail", tabs }
+  const id = typeof ctx.page?.data === "string" ? pageWidget(ctx.page.data, "detail") : "detail"
+  const active = tabs.find((tab) => tab.key === ctx.state.activeTabs[id]) ?? tabs[0]!
+  return {
+    type: "column",
+    children: [
+      {
+        size: 1,
+        node: {
+          type: "row",
+          children: [
+            {
+              size: ctx.width < 110 ? "fill" : 72,
+              node: {
+                type: "tabs",
+                id: "detail",
+                tabs: tabs.map((tab) => ({ ...tab, body: { type: "spacer" } })),
+              },
+            },
+            ...(ctx.width < 110
+              ? []
+              : [
+                  {
+                    node: {
+                      type: "bar" as const,
+                      left: [],
+                      right: [part(`${agent.name}  ${agent.task}   × `, "muted")],
+                    },
+                  },
+                ]),
+          ],
+        },
+      },
+      { size: 1, node: { type: "rule" } },
+      { node: active.body },
+    ],
+  }
 }
 
 /** Transcript and trace are offered only for descendants the session itself lists. */
@@ -632,7 +531,7 @@ function onEvent(event: UiEvent, data: DashboardViewData, host: UiControl) {
     view.setState({ expanded: {} })
   } else if (event.key === "?") {
     data.flash =
-      "↑↓ select · ←→ expand or switch focused tabs · Enter open · Tab focus · 1–4 tabs · 5 stats · Esc back/close · q close"
+      "e expand all · o diff · p pause/resume · r request changes · a actions · x stop · 1–4 tabs · 5 stats"
   } else if (event.key === "a") {
     data.pendingAction = undefined
     setTab(data, view, "actions")
@@ -687,16 +586,31 @@ function onEvent(event: UiEvent, data: DashboardViewData, host: UiControl) {
 
 export const dashboardView: ViewDefinition<DashboardViewData> = {
   kind: VIEW_KIND,
+  onOpen(data, view) {
+    const phases = data.source.snapshot().phases
+    const active =
+      phases.find((phase) =>
+        phaseInfo(phase, Date.now()).agents.some(
+          (agent) => agent.status === "running" || agent.status === "paused",
+        ),
+      ) ?? phases[0]
+    const first = active?.groups.flatMap((group) => group.agents)[0]
+    data.selected = first?.id
+    view.setState({
+      selected: { timeline: first ? agentKey(first.id) : `phase:${active?.id ?? ""}` },
+      focused: "timeline",
+    })
+  },
   title: (data, ctx) => (ctx.page ? "Dashboard · Agent" : `Dashboard · ${data.source.label}`),
   keys: [
-    { key: "e", label: "expand all" },
-    { key: "o", label: "diff" },
+    { key: "e", label: "" },
+    { key: "o", label: "" },
     // Capability-specific hints live beside the selected agent, not in the static host key bar.
     { key: "p", label: "" },
     { key: "r", label: "" },
     { key: "x", label: "" },
-    { key: "a", label: "actions" },
-    { key: "?", label: "help" },
+    { key: "a", label: "" },
+    { key: "?", label: "" },
     ...["1", "2", "3", "4", "5", "left", "right"].map((key) => ({ key, label: "" })),
   ],
   ui(data, ctx) {
@@ -722,64 +636,93 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
         item.groups.some((group) => group.agents.some((item) => item.status === "running")),
       ) ?? snapshot.phases[0]
     const narrow = ctx.width < 110
-    const totals = `${phase?.name ?? "Agents"}  │ ${agents.filter((item) => item.status === "running").length}/${agents.length} running  │ ${money(cost)}`
-    const top: UiNode = narrow
-      ? {
-          type: "column",
-          children: [
+    const totals = `phase: ${phase?.name ?? "Agents"}  │  running: ${agents.filter((item) => item.status === "running").length}/${agents.length}  │  cost: ${cost === undefined ? "unknown" : `$${cost.toFixed(4)}`}`
+    const top: UiNode = {
+      type: "bar",
+      left: [
+        part(" amira", "accent"),
+        part(`  │  workspace: ${snapshot.workspace}${narrow ? "" : `  │  ${totals}`}`),
+      ],
+      right: [part(narrow ? "? help · q quit" : "? shortcuts  │  q quit ", "muted")],
+    }
+    const detailHeight = agent ? (narrow ? 6 : Math.min(15, Math.max(9, Math.round(ctx.height * 0.3)))) : 2
+    const flashHeight = data.flash ? (narrow ? 2 : 1) : 0
+    const panel: UiNode = {
+      type: "column",
+      children: [
+        {
+          size: 1,
+          node: text([
             {
-              size: 1,
-              node: {
-                type: "bar",
-                left: [part("amira · ", "accent"), part(snapshot.workspace)],
-                right: [part("? help", "muted")],
-              },
+              kind: "segments",
+              parts: [
+                part(
+                  `${"─".repeat(Math.max(0, Math.floor((ctx.width - 3) / 2)))} ≡ ${"─".repeat(Math.max(0, Math.ceil((ctx.width - 3) / 2)))}`,
+                  "muted",
+                ),
+              ],
             },
-            { size: 1, node: { type: "bar", left: [part(totals)] } },
-          ],
-        }
-      : {
-          type: "bar",
-          left: [part("amira · ", "accent"), part(`${snapshot.workspace}  │ ${totals}`)],
-          right: [part("? help · q close", "muted")],
-        }
+          ]),
+        },
+        { node: page ? pageDetails(details(data, ctx, agent), page) : details(data, ctx, agent) },
+        ...(agent
+          ? [
+              {
+                size: 1,
+                node: text([
+                  {
+                    kind: "muted" as const,
+                    text: narrow
+                      ? " 1–4 tabs · o diff · a actions · ? shortcuts"
+                      : " 1–4 tabs · 5 stats (when available) · x stop",
+                  },
+                ]),
+              },
+            ]
+          : []),
+      ],
+    }
     return {
       type: "column",
       children: [
-        { size: narrow ? 2 : 1, node: top },
+        { size: 1, node: top },
+        ...(narrow ? [{ size: 1, node: { type: "bar" as const, left: [part(totals, "muted")] } }] : []),
+        { size: 1, node: { type: "rule" } },
+        ...(!page
+          ? [
+              {
+                node: timeline(
+                  data.source,
+                  {
+                    ...ctx,
+                    height: Math.max(0, ctx.height - (narrow ? 3 : 2) - detailHeight - 3 - flashHeight),
+                  },
+                  agent?.id,
+                ),
+              },
+            ]
+          : []),
+        { ...(page ? {} : { size: detailHeight }), node: panel },
+        ...(data.flash
+          ? [{ size: flashHeight, node: text([{ kind: "accent" as const, text: data.flash }]) }]
+          : []),
         {
-          size: 1,
-          node: {
-            type: "rule",
-            label: page ? `${agent?.name ?? "Agent unavailable"} · ${data.source.label}` : data.source.label,
-          },
-        },
-        ...(!page ? [{ node: timeline(data, ctx, agent?.id ?? agents[0]?.id) }] : []),
-        {
-          ...(page ? {} : { size: agent ? Math.max(7, Math.min(18, Math.round(ctx.height * 0.35))) : 7 }),
+          size: 3,
           node: {
             type: "box",
-            title: `Details${agent ? ` · ${agent.name}` : ""}`,
-            child: page ? pageDetails(details(data, agent), page) : details(data, agent),
-          } as UiNode,
-        },
-        {
-          size: narrow ? 3 : 2,
-          node: text([
-            {
-              kind: data.flash ? "accent" : "muted",
-              text:
-                data.flash ??
-                snapshot.note ??
-                "Enter opens an agent · e expands all · Tab moves focus · 1–4 switches tabs",
+            child: {
+              type: "bar",
+              left: [
+                part(
+                  narrow
+                    ? " > Ask Amira after closing this view"
+                    : " > Ask Amira or enter a command after closing this view…",
+                  "muted",
+                ),
+              ],
+              right: narrow ? [] : [part("Hint only · close this view to send ", "muted")],
             },
-            {
-              kind: "muted",
-              text: page
-                ? `${agent ? hints(agent) : "Agent unavailable"} · Esc back`
-                : `${agent ? hints(agent) : "Enter opens an agent"} · Esc/q close`,
-            },
-          ]),
+          },
         },
       ],
     }
