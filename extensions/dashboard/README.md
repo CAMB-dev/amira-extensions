@@ -19,45 +19,92 @@ The command offers source-ID completion. Trace replay reads completed records on
 
 ### Screenshots as text
 
-Schematic wide view (180×52; actual styling comes from your terminal theme):
+Real output of the dashboard rendered through Amira's TUI `ExtensionViewer` with fake sub-agents
+(`test/tui-render.test.ts`), plain text without colors, after pressing `e` to expand everything.
+Wide view, 180×52:
 
 ```text
-amira · workspace  │ Agents │ 1/2 running │ $0.042                         ? help · b back · q quit
-──────────────────────────────────────── agents ─────────────────────────────────────────────────
-            ◉ Agents                                                                          ▾
-10:12:40  ●  ├─◉ Build ×2 · 1 running                                              spawn-group  ▾
-            │ ├─● API worker                                                          running
-            │ │ ╭ ● API worker [TypeScript] ─────────────────────────────────────────────────╮
-            │ │ │ Define the event contract                                                   │
-            │ │ │ ━━━━━━━━━━━       75%                                                        │
-            │ │ │ 2 files reported changed · $0.030                                            │
-            │ │ │ src/events.ts                                                               │
-            │ │ │ o Open diff · p Pause · r Request changes · a ⋮ Actions                      │
-            │ │ ╰────────────────────────────────────────────────────────────────────────────╯
-            │ └─✓ Reviewer                                                           done
-            └─────────────────────────────────────────────────────────────────────────────────
-╭ Details · API worker ────────────────────────────────────────────────────────────────────────╮
-│ Summary │ Diff │ Logs │ Actions                                                              │
-│ ● API worker · running · $0.030                                                              │
-│ Define the event contract                                                                   │
-╰─────────────────────────────────────────────────────────────────────────────────────────────╯
-Enter opens an agent · e expands all · Tab moves focus · 1–4 switches tabs
+amira · acme/checkout  │ Implementation  │ 1/3 running  │ cost unknown                                                                                      ? help · b back · q quit
+ Checkout run ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯             ◉ Implementation                                                                                                                                                     ▾
+              │ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  09:00:30  ● └─◉ Checkout workers ×2  1 running                                                                                                                      checkout-v2  ▾
+                │ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                ├─▾ ● Payment validation                                                                                                                                     running
+                │ │ ╭ ● Payment validation  [TypeScript] ───────────────────────────────────────────────────────────────────────────────────────────────────────────────── running ╮
+                │ │ │Validate payment amounts and add regression coverage for partial refunds.                                                                                     │
+                │ │ │━━━━━━━━━━━─────── 60%                                                                                                                                        │
+                │ │ │2 files reported changed · $0.125                                                                                                                             │
+                │ │ │src/payments.ts                                                                                                                                               │
+                │ │ │test/payments.test.ts                                                                                                                                         │
+                │ │ │o Open diff · p Pause · r Request changes · x Stop · a ⋮ Actions                                                                                              │
+                │ │ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+                └─▾ ‖ Receipt templates                                                                                                                                       paused
+                  │ ╭ ‖ Receipt templates   ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── paused ╮
+                  │ │Check the receipt template while awaiting product approval.                                                                                                   │
+                  │ │────────────────── Progress unknown                                                                                                                           │
+                  │ │1 file reported changed · cost unknown                                                                                                                        │
+                  │ │templates/receipt.html                                                                                                                                        │
+                  │ │o Open diff · p Resume · x Stop · a ⋮ Actions                                                                                                                 │
+                  │ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+              ◉ Review                                                                                                                                                             ▾
+              │ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  09:00:00  ✓ └─○ Security review ×1  0 running                                                                                                                           workers  ▾
+                │ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                └─▾ ✓ Refund audit                                                                                                                                              done
+                  │ ╭ ✓ Refund audit   ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── done ╮
+                  │ │Review authorization checks on refund requests.                                                                                                               │
+                  │ │━━━━━━━━━━━━━━━━━━ 100%                                                                                                                                       │
+                  │ │0 files reported changed · $0.040                                                                                                                             │
+                  │ │o Open diff · a ⋮ Actions                                                                                                                                     │
+                  │ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+╭ Details ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│  Select an agent in the timeline. Press e to expand all groups.                                                                                                                  │
+│                                                                                                                                                                                  │
+│                                                                                                                                                                                  │
+│                                                                                                                                                                                  │
+│                                                                                                                                                                                  │
+│                                                                                                                                                                                  │
+│                                                                                                                                                                                  │
+│                                                                                                                                                                                  │
+│                                                                                                                                                                                  │
+│                                                                                                                                                                                  │
+│                                                                                                                                                                                  │
+│                                                                                                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+Own reported usage only; missing costs are unknown.
+Enter opens an agent · Esc/q close
 ```
 
-An adapter may supply a real progress fraction (as in this schematic). The built-in sources show **Progress unknown**, not a guessed percentage, until successful completion. A language chip appears only when reported file extensions identify a single known language.
+An adapter may supply a real progress fraction (as for "Payment validation" above). The built-in sources show **Progress unknown**, not a guessed percentage, until successful completion. A language chip appears only when reported file extensions identify a single known language. The dashboard opens with every row collapsed (the API has no initial tree state); press **e** to expand all.
 
-At 80×24, only the selected agent gets a card, file previews are shortened, and the detail panel is smaller. The host scrolls the tree and detail body independently. Open the agent page for more room:
+At 80×24 the selected agent's card scrolls into view with a smaller detail panel. The host scrolls the tree and detail body independently. Open the agent page (Enter) for more room:
 
 ```text
-amira · workspace │ Agents │ 1/2 running │ cost unknown                  ? help
-────────────────────────── API worker · Live agents ─────────────────────────
-╭ Details · API worker ──────────────────────────────────────────────────────╮
-│ Summary │ Diff │ Logs │ Actions                                           │
-│ ● API worker · running · cost unknown                                     │
-│ Define the event contract                                                │
-│ ...                                                                      │
-╰──────────────────────────────────────────────────────────────────────────╯
-←→ tabs · b back to dashboard · Esc/q closes dashboard
+amira · acme/checkout                                                     ? help
+Implementation  │ 1/3 running  │ cost unknown
+ Checkout run ──────────────────────────────────────────────────────────────────
+»             ◉ Implementation                                                 ▾
+              │ ────────────────────────────────────────────────────────────────
+  09:00:30  ● └─◉ Checkout workers ×2  1 running                  checkout-v2  ▾
+                │ ──────────────────────────────────────────────────────────────
+❯               ├─▾ ● Payment validation                                 running
+                │ │ ╭ ● Payment validation  [TypeScript] ───────────── running ╮
+                │ │ │Validate payment amounts and add regression coverage for  │
+                │ │ │partial refunds.                                          │
+                │ │ │━━━━━━━━━━━─────── 60%                                    │
+                │ │ │2 files reported changed · $0.125                         │
+╭ Details · Payment validation ────────────────────────────────────────────────╮
+│  [Summary]  Diff  Logs  Actions  Stats                                       │
+│  ● Payment validation · running · $0.125                                     │
+│  Validate payment amounts and add regression coverage for partial refunds.   │
+│  Amount validation is implemented; regression tests are in progress.         │
+│  Own reported usage only; missing costs are unknown.                         │
+╰──────────────────────────────────────────────────────────────────────────────╯
+Own reported usage only; missing costs are unknown.
+o Open diff · p Pause · r Request changes · x Stop · a ⋮ Actions · Esc/q close
+
 ```
 
 Replay adds a **Stats** tab: first-token wait, streaming, unclassified model time, tool interval union, approval wait and idle; a per-tool count/total/average/maximum/outcome table; failures; and cost per agent. These time measures can overlap and **must not be summed into wall time**. Each trace is summarized separately with `summarizeTrace`; parent/child costs are never recursively added twice. Missing cost is shown as unknown, not zero.
@@ -91,7 +138,8 @@ Card action labels are keyboard hints, not pretend clickable buttons: tree detai
 - Authoritative `writtenPaths` identify files, not their before/after content. Diff shows supplied diff lines when an adapter has them; otherwise it lists reported paths with **No diff available**. It does not attribute the entire workspace's git diff to an agent.
 - Traces contain completed intervals and bounded tool previews, not unfinished work or full tool payloads. An empty trace is not evidence of zero work or zero cost.
 - A live source observes events while loaded and also reads session listings/messages. Files changed before its event subscription may not be known; trace replay can recover persisted `writtenPaths`.
-- API `UiContext` exposes width, **not height**, and `@amira/api` exports no terminal widget renderer. Tests snapshot public semantic widget trees for the 180×52 and 80×24 target viewports; these are **not terminal-cell raster snapshots**. Actual terminal rendering and host keyboard dispatch need a TUI smoke test. The extension does not import private TUI code to fake that verification.
+- API `UiContext` exposes width, **not height**, and `@amira/api` exports no terminal widget renderer. `test/*.test.ts` snapshot the public semantic widget trees; `test/tui-render.test.ts` additionally renders the view through a linked Amira checkout's TUI at 180×52 and 80×24 (skipped when the checkout is not linked). It is not a raster or real-terminal test, and the runtime code never imports the TUI.
+- There is no initial tree state: `UiState.expanded` starts empty, so the timeline opens collapsed until the user presses **e**.
 
 ## Source service
 
@@ -154,6 +202,6 @@ bun run typecheck
 bunx biome check .
 ```
 
-The helper links only `@amira/api` and its transitive `@amira/ai` dependency. Extension runtime imports remain API-only; the linking script uses Node filesystem utilities, and tests use `bun:test`. Tests use fake sessions and event buses, no models, network requests, process killing or changes to core. Snapshot updates: `bun test --update-snapshots` after inspecting intentional widget changes.
+The helper links `@amira/api` and its transitive `@amira/ai` dependency, plus `@amira/tui` and `@amira/tui-kit` for the render test when the checkout has them. Extension runtime imports remain API-only; the linking script uses Node filesystem utilities, and tests use `bun:test`. Tests use fake sessions and event buses, no models, network requests, process killing or changes to core. Snapshot updates: `bun test --update-snapshots` after inspecting intentional widget changes.
 
 License: Apache-2.0.

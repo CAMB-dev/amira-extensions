@@ -21,6 +21,7 @@ moves every installed one to its newest commit, and `--project` installs into
 | [browser](extensions/browser/README.md) | `browser_*` tools: the model opens pages (your dev server) in an installed Chrome or Edge, takes screenshots, clicks, types and reads the console | `amira ext install browser` |
 | [images](extensions/images/README.md) | Images in replies drawn in the terminal (Sixel, kitty, iTerm2): local files, and http(s) URLs with web_fetch's private-network protection | `amira ext install images` |
 | [mermaid](extensions/mermaid/README.md) | ` ```mermaid ` blocks as diagrams: flowcharts and sequence diagrams as text that fits the width, other types as pictures (with images and browser) | `amira ext install mermaid` |
+| [dashboard](extensions/dashboard/README.md) | `/dashboard` (experimental): a live timeline of sub-agents with detail pages, and trace replay statistics | `amira ext install dashboard` |
 
 <details>
 <summary>The index, writing a package, and adding one here</summary>
