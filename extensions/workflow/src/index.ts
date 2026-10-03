@@ -51,11 +51,11 @@ export async function confirmStop(view: ViewControl, question: string): Promise<
 /** settings.json `extensions.workflow` (D81). */
 export interface WorkflowSettings {
   /**
-   * How a workflow starts: "ask" (default) asks the user to confirm every start, which is the
-   * gate; "always" starts without asking; "never" starts none. ("explicit", the setting's
-   * earlier default, reads as "ask".)
+   * How a workflow starts: "mode" (default) follows the current permission mode: auto starts
+   * without asking; edits, plan or missing permission info ask. "ask" confirms every start;
+   * "always" starts without asking; "never" starts none. The older "explicit" reads as "ask".
    */
-  enabled?: "ask" | "always" | "never"
+  enabled?: "mode" | "ask" | "always" | "never"
   /** Agents a run may start in all. Default 30. */
   maxAgents?: number
   /** Agents of a run working at once. Default 6. */
@@ -85,9 +85,10 @@ export function readSettings(raw: unknown, report: (error: string) => void = () 
   const bad = (field: string, want: string) =>
     report(`settings: extensions.workflow.${field} must be ${want}; using the default`)
   if (r.enabled !== undefined) {
-    if (r.enabled === "ask" || r.enabled === "always" || r.enabled === "never") out.enabled = r.enabled
+    if (r.enabled === "mode" || r.enabled === "ask" || r.enabled === "always" || r.enabled === "never")
+      out.enabled = r.enabled
     else if (r.enabled === "explicit") out.enabled = "ask"
-    else bad("enabled", '"ask", "always" or "never"')
+    else bad("enabled", '"mode", "ask", "always" or "never"')
   }
   for (const key of ["maxAgents", "maxConcurrent"] as const) {
     if (r[key] === undefined) continue
@@ -316,7 +317,8 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
     /** Asks the user, then starts the run in the background. Returns the run, or why it did not start. */
     const launch = async (l: Launch): Promise<WorkflowRun | string> => {
       const s = settings()
-      const mode = s.enabled ?? "ask"
+      const mode = s.enabled ?? "mode"
+      const auto = mode === "mode" && api.session?.()?.info().permissions?.mode === "auto"
       if (mode === "never")
         return "Workflows are turned off in settings (extensions.workflow.enabled: never)."
       let meta: WorkflowMeta
@@ -329,7 +331,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       if (l.initiator === "model" && keys.some((k) => declined.has(k))) {
         return `The user already declined the workflow "${meta.name}" in this session, so it was not proposed again. Do not propose it again, renamed or reworded; carry on without it (e.g. with the agent tool) unless the user asks for a workflow.`
       }
-      if (mode === "ask") {
+      if (mode !== "always" && !auto) {
         const ok = await l.ui.confirm(
           `${l.resume ? "Resume" : "Start"} workflow "${meta.name}"?`,
           confirmText(meta, l.source, l.initiator, l.resume),
@@ -412,6 +414,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         else l.send?.(message)
       })
       run.start()
+      if (auto) api.notify(`Workflow "${meta.name}" started without asking: permission mode is auto.`)
       dashboard.update(run)
       dashboardBinding.refresh()
       setStatus(run)
@@ -448,7 +451,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
     const tool: ToolDefinition<Params> = {
       name: WORKFLOW_TOOL,
       mainOnly: true,
-      description: `Runs a workflow: a TypeScript script that orchestrates many sub-agents (fan-out, verification, pipelines) deterministically, in the background. Use it when a workflow clearly helps (many agents fanning out, checking each other's work, or a long pipeline); for one or two sub-agents use the agent tool. Calling it proposes the workflow: the user sees its name, description, phases and estimated size and approves or declines it. When the user declines one, do not call it again for the same workflow unless they ask. Load the "workflow" skill first for how to write scripts. The script runs in a sandbox with only agent(prompt, {label, phase, schema, role, model, isolation}), parallel(thunks), pipeline(items, ...stages), phase(title), log(msg), args, budget and workflow(name, args); it starts with \`export const meta = { name, description, phases }\` and its top level ends with \`return result\`. The call returns at once with the run's id; the script's return value comes back to you by itself as a message when the run ends: end your turn instead of waiting. Give "script" (the source), or "name" (a saved workflow from .amira/workflows or ~/.amira/workflows), and "args" for the script. "resume" with a run id reruns that run (with "script" or "name" to use an edited script), replaying unchanged agent calls from its journal.`,
+      description: `Runs a workflow: a TypeScript script that orchestrates many sub-agents (fan-out, verification, pipelines) deterministically, in the background. Use it when a workflow clearly helps (many agents fanning out, checking each other's work, or a long pipeline); for one or two sub-agents use the agent tool. Calling it proposes the workflow: when confirmation is required by settings and the current permission mode, the user sees its name, description, phases and estimated size and approves or declines it. When the user declines one, do not call it again for the same workflow unless they ask. Load the "workflow" skill first for how to write scripts. The script runs in a sandbox with only agent(prompt, {label, phase, schema, role, model, isolation}), parallel(thunks), pipeline(items, ...stages), phase(title), log(msg), args, budget and workflow(name, args); it starts with \`export const meta = { name, description, phases }\` and its top level ends with \`return result\`. The call returns at once with the run's id; the script's return value comes back to you by itself as a message when the run ends: end your turn instead of waiting. Give "script" (the source), or "name" (a saved workflow from .amira/workflows or ~/.amira/workflows), and "args" for the script. "resume" with a run id reruns that run (with "script" or "name" to use an edited script), replaying unchanged agent calls from its journal.`,
       parameters: {
         type: "object",
         properties: {

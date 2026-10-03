@@ -18,12 +18,22 @@ You can ask for a swarm, and the model may propose one when it clearly helps:
 - say "swarm" in a message ("use a swarm to ..."): the model calls the `swarm` tool;
 - or the model proposes one on its own.
 
-Every start asks you to confirm, showing whether the model proposes it or you asked for it,
+By default, `enabled: "mode"` follows the session's current permission mode at each start:
+
+- `auto`: starts without asking and adds a notice explaining why to the transcript;
+- `edits`: asks you to confirm;
+- `plan`: asks you to confirm.
+
+Missing session or permission information also falls back to asking. The same rule applies
+whether you requested the swarm or the model proposed it. A confirmation shows the initiator,
 the goal, the roster (names, roles, briefs), the limits and the budget. If you decline, the
 model is told so and may not propose a swarm for the same goal again in this session unless
-you ask for one. Where nobody can confirm (print mode, an rpc client that does not answer
-dialogs), the model cannot start one: run `/swarm <goal>` in the interactive UI, or set
-`enabled` to `"always"`.
+you ask for one.
+
+Print mode (`amira -p`) uses `auto` by default, so swarms can start without a dialog. When
+confirmation is required, nobody answering (print mode, or an rpc client that does not answer
+dialogs) means no swarm starts. Run it in the interactive UI, or set `enabled` to `"always"`
+to skip confirmation in every permission mode.
 
 Only the main session can start a swarm; members and other sub-agents cannot. The start
 returns at once. The swarm runs in the background and, when it ends, sends the main session
@@ -140,7 +150,7 @@ In `settings.json`, under `extensions.swarm`:
 {
   "extensions": {
     "swarm": {
-      "enabled": "ask",            // "ask" (default): confirm every start; "always": start without asking; "never"
+      "enabled": "mode",           // default: follow the session's permission mode (see below)
       "maxMembers": 6,
       "limits": {
         "maxMessagesPerMember": 30,
@@ -156,17 +166,27 @@ In `settings.json`, under `extensions.swarm`:
 }
 ```
 
+`enabled` controls confirmation:
+
+- `"mode"` (default): starts without asking in `auto`; asks in `edits` and `plan`, or when
+  permission information is unavailable. Switching permission modes affects the next start.
+- `"ask"`: confirms every start, including in `auto`.
+- `"always"`: starts without asking in any permission mode.
+- `"never"`: disables swarms.
+
 A start may lower the message and turn limits (`limits` of the `swarm` tool), never raise
 them.
 
-Older settings still work: `"enabled": "explicit"` reads as `"ask"`, and `"confirm": false`
-reads as `"enabled": "always"`. Since 0.1.1, `"always"` starts swarms without the confirmation
+Older settings still work: `"enabled": "explicit"` reads as `"ask"`. Without `enabled`,
+`"confirm": false` reads as `"always"` and `"confirm": true` as `"ask"`. As before,
+`"confirm": false` also turns `"ask"` or `"explicit"` into `"always"`; it does not override
+`"mode"` or `"never"`. Since 0.1.1, `"always"` starts swarms without the confirmation
 (before, `"always"` with the default `"confirm": true` still asked).
 
 ## Tests
 
-The tests run swarms on a real agent tree with a scripted model, so they need Amira's
-packages:
+The integration tests run swarms on a real agent tree with a scripted model, so they need
+Amira's packages. Start-policy tests use public API fakes:
 
 ```sh
 bun run link-amira <path to an Amira checkout>   # after `bun install` there

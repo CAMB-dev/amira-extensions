@@ -7,6 +7,7 @@ import type {
   CommandDefinition,
   ExtensionAPI,
   ExtensionView,
+  PermissionMode,
   SpawnGroupOptions,
   ToolContext,
   ToolDefinition,
@@ -39,6 +40,8 @@ function setup(
   opts: {
     settings?: Record<string, unknown>
     confirm?: boolean | undefined
+    permissionMode?: PermissionMode
+    noSession?: boolean
     answer?: (o: { prompt: string }) => Answer | Promise<Answer>
     /** false: the session has no file yet (runs go to ~/.amira/workflow-runs). */
     sessionFile?: false
@@ -63,12 +66,17 @@ function setup(
   let cancelled = 0
   let expected = 0
   let confirmAnswer: boolean | undefined = "confirm" in opts ? opts.confirm : true
+  let permissionMode = opts.permissionMode
   const answer = opts.answer ?? ((o: { prompt: string }) => ({ text: `saw ${o.prompt.split(" ").at(-1)}` }))
   const api = {
     apiVersion: "0.1.0",
     cwd,
     home,
     settings: { extensions: { workflow: opts.settings } },
+    session: () =>
+      opts.noSession
+        ? undefined
+        : { info: () => ({ permissions: permissionMode ? { mode: permissionMode, rules: 0 } : undefined }) },
     registerTool: (t: ToolDefinition) => {
       tool = t
       return () => {}
@@ -178,6 +186,9 @@ function setup(
     printed,
     opened,
     sent,
+    setPermissionMode(mode: PermissionMode) {
+      permissionMode = mode
+    },
     /** What the user answers the next confirmations with. */
     answerConfirm(v: boolean | undefined) {
       confirmAnswer = v
@@ -331,6 +342,82 @@ test('settings: "always" starts without asking, "never" refuses even when asked;
   expect(never.confirms).toHaveLength(0)
   expect(never.groups).toHaveLength(0)
   expect(never.expected).toBe(0)
+})
+
+test('default "mode" checks the current permission mode for each start', async () => {
+  for (const permissionMode of ["auto", "edits", "plan"] as const) {
+    const t = setup({ permissionMode })
+    expect((await t.call({ script: SCRIPT })).isError).toBeUndefined()
+    expect(t.confirms).toHaveLength(permissionMode === "auto" ? 0 : 1)
+    expect(t.told).toEqual(
+      permissionMode === "auto" ? ['Workflow "fanout" started without asking: permission mode is auto.'] : [],
+    )
+    await until(() => t.notices.length === 1)
+  }
+  const t = setup({ settings: { enabled: "mode" }, permissionMode: "auto" })
+  await t.call({ script: SCRIPT })
+  await until(() => t.notices.length === 1)
+  expect(t.confirms).toHaveLength(0)
+  t.setPermissionMode("edits")
+  await t.call({ script: SCRIPT })
+  await until(() => t.notices.length === 2)
+  expect(t.confirms).toHaveLength(1)
+  t.setPermissionMode("auto")
+  await t.call({ script: SCRIPT })
+  await until(() => t.notices.length === 3)
+  expect(t.confirms).toHaveLength(1)
+  expect(t.told).toHaveLength(2)
+})
+
+test('"mode" asks without a session or permission info', async () => {
+  for (const noSession of [true, false]) {
+    const t = setup({ noSession, confirm: false })
+    expect((await t.call({ script: SCRIPT })).isError).toBe(true)
+    expect(t.confirms).toHaveLength(1)
+    expect(t.groups).toHaveLength(0)
+  }
+})
+
+test('explicit "ask", "always" and "never" override the permission mode', async () => {
+  for (const permissionMode of ["auto", "edits", "plan"] as const) {
+    for (const enabled of ["ask", "always", "never"] as const) {
+      const t = setup({ settings: { enabled }, permissionMode, confirm: false })
+      t.say("use a workflow to review this")
+      const r = await t.call({ script: SCRIPT })
+      expect(Boolean(r.isError)).toBe(enabled !== "always")
+      expect(t.confirms).toHaveLength(enabled === "ask" ? 1 : 0)
+      expect(t.groups).toHaveLength(enabled === "always" ? 1 : 0)
+      expect(t.told.some((text) => text.includes("permission mode is auto"))).toBe(false)
+      if (enabled === "always") await until(() => t.notices.length === 1)
+    }
+  }
+})
+
+test("print mode: auto starts without a dialog; edits refuses without an answer", async () => {
+  for (const permissionMode of ["auto", "edits"] as const) {
+    const t = setup({ permissionMode, confirm: undefined })
+    const r = await t.call({ script: SCRIPT })
+    expect(Boolean(r.isError)).toBe(permissionMode === "edits")
+    expect(t.confirms).toHaveLength(permissionMode === "auto" ? 0 : 1)
+    expect(t.groups).toHaveLength(permissionMode === "auto" ? 1 : 0)
+    if (permissionMode === "auto") await until(() => t.notices.length === 1)
+    else expect(t.text(r)).toContain("Nobody confirmed")
+  }
+})
+
+test("user requests and /workflow starts follow the permission mode too", async () => {
+  for (const permissionMode of ["auto", "edits", "plan"] as const) {
+    const t = setup({ permissionMode })
+    t.say("use a workflow to review this")
+    await t.call({ script: SCRIPT })
+    await until(() => t.notices.length === 1)
+    expect(t.confirms).toHaveLength(permissionMode === "auto" ? 0 : 1)
+    mkdirSync(path.join(t.cwd, ".amira", "workflows"), { recursive: true })
+    writeFileSync(path.join(t.cwd, ".amira", "workflows", "fanout.ts"), SCRIPT)
+    await t.run("fanout")
+    await until(() => t.notices.length === 2)
+    expect(t.confirms).toHaveLength(permissionMode === "auto" ? 0 : 2)
+  }
 })
 
 test("defaults: a run's group gets 30 agents and 6 at once", async () => {
@@ -648,9 +735,11 @@ test("settings are checked: bad fields are reported once and left at their defau
     maxConcurrent: 2,
   })
   expect(errors).toEqual([
-    'settings: extensions.workflow.enabled must be "ask", "always" or "never"; using the default',
+    'settings: extensions.workflow.enabled must be "mode", "ask", "always" or "never"; using the default',
     "settings: extensions.workflow.maxAgents must be a positive number; using the default",
     "settings: extensions.workflow.budget must be { tokens?, costUsd? } with positive numbers; using the default",
   ])
   expect(readSettings(undefined)).toEqual({})
+  expect(readSettings({ enabled: "mode" })).toEqual({ enabled: "mode" })
+  expect(readSettings({ enabled: "explicit" })).toEqual({ enabled: "ask" })
 })
