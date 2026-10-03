@@ -1,4 +1,4 @@
-import type { TraceSummary, ViewLine } from "@amira/api"
+import type { TraceSummary, UiNode, ViewLine } from "@amira/api"
 
 export type DashboardStatus = "queued" | "running" | "idle" | "paused" | "done" | "failed" | "stopped"
 export type DashboardAction = "pause" | "resume" | "stop" | "request-changes"
@@ -11,6 +11,8 @@ export interface DashboardFile {
 
 export interface DashboardAgent {
   id: string
+  /** Child session ID for host-authorized transcript and trace navigation. */
+  sessionId?: string
   name: string
   task: string
   status: DashboardStatus
@@ -43,10 +45,19 @@ export interface DashboardSnapshot {
   note?: string
 }
 
+export interface DashboardTab {
+  /** Stable, unique key; summary/diff/logs/actions/stats are reserved. */
+  key: string
+  label: string
+  /** Synchronous, side-effect-free content. Widget IDs need only be unique within this tab. */
+  render(): UiNode | ViewLine[]
+}
+
 export interface DashboardDetails {
   summary: ViewLine[]
   logs: ViewLine[]
   stats?: TraceSummary
+  tabs?: DashboardTab[]
 }
 
 /** Synchronous, side-effect-free reads: adapters cache asynchronous work before rendering. */

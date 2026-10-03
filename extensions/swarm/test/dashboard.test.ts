@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import type { ExtensionAPI } from "@amira/api"
+import type { ExtensionAPI, ViewLine } from "@amira/api"
 import {
   connectDashboardSource,
   createSwarmSource,
@@ -29,10 +29,19 @@ const snapshot = (members: MemberView[]): SwarmSnapshot => ({
   messages: 1,
 })
 
-const textOf = (details: ReturnType<DashboardSource["details"]>, key: "summary" | "logs") =>
-  details?.[key]
+const linesText = (lines: ViewLine[]) =>
+  lines
     .map((line) => (line.kind === "segments" ? line.parts.map((part) => part.text).join("") : line.text))
-    .join("\n") ?? ""
+    .join("\n")
+
+const textOf = (details: ReturnType<DashboardSource["details"]>, key: "summary" | "logs") =>
+  linesText(details?.[key] ?? [])
+
+const tabText = (details: ReturnType<DashboardSource["details"]>, key: string) => {
+  const rendered = details?.tabs?.find((tab) => tab.key === key)?.render()
+  expect(Array.isArray(rendered)).toBe(true)
+  return Array.isArray(rendered) ? linesText(rendered) : ""
+}
 
 test("swarm source uses only supported fields and shows roles, paused states and own metrics", () => {
   const swarm = snapshot([
@@ -61,6 +70,7 @@ test("swarm source uses only supported fields and shows roles, paused states and
   const agents = output.phases[0]!.groups[0]!.agents
   expect(agents[0]).toEqual({
     id: "sw1:a",
+    sessionId: "child-a",
     name: "a (researcher)",
     task: "Read the specification",
     status: "paused",
@@ -81,6 +91,7 @@ test("swarm source uses only supported fields and shows roles, paused states and
     "running",
   ])
   expect(agents[1]).not.toHaveProperty("cost")
+  expect(agents[1]).not.toHaveProperty("sessionId")
   expect(agents[4]).not.toHaveProperty("cost")
   expect(agents[4]).not.toHaveProperty("durationMs")
   expect(source).not.toHaveProperty("act")
@@ -88,20 +99,27 @@ test("swarm source uses only supported fields and shows roles, paused states and
     new Set(output.phases.flatMap((phase) => phase.groups[0]!.agents.map((agent) => agent.id))).size,
   ).toBe(16)
   const details = source.details("sw1:a")!
-  expect(Object.keys(details).sort()).toEqual(["logs", "summary"])
+  expect(Object.keys(details).sort()).toEqual(["logs", "summary", "tabs"])
+  expect(details.tabs?.map(({ key, label }) => ({ key, label }))).toEqual([
+    { key: "board", label: "Board" },
+    { key: "messages", label: "Messages" },
+  ])
   expect(textOf(details, "summary")).toContain("Session ID: child-a")
   expect(textOf(details, "summary")).toContain("13 tokens · $0.000000 · 0 ms")
   expect(textOf(details, "summary")).toContain("Waiting for review")
-  expect(textOf(details, "logs")).toContain("Blackboard\nfindings")
-  expect(textOf(details, "logs")).toContain("Option A")
-  expect(textOf(details, "logs")).toContain("a → b: Please review")
+  expect(tabText(details, "board")).toContain("Blackboard\nfindings (by a, 1 writes):\nOption A")
+  expect(tabText(details, "messages")).toContain("Timeline (last 1 of 1)")
+  expect(tabText(details, "messages")).toContain("a → b: Please review")
+  expect(tabText(details, "board")).not.toContain("Please review")
+  expect(tabText(details, "messages")).not.toContain("Option A")
+  expect(textOf(details, "logs")).toBe("Swarm activity is shown in the Board and Messages tabs.")
   expect(textOf(source.details("sw1:b"), "summary")).toContain("Error: Model unavailable")
   expect(textOf(source.details("sw1:b"), "summary")).toContain("Cost unknown")
   expect(textOf(source.details("sw1:b"), "summary")).toContain("Session ID: unknown")
   expect(source.details("missing")).toBeUndefined()
 })
 
-test("live notifications unsubscribe and detail logs are bounded", () => {
+test("live notifications unsubscribe and detail tabs keep the latest 200 timeline entries", () => {
   let current = snapshot([member("a")])
   current.timeline = Array.from({ length: 250 }, (_, index) => ({
     seq: index + 1,
@@ -119,12 +137,78 @@ test("live notifications unsubscribe and detail logs are bounded", () => {
   changed()
   expect(notifications).toBe(1)
   expect(source.snapshot().phases[0]!.groups[0]!.agents[0]!.status).toBe("paused")
-  expect(textOf(source.details("sw1:a"), "logs")).toContain("Timeline (last 200 of 250)")
-  expect(textOf(source.details("sw1:a"), "logs")).not.toContain("entry 49\n")
+  const messages = tabText(source.details("sw1:a"), "messages")
+  expect(messages).toContain("Timeline (last 200 of 250)")
+  expect(messages).not.toContain("entry 49\n")
+  expect(messages).toContain("entry 50\n")
+  expect(messages).toContain("entry 249")
   unsubscribe()
   unsubscribe()
   changed()
   expect(notifications).toBe(1)
+})
+
+test("detail tabs and summaries clip long text without changing saved content", () => {
+  const long = "x".repeat(25_000)
+  const swarm = snapshot([member("a", { result: long, lastMessage: long })])
+  swarm.board[0]!.value = long
+  swarm.timeline = Array.from({ length: 250 }, (_, index) => ({
+    seq: index + 1,
+    at: index,
+    kind: "message",
+    from: "a",
+    to: "b",
+    text: long,
+  }))
+  const before = JSON.stringify(swarm)
+  const details = createSwarmSource("workspace", () => [swarm]).source.details("sw1:a")
+  const board = tabText(details, "board")
+  const messages = tabText(details, "messages")
+  expect(board).toContain("… (cut)")
+  expect(board.length).toBeLessThan(20_100)
+  expect(messages.match(/… \(cut\)/g)).toHaveLength(200)
+  expect(messages.length).toBeLessThan(210_000)
+  expect(textOf(details, "summary")).toContain(`Result: ${"x".repeat(4000)}… (cut)`)
+  expect(textOf(details, "summary")).toContain(`Last message: ${"x".repeat(4000)}… (cut)`)
+  expect(textOf(details, "summary").length).toBeLessThan(9000)
+  expect(textOf(details, "logs").length).toBeLessThan(100)
+  expect(JSON.stringify(swarm)).toBe(before)
+})
+
+test("empty tabs and legacy sources without optional fields remain readable", () => {
+  const swarm = { ...snapshot([member("a")]), board: [], timeline: [] }
+  const { source } = createSwarmSource("workspace", () => [swarm])
+  const details = source.details("sw1:a")
+  expect(tabText(details, "board")).toBe("Blackboard\n(empty)")
+  expect(tabText(details, "messages")).toBe("Timeline (last 0 of 0)\n(empty)")
+  expect(textOf(details, "summary")).toContain("Session ID: unknown (not recorded)")
+  expect(textOf(details, "summary")).toContain("Last message unavailable")
+  expect(source.snapshot().phases[0]!.groups[0]!.agents[0]).not.toHaveProperty("sessionId")
+  const legacy: DashboardSource = {
+    id: "legacy",
+    label: "Legacy source",
+    snapshot: source.snapshot,
+    details: () => ({ summary: [{ kind: "text", text: "Legacy summary" }], logs: [] }),
+  }
+  expect(legacy.details("sw1:a")?.tabs).toBeUndefined()
+  expect(textOf(legacy.details("sw1:a"), "summary")).toBe("Legacy summary")
+  expect(textOf(legacy.details("sw1:a"), "logs")).toBe("")
+})
+
+test("dashboard IDs escape separators while session IDs identify the exact member", () => {
+  const first = { ...snapshot([member("b:c", { sessionId: "child:one/%" })]), id: "a" }
+  const second = { ...snapshot([member("c", { sessionId: "child:two/%" })]), id: "a:b" }
+  const { source } = createSwarmSource("workspace", () => [first, second])
+  const agents = source.snapshot().phases.flatMap((phase) => phase.groups[0]!.agents)
+  expect(agents.map(({ id, sessionId }) => ({ id, sessionId }))).toEqual([
+    { id: "a:b%3Ac", sessionId: "child:one/%" },
+    { id: "a%3Ab:c", sessionId: "child:two/%" },
+  ])
+  for (const agent of agents) {
+    expect(textOf(source.details(agent.id), "summary")).toContain(`Session ID: ${agent.sessionId}`)
+    expect(source.details(agent.sessionId!)).toBeUndefined()
+  }
+  expect(source.details("a:b:c")).toBeUndefined()
 })
 
 test("historical source reconstructs new totals and keeps old or interrupted records unknown", () => {
@@ -172,6 +256,7 @@ test("historical source reconstructs new totals and keeps old or interrupted rec
   expect(restored[0]!.tokens).toBe(14)
   expect(source.snapshot().phases[0]!.groups[0]!.agents[0]).toMatchObject({
     status: "failed",
+    sessionId: "child-a",
     durationMs: 30,
   })
   expect(textOf(source.details("sw1:a"), "summary")).toContain("14 tokens · Cost unknown · 30 ms")
@@ -181,6 +266,9 @@ test("historical source reconstructs new totals and keeps old or interrupted rec
     const past = swarmsFromRecords(old)
     const oldSource = createSwarmSource("workspace", () => past).source
     expect(oldSource.snapshot().phases[0]!.groups[0]!.agents[0]).not.toHaveProperty("cost")
+    expect(oldSource.snapshot().phases[0]!.groups[0]!.agents[0]).not.toHaveProperty("sessionId")
+    expect(tabText(oldSource.details("sw1:a"), "board")).toBe("Blackboard\n(empty)")
+    expect(tabText(oldSource.details("sw1:a"), "messages")).toContain("Timeline (last")
     expect(past[0]!.members[0]!.sessionId).toBeUndefined()
     expect(past[0]!.members[0]!.usage).toBeUndefined()
     expect(textOf(oldSource.details("sw1:a"), "summary")).toContain("Tokens unknown")

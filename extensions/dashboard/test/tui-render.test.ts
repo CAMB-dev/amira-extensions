@@ -3,6 +3,8 @@
  * UPDATE_DASHBOARD_README=1 bun test test/tui-render.test.ts refreshes the README captures.
  */
 import { describe, expect, mock, test } from "bun:test"
+import type { SessionControl } from "@amira/api"
+import { agentsOf } from "../src/source.ts"
 import { dashboardView } from "../src/view.ts"
 import { viewFixture } from "./view-fixture.ts"
 
@@ -77,6 +79,146 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
       viewer.dispose()
     })
   }
+
+  test("custom tabs, transcript and trace navigate through real host pages and restore on Esc", async () => {
+    const { render, press, fixture, viewer } = open(80, 24)
+    agentsOf(fixture.snapshot)[0]!.sessionId = "child-session"
+    fixture.data.session = {
+      info: () => ({ id: "root" }),
+      subagentMessages: (id: string) => {
+        expect(id).toBe("child-session")
+        return [{ role: "user", content: [{ type: "text", text: "Child transcript contents" }] }]
+      },
+      trace: async (id: string) => {
+        expect(id).toBe("child-session")
+        return [{ type: "trace", v: 1, sessionId: id, startedAt: 0 }]
+      },
+    } as unknown as SessionControl
+    fixture.details.payments!.tabs = [
+      { key: "board", label: "Board", render: () => [{ kind: "text", text: "Shared board contents" }] },
+      {
+        key: "messages",
+        label: "Messages",
+        render: () => ({
+          type: "box",
+          child: { type: "text", id: "messages", lines: [{ kind: "text", text: "Member messages" }] },
+        }),
+      },
+    ]
+    press("down", "down", "enter", "5", "right")
+    expect(render().join("\n")).toContain("Shared board contents")
+    press("tab", "right")
+    expect(render().join("\n")).toContain("Member messages")
+    press("a", "down", "enter")
+    await Promise.resolve()
+    expect(render().join("\n")).toContain("Child transcript contents")
+    expect(render().join("\n")).toContain("Esc back")
+    press("escape")
+    expect(render().join("\n")).toContain("Open transcript")
+    press("down", "enter")
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(render().join("\n")).toContain("First token wait")
+    press("escape", "escape")
+    expect(render().join("\n")).toContain("Esc close")
+    viewer.dispose()
+  })
+
+  test("custom widget arrows use retained host agent selection after replacement", () => {
+    const { render, press, fixture, viewer } = open(180, 52)
+    fixture.details.payments!.tabs = [
+      { key: "board", label: "Board", render: () => [{ kind: "text", text: "Retained board" }] },
+      { key: "messages", label: "Messages", render: () => [{ kind: "text", text: "Retained messages" }] },
+    ]
+    press("down", "down")
+    viewer.show({ source: fixture.data.source })
+    render()
+    // Select Board in the tab bar, then focus its text before cycling.
+    press("tab", "5", "right", "tab")
+    expect(render().join("\n")).toContain("Retained board")
+    press("right")
+    expect(render().join("\n")).toContain("Retained messages")
+    viewer.dispose()
+  })
+
+  test("dashboard shortcuts preserve nested source tab selections", () => {
+    const { render, press, fixture, viewer } = open(180, 52)
+    fixture.details.payments!.tabs = [
+      {
+        key: "board",
+        label: "Board",
+        render: () => ({
+          type: "tabs",
+          id: "inner",
+          tabs: [
+            {
+              key: "first",
+              label: "First",
+              body: { type: "text", id: "first", lines: [{ kind: "text", text: "First inner body" }] },
+            },
+            {
+              key: "second",
+              label: "Second",
+              body: { type: "text", id: "second", lines: [{ kind: "text", text: "Second inner body" }] },
+            },
+          ],
+        }),
+      },
+    ]
+    press("down", "down", "enter", "5", "right", "tab", "right")
+    expect(render().join("\n")).toContain("Second inner body")
+    press("1", "5", "right")
+    expect(render().join("\n")).toContain("Second inner body")
+    viewer.dispose()
+  })
+
+  test("source replacement invalidates a pending session page even after its read completes", async () => {
+    const { render, press, fixture, viewer } = open(180, 52)
+    let finish!: (records: []) => void
+    agentsOf(fixture.snapshot)[0]!.sessionId = "child-session"
+    fixture.data.session = {
+      info: () => ({ id: "root" }),
+      trace: () =>
+        new Promise((resolve) => {
+          finish = resolve
+        }),
+    } as unknown as SessionControl
+    press("down", "down", "enter", "a", "down", "down", "enter")
+    expect(render().join("\n")).toContain("Loading")
+    viewer.show({ source: { ...fixture.data.source, id: "other" }, session: fixture.data.session })
+    expect(render().join("\n")).toContain("Dashboard source or session changed")
+    finish([])
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(render().join("\n")).toContain("Dashboard source or session changed")
+    expect(render().join("\n")).not.toContain("No trace statistics")
+    viewer.dispose()
+  })
+
+  test("expand-all mode also expands agents and groups arriving after e", () => {
+    const { render, press, fixture, viewer } = open(180, 100)
+    press("left", "e")
+    fixture.snapshot.phases[0]!.groups.push({
+      id: "late",
+      name: "Late workers",
+      agents: [
+        {
+          id: "late",
+          name: "Late agent",
+          task: "Newly arrived task",
+          status: "running",
+          files: [],
+          actions: [],
+        },
+      ],
+    })
+    expect(render().join("\n")).toContain("╭ ● Late agent")
+    press("left")
+    expect(render().join("\n")).not.toContain("╭ ● Late agent")
+    press("e")
+    expect(render().join("\n")).toContain("╭ ● Late agent")
+    viewer.dispose()
+  })
 
   test("Enter pushes an agent page; Esc restores selection, expansion, tabs and scroll before closing", () => {
     const { render, press, closed } = open(180, 52)

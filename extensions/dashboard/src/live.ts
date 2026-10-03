@@ -272,6 +272,7 @@ export function createLiveSource(
         const files = [...(cache.get(agent.id)?.files ?? [])].map((path) => ({ path }))
         const item: DashboardAgent = {
           id: agent.id,
+          sessionId: agent.id,
           name: agent.title,
           task: agent.task,
           status: statusOf(agent),

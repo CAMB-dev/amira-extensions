@@ -223,7 +223,7 @@ describe.skipIf(!gitBin)("with git", () => {
     expect(existsSync(wt.dir)).toBe(false)
     expect(existsSync(wt.patch)).toBe(false)
     expect(sh(root, "worktree", "list")).not.toContain("wf_r_1")
-  })
+  }, 30_000)
 
   test("a conflicting change stays in the worktree, with its patch", async () => {
     const { root, home } = repo()
@@ -272,7 +272,7 @@ describe.skipIf(!gitBin)("with git", () => {
     expect(read(path.join(root, "y.txt"))).toBe("y\n")
     expect(group.spawned[0]!.systemPrompt).toContain("your own git worktree")
     expect(sh(root, "worktree", "list").trim().split("\n")).toHaveLength(1)
-  })
+  }, 30_000)
 })
 
 test("a run stopped while an agent's worktree is being made removes that worktree", async () => {

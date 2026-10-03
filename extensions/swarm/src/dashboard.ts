@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ViewLine } from "@amira/api"
+import type { ExtensionAPI, UiNode, ViewLine } from "@amira/api"
 import type { MemberView, SwarmSnapshot } from "./swarm.ts"
 
 /** Structural mirror of dashboard.sources; no cross-extension import or declaration merging. */
@@ -15,6 +15,7 @@ export interface DashboardSource {
         name: string
         agents: {
           id: string
+          sessionId?: string
           name: string
           task: string
           status: "queued" | "running" | "idle" | "paused" | "done" | "failed" | "stopped"
@@ -28,7 +29,13 @@ export interface DashboardSource {
     }[]
     note?: string
   }
-  details(agentId: string): { summary: ViewLine[]; logs: ViewLine[] } | undefined
+  details(agentId: string):
+    | {
+        summary: ViewLine[]
+        logs: ViewLine[]
+        tabs?: { key: string; label: string; render(): UiNode | ViewLine[] }[]
+      }
+    | undefined
   subscribe?(changed: () => void): () => void
 }
 
@@ -70,6 +77,7 @@ export function createSwarmSource(workspace: string, read: () => SwarmSnapshot[]
             name: `Members · ${swarm.state}`,
             agents: swarm.members.map((member) => ({
               id: idOf(swarm.id, member.name),
+              ...(member.sessionId !== undefined ? { sessionId: member.sessionId } : {}),
               name: `${member.name} (${member.role})`,
               task: member.brief ?? swarm.goal,
               status: statusOf(member),
@@ -123,11 +131,21 @@ export function createSwarmSource(workspace: string, read: () => SwarmSnapshot[]
           )
         return {
           summary: summary.flatMap((text) => lines(text)),
-          logs: [
-            ...lines(`Blackboard\n${board ? clip(board, 20_000) : "(empty)"}`),
-            ...lines(
-              `\nTimeline (last ${timeline.length} of ${swarm.timeline.length})\n${timeline.join("\n")}`,
-            ),
+          logs: lines("Swarm activity is shown in the Board and Messages tabs."),
+          tabs: [
+            {
+              key: "board",
+              label: "Board",
+              render: () => lines(`Blackboard\n${board ? clip(board, 20_000) : "(empty)"}`),
+            },
+            {
+              key: "messages",
+              label: "Messages",
+              render: () =>
+                lines(
+                  `Timeline (last ${timeline.length} of ${swarm.timeline.length})\n${timeline.length ? timeline.join("\n") : "(empty)"}`,
+                ),
+            },
           ],
         }
       }

@@ -1,6 +1,6 @@
 # Dashboard (experimental)
 
-The default dashboard extension for Amira (D103/D104/D105). It lives in **amira-extensions**, not Amira core. Version 0.2.0 targets API **0.1.24**, using host-owned pages, view lifecycle hooks and sub-agent controls. The declarative widgets and source contract remain experimental.
+The default dashboard extension for Amira (D103/D104/D105). It lives in **amira-extensions**, not Amira core. Version 0.2.1 targets API **0.1.24**, using host-owned pages, view lifecycle hooks and sub-agent controls. The declarative widgets and source contract remain experimental.
 
 Runtime code imports only `@amira/api` and local modules. The host owns terminal rendering, themes, clipping, focus and scrolling. Nothing in this extension reads private core state or runs shell commands to infer an agent's changes.
 
@@ -57,19 +57,19 @@ amira · acme/checkout  │ Implementation  │ 1/3 running  │ cost unknown   
                   │ ╭ ✓ Refund audit   ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── done ╮
                   │ │Review authorization checks on refund requests.                                                                                                               │
                   │ │━━━━━━━━━━━━━━━━━━ 100%                                                                                                                                       │
+                  │ │0 files reported changed · $0.040                                                                                                                             │
+                  │ │o Open diff · a ⋮ Actions                                                                                                                                     │
+                  │ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+
+
+
+
+
+
 ╭ Details ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
 │  Select an agent in the timeline, then press Enter to open its page.                                                                                                             │
-│                                                                                                                                                                                  │
-│                                                                                                                                                                                  │
-│                                                                                                                                                                                  │
-│                                                                                                                                                                                  │
-│                                                                                                                                                                                  │
-│                                                                                                                                                                                  │
-│                                                                                                                                                                                  │
-│                                                                                                                                                                                  │
-│                                                                                                                                                                                  │
-│                                                                                                                                                                                  │
-│                                                                                                                                                                                  │
 │                                                                                                                                                                                  │
 │                                                                                                                                                                                  │
 │                                                                                                                                                                                  │
@@ -82,9 +82,9 @@ e expand all · o diff · a actions · ? help · Tab focus · arrows navigate ·
 
 <!-- /render:180x52 -->
 
-An adapter may supply a real progress fraction (as for "Payment validation" above). The built-in sources show **Progress unknown**, not a guessed percentage, until successful completion. A language chip appears only when reported file extensions identify a single known language. Collapse rows with **←**; press **e** to expand all again.
+An adapter may supply a real progress fraction (as for "Payment validation" above). The built-in sources show **Progress unknown**, not a guessed percentage, until successful completion. A language chip appears only when reported file extensions identify a single known language. Collapse rows with **←**; press **e** to restore expand-all mode, including agents and groups that arrive later.
 
-At 80×24 the timeline shows the selected agent's card (or the first agent's card before selection). The details panel uses about 35% of the available body height, clamped to 7–18 rows, at any width. The host scrolls the tree and details independently. Open an agent page (Enter) for more room:
+At 80×24 the timeline shows the selected agent's card (or the first agent's card before selection). The details panel stays at its 7-row minimum until an agent is selected (phase and group selections also use the minimum). With an agent selected, it uses about 35% of the available body height, clamped to 7–18 rows, at any width. The host scrolls the tree and details independently. Open an agent page (Enter) for more room:
 
 <!-- render:80x24 -->
 
@@ -101,9 +101,9 @@ Implementation  │ 1/3 running  │ cost unknown
                 │ │ │Validate payment amounts and add regression coverage for  │
                 │ │ │partial refunds.                                          │
                 │ │ │━━━━━━━━━━━─────── 60%                                    │
+                │ │ │2 files reported changed · $0.125                         │
 ╭ Details ─────────────────────────────────────────────────────────────────────╮
 │  Select an agent in the timeline, then press Enter to open its page.         │
-│                                                                              │
 │                                                                              │
 │                                                                              │
 │                                                                              │
@@ -150,9 +150,9 @@ Card action labels are keyboard hints, not pretend clickable buttons: tree detai
 - Traces contain completed intervals and bounded tool previews, not unfinished work or full tool payloads. An empty trace is not evidence of zero work or zero cost.
 - Semantic snapshots cover widget contracts. `test/tui-render.test.ts` also renders the actual TUI at 180×52 and 80×24, including first-frame expansion and Esc navigation (skipped without a linked checkout). This is not a real-terminal test; runtime code never imports the TUI.
 
-## Source service
+## Source interface
 
-The extension provides `dashboard.sources` via `provideService`. Workflow and swarm adapters are deliberately deferred; neither existing extension is changed here.
+The extension provides `dashboard.sources` via `provideService`. Workflow and swarm register optional adapters: `/dashboard workflow` shows agent calls, and `/dashboard swarm` shows members with dedicated **Board** and **Messages** tabs.
 
 Look up the service when registering (it may be absent or reloaded), and retain the disposer:
 
@@ -187,10 +187,12 @@ interface DashboardSource {
 
 - `DashboardSnapshot`: `{ workspace, phases, note? }`.
 - A phase: `{ id, name, groups }`. A group: `{ id, name, ref?, agents }`.
-- An agent: `{ id, name, task, status, files, actions, startedAt?, durationMs?, cost?, language?, progress? }`.
+- An agent: `{ id, name, task, status, files, actions, sessionId?, startedAt?, durationMs?, cost?, language?, progress? }`.
+- `sessionId?: string` is the actual child session ID, not the dashboard agent ID. When supplied, **Actions → Open transcript / Open trace** opens a host-owned page using `SessionControl.subagentMessages(sessionId)` or `SessionControl.trace(sessionId)`. Transcript shows recorded messages; trace opens the same **Stats** view used by replay, plus recorded logs. These reads remain host-authorized; missing or unrelated sessions show unavailable data. Esc returns to the agent page with its state intact. Sources without `sessionId` keep their existing actions.
 - Status: `queued | running | idle | paused | done | failed | stopped`.
 - A file: `{ path, diff?: ViewLine[] }`; a path alone must not imply diff content.
-- Details: `{ summary: ViewLine[], logs: ViewLine[], stats?: TraceSummary }`.
+- Details: `{ summary: ViewLine[], logs: ViewLine[], stats?: TraceSummary, tabs?: DashboardTab[] }`.
+- A custom tab: `{ key: string; label: string; render(): UiNode | ViewLine[] }`. Tabs append after the built-ins; use the focused tab bar's arrows (or arrows from its text body) to reach them. Keys must be nonempty, stable and unique. `summary`, `diff`, `logs`, `actions` and `stats` are reserved; duplicate/reserved keys are ignored. `render()` follows the same synchronous, side-effect-free rules as other source reads. Line arrays become scrollable text; widget trees retain host-owned focus, selection and scroll. IDs must be unique within each tab; the dashboard namespaces them across tabs and agent pages. The contract supplies content only, not custom event handlers. Omitting `tabs` preserves the original page.
 - Cost is USD for that agent's **own** usage, not its descendants. Omit unknown cost.
 - Progress is a known 0–1 fraction; omit it when unknown. Do not estimate completion from a count of tools.
 - Agent IDs are unique across a source; phase IDs across the snapshot; group IDs within their phase. Keep them stable across redraws. Sources `agents` and `trace` are reserved. Custom IDs start with a letter and contain letters, numbers, underscores, dots or hyphens. Duplicate registration throws.

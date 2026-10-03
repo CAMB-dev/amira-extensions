@@ -103,10 +103,11 @@ the last attempt, in script-call order. Legacy journals without attempt numbers 
 latest recorded outcome of each call instead. Live updates notify the dashboard without
 doing filesystem work during rendering.
 
-The dashboard source contract has no token or child-session fields, custom tabs, or session
-navigation. Tokens, model, and child session ID therefore appear as **Summary** text, with
-results and errors in **Logs**. IDs are informational, not links; the adapter advertises no
-actions or inferred file changes/diffs. Use `/workflow stop` to stop a run.
+Since **0.1.6**, the adapter supplies child session IDs for dashboard navigation, including
+original child IDs for cached calls. Calls that never spawned a child have no session link.
+Tokens, model, and child session ID also appear in **Summary**, with results and errors in
+**Logs**. The adapter advertises no actions or inferred file changes/diffs. Use
+`/workflow stop` to stop a run.
 
 Dashboard is optional: workflow still runs when its service is absent. The adapter mirrors
 its structural contract locally and imports no dashboard code. It re-registers when the

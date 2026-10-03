@@ -1,4 +1,7 @@
 import type {
+  Message,
+  SessionControl,
+  TraceSummary,
   UiContext,
   UiControl,
   UiEvent,
@@ -8,13 +11,16 @@ import type {
   ViewLine,
   ViewSegment,
 } from "@amira/api"
+import { summarizeTrace } from "@amira/api"
 import {
   agentsOf,
   type DashboardAction,
   type DashboardAgent,
   type DashboardSource,
   type DashboardStatus,
+  type DashboardTab,
 } from "./source.ts"
+import { ownCost, traceLogLines } from "./trace.ts"
 
 export const VIEW_KIND = "dashboard"
 const TABS = ["summary", "diff", "logs", "actions", "stats"]
@@ -39,10 +45,13 @@ const tone = (status: DashboardStatus): ViewSegment["kind"] =>
 
 export interface DashboardViewData {
   source: DashboardSource
+  session?: SessionControl
   selected?: string
   tab?: string
   flash?: string
   busy?: boolean
+  /** Tab events retain nested source-widget choices when a dashboard shortcut replaces host maps. */
+  activeTabs?: Record<string, string>
   /** Timeline shortcuts require an explicit, agent-keyed activation after host reconciliation. */
   pendingAction?: string
 }
@@ -157,8 +166,7 @@ function timeline(data: DashboardViewData, ctx: UiContext, selected?: string): U
     : text([line("No agents yet. Start a task with sub-agents, then return here.")], "empty")
 }
 
-function statsPanel(data: DashboardViewData, agent: DashboardAgent): UiNode {
-  const stats = data.source.details(agent.id)?.stats
+function statsPanel(stats: TraceSummary | undefined, agents: DashboardAgent[]): UiNode {
   if (!stats) return text([line("No trace statistics available.")], "stats-empty")
   const rows = [
     ["First token wait", stats.modelWaitMs],
@@ -195,7 +203,7 @@ function statsPanel(data: DashboardViewData, agent: DashboardAgent): UiNode {
       : [line("No recorded failures.")]),
     line(""),
     line("Cost per agent · own usage only, no recursive totals"),
-    ...agentsOf(data.source.snapshot()).map((item) => line(`${item.name}: ${money(item.cost)}`)),
+    ...agents.map((item) => line(`${item.name}: ${money(item.cost)}`)),
   ]
   return text(lines, "stats")
 }
@@ -228,6 +236,12 @@ function details(data: DashboardViewData, agent?: DashboardAgent): UiNode {
       : data.pendingAction
   const labels = [
     ["open-diff", "Open diff", "o"],
+    ...(agent.sessionId && data.session
+      ? [
+          ["open-transcript", "Open transcript", ""],
+          ["open-trace", "Open trace", ""],
+        ]
+      : []),
     [agent.status === "paused" ? "resume" : "pause", agent.status === "paused" ? "Resume" : "Pause", "p"],
     ["request-changes", "Request changes", "r"],
     ["stop", "Stop agent", "x"],
@@ -278,16 +292,68 @@ function details(data: DashboardViewData, agent?: DashboardAgent): UiNode {
             available:
               key === "open-diff"
                 ? "View reported files"
-                : data.source.act && agent.actions.some((action) => action === key)
-                  ? "Available"
-                  : "Unavailable from this source",
+                : key === "open-transcript" || key === "open-trace"
+                  ? "View child session"
+                  : data.source.act && agent.actions.some((action) => action === key)
+                    ? "Available"
+                    : "Unavailable from this source",
           },
         })),
       },
     },
   ]
-  if (detail?.stats) tabs.push({ key: "stats", label: "Stats", body: statsPanel(data, agent) })
+  if (detail?.stats)
+    tabs.push({
+      key: "stats",
+      label: "Stats",
+      body: statsPanel(detail.stats, agentsOf(data.source.snapshot())),
+    })
+  for (const tab of sourceTabs(detail?.tabs)) {
+    const body = tab.render()
+    tabs.push({
+      key: tab.key,
+      label: tab.label,
+      body: mapWidgetIds(Array.isArray(body) ? text(body, "body") : body, (id) =>
+        JSON.stringify(["source-tab", tab.key, id, agent.id]),
+      ),
+    })
+  }
   return { type: "tabs", id: "detail", tabs }
+}
+
+function sourceTabs(tabs: DashboardTab[] = []): DashboardTab[] {
+  const seen = new Set(TABS)
+  return tabs.filter((tab) => {
+    if (!tab.key || seen.has(tab.key)) return false
+    seen.add(tab.key)
+    return true
+  })
+}
+
+/** Namespace entire source subtrees, including inactive tabs and tree details. */
+function mapWidgetIds(node: UiNode, map: (id: string) => string): UiNode {
+  if (node.type === "column" || node.type === "row")
+    return {
+      ...node,
+      children: node.children.map((child) => ({ ...child, node: mapWidgetIds(child.node, map) })),
+    }
+  if (node.type === "box") return { ...node, child: mapWidgetIds(node.child, map) }
+  if (node.type === "tabs")
+    return {
+      ...node,
+      id: map(node.id),
+      tabs: node.tabs.map((tab) => ({ ...tab, body: mapWidgetIds(tab.body, map) })),
+    }
+  if (node.type === "tree") {
+    const items = (rows: UiTreeItem[]): UiTreeItem[] =>
+      rows.map((item) => ({
+        ...item,
+        ...(item.children ? { children: items(item.children) } : {}),
+        ...(item.detail && !Array.isArray(item.detail) ? { detail: mapWidgetIds(item.detail, map) } : {}),
+      }))
+    return { ...node, id: map(node.id), items: items(node.items) }
+  }
+  return "id" in node && node.id ? { ...node, id: map(node.id) } : node
 }
 
 function selectedAgent(data: DashboardViewData, key?: string): DashboardAgent | undefined {
@@ -297,7 +363,7 @@ function selectedAgent(data: DashboardViewData, key?: string): DashboardAgent | 
 
 // Page identity travels through host-owned focus, not a cache that would outlive Esc.
 const pageWidget = (agentId: string, id: string) => JSON.stringify(["agent-page", agentId, id])
-function widgetTarget(id?: string): { agentId?: string; id?: string } {
+function widgetTarget(id?: string): { agentId?: string; id?: string; page?: boolean } {
   try {
     const value: unknown = JSON.parse(id ?? "")
     if (
@@ -307,7 +373,9 @@ function widgetTarget(id?: string): { agentId?: string; id?: string } {
       typeof value[1] === "string" &&
       typeof value[2] === "string"
     )
-      return { agentId: value[1], id: value[2] }
+      return { agentId: value[1], id: value[2], page: true }
+    if (Array.isArray(value) && value[0] === "source-tab" && typeof value[3] === "string")
+      return { agentId: value[3], id }
   } catch {
     // Root widgets have plain IDs.
   }
@@ -315,32 +383,24 @@ function widgetTarget(id?: string): { agentId?: string; id?: string } {
 }
 
 function pageDetails(node: UiNode, agentId: string): UiNode {
-  if (node.type === "tabs") {
-    return {
-      ...node,
-      id: pageWidget(agentId, node.id),
-      tabs: node.tabs.map((tab) => ({ ...tab, body: pageDetails(tab.body, agentId) })),
-    }
-  }
-  return "id" in node && node.id ? { ...node, id: pageWidget(agentId, node.id) } : node
+  return mapWidgetIds(node, (id) => pageWidget(agentId, id))
 }
 
-function pageControl(view: UiControl, agentId?: string): UiControl {
-  if (!agentId) return view
+function pageControl(view: UiControl, data: DashboardViewData, agentId?: string): UiControl {
+  const widget = (id: string) => (agentId ? pageWidget(agentId, id) : id)
   return {
     ...view,
-    focus: (id) => view.focus(pageWidget(agentId, id)),
-    setState: (patch) =>
-      view.setState({
-        ...patch,
-        ...(patch.activeTabs
-          ? {
-              activeTabs: Object.fromEntries(
-                Object.entries(patch.activeTabs).map(([id, tab]) => [pageWidget(agentId, id), tab]),
-              ),
-            }
-          : {}),
-      }),
+    focus: (id) => view.focus(widget(id)),
+    setState: (patch) => {
+      if (patch.activeTabs) {
+        data.activeTabs = {
+          ...data.activeTabs,
+          ...Object.fromEntries(Object.entries(patch.activeTabs).map(([id, tab]) => [widget(id), tab])),
+        }
+        patch = { ...patch, activeTabs: data.activeTabs }
+      }
+      view.setState(patch)
+    },
   }
 }
 
@@ -348,6 +408,101 @@ function setTab(data: DashboardViewData, view: UiControl, tab: string) {
   data.tab = tab
   if (tab !== "actions") data.pendingAction = undefined
   view.setState({ activeTabs: { detail: tab } })
+}
+
+interface SessionPage {
+  kind: "session"
+  source: DashboardSource
+  rootId: string
+  body: UiNode
+}
+
+function transcriptLines(messages: readonly Message[] | undefined): ViewLine[] {
+  if (!messages?.length) return [line("No transcript messages available for this child session.")]
+  return messages.flatMap((message) => [
+    {
+      kind: "accent" as const,
+      text:
+        message.role === "toolResult"
+          ? `tool: ${message.toolName}${message.isError ? " (error)" : ""}`
+          : message.role,
+    },
+    ...message.content.flatMap((block): ViewLine[] => {
+      if (block.type === "text" || block.type === "thinking")
+        return block.text
+          .split("\n")
+          .map((value) => ({ kind: block.type === "thinking" ? "muted" : "text", text: value }))
+      if (block.type === "toolCall") return [line(`${block.name} ${JSON.stringify(block.args)}`)]
+      return [{ kind: "muted", text: `[${block.type}]` }]
+    }),
+    line(""),
+  ])
+}
+
+async function openSessionPage(
+  data: DashboardViewData,
+  view: UiControl,
+  agent: DashboardAgent,
+  trace: boolean,
+) {
+  const session = data.session
+  if (!session || !agent.sessionId) {
+    data.flash = "No child session is available from this source."
+    return
+  }
+  const rootId = session.info().id
+  const sessionId = agent.sessionId
+  const page: SessionPage = {
+    kind: "session",
+    source: data.source,
+    rootId,
+    body: text([line("Loading…")], "session-page:loading"),
+  }
+  // Push before awaiting. Esc can discard this page; completion must never push it back.
+  view.pushPage({ title: `${trace ? "Trace" : "Transcript"} · ${agent.name}`, data: page })
+  try {
+    if (!trace) {
+      page.body = text(transcriptLines(session.subagentMessages(sessionId)), "session-page:transcript")
+    } else {
+      const records = await session.trace(sessionId)
+      if (session.info().id !== rootId) throw new Error("Session changed. Reopen the dashboard.")
+      if (records.some((record) => record.type === "trace" && record.sessionId !== sessionId))
+        throw new Error("Trace records belong to another session.")
+      const stats = records.length ? summarizeTrace(records) : undefined
+      page.body = mapWidgetIds(
+        {
+          type: "tabs",
+          id: "trace",
+          tabs: [
+            {
+              key: "stats",
+              label: "Stats",
+              body: statsPanel(stats, [{ ...agent, cost: ownCost(records, stats?.usage.cost) }]),
+            },
+            {
+              key: "logs",
+              label: "Logs",
+              body: text(
+                records.length ? records.flatMap(traceLogLines) : [line("No trace records available.")],
+                "logs",
+              ),
+            },
+          ],
+        },
+        (id) => `session-page:${id}`,
+      )
+    }
+  } catch (error) {
+    page.body = text(
+      [
+        {
+          kind: "warning",
+          text: `Could not open ${trace ? "trace" : "transcript"}: ${error instanceof Error ? error.message : String(error)}`,
+        },
+      ],
+      "session-page:error",
+    )
+  }
 }
 
 export async function performAction(
@@ -368,6 +523,11 @@ export async function performAction(
   if (action === "open-diff") {
     setTab(data, view, "diff")
     view.focus("detail")
+    return
+  }
+  if (action === "open-transcript" || action === "open-trace") {
+    await openSessionPage(data, view, agent, action === "open-trace")
+    view.requestRender()
     return
   }
   if (data.busy) return
@@ -404,7 +564,18 @@ export async function performAction(
 
 function onEvent(event: UiEvent, data: DashboardViewData, host: UiControl) {
   const target = widgetTarget(event.type === "key" ? event.focused : event.id)
-  const view = pageControl(host, target.agentId)
+  if (target.id?.startsWith("session-page:")) {
+    if (event.type === "key" && event.key === "5")
+      host.setState({ activeTabs: { "session-page:trace": "stats" } })
+    else if (event.type === "key" && (event.key === "left" || event.key === "right")) {
+      host.setState({
+        activeTabs: { "session-page:trace": target.id === "session-page:logs" ? "stats" : "logs" },
+      })
+    }
+    return
+  }
+  const view = pageControl(host, data, target.page ? target.agentId : undefined)
+  if (event.type === "tab") data.activeTabs = { ...data.activeTabs, [event.id]: event.key }
   if ((event.type === "select" || event.type === "activate") && event.id === "timeline") {
     data.selected = event.key.startsWith("agent:") ? event.key.slice(6) : undefined
     if (event.type === "activate" && data.selected) {
@@ -438,19 +609,8 @@ function onEvent(event: UiEvent, data: DashboardViewData, host: UiControl) {
   if (event.type !== "key") return
   const agent = selectedAgent(data, target.agentId ? agentKey(target.agentId) : undefined)
   if (event.key === "e") {
-    view.setState({
-      expanded: {
-        timeline: data.source
-          .snapshot()
-          .phases.flatMap((phase) => [
-            `phase:${phase.id}`,
-            ...phase.groups.flatMap((group) => [
-              `group:${phase.id}:${group.id}`,
-              ...group.agents.map((item) => agentKey(item.id)),
-            ]),
-          ]),
-      },
-    })
+    // Remove the explicit key list: the host's expanded="all" mode includes future rows.
+    view.setState({ expanded: {} })
   } else if (event.key === "?") {
     data.flash =
       "↑↓ select · ←→ expand or switch focused tabs · Enter open · Tab focus · 1–4 tabs · 5 stats · Esc back/close · q close"
@@ -459,10 +619,22 @@ function onEvent(event: UiEvent, data: DashboardViewData, host: UiControl) {
     setTab(data, view, "actions")
     view.focus("actions")
   } else if (["1", "2", "3", "4", "5", "left", "right"].includes(event.key)) {
-    const tabs = data.source.details(agent?.id ?? "")?.stats ? TABS : TABS.slice(0, 4)
+    const detail = data.source.details(agent?.id ?? "")
+    const tabs = [
+      ...(detail?.stats ? TABS : TABS.slice(0, 4)),
+      ...sourceTabs(detail?.tabs).map((tab) => tab.key),
+    ]
+    let focusedTab = target.id
+    try {
+      const value: unknown = JSON.parse(target.id ?? "")
+      if (Array.isArray(value) && value[0] === "source-tab" && typeof value[1] === "string")
+        focusedTab = value[1]
+    } catch {
+      /* Built-in widgets have plain IDs. */
+    }
     const index = Math.max(
       0,
-      tabs.indexOf(TABS.includes(target.id ?? "") ? target.id! : (data.tab ?? "summary")),
+      tabs.indexOf(tabs.includes(focusedTab ?? "") ? focusedTab! : (data.tab ?? "summary")),
     )
     const tab =
       event.key === "left"
@@ -483,7 +655,7 @@ function onEvent(event: UiEvent, data: DashboardViewData, host: UiControl) {
     if (action === "open-diff") {
       setTab(data, view, "diff")
       view.focus("detail")
-    } else if (action && target.agentId) void performAction(data, view, action, target.agentId)
+    } else if (action && target.page && target.agentId) void performAction(data, view, action, target.agentId)
     else if (action) {
       data.pendingAction = event.key === "p" ? "pause-resume" : action
       data.flash = "Press Enter on the named action to continue. Press a to show all actions."
@@ -509,6 +681,15 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
     ...["1", "2", "3", "4", "5", "left", "right"].map((key) => ({ key, label: "" })),
   ],
   ui(data, ctx) {
+    const sessionPage = ctx.page?.data as SessionPage | undefined
+    if (sessionPage?.kind === "session") {
+      return sessionPage.source === data.source && sessionPage.rootId === data.session?.info().id
+        ? sessionPage.body
+        : text(
+            [line("Dashboard source or session changed. Press Esc to return.")],
+            "session-page:unavailable",
+          )
+    }
     const snapshot = data.source.snapshot()
     const agents = agentsOf(snapshot)
     const page = typeof ctx.page?.data === "string" ? ctx.page.data : undefined
@@ -556,7 +737,7 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
         },
         ...(!page ? [{ node: timeline(data, ctx, agent?.id ?? agents[0]?.id) }] : []),
         {
-          ...(page ? {} : { size: Math.max(7, Math.min(18, Math.round(ctx.height * 0.35))) }),
+          ...(page ? {} : { size: agent ? Math.max(7, Math.min(18, Math.round(ctx.height * 0.35))) : 7 }),
           node: {
             type: "box",
             title: `Details${agent ? ` · ${agent.name}` : ""}`,

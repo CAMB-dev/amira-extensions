@@ -62,7 +62,7 @@ function childEntry(record: ChildRecord, parentSessionId: string): SessionEntry 
 }
 
 /** The API's summary covers reported usage only; do not price missing usage as zero. */
-function ownCost(records: TraceRecord[], reportedCost?: number): number | undefined {
+export function ownCost(records: TraceRecord[], reportedCost?: number): number | undefined {
   const requests = records.filter(
     (record) => record.type === "model" || record.type === "compact" || record.type === "side",
   )
@@ -70,7 +70,7 @@ function ownCost(records: TraceRecord[], reportedCost?: number): number | undefi
   return reportedCost
 }
 
-function logLines(record: TraceRecord): ViewLine[] {
+export function traceLogLines(record: TraceRecord): ViewLine[] {
   switch (record.type) {
     case "trace":
       return [
@@ -252,7 +252,7 @@ export async function createTraceSource(
               ]
             : []),
         ],
-        logs: records.flatMap(logLines),
+        logs: records.flatMap(traceLogLines),
         ...(stats ? { stats } : {}),
       }),
     )

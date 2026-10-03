@@ -175,6 +175,7 @@ test("registers /dashboard and its declarative view; agents is the default", asy
   const opened = s.opened[0]!
   expect(opened.kind).toBe("dashboard")
   expect("data" in opened && (opened.data as DashboardViewData).source.id).toBe("agents")
+  expect("data" in opened && (opened.data as DashboardViewData).session).toBe(s.ctx.session)
   for (const exit of s.exits) exit()
 })
 
