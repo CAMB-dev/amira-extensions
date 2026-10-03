@@ -40,7 +40,6 @@ const tone = (status: DashboardStatus): ViewSegment["kind"] =>
 export interface DashboardViewData {
   source: DashboardSource
   selected?: string
-  page?: string
   tab?: string
   flash?: string
   busy?: boolean
@@ -111,14 +110,15 @@ function card(agent: DashboardAgent, narrow: boolean): UiNode {
 }
 
 function timeline(data: DashboardViewData, ctx: UiContext, selected?: string): UiNode {
-  const expanded = new Set(ctx.state.expanded.timeline ?? [])
+  const expanded = ctx.state.expanded.timeline
+  const isExpanded = (key: string) => expanded === undefined || expanded.includes(key)
   const items: UiTreeItem[] = data.source.snapshot().phases.map((phase) => ({
     key: `phase:${phase.id}`,
     row: [part(phase.name, "accent")],
     rail: true,
     underline: true,
     node: [part("◉", "accent")],
-    aside: [part(expanded.has(`phase:${phase.id}`) ? "▾" : "▸", "muted")],
+    aside: [part(isExpanded(`phase:${phase.id}`) ? "▾" : "▸", "muted")],
     children: phase.groups.map((group) => {
       const running = group.agents.filter((agent) => agent.status === "running").length
       const times = group.agents.flatMap((agent) => (agent.startedAt === undefined ? [] : [agent.startedAt]))
@@ -136,7 +136,7 @@ function timeline(data: DashboardViewData, ctx: UiContext, selected?: string): U
         row: [part(`${group.name} ×${group.agents.length}`), part(`  ${running} running`, "muted")],
         aside: [
           part(
-            `${group.ref ?? group.id}  ${expanded.has(`group:${phase.id}:${group.id}`) ? "▾" : "▸"}`,
+            `${group.ref ?? group.id}  ${isExpanded(`group:${phase.id}:${group.id}`) ? "▾" : "▸"}`,
             "muted",
           ),
         ],
@@ -153,7 +153,7 @@ function timeline(data: DashboardViewData, ctx: UiContext, selected?: string): U
     }),
   }))
   return agentsOf(data.source.snapshot()).length
-    ? { type: "tree", id: "timeline", items }
+    ? { type: "tree", id: "timeline", expanded: "all", items }
     : text([line("No agents yet. Start a task with sub-agents, then return here.")], "empty")
 }
 
@@ -288,8 +288,57 @@ function details(data: DashboardViewData, agent?: DashboardAgent): UiNode {
 }
 
 function selectedAgent(data: DashboardViewData, key?: string): DashboardAgent | undefined {
-  const id = data.page ?? (key?.startsWith("agent:") ? key.slice(6) : key ? undefined : data.selected)
+  const id = key?.startsWith("agent:") ? key.slice(6) : key ? undefined : data.selected
   return agentsOf(data.source.snapshot()).find((agent) => agent.id === id)
+}
+
+// Page identity travels through host-owned focus, not a cache that would outlive Esc.
+const pageWidget = (agentId: string, id: string) => JSON.stringify(["agent-page", agentId, id])
+function widgetTarget(id?: string): { agentId?: string; id?: string } {
+  try {
+    const value: unknown = JSON.parse(id ?? "")
+    if (
+      Array.isArray(value) &&
+      value.length === 3 &&
+      value[0] === "agent-page" &&
+      typeof value[1] === "string" &&
+      typeof value[2] === "string"
+    )
+      return { agentId: value[1], id: value[2] }
+  } catch {
+    // Root widgets have plain IDs.
+  }
+  return { id }
+}
+
+function pageDetails(node: UiNode, agentId: string): UiNode {
+  if (node.type === "tabs") {
+    return {
+      ...node,
+      id: pageWidget(agentId, node.id),
+      tabs: node.tabs.map((tab) => ({ ...tab, body: pageDetails(tab.body, agentId) })),
+    }
+  }
+  return "id" in node && node.id ? { ...node, id: pageWidget(agentId, node.id) } : node
+}
+
+function pageControl(view: UiControl, agentId?: string): UiControl {
+  if (!agentId) return view
+  return {
+    ...view,
+    focus: (id) => view.focus(pageWidget(agentId, id)),
+    setState: (patch) =>
+      view.setState({
+        ...patch,
+        ...(patch.activeTabs
+          ? {
+              activeTabs: Object.fromEntries(
+                Object.entries(patch.activeTabs).map(([id, tab]) => [pageWidget(agentId, id), tab]),
+              ),
+            }
+          : {}),
+      }),
+  }
 }
 
 function setTab(data: DashboardViewData, view: UiControl, tab: string) {
@@ -350,17 +399,24 @@ export async function performAction(
   }
 }
 
-function onEvent(event: UiEvent, data: DashboardViewData, view: UiControl) {
+function onEvent(event: UiEvent, data: DashboardViewData, host: UiControl) {
+  const target = widgetTarget(event.type === "key" ? event.focused : event.id)
+  const view = pageControl(host, target.agentId)
   if ((event.type === "select" || event.type === "activate") && event.id === "timeline") {
     data.selected = event.key.startsWith("agent:") ? event.key.slice(6) : undefined
     if (event.type === "activate" && data.selected) {
-      data.page = data.selected
-      setTab(data, view, "summary")
-      view.focus("detail")
+      data.pendingAction = undefined
+      view.pushPage({
+        data: data.selected,
+        state: {
+          activeTabs: { [pageWidget(data.selected, "detail")]: "summary" },
+          focused: pageWidget(data.selected, "detail"),
+        },
+      })
     }
   }
-  if (event.type === "tab" && event.id === "detail") data.tab = event.key
-  if (event.type === "activate" && event.id === "actions") {
+  if (event.type === "tab" && target.id === "detail") data.tab = event.key
+  if (event.type === "activate" && target.id === "actions") {
     // The target travels in the rendered row key, never in a stale selection cache.
     try {
       const target: unknown = JSON.parse(event.key)
@@ -377,12 +433,8 @@ function onEvent(event: UiEvent, data: DashboardViewData, view: UiControl) {
     }
   }
   if (event.type !== "key") return
-  const agent = selectedAgent(data)
-  if (event.key === "b") {
-    data.page = undefined
-    data.pendingAction = undefined
-    view.focus("timeline")
-  } else if (event.key === "e") {
+  const agent = selectedAgent(data, target.agentId ? agentKey(target.agentId) : undefined)
+  if (event.key === "e") {
     view.setState({
       expanded: {
         timeline: data.source
@@ -398,20 +450,24 @@ function onEvent(event: UiEvent, data: DashboardViewData, view: UiControl) {
     })
   } else if (event.key === "?") {
     data.flash =
-      "↑↓ select · ←→ expand or switch focused tabs · Enter open · Tab focus · 1–4 tabs · 5 stats · b back · Esc/q close"
+      "↑↓ select · ←→ expand or switch focused tabs · Enter open · Tab focus · 1–4 tabs · 5 stats · Esc back/close · q close"
   } else if (event.key === "a") {
     data.pendingAction = undefined
     setTab(data, view, "actions")
     view.focus("actions")
   } else if (["1", "2", "3", "4", "5", "left", "right"].includes(event.key)) {
     const tabs = data.source.details(agent?.id ?? "")?.stats ? TABS : TABS.slice(0, 4)
-    const index = Math.max(0, tabs.indexOf(data.tab ?? "summary"))
+    const index = Math.max(
+      0,
+      tabs.indexOf(TABS.includes(target.id ?? "") ? target.id! : (data.tab ?? "summary")),
+    )
     const tab =
       event.key === "left"
         ? tabs[(index + tabs.length - 1) % tabs.length]
         : event.key === "right"
           ? tabs[(index + 1) % tabs.length]
-          : tabs[Number(event.key) - 1]
+          : // Let the host reconcile missing tabs; event selection may lag its retained state.
+            TABS[Number(event.key) - 1]
     if (tab) setTab(data, view, tab)
   } else {
     const actions: Record<string, string> = {
@@ -424,7 +480,7 @@ function onEvent(event: UiEvent, data: DashboardViewData, view: UiControl) {
     if (action === "open-diff") {
       setTab(data, view, "diff")
       view.focus("detail")
-    } else if (action && data.page) void performAction(data, view, action, data.page)
+    } else if (action && target.agentId) void performAction(data, view, action, target.agentId)
     else if (action) {
       data.pendingAction = event.key === "p" ? "pause-resume" : action
       data.flash = "Press Enter on the named action to continue. Press a to show all actions."
@@ -437,22 +493,23 @@ function onEvent(event: UiEvent, data: DashboardViewData, view: UiControl) {
 
 export const dashboardView: ViewDefinition<DashboardViewData> = {
   kind: VIEW_KIND,
-  title: (data) => (data.page ? "Dashboard · Agent" : `Dashboard · ${data.source.label}`),
+  title: (data, ctx) => (ctx.page ? "Dashboard · Agent" : `Dashboard · ${data.source.label}`),
   keys: [
     { key: "e", label: "expand all" },
     { key: "o", label: "diff" },
-    { key: "p", label: "pause/resume" },
-    { key: "r", label: "request changes" },
-    { key: "x", label: "stop" },
+    // Capability-specific hints live beside the selected agent, not in the static host key bar.
+    { key: "p", label: "" },
+    { key: "r", label: "" },
+    { key: "x", label: "" },
     { key: "a", label: "actions" },
-    { key: "b", label: "back" },
     { key: "?", label: "help" },
     ...["1", "2", "3", "4", "5", "left", "right"].map((key) => ({ key, label: "" })),
   ],
   ui(data, ctx) {
     const snapshot = data.source.snapshot()
     const agents = agentsOf(snapshot)
-    const agent = selectedAgent(data, ctx.state.selected.timeline)
+    const page = typeof ctx.page?.data === "string" ? ctx.page.data : undefined
+    const agent = selectedAgent(data, page ? agentKey(page) : ctx.state.selected.timeline)
     const cost =
       agents.length && agents.every((item) => item.cost !== undefined)
         ? agents.reduce((sum, item) => sum + item.cost!, 0)
@@ -481,7 +538,7 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
       : {
           type: "bar",
           left: [part("amira · ", "accent"), part(`${snapshot.workspace}  │ ${totals}`)],
-          right: [part("? help · b back · q quit", "muted")],
+          right: [part("? help · q close", "muted")],
         }
     return {
       type: "column",
@@ -491,18 +548,16 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
           size: 1,
           node: {
             type: "rule",
-            label: data.page
-              ? `${agent?.name ?? "Agent unavailable"} · ${data.source.label}`
-              : data.source.label,
+            label: page ? `${agent?.name ?? "Agent unavailable"} · ${data.source.label}` : data.source.label,
           },
         },
-        ...(!data.page ? [{ node: timeline(data, ctx, agent?.id) }] : []),
+        ...(!page ? [{ node: timeline(data, ctx, agent?.id ?? agents[0]?.id) }] : []),
         {
-          ...(data.page ? {} : { size: narrow ? 7 : 14 }),
+          ...(page ? {} : { size: Math.max(7, Math.min(18, Math.round(ctx.height * 0.35))) }),
           node: {
             type: "box",
             title: `Details${agent ? ` · ${agent.name}` : ""}`,
-            child: details(data, agent),
+            child: page ? pageDetails(details(data, agent), page) : details(data, agent),
           } as UiNode,
         },
         {
@@ -517,8 +572,8 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
             },
             {
               kind: "muted",
-              text: data.page
-                ? "←→ tabs · b back to dashboard · Esc/q closes dashboard"
+              text: page
+                ? `${agent ? hints(agent) : "Agent unavailable"} · Esc back`
                 : `${agent ? hints(agent) : "Enter opens an agent"} · Esc/q close`,
             },
           ]),

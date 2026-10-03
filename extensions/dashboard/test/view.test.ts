@@ -30,7 +30,7 @@ function treeItems(items: UiTreeItem[]): UiTreeItem[] {
 }
 
 function widget(fixture: Fixture, id: string): UiNode {
-  const found = nodes(render(fixture)).find((node) => "id" in node && node.id === id)
+  const found = nodes(render(fixture)).find((node) => "id" in node && node.id === fixture.widgetId(id))
   if (!found) throw new Error(`Missing widget: ${id}`)
   return found
 }
@@ -48,6 +48,7 @@ function words(fixture: Fixture, id: string): string[] {
 }
 
 function send(fixture: Fixture, event: UiEvent): void {
+  if ("id" in event && event.id !== "timeline") event = { ...event, id: fixture.widgetId(event.id) }
   // The public host contract updates widget state before notifying the extension.
   if (event.type === "select" || event.type === "activate") fixture.state.selected[event.id] = event.key
   if (event.type === "tab") fixture.state.activeTabs[event.id] = event.key
@@ -55,7 +56,7 @@ function send(fixture: Fixture, event: UiEvent): void {
 }
 
 function key(fixture: Fixture, value: string): void {
-  send(fixture, { type: "key", key: value })
+  send(fixture, { type: "key", key: value, focused: fixture.state.focused })
 }
 
 function freeze(value: unknown): void {
@@ -65,8 +66,7 @@ function freeze(value: unknown): void {
 }
 
 describe("public semantic rendering (not terminal raster snapshots)", () => {
-  // UiContext exposes width, not height. Rows are metadata documenting the target
-  // viewport, not a claim about host wrapping, clipping, scrolling, or cell layout.
+  // Semantic snapshots complement the real host's wrapping/clipping tests.
   for (const viewport of [
     { columns: 180, rows: 52 },
     { columns: 80, rows: 24 },
@@ -78,9 +78,9 @@ describe("public semantic rendering (not terminal raster snapshots)", () => {
           send(fixture, { type: "activate", id: "timeline", key: "agent:payments" })
         }
         if (screen === "stats") send(fixture, { type: "tab", id: "detail", key: "stats" })
-        const context = fixture.context(viewport.columns)
+        const context = fixture.context(viewport.columns, viewport.rows - 1)
         expect({
-          contract: "Public UiNode tree; viewport rows are metadata only",
+          contract: "Public UiNode tree; body height excludes the host key bar",
           viewport,
           title: dashboardView.title(fixture.data, context),
           state: context.state,
@@ -116,12 +116,17 @@ describe("public semantic rendering (not terminal raster snapshots)", () => {
     const fixture = viewFixture()
     for (const width of [180, 80]) {
       for (const page of [undefined, "payments"]) {
-        fixture.data.page = page
+        if (fixture.context().page) fixture.control.popPage()
+        if (page) send(fixture, { type: "activate", id: "timeline", key: `agent:${page}` })
         const all = nodes(render(fixture, width))
         const ids = all.flatMap((node) => ("id" in node && node.id ? [node.id] : []))
         expect(ids.length).toBeGreaterThan(0)
         expect(new Set(ids).size).toBe(ids.length)
-        expect(ids).toEqual(expect.arrayContaining(["detail", "summary", "diff", "logs", "actions", "stats"]))
+        expect(ids).toEqual(
+          expect.arrayContaining(
+            ["detail", "summary", "diff", "logs", "actions", "stats"].map(fixture.widgetId),
+          ),
+        )
         for (const node of all) {
           if (node.type !== "tree") continue
           const keys = treeItems(node.items).map((item) => item.key)
@@ -145,6 +150,38 @@ describe("public semantic rendering (not terminal raster snapshots)", () => {
     }
   })
 
+  test("details use body height, clamped to 7–18 rows independently of width", () => {
+    const fixture = viewFixture()
+    for (const width of [80, 180]) {
+      for (const [height, expected] of [
+        [0, 7],
+        [20, 7],
+        [30, 11],
+        [40, 14],
+        [51, 18],
+        [100, 18],
+      ]) {
+        const tree = dashboardView.ui!(fixture.data, fixture.context(width, height))
+        if (tree.type !== "column") throw new Error("Missing layout")
+        expect(tree.children.find(({ node }) => node.type === "box")?.size).toBe(expected)
+      }
+    }
+  })
+
+  test("timeline defaults expanded and hints match each agent's capabilities", () => {
+    const fixture = viewFixture()
+    fixture.state.expanded = {}
+    const tree = widget(fixture, "timeline")
+    if (tree.type !== "tree") throw new Error("Missing timeline")
+    expect(tree.expanded).toBe("all")
+    const serialized = JSON.stringify(tree)
+    expect(serialized).toContain("p Resume")
+    expect(serialized).toContain("p Pause · r Request changes")
+    const audit = treeItems(tree.items).find((item) => item.key === "agent:audit")!
+    expect(JSON.stringify(audit.detail)).not.toContain("p Pause")
+    expect(JSON.stringify(audit.detail)).not.toContain("r Request changes")
+  })
+
   test("empty source remains a valid semantic tree", () => {
     const fixture = viewFixture()
     fixture.snapshot.phases = []
@@ -158,26 +195,26 @@ describe("public semantic rendering (not terminal raster snapshots)", () => {
 })
 
 describe("public events and host-owned navigation", () => {
-  test("Enter's activate event opens an agent page; b returns to the timeline", () => {
+  test("Enter pushes host page state; popping restores timeline selection, expansion and tabs", () => {
     const fixture = viewFixture()
     send(fixture, { type: "select", id: "timeline", key: "agent:receipts" })
-    expect(fixture.data.selected).toBe("receipts")
-    expect(fixture.data.page).toBeUndefined()
-    // Enter is translated by the host to activate, not an extension-owned raw key.
+    const root = structuredClone(fixture.state)
     send(fixture, { type: "activate", id: "timeline", key: "agent:receipts" })
-    expect(fixture.data.page).toBe("receipts")
-    expect(fixture.state.activeTabs.detail).toBe("summary")
-    expect(fixture.state.focused).toBe("detail")
+    expect(fixture.control.pushPage).toHaveBeenCalledTimes(1)
+    expect(fixture.context().page).toEqual({ depth: 1, data: "receipts" })
+    expect(fixture.state.activeTabs[fixture.widgetId("detail")]).toBe("summary")
+    expect(fixture.state.focused).toBe(fixture.widgetId("detail"))
     expect(nodes(render(fixture)).some((node) => node.type === "tree")).toBe(false)
     expect(words(fixture, "summary")[0]).toContain("Receipt templates")
-    key(fixture, "b")
-    expect(fixture.data.page).toBeUndefined()
-    expect(fixture.state.focused).toBe("timeline")
+    key(fixture, "3")
+    fixture.control.popPage()
+    expect(fixture.context().page).toBeUndefined()
+    expect(fixture.state).toEqual(root)
     expect(widget(fixture, "timeline").type).toBe("tree")
     expect(fixture.control.close).not.toHaveBeenCalled()
   })
 
-  test("Esc and q are host-owned close keys, not a back shortcut", () => {
+  test("Esc and q stay host-owned; the b workaround is removed", () => {
     const fixture = viewFixture()
     send(fixture, { type: "activate", id: "timeline", key: "agent:payments" })
     const declared = dashboardView.keys!.map((binding) => binding.key)
@@ -185,10 +222,10 @@ describe("public events and host-owned navigation", () => {
     expect(declared).not.toContain("esc")
     expect(declared).not.toContain("q")
     expect(declared).not.toContain("enter")
-    // A synthetic event cannot make Esc navigate back. We do not simulate or claim
-    // to test the private host implementation that actually closes the view.
+    expect(declared).not.toContain("b")
+    // Esc page-pop behavior is exercised through the real TUI in tui-render.test.ts.
     key(fixture, "escape")
-    expect(fixture.data.page).toBe("payments")
+    expect(fixture.context().page?.data).toBe("payments")
     expect(fixture.control.close).not.toHaveBeenCalled()
   })
 
@@ -196,7 +233,7 @@ describe("public events and host-owned navigation", () => {
     const fixture = viewFixture()
     for (const item of ["phase:implementation", "group:implementation:workers"]) {
       send(fixture, { type: "activate", id: "timeline", key: item })
-      expect(fixture.data.page).toBeUndefined()
+      expect(fixture.context().page).toBeUndefined()
       expect(fixture.data.selected).toBeUndefined()
       expect(widget(fixture, "selection-hint").type).toBe("text")
     }
@@ -207,35 +244,36 @@ describe("public events and host-owned navigation", () => {
     for (const [index, tab] of ["summary", "diff", "logs", "actions"].entries()) {
       key(fixture, String(index + 1))
       expect(fixture.data.tab).toBe(tab)
-      expect(fixture.state.activeTabs.detail).toBe(tab)
+      expect(fixture.state.activeTabs[fixture.widgetId("detail")]).toBe(tab)
     }
     send(fixture, { type: "tab", id: "detail", key: "logs" })
     expect(fixture.data.tab).toBe("logs")
     key(fixture, "left")
-    expect(fixture.state.activeTabs.detail).toBe("diff")
+    expect(fixture.state.activeTabs[fixture.widgetId("detail")]).toBe("diff")
     key(fixture, "right")
-    expect(fixture.state.activeTabs.detail).toBe("logs")
+    expect(fixture.state.activeTabs[fixture.widgetId("detail")]).toBe("logs")
     send(fixture, { type: "tab", id: "unrelated", key: "other" })
     expect(fixture.data.tab).toBe("logs")
     // Tab/Shift-Tab focus traversal and focused-widget arrows belong to the host.
     expect(dashboardView.keys!.map((binding) => binding.key)).not.toContain("tab")
   })
 
-  test("stats participates in numeric and wrapping navigation only when supplied", () => {
+  test("numeric tabs defer missing-tab repair to the host; cycling uses available tabs", () => {
     const fixture = viewFixture()
     key(fixture, "5")
-    expect(fixture.state.activeTabs.detail).toBe("stats")
+    expect(fixture.state.activeTabs[fixture.widgetId("detail")]).toBe("stats")
     key(fixture, "right")
-    expect(fixture.state.activeTabs.detail).toBe("summary")
+    expect(fixture.state.activeTabs[fixture.widgetId("detail")]).toBe("summary")
     key(fixture, "left")
-    expect(fixture.state.activeTabs.detail).toBe("stats")
+    expect(fixture.state.activeTabs[fixture.widgetId("detail")]).toBe("stats")
     send(fixture, { type: "activate", id: "timeline", key: "agent:receipts" })
     key(fixture, "5")
-    expect(fixture.state.activeTabs.detail).toBe("summary")
+    expect(fixture.state.activeTabs[fixture.widgetId("detail")]).toBe("stats")
+    // A real host repairs this absent tab to Summary (covered in tui-render.test.ts).
     key(fixture, "left")
-    expect(fixture.state.activeTabs.detail).toBe("actions")
+    expect(fixture.state.activeTabs[fixture.widgetId("detail")]).toBe("actions")
     key(fixture, "right")
-    expect(fixture.state.activeTabs.detail).toBe("summary")
+    expect(fixture.state.activeTabs[fixture.widgetId("detail")]).toBe("summary")
     const tabs = widget(fixture, "detail")
     if (tabs.type !== "tabs") throw new Error("Missing tabs")
     expect(tabs.tabs.map((tab) => tab.key)).toEqual(["summary", "diff", "logs", "actions"])
@@ -285,7 +323,7 @@ describe("agent actions", () => {
   test("Open diff works from the shortcut and action table, showing real lines or an honest missing note", () => {
     const fixture = viewFixture()
     key(fixture, "o")
-    expect(fixture.state.activeTabs.detail).toBe("diff")
+    expect(fixture.state.activeTabs[fixture.widgetId("detail")]).toBe("diff")
     expect(fixture.state.focused).toBe("detail")
     expect(lines(fixture, "diff")).toEqual([
       { kind: "accent", text: "src/payments.ts" },

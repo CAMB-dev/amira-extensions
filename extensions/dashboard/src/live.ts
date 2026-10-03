@@ -8,6 +8,7 @@ import type {
   ViewLine,
 } from "@amira/api"
 import {
+  type DashboardAction,
   type DashboardAgent,
   type DashboardGroup,
   type DashboardSource,
@@ -50,12 +51,22 @@ function statusOf(agent: SubagentInfo): DashboardStatus {
 }
 
 const stoppable = (agent: SubagentInfo): boolean =>
-  agent.status === "queued" || agent.status === "running" || agent.status === "idle"
+  ["queued", "running", "idle", "paused"].includes(agent.status)
+
+function actionsOf(agent: SubagentInfo): DashboardAction[] {
+  if (!stoppable(agent)) return []
+  return [
+    ...(agent.status === "running" ? ["pause" as const] : []),
+    ...(agent.status === "paused" ? ["resume" as const] : []),
+    "stop",
+    "request-changes",
+  ]
+}
 
 /** Live session listings are authoritative; event caches contain only recent child details. */
 export function createLiveSource(
   session: SessionControl,
-  bus: Pick<ExtensionAPI, "on" | "requestRender">,
+  bus: Pick<ExtensionAPI, "on">,
 ): DashboardSource & { dispose(): void } {
   const root = session.info()
   const rootId = root.id
@@ -69,7 +80,6 @@ export function createLiveSource(
   const current = (): boolean => !disposed && !switched && session.info().id === rootId
   const notify = (): void => {
     for (const changed of subscribers) changed()
-    bus.requestRender()
   }
 
   function agents(): SubagentInfo[] {
@@ -135,54 +145,61 @@ export function createLiveSource(
     })
   }
 
-  for (const type of ["subagent.start", "subagent.state", "subagent.end"] as const) {
-    on(type, (event, listed) => {
-      if (event.sessionId === rootId || listed.some((agent) => agent.id === event.sessionId)) notify()
-    })
-  }
-  for (const type of ["group.start", "group.update", "group.end"] as const) {
-    on(type, (event, listed) => {
-      if (event.sessionId === rootId || listed.some((agent) => agent.id === event.sessionId)) notify()
-    })
-  }
-  on("session.start", () => {})
-  on("session.end", (event) => {
-    if (event.sessionId !== rootId || event.data.reason !== "switch") return
-    switched = true
-    cache.clear()
-    notify()
-  })
-  child("message.start", (_event, value) => {
-    value.text = ""
-    value.thinking = ""
-  })
-  child("message.delta", (event, value) => {
-    if (event.data.kind === "text") value.text = tail(value.text + tail(event.data.text))
-    if (event.data.kind === "thinking") value.thinking = tail(value.thinking + tail(event.data.text))
-  })
-  child("message.end", (event, value) => {
-    value.reply = messageText(event.data.message)
-    value.text = ""
-    value.thinking = ""
-  })
-  child("tool.execute.start", (event, value) => {
-    log(value, `${event.data.name}: started`)
-  })
-  child("tool.execute.update", (event, value) => {
-    log(value, `${event.data.name}: ${messageText(event.data.partial)}`)
-  })
-  child("tool.execute.end", (event, value) => {
-    const { name, result, rejected, writtenPaths } = event.data
-    log(
-      value,
-      `${name}: ${rejected ? "not run" : result.isError ? "failed" : "finished"}\n${messageText(result)}`,
-    )
-    // Arguments, start-event paths and result text are not evidence of a completed write.
-    for (const path of writtenPaths ?? []) {
-      if (value.files.size >= MAX_FILES) break
-      value.files.add(path)
+  function listen(): void {
+    for (const type of ["subagent.start", "subagent.state", "subagent.end"] as const) {
+      on(type, (event, listed) => {
+        if (event.sessionId === rootId || listed.some((agent) => agent.id === event.sessionId)) notify()
+      })
     }
-  })
+    for (const type of ["group.start", "group.update", "group.end"] as const) {
+      on(type, (event, listed) => {
+        if (event.sessionId === rootId || listed.some((agent) => agent.id === event.sessionId)) notify()
+      })
+    }
+    on("session.start", () => {})
+    on("session.end", (event) => {
+      if (event.sessionId !== rootId || event.data.reason !== "switch") return
+      switched = true
+      cache.clear()
+      notify()
+    })
+    child("message.start", (_event, value) => {
+      value.text = ""
+      value.thinking = ""
+    })
+    child("message.delta", (event, value) => {
+      if (event.data.kind === "text") value.text = tail(value.text + tail(event.data.text))
+      if (event.data.kind === "thinking") value.thinking = tail(value.thinking + tail(event.data.text))
+    })
+    child("message.end", (event, value) => {
+      value.reply = messageText(event.data.message)
+      value.text = ""
+      value.thinking = ""
+    })
+    child("tool.execute.start", (event, value) => {
+      log(value, `${event.data.name}: started`)
+    })
+    child("tool.execute.update", (event, value) => {
+      log(value, `${event.data.name}: ${messageText(event.data.partial)}`)
+    })
+    child("tool.execute.end", (event, value) => {
+      const { name, result, rejected, writtenPaths } = event.data
+      log(
+        value,
+        `${name}: ${rejected ? "not run" : result.isError ? "failed" : "finished"}\n${messageText(result)}`,
+      )
+      // Arguments, start-event paths and result text are not evidence of a completed write.
+      for (const path of writtenPaths ?? []) {
+        if (value.files.size >= MAX_FILES) break
+        value.files.add(path)
+      }
+    })
+  }
+
+  function unlisten(): void {
+    for (const remove of removers.splice(0)) remove()
+    cache.clear()
+  }
 
   return {
     id: "agents",
@@ -261,7 +278,7 @@ export function createLiveSource(
           language: languageOf(files),
           ...(agent.status === "done" ? { progress: 1 } : {}),
           files,
-          actions: stoppable(agent) ? ["stop"] : [],
+          actions: actionsOf(agent),
         }
         group.agents.push(item)
       }
@@ -289,19 +306,38 @@ export function createLiveSource(
       return { summary: lines(summary), logs: logs.slice(-MAX_LOGS) }
     },
     subscribe(changed) {
-      if (disposed) return () => {}
-      subscribers.add(changed)
+      if (!current()) return () => {}
+      const listener = () => changed()
+      subscribers.add(listener)
+      if (subscribers.size === 1) listen()
       return () => {
-        subscribers.delete(changed)
+        if (!subscribers.delete(listener)) return
+        if (!subscribers.size) unlisten()
       }
     },
-    act(agentId, action) {
+    act(agentId, action, text) {
       if (!current()) return "Session changed or closed. Reopen the dashboard before acting on an agent."
       const agent = agents().find((agent) => agent.id === agentId)
       if (!agent) return "Agent not found in this session."
-      if (action !== "stop")
-        return "Live agents support Stop only. Pause, resume and request changes need a child session handle that is not available here."
       if (!stoppable(agent)) return "This agent has already ended."
+      if (action === "pause") {
+        if (agent.status !== "running") return "Agent is not running. Only running agents can be paused."
+        return session.pauseSubagent(agentId)
+          ? "Pause accepted. Current work can finish before the next model call is held."
+          : "Pause not accepted. Agent may no longer be running or is already paused."
+      }
+      if (action === "resume") {
+        if (agent.status !== "paused") return "Agent is not paused."
+        return session.resumeSubagent(agentId)
+          ? "Resume accepted."
+          : "Resume not accepted. Agent may no longer be paused or has ended."
+      }
+      if (action === "request-changes") {
+        if (!text?.trim()) return "Enter a message to send to this agent."
+        return session.messageSubagent(agentId, text)
+          ? "Message sent. The agent will receive it before its next model call."
+          : "Not sent: agent is stopping or no longer running."
+      }
       return session.stopSubagent(agentId)
         ? "Stop requested."
         : "Agent could not be stopped; it may have already ended."
@@ -309,9 +345,8 @@ export function createLiveSource(
     dispose() {
       if (disposed) return
       disposed = true
-      for (const remove of removers.splice(0)) remove()
+      unlisten()
       subscribers.clear()
-      cache.clear()
     },
   }
 }

@@ -1,8 +1,8 @@
-import { defineExtension, type SessionControl } from "@amira/api"
+import { defineExtension } from "@amira/api"
 import { createLiveSource } from "./live.ts"
 import type { DashboardSource, DashboardSources } from "./source.ts"
 import { createTraceSource } from "./trace.ts"
-import { dashboardView, VIEW_KIND } from "./view.ts"
+import { type DashboardViewData, dashboardView, VIEW_KIND } from "./view.ts"
 
 export type * from "./source.ts"
 
@@ -11,13 +11,13 @@ export function sourceRegistry(changed: () => void) {
   const sources = new Map<string, DashboardSource>()
   const disposers = new Map<string, () => void>()
   const registrations = new Map<string, symbol>()
+  const subscriptions = new Map<string, Set<() => void>>()
   const service: DashboardSources = {
     register(source) {
       if (!/^[a-z][\w.-]*$/i.test(source.id) || ["agents", "trace"].includes(source.id)) {
         throw new Error(`Invalid or reserved dashboard source ID: ${source.id}`)
       }
       if (sources.has(source.id)) throw new Error(`Dashboard source already registered: ${source.id}`)
-      const unsubscribe = source.subscribe?.(changed)
       const registration = Symbol(source.id)
       registrations.set(source.id, registration)
       sources.set(source.id, source)
@@ -26,7 +26,8 @@ export function sourceRegistry(changed: () => void) {
         registrations.delete(source.id)
         sources.delete(source.id)
         disposers.delete(source.id)
-        unsubscribe?.()
+        for (const unsubscribe of [...(subscriptions.get(source.id) ?? [])]) unsubscribe()
+        subscriptions.delete(source.id)
         changed()
       }
       disposers.set(source.id, dispose)
@@ -38,6 +39,24 @@ export function sourceRegistry(changed: () => void) {
     sources,
     registrations,
     service,
+    subscribe(id: string, changed: () => void) {
+      const source = sources.get(id)
+      const registration = registrations.get(id)
+      const listeners = subscriptions.get(id) ?? new Set<() => void>()
+      let active = true
+      const unsubscribe = source?.subscribe?.(() => {
+        if (active && registrations.get(id) === registration) changed()
+      })
+      const release = () => {
+        if (!active) return
+        active = false
+        listeners.delete(release)
+        unsubscribe?.()
+      }
+      listeners.add(release)
+      subscriptions.set(id, listeners)
+      return release
+    },
     dispose: () => {
       for (const dispose of [...disposers.values()]) dispose()
     },
@@ -45,37 +64,49 @@ export function sourceRegistry(changed: () => void) {
 }
 
 export default defineExtension((api) => {
-  const registry = sourceRegistry(() => api.requestRender())
-  let live: ReturnType<typeof createLiveSource> | undefined
-  let owner: string | undefined
+  let active: DashboardViewData | undefined
+  let unsubscribe: (() => void) | undefined
   let generation = 0
-  const liveFor = (session: SessionControl) => {
-    if (!live || owner !== session.info().id) {
-      live?.dispose()
-      live = createLiveSource(session, api)
-      owner = session.info().id
-    }
-    return live
+  const liveSources = new WeakMap<DashboardSource, { sessionId: string; dispose: () => void }>()
+  const registry = sourceRegistry(() => {
+    if (active) api.requestRender()
+  })
+  const close = () => {
+    const previous = active
+    active = undefined
+    const release = unsubscribe
+    unsubscribe = undefined
+    release?.()
+    if (previous) liveSources.get(previous.source)?.dispose()
   }
-  const initial = api.session()
-  if (initial) liveFor(initial)
-  api.on("session.start", (event) => {
-    if (event.parentSessionId) return
-    const session = api.session()
-    if (session && session.info().id === event.sessionId) liveFor(session)
-  })
-  api.on("session.end", (event) => {
-    if (event.sessionId !== owner || event.data.reason !== "switch") return
-    live?.dispose()
-    live = undefined
-    owner = undefined
-  })
+  const open = (data: DashboardViewData) => {
+    if (active?.source === data.source) {
+      // Replacing view data must not interrupt the live source's event cache.
+      active = data
+      return
+    }
+    close()
+    active = data
+    unsubscribe = data.source.subscribe?.(() => {
+      if (active?.source === data.source) api.requestRender()
+    })
+  }
   api.onExit(() => {
-    live?.dispose()
+    close()
     registry.dispose()
   })
   api.provideService("dashboard.sources", registry.service)
-  api.registerView(dashboardView)
+  api.registerView({
+    ...dashboardView,
+    onOpen(data, view) {
+      open(data)
+      dashboardView.onOpen?.(data, view)
+    },
+    onClose(data) {
+      close()
+      dashboardView.onClose?.(data)
+    },
+  })
   api.registerCommand({
     name: "dashboard",
     description: "Open the agent timeline or replay recorded trace statistics",
@@ -95,13 +126,22 @@ export default defineExtension((api) => {
         return
       }
       const id = args.trim() || "agents"
+      const sessionId = ctx.session.info().id
+      const current = active?.source
+      const live =
+        id === "agents" && (!current || liveSources.get(current)?.sessionId !== sessionId)
+          ? createLiveSource(ctx.session, api)
+          : undefined
       const source =
         id === "agents"
-          ? liveFor(ctx.session)
+          ? (live ?? current)
           : id === "trace"
             ? await createTraceSource(ctx.session, ctx.signal)
             : registry.sources.get(id)
-      if (ctx.signal.aborted || request !== generation) return
+      if (ctx.signal.aborted || request !== generation) {
+        live?.dispose()
+        return
+      }
       if (!source) {
         ctx.print(`Unknown dashboard source: ${id}. Use /dashboard agents or /dashboard trace.`, "warning")
         return
@@ -122,14 +162,21 @@ export default defineExtension((api) => {
                     note: "This dashboard source was unregistered. Reopen /dashboard to choose another source.",
                   },
             details: (agentId) => (registered() ? source.details(agentId) : undefined),
+            subscribe: (changed) => (registered() ? registry.subscribe(id, changed) : () => {}),
             act: (agentId, action, text) =>
               registered() && source.act
                 ? source.act(agentId, action, text)
                 : "This dashboard source is no longer available.",
           }
         : source
-      if (!ctx.openView({ kind: VIEW_KIND, data: { source: guarded } })) {
+      const data: DashboardViewData = { source: guarded }
+      if (live) liveSources.set(live, { sessionId, dispose: () => live.dispose() })
+      if (!ctx.openView({ kind: VIEW_KIND, data })) {
+        live?.dispose()
         ctx.print("The dashboard could not open. Close the current dialog and try again.", "warning")
+      } else if (active) {
+        // Same-kind replacement does not call onOpen: switch subscriptions only after success.
+        open(data)
       }
     },
   })

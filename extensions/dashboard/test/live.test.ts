@@ -13,6 +13,8 @@ import type {
 } from "@amira/api"
 import { createLiveSource } from "../src/live.ts"
 import { agentsOf } from "../src/source.ts"
+import { performAction } from "../src/view.ts"
+import { viewFixture } from "./view-fixture.ts"
 
 const model = { provider: "test", model: "test" }
 const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
@@ -47,7 +49,7 @@ const group = (id: string, parentSessionId = "root"): SpawnGroupInfo => ({
 const textOf = (lines: ViewLine[]): string =>
   lines.map((line) => ("text" in line ? line.text : "")).join("\n")
 
-function setup(initial: SubagentInfo[] = [agent("child")]) {
+function setup(initial: SubagentInfo[] = [agent("child")], observe = true) {
   let info: SessionInfo = {
     id: "root",
     cwd: "/workspace",
@@ -62,9 +64,13 @@ function setup(initial: SubagentInfo[] = [agent("child")]) {
   let reads = 0
   let stopResult = true
   const stopped: string[] = []
+  const paused: string[] = []
+  const resumed: string[] = []
+  const sent: { id: string; text: string }[] = []
+  let controlResult = true
   const messages = new Map<string, readonly Message[]>()
   const handlers = new Map<keyof EventMap, Set<(event: EventEnvelope) => void>>()
-  const bus: Pick<ExtensionAPI, "on" | "requestRender"> = {
+  const bus: Pick<ExtensionAPI, "on"> = {
     on(type, handler) {
       const set = handlers.get(type) ?? new Set()
       // The registration key and emit's generic payload guarantee this correspondence.
@@ -74,9 +80,6 @@ function setup(initial: SubagentInfo[] = [agent("child")]) {
       return () => {
         set.delete(receive)
       }
-    },
-    requestRender: () => {
-      renders++
     },
   }
   const session = {
@@ -94,9 +97,37 @@ function setup(initial: SubagentInfo[] = [agent("child")]) {
       stopped.push(id)
       return stopResult
     },
-  } satisfies Pick<SessionControl, "info" | "subagents" | "groups" | "subagentMessages" | "stopSubagent">
+    pauseSubagent: (id: string) => {
+      paused.push(id)
+      return controlResult
+    },
+    resumeSubagent: (id: string) => {
+      resumed.push(id)
+      return controlResult
+    },
+    messageSubagent: (id: string, text: string) => {
+      sent.push({ id, text })
+      return controlResult
+    },
+  } satisfies Pick<
+    SessionControl,
+    | "info"
+    | "subagents"
+    | "groups"
+    | "subagentMessages"
+    | "stopSubagent"
+    | "pauseSubagent"
+    | "resumeSubagent"
+    | "messageSubagent"
+  >
   // All other SessionControl capabilities are deliberately absent from this adapter fake.
   const source = createLiveSource(session as SessionControl, bus)
+  const subscribe = (changed = () => {}) =>
+    source.subscribe!(() => {
+      renders++
+      changed()
+    })
+  if (observe) subscribe()
   let seq = 0
   function emit<K extends keyof EventMap>(type: K, sessionId: string, data: EventMap[K]) {
     const event: EventEnvelope<K> = { type, sessionId, data, seq: ++seq, ts: seq }
@@ -107,6 +138,13 @@ function setup(initial: SubagentInfo[] = [agent("child")]) {
     emit,
     messages,
     stopped,
+    paused,
+    resumed,
+    sent,
+    subscribe,
+    controlResult: (result: boolean) => {
+      controlResult = result
+    },
     setAgents: (next: SubagentInfo[]) => {
       listed = next
     },
@@ -173,7 +211,7 @@ test("one Agents phase groups by parent-qualified spawn group or tool call, incl
 })
 
 test("uses authoritative statuses and costs without estimated progress or duration", () => {
-  const states: SubagentInfo["status"][] = ["queued", "running", "idle", "done", "error", "aborted"]
+  const states: SubagentInfo["status"][] = ["queued", "running", "idle", "paused", "done", "error", "aborted"]
   const s = setup(
     states.map((status) =>
       agent(status, {
@@ -184,20 +222,52 @@ test("uses authoritative statuses and costs without estimated progress or durati
     ),
   )
   const listed = agentsOf(s.source.snapshot())
-  expect(listed.map((a) => a.status)).toEqual(["queued", "running", "idle", "done", "failed", "stopped"])
-  expect(listed.map((a) => a.progress)).toEqual([undefined, undefined, undefined, 1, undefined, undefined])
-  expect(listed.map((a) => a.cost)).toEqual([undefined, undefined, undefined, 0, undefined, undefined])
+  expect(listed.map((a) => a.status)).toEqual([
+    "queued",
+    "running",
+    "idle",
+    "paused",
+    "done",
+    "failed",
+    "stopped",
+  ])
+  expect(listed.map((a) => a.progress)).toEqual([
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    1,
+    undefined,
+    undefined,
+  ])
+  expect(listed.map((a) => a.cost)).toEqual([
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    0,
+    undefined,
+    undefined,
+  ])
   expect(listed[0]?.durationMs).toBeUndefined()
-  expect(listed[3]?.durationMs).toBe(10)
-  expect(listed[3]?.startedAt).toBe(5)
-  expect(listed.map((a) => a.actions)).toEqual([["stop"], ["stop"], ["stop"], [], [], []])
+  expect(listed[4]?.durationMs).toBe(10)
+  expect(listed[4]?.startedAt).toBe(5)
+  expect(listed.map((a) => a.actions)).toEqual([
+    ["stop", "request-changes"],
+    ["pause", "stop", "request-changes"],
+    ["stop", "request-changes"],
+    ["resume", "stop", "request-changes"],
+    [],
+    [],
+    [],
+  ])
   s.source.dispose()
 })
 
 test("notifies for starts, state changes, ends and groups; reads current listings", () => {
-  const s = setup([])
+  const s = setup([], false)
   let changes = 0
-  const unsubscribe = s.source.subscribe!(() => {
+  const unsubscribe = s.subscribe(() => {
     changes++
   })
   s.setAgents([agent("child", { status: "queued" })])
@@ -220,6 +290,8 @@ test("notifies for starts, state changes, ends and groups; reads current listing
   unsubscribe()
   s.emit("group.end", "root", { group: group("g") })
   expect(changes).toBe(4)
+  expect(s.renders()).toBe(4)
+  expect(s.listeners()).toBe(0)
   s.source.dispose()
 })
 
@@ -297,19 +369,97 @@ test("retains nested descendants but ignores root messages, other roots, orphans
   s.source.dispose()
 })
 
-test("stops only live agents from this session and explains unsupported actions", () => {
-  const s = setup([agent("child"), agent("done", { status: "done" })])
-  expect(s.source.act!("child", "stop")).toBe("Stop requested.")
-  expect(s.stopped).toEqual(["child"])
-  for (const action of ["pause", "resume", "request-changes"] as const) {
-    expect(s.source.act!("child", action, "Try another approach")).toContain("support Stop only")
+test("view actions prompt and dispatch through the live source to SessionControl, showing results", async () => {
+  const s = setup()
+  const fixture = viewFixture()
+  fixture.data.source = s.source
+  fixture.data.selected = "child"
+  await performAction(fixture.data, fixture.control, "pause")
+  expect(s.paused).toEqual(["child"])
+  expect(fixture.data.flash).toContain("Pause accepted")
+  s.setAgents([agent("child", { status: "paused" })])
+  await performAction(fixture.data, fixture.control, "resume")
+  expect(s.resumed).toEqual(["child"])
+  expect(fixture.data.flash).toBe("Resume accepted.")
+  await performAction(fixture.data, fixture.control, "request-changes")
+  expect(fixture.control.prompt).toHaveBeenCalledWith("Request changes from child")
+  expect(s.sent).toEqual([{ id: "child", text: "Please cover negative refunds." }])
+  expect(fixture.data.flash).toContain("Message sent")
+  s.controlResult(false)
+  await performAction(fixture.data, fixture.control, "request-changes")
+  expect(fixture.data.flash).toContain("Not sent")
+  s.source.dispose()
+})
+
+test("live controls accept pause, resume, stop and messages with accurate state gates", () => {
+  const s = setup([
+    agent("child"),
+    agent("paused", { status: "paused" }),
+    agent("queued", { status: "queued" }),
+    agent("idle", { status: "idle" }),
+    agent("done", { status: "done" }),
+  ])
+  expect(s.source.act!("child", "pause")).toContain("Pause accepted")
+  expect(s.paused).toEqual(["child"])
+  expect(s.source.act!("paused", "resume")).toBe("Resume accepted.")
+  expect(s.resumed).toEqual(["paused"])
+  for (const id of ["child", "paused", "queued", "idle"]) {
+    expect(s.source.act!(id, "stop")).toBe("Stop requested.")
+    expect(s.source.act!(id, "request-changes", "Try another approach")).toContain("Message sent")
   }
-  expect(s.source.act!("done", "stop")).toContain("already ended")
-  expect(s.source.act!("foreign", "stop")).toContain("not found")
-  expect(s.stopped).toEqual(["child"])
+  expect(s.stopped).toEqual(["child", "paused", "queued", "idle"])
+  expect(s.sent).toEqual(
+    ["child", "paused", "queued", "idle"].map((id) => ({ id, text: "Try another approach" })),
+  )
+  for (const id of ["paused", "queued", "idle"]) {
+    expect(s.source.act!(id, "pause")).toContain("not running")
+  }
+  expect(s.source.act!("child", "resume")).toContain("not paused")
+  expect(s.source.act!("child", "request-changes", "  ")).toContain("Enter a message")
+  for (const action of ["pause", "resume", "stop", "request-changes"] as const) {
+    expect(s.source.act!("done", action, "Try again")).toContain("already ended")
+    expect(s.source.act!("foreign", action, "Try again")).toContain("not found")
+  }
+  expect(s.paused).toEqual(["child"])
+  expect(s.resumed).toEqual(["paused"])
+  expect(s.sent).toHaveLength(4)
+  s.controlResult(false)
+  expect(s.source.act!("child", "pause")).toContain("Pause not accepted")
+  expect(s.source.act!("paused", "resume")).toContain("Resume not accepted")
+  expect(s.source.act!("child", "request-changes", "Try again")).toContain("Not sent")
   s.stopResult(false)
   expect(s.source.act!("child", "stop")).toContain("could not be stopped")
   s.source.dispose()
+})
+
+test("live event listeners exist only while subscribed and last release clears transient details", () => {
+  const s = setup(undefined, false)
+  expect(s.listeners()).toBe(0)
+  s.source.snapshot()
+  s.source.details("child")
+  writeEvent(s, "child", ["closed.ts"])
+  expect(s.renders()).toBe(0)
+  const first = s.subscribe()
+  const listeners = s.listeners()
+  expect(listeners).toBeGreaterThan(0)
+  const second = s.subscribe()
+  expect(s.listeners()).toBe(listeners)
+  writeEvent(s, "child", ["open.ts"])
+  expect(agentsOf(s.source.snapshot())[0]?.files).toEqual([{ path: "open.ts" }])
+  first()
+  first()
+  expect(s.listeners()).toBe(listeners)
+  second()
+  expect(s.listeners()).toBe(0)
+  const renders = s.renders()
+  writeEvent(s, "child", ["closed-again.ts"])
+  expect(s.renders()).toBe(renders)
+  const reopened = s.subscribe()
+  expect(s.listeners()).toBe(listeners)
+  expect(agentsOf(s.source.snapshot())[0]?.files).toEqual([])
+  s.source.dispose()
+  reopened()
+  expect(s.listeners()).toBe(0)
 })
 
 test("session switches cannot expose another session or apply stale actions, even with reused child IDs", () => {
