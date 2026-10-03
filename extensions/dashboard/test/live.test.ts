@@ -486,6 +486,8 @@ test("a switch event invalidates the source before the control changes and dispo
   const s = setup()
   expect(s.listeners()).toBeGreaterThan(0)
   s.emit("session.end", "root", { reason: "switch" })
+  // A switched session never returns, so its bus listeners go immediately rather than at close.
+  expect(s.listeners()).toBe(0)
   expect(s.source.details("child")).toBeUndefined()
   expect(s.source.act!("child", "stop")).toContain("Session changed")
   const renders = s.renders()

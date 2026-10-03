@@ -82,6 +82,13 @@ export function createLiveSource(
     for (const changed of subscribers) changed()
   }
 
+  /** A switched session never becomes current again: release the bus listeners at once, not at close. */
+  function leave(): void {
+    switched = true
+    unlisten()
+    notify()
+  }
+
   function agents(): SubagentInfo[] {
     if (!current()) return []
     const listed = session.subagents()
@@ -124,9 +131,7 @@ export function createLiveSource(
       bus.on(type, (event) => {
         if (disposed || switched) return
         if (session.info().id !== rootId) {
-          switched = true
-          cache.clear()
-          notify()
+          leave()
           return
         }
         handler(event, agents())
@@ -159,9 +164,7 @@ export function createLiveSource(
     on("session.start", () => {})
     on("session.end", (event) => {
       if (event.sessionId !== rootId || event.data.reason !== "switch") return
-      switched = true
-      cache.clear()
-      notify()
+      leave()
     })
     child("message.start", (_event, value) => {
       value.text = ""
