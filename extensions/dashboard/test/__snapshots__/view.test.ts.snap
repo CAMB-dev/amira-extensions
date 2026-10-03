@@ -1485,7 +1485,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
                             "right": [
                               {
                                 "kind": "muted",
-                                "text": "Payment validation  Validate payment amounts and add regression coverage for partial refunds.   × ",
+                                "text": "Payment validation  Validate payment amounts and add regression coverage for partial refunds.   ✕ ",
                               },
                             ],
                             "type": "bar",
@@ -1650,14 +1650,19 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
             },
             {
               "node": {
-                "id": undefined,
-                "lines": [
+                "left": [
                   {
                     "kind": "muted",
-                    "text": " 1–4 tabs · 5 stats (when available) · x stop",
+                    "text": " o open diff   p pause/resume   r request changes   a actions   x stop",
                   },
                 ],
-                "type": "text",
+                "right": [
+                  {
+                    "kind": "muted",
+                    "text": "1–4 tabs · 5 stats (when available) ",
+                  },
+                ],
+                "type": "bar",
               },
               "size": 1,
             },
@@ -1818,7 +1823,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 agent 
                             "right": [
                               {
                                 "kind": "muted",
-                                "text": "Payment validation  Validate payment amounts and add regression coverage for partial refunds.   × ",
+                                "text": "Payment validation  Validate payment amounts and add regression coverage for partial refunds.   ✕ ",
                               },
                             ],
                             "type": "bar",
@@ -1983,14 +1988,19 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 agent 
             },
             {
               "node": {
-                "id": undefined,
-                "lines": [
+                "left": [
                   {
                     "kind": "muted",
-                    "text": " 1–4 tabs · 5 stats (when available) · x stop",
+                    "text": " o open diff   p pause/resume   r request changes   a actions   x stop",
                   },
                 ],
-                "type": "text",
+                "right": [
+                  {
+                    "kind": "muted",
+                    "text": "1–4 tabs · 5 stats (when available) ",
+                  },
+                ],
+                "type": "bar",
               },
               "size": 1,
             },
@@ -2150,7 +2160,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 stats 
                             "right": [
                               {
                                 "kind": "muted",
-                                "text": "Payment validation  Validate payment amounts and add regression coverage for partial refunds.   × ",
+                                "text": "Payment validation  Validate payment amounts and add regression coverage for partial refunds.   ✕ ",
                               },
                             ],
                             "type": "bar",
@@ -2265,14 +2275,19 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 stats 
             },
             {
               "node": {
-                "id": undefined,
-                "lines": [
+                "left": [
                   {
                     "kind": "muted",
-                    "text": " 1–4 tabs · 5 stats (when available) · x stop",
+                    "text": " o open diff   p pause/resume   r request changes   a actions   x stop",
                   },
                 ],
-                "type": "text",
+                "right": [
+                  {
+                    "kind": "muted",
+                    "text": "1–4 tabs · 5 stats (when available) ",
+                  },
+                ],
+                "type": "bar",
               },
               "size": 1,
             },

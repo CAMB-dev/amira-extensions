@@ -217,7 +217,7 @@ function details(data: DashboardViewData, ctx: UiContext, agent?: DashboardAgent
                     node: {
                       type: "bar" as const,
                       left: [],
-                      right: [part(`${agent.name}  ${agent.task}   × `, "muted")],
+                      right: [part(`${agent.name}  ${agent.task}   ✕ `, "muted")],
                     },
                   },
                 ]),
@@ -669,14 +669,13 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
           ? [
               {
                 size: 1,
-                node: text([
-                  {
-                    kind: "muted" as const,
-                    text: narrow
-                      ? " 1–4 tabs · o diff · a actions · ? shortcuts"
-                      : " 1–4 tabs · 5 stats (when available) · x stop",
-                  },
-                ]),
+                node: narrow
+                  ? text([{ kind: "muted" as const, text: " 1–4 tabs · o diff · a actions · ? shortcuts" }])
+                  : {
+                      type: "bar" as const,
+                      left: [part(" o open diff   p pause/resume   r request changes   a actions   x stop", "muted")],
+                      right: [part("1–4 tabs · 5 stats (when available) ", "muted")],
+                    },
               },
             ]
           : []),

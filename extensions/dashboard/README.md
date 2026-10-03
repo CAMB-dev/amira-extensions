@@ -60,7 +60,7 @@ Phases and cards start expanded, with the first active phase’s agent selected.
               │
               │
 ──────────────────────────────────────────────────────────────────────────────────────── ≡ ─────────────────────────────────────────────────────────────────────────────────────────
-  [Summary]  Diff  Logs  Actions  Stats                                           Payment validation  Validate payment amounts and add regression coverage for partial refunds.   ×
+  [Summary]  Diff  Logs  Actions  Stats                                           Payment validation  Validate payment amounts and add regression coverage for partial refunds.   ✕
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   Agent    Payment validation    │   What this agent is doing                                                                    │   Changed files  2 files
   Task     Validate payment amou…│   Amount validation is implemented; regression tests are in progress.                         │   src/payments.ts
@@ -73,7 +73,7 @@ Phases and cards start expanded, with the first active phase’s agent selected.
                                  │                                                                                               │
                                  │                                                                                               │
                                  │                                                                                               │
- 1–4 tabs · 5 stats (when available) · x stop
+ o open diff   p pause/resume   r request changes   a actions   x stop                                                                          1–4 tabs · 5 stats (when available)
 ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
 │ > Ask Amira or enter a command after closing this view…                                                                                      Hint only · close this view to send │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
