@@ -8,7 +8,7 @@ import type {
   ViewLine,
   ViewSegment,
 } from "@amira/api"
-import { agentsOf, type DashboardAgent, type DashboardSource, type DashboardStatus } from "./source.ts"
+import { agentsOf, type DashboardAction, type DashboardAgent, type DashboardSource, type DashboardStatus } from "./source.ts"
 
 export const VIEW_KIND = "dashboard"
 const TABS = ["summary", "diff", "logs", "actions", "stats"]
@@ -42,6 +42,18 @@ export interface DashboardViewData {
   pendingAction?: string
 }
 
+/** Key hints name only what this agent's source can do; Open diff and Actions always work. */
+function hints(agent: DashboardAgent): string {
+  const can = (action: DashboardAction) => agent.actions.includes(action)
+  return [
+    "o Open diff",
+    ...(can("pause") || can("resume") ? [`p ${can("resume") ? "Resume" : "Pause"}`] : []),
+    ...(can("request-changes") ? ["r Request changes"] : []),
+    ...(can("stop") ? ["x Stop"] : []),
+    "a ⋮ Actions",
+  ].join(" · ")
+}
+
 function card(agent: DashboardAgent, narrow: boolean): UiNode {
   return {
     type: "box",
@@ -69,7 +81,7 @@ function card(agent: DashboardAgent, narrow: boolean): UiNode {
         {
           size: 1,
           node: text([
-            { kind: "muted", text: `${agent.files.length} files reported changed · ${money(agent.cost)}` },
+            { kind: "muted", text: `${agent.files.length} ${agent.files.length === 1 ? "file" : "files"} reported changed · ${money(agent.cost)}` },
           ]),
         },
         ...agent.files
@@ -80,7 +92,7 @@ function card(agent: DashboardAgent, narrow: boolean): UiNode {
           node: text([
             {
               kind: "accent",
-              text: `o Open diff · p ${agent.status === "paused" ? "Resume" : "Pause"} · r Request changes · a ⋮ Actions`,
+              text: hints(agent),
             },
           ]),
         },
@@ -498,7 +510,7 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
               kind: "muted",
               text: data.page
                 ? "←→ tabs · b back to dashboard · Esc/q closes dashboard"
-                : "o diff · p pause/resume · r request changes · a actions · Esc/q close",
+                : `${agent ? hints(agent) : "Enter opens an agent"} · Esc/q close`,
             },
           ]),
         },

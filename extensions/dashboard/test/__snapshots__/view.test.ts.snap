@@ -161,7 +161,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
                                 "lines": [
                                   {
                                     "kind": "accent",
-                                    "text": "o Open diff · p Pause · r Request changes · a ⋮ Actions",
+                                    "text": "o Open diff · p Pause · r Request changes · x Stop · a ⋮ Actions",
                                   },
                                 ],
                                 "type": "text",
@@ -235,7 +235,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
                                 "lines": [
                                   {
                                     "kind": "muted",
-                                    "text": "1 files reported changed · cost unknown",
+                                    "text": "1 file reported changed · cost unknown",
                                   },
                                 ],
                                 "type": "text",
@@ -261,7 +261,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
                                 "lines": [
                                   {
                                     "kind": "accent",
-                                    "text": "o Open diff · p Resume · r Request changes · a ⋮ Actions",
+                                    "text": "o Open diff · p Resume · x Stop · a ⋮ Actions",
                                   },
                                 ],
                                 "type": "text",
@@ -403,7 +403,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
                                 "lines": [
                                   {
                                     "kind": "accent",
-                                    "text": "o Open diff · p Pause · r Request changes · a ⋮ Actions",
+                                    "text": "o Open diff · a ⋮ Actions",
                                   },
                                 ],
                                 "type": "text",
@@ -726,7 +726,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
             },
             {
               "kind": "muted",
-              "text": "o diff · p pause/resume · r request changes · a actions · Esc/q close",
+              "text": "o Open diff · p Pause · r Request changes · x Stop · a ⋮ Actions · Esc/q close",
             },
           ],
           "type": "text",
@@ -1559,7 +1559,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 timelin
                                 "lines": [
                                   {
                                     "kind": "accent",
-                                    "text": "o Open diff · p Pause · r Request changes · a ⋮ Actions",
+                                    "text": "o Open diff · p Pause · r Request changes · x Stop · a ⋮ Actions",
                                   },
                                 ],
                                 "type": "text",
@@ -1981,7 +1981,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 timelin
             },
             {
               "kind": "muted",
-              "text": "o diff · p pause/resume · r request changes · a actions · Esc/q close",
+              "text": "o Open diff · p Pause · r Request changes · x Stop · a ⋮ Actions · Esc/q close",
             },
           ],
           "type": "text",
