@@ -50,7 +50,7 @@ window.amiraRenderDone = (async () => {
   card.setAttribute("aria-label", source)
   try {
     katex.render(source, formula, { displayMode: true, throwOnError: true, trust: false,
-      strict: "error", maxExpand: 1000, maxSize: 20, output: "html" })
+      strict: "warn", maxExpand: 1000, maxSize: 20, output: "html" })
   } catch (err) {
     throw new Error("latex could not render math: " + (err && err.message ? err.message : String(err)))
   }

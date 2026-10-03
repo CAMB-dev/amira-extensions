@@ -38,6 +38,8 @@ export interface LatexOptions {
 }
 
 const LANGUAGES = ["math", "latex", "tex"]
+/** Longer sources stay text: the browser would be asked to typeset a page-sized formula. */
+const MAX_PICTURE_SOURCE = 20_000
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" })
 
 /** Wrap rather than let core cut the end of a formula. Never split a grapheme. */
@@ -76,7 +78,9 @@ export function latexRenderer(api: ExtensionAPI, opts: LatexOptions = {}): Markd
     render(node, ctx) {
       if (node.type !== "code" || !LANGUAGES.includes(node.lang.toLowerCase())) return undefined
       const text = () => textResult(node.code, ctx.width)
-      const render = settings.mode !== "text" && ctx.images && term() !== "dumb" ? renderHtml() : undefined
+      const pictures =
+        settings.mode !== "text" && node.code.length <= MAX_PICTURE_SOURCE && ctx.images && term() !== "dumb"
+      const render = pictures ? renderHtml() : undefined
       if (!render) return text()
       // Pixel cell sizes are not exposed by the API; core fits the resulting PNG to the terminal.
       const width = Math.max(16, Math.min(settings.maxWidth, Math.floor(ctx.width * 10)))

@@ -43,7 +43,7 @@ iTerm2 protocols; this extension never writes terminal escape sequences itself.
 
 ## Text fallback
 
-`mode: "text"`, a missing browser or image provider, a terminal without graphics,
+`mode: "text"`, a source over 20,000 characters, a missing browser or image provider, a terminal without graphics,
 `TERM=dumb`, and browser/KaTeX failures all use the small hand-written converter:
 
 - Greek letters and common operators: `\alpha` → α, `\sum` → ∑, `\infty` → ∞,
@@ -121,7 +121,7 @@ license. No CDN or runtime dependency installation is needed. Source:
 <https://registry.npmjs.org/katex/-/katex-0.16.22.tgz> (`dist/katex.min.js`,
 `dist/katex.min.css`, `dist/fonts/*.woff2`, `LICENSE`). CSS font `src` lists are reduced to
 their WOFF2 entry, replacing the file URL with its base64 data URL. KaTeX runs with
-`trust: false`, strict errors and bounded macro expansion; fonts load before the screenshot.
+`trust: false`, lenient strictness (warnings only) and bounded macro expansion; fonts load before the screenshot.
 
 ## Development
 

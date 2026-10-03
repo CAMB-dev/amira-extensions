@@ -99,6 +99,13 @@ test("text mode, plain rendering and TERM=dumb never look up the browser", () =>
   expect(setup().renderer.render(node(), ctx)).toEqual(TEXT)
 })
 
+test("very long sources stay text and never reach the browser", () => {
+  const s = setup({ browser: true })
+  const result = s.renderer.render(node("x+".repeat(10_001)), { ...ctx, images: true })
+  expect(result).toHaveProperty("lines")
+  expect(s.renders).toEqual([])
+})
+
 test("text wraps instead of losing the end of a formula", () => {
   const { renderer } = setup()
   expect(renderer.render(node("x^2 + y^2"), { ...ctx, width: 3 })).toEqual({
@@ -157,7 +164,7 @@ test("page is offline, safely quotes source, waits for fonts and crops scaled ma
   expect(page).not.toContain("</script><script>alert(1)")
   expect(page).toContain('card.setAttribute("aria-label", source)')
   expect(page).toContain("trust: false")
-  expect(page).toContain('strict: "error"')
+  expect(page).toContain('strict: "warn"')
   expect(page).toContain("await document.fonts.ready")
   // Tags must contribute to the measured width instead of overlapping the formula.
   expect(page).toContain(".katex-display>.katex>.katex-html>.tag{position:static;margin-left:1em}")
