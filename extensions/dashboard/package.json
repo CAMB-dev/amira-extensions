@@ -1,0 +1,28 @@
+{
+  "name": "dashboard",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "description": "Experimental agent timeline, detail pages and trace replay statistics for Amira",
+  "type": "module",
+  "scripts": {
+    "link-amira": "bun scripts/link-amira.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "amira": {
+    "engines": {
+      "amira": "^0.1.23"
+    },
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./source": "./src/source.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "typescript": "^5.9.3"
+  }
+}

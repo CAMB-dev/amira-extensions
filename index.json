@@ -2,6 +2,15 @@
   "schemaVersion": 1,
   "extensions": [
     {
+      "name": "dashboard",
+      "description": "Experimental default dashboard: live sub-agent timeline, agent detail pages and trace replay statistics: /dashboard",
+      "version": "0.1.0",
+      "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/dashboard" },
+      "engines": { "amira": "^0.1.23" },
+      "tags": ["dashboard", "agents", "orchestration", "trace", "statistics"],
+      "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/dashboard"
+    },
+    {
       "name": "mcp-server",
       "description": "Serve Amira over MCP (stdio) so other coding agents can delegate tasks to it: amira mcp serve",
       "version": "0.1.0",
