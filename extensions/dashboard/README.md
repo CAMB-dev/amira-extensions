@@ -1,6 +1,6 @@
 # Dashboard (experimental)
 
-The first default dashboard extension for Amira (D103/D104). It lives in **amira-extensions**, not Amira core. Version 0.1.0 targets API **0.1.23** and its experimental declarative widgets. We will iterate on the interface and source contract.
+The default dashboard extension for Amira (D103/D104/D105). It lives in **amira-extensions**, not Amira core. Version 0.2.0 targets API **0.1.24**, using host-owned pages, view lifecycle hooks and sub-agent controls. The declarative widgets and source contract remain experimental.
 
 Runtime code imports only `@amira/api` and local modules. The host owns terminal rendering, themes, clipping, focus and scrolling. Nothing in this extension reads private core state or runs shell commands to infer an agent's changes.
 
@@ -20,11 +20,13 @@ The command offers source-ID completion. Trace replay reads completed records on
 ### Screenshots as text
 
 Real output of the dashboard rendered through Amira's TUI `ExtensionViewer` with fake sub-agents
-(`test/tui-render.test.ts`), plain text without colors, after pressing `e` to expand everything.
-Wide view, 180×52:
+(`test/tui-render.test.ts`), plain text without colors, **on the first frame without input**.
+Groups and agent cards start expanded. Wide view, 180×52:
+
+<!-- render:180x52 -->
 
 ```text
-amira · acme/checkout  │ Implementation  │ 1/3 running  │ cost unknown                                                                                      ? help · b back · q quit
+amira · acme/checkout  │ Implementation  │ 1/3 running  │ cost unknown                                                                                              ? help · q close
  Checkout run ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ❯             ◉ Implementation                                                                                                                                                     ▾
               │ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -55,12 +57,12 @@ amira · acme/checkout  │ Implementation  │ 1/3 running  │ cost unknown   
                   │ ╭ ✓ Refund audit   ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── done ╮
                   │ │Review authorization checks on refund requests.                                                                                                               │
                   │ │━━━━━━━━━━━━━━━━━━ 100%                                                                                                                                       │
-                  │ │0 files reported changed · $0.040                                                                                                                             │
-                  │ │o Open diff · a ⋮ Actions                                                                                                                                     │
-                  │ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
-
 ╭ Details ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│  Select an agent in the timeline. Press e to expand all groups.                                                                                                                  │
+│  Select an agent in the timeline, then press Enter to open its page.                                                                                                             │
+│                                                                                                                                                                                  │
+│                                                                                                                                                                                  │
+│                                                                                                                                                                                  │
+│                                                                                                                                                                                  │
 │                                                                                                                                                                                  │
 │                                                                                                                                                                                  │
 │                                                                                                                                                                                  │
@@ -75,37 +77,45 @@ amira · acme/checkout  │ Implementation  │ 1/3 running  │ cost unknown   
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 Own reported usage only; missing costs are unknown.
 Enter opens an agent · Esc/q close
+e expand all · o diff · a actions · ? help · Tab focus · arrows navigate · Enter open/send · PgUp PgDn scroll · Esc close
 ```
 
-An adapter may supply a real progress fraction (as for "Payment validation" above). The built-in sources show **Progress unknown**, not a guessed percentage, until successful completion. A language chip appears only when reported file extensions identify a single known language. The dashboard opens with every row collapsed (the API has no initial tree state); press **e** to expand all.
+<!-- /render:180x52 -->
 
-At 80×24 the selected agent's card scrolls into view with a smaller detail panel. The host scrolls the tree and detail body independently. Open the agent page (Enter) for more room:
+An adapter may supply a real progress fraction (as for "Payment validation" above). The built-in sources show **Progress unknown**, not a guessed percentage, until successful completion. A language chip appears only when reported file extensions identify a single known language. Collapse rows with **←**; press **e** to expand all again.
+
+At 80×24 the timeline shows the selected agent's card (or the first agent's card before selection). The details panel uses about 35% of the available body height, clamped to 7–18 rows, at any width. The host scrolls the tree and details independently. Open an agent page (Enter) for more room:
+
+<!-- render:80x24 -->
 
 ```text
 amira · acme/checkout                                                     ? help
 Implementation  │ 1/3 running  │ cost unknown
  Checkout run ──────────────────────────────────────────────────────────────────
-»             ◉ Implementation                                                 ▾
+❯             ◉ Implementation                                                 ▾
               │ ────────────────────────────────────────────────────────────────
   09:00:30  ● └─◉ Checkout workers ×2  1 running                  checkout-v2  ▾
                 │ ──────────────────────────────────────────────────────────────
-❯               ├─▾ ● Payment validation                                 running
+                ├─▾ ● Payment validation                                 running
                 │ │ ╭ ● Payment validation  [TypeScript] ───────────── running ╮
                 │ │ │Validate payment amounts and add regression coverage for  │
                 │ │ │partial refunds.                                          │
                 │ │ │━━━━━━━━━━━─────── 60%                                    │
-                │ │ │2 files reported changed · $0.125                         │
-╭ Details · Payment validation ────────────────────────────────────────────────╮
-│  [Summary]  Diff  Logs  Actions  Stats                                       │
-│  ● Payment validation · running · $0.125                                     │
-│  Validate payment amounts and add regression coverage for partial refunds.   │
-│  Amount validation is implemented; regression tests are in progress.         │
-│  Own reported usage only; missing costs are unknown.                         │
+╭ Details ─────────────────────────────────────────────────────────────────────╮
+│  Select an agent in the timeline, then press Enter to open its page.         │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 Own reported usage only; missing costs are unknown.
-o Open diff · p Pause · r Request changes · x Stop · a ⋮ Actions · Esc/q close
+Enter opens an agent · Esc/q close
 
+e expand all · o diff · a actions · ? help · Esc close
 ```
+
+<!-- /render:80x24 -->
 
 Replay adds a **Stats** tab: first-token wait, streaming, unclassified model time, tool interval union, approval wait and idle; a per-tool count/total/average/maximum/outcome table; failures; and cost per agent. These time measures can overlap and **must not be summed into wall time**. Each trace is summarized separately with `summarizeTrace`; parent/child costs are never recursively added twice. Missing cost is shown as unknown, not zero.
 
@@ -125,21 +135,20 @@ Replay adds a **Stats** tab: first-token wait, streaming, unclassified model tim
 | r | Prompt for requested changes; send only when the source supports messaging |
 | a | Open and focus the Actions table (the card's ⋮) |
 | x | Stop the selected agent, after confirmation |
-| b | Return from an agent page to the timeline |
 | ? | Show keyboard help |
-| Esc / q / Ctrl+C | Close the dashboard (host-owned) |
+| Esc | Cancel a prompt first; otherwise return from an agent page, or close at the timeline |
+| q / Ctrl+C | Close the whole dashboard; q types text inside a prompt, Ctrl+C always closes |
 
 Card action labels are keyboard hints, not pretend clickable buttons: tree detail widgets are display-only in this API. From the timeline, **p/r/x focus a single named action; press Enter to continue**. On an agent page they act directly on that page's fixed target. The Actions table provides an Enter-activated path for every action. Its row keys include the target agent, so host selection repair or same-kind view replacement cannot redirect an action to an old selection. `UiControl` has no state getter; the handler deliberately does not guess the host's current selection. Status always includes a word or mark, not color alone.
 
-### Current API limits
+### Behavior and data boundaries
 
-- **Esc cannot go back one page.** `ViewDefinition` reserves it for closing the entire view, and `ViewControl` has no navigation stack or close interception. This version uses **b** for back rather than claiming otherwise.
-- `SessionControl.stopSubagent(id)` is available. **Pause/resume and messaging arbitrary existing sub-agents are not.** `ChildSession.send` exists for extensions holding the child handle, but the dashboard cannot retrieve that handle. It never invents a session method or sends a request to the main agent instead. Request changes opens the prompt and reports **Not sent** when unsupported.
+- Agent pages use the host page stack. **Esc** restores the timeline's selection, expansion, tabs, focus and scroll position; it closes only at the root. The old **b** workaround is removed.
+- Live running agents offer **Pause**; paused agents offer **Resume**. Pausing holds before the next model call without aborting current work or freeing an admission slot. **Request changes** prompts for a user-authored message and sends it with `messageSubagent`; queued messages wait for admission, and idle persistent children start another turn. Notes report accepted requests or agents that are no longer running. Accepted delivery does not mean the model has read the message yet.
+- Live event subscriptions and source update subscriptions exist only while the dashboard is open, and close releases them. Session listings and messages remain authoritative; live files/logs cover only observed activity. Files changed before opening may not be known; trace replay can recover persisted `writtenPaths`.
 - Authoritative `writtenPaths` identify files, not their before/after content. Diff shows supplied diff lines when an adapter has them; otherwise it lists reported paths with **No diff available**. It does not attribute the entire workspace's git diff to an agent.
 - Traces contain completed intervals and bounded tool previews, not unfinished work or full tool payloads. An empty trace is not evidence of zero work or zero cost.
-- A live source observes events while loaded and also reads session listings/messages. Files changed before its event subscription may not be known; trace replay can recover persisted `writtenPaths`.
-- API `UiContext` exposes width, **not height**, and `@amira/api` exports no terminal widget renderer. `test/*.test.ts` snapshot the public semantic widget trees; `test/tui-render.test.ts` additionally renders the view through a linked Amira checkout's TUI at 180×52 and 80×24 (skipped when the checkout is not linked). It is not a raster or real-terminal test, and the runtime code never imports the TUI.
-- There is no initial tree state: `UiState.expanded` starts empty, so the timeline opens collapsed until the user presses **e**.
+- Semantic snapshots cover widget contracts. `test/tui-render.test.ts` also renders the actual TUI at 180×52 and 80×24, including first-frame expansion and Esc navigation (skipped without a linked checkout). This is not a real-terminal test; runtime code never imports the TUI.
 
 ## Source service
 
@@ -187,7 +196,7 @@ interface DashboardSource {
 - Agent IDs are unique across a source; phase IDs across the snapshot; group IDs within their phase. Keep them stable across redraws. Sources `agents` and `trace` are reserved. Custom IDs start with a letter and contain letters, numbers, underscores, dots or hyphens. Duplicate registration throws.
 - Reads are synchronous, side-effect-free and fast: cache asynchronous work outside rendering. Keep the snapshot and its details coherent. Bound live logs. Publish changes through `subscribe`; the dashboard requests a host redraw. No subscriptions are created by `ui()`.
 - The `actions` list advertises actual capabilities; `act` must check the target still exists and is authorized at invocation time. Return a short English result, or throw an error the view can show. Never perform work during `snapshot()` or `details()`.
-- The registry subscribes once per registration. The returned disposer is idempotent and unsubscribes; an old disposer cannot remove a replacement. A view for an unregistered source becomes unavailable instead of retaining its actions. Adapters own and must release their other resources, including on reload. Re-register against a newly loaded dashboard service after dashboard reload.
+- Registration keeps a source discoverable without subscribing while the dashboard is closed. Opening a source subscribes to its updates; closing or switching sources releases that subscription. The registration disposer is idempotent and releases active subscriptions; an old disposer cannot remove a replacement. A view for an unregistered source becomes unavailable instead of retaining its actions. Adapters own and must release their other resources, including on reload. Re-register against a newly loaded dashboard service after dashboard reload.
 - This experimental service name is a contract: compatible additions are optional; a breaking shape change should use a new service name rather than silently changing this one.
 
 ## Development
@@ -199,9 +208,9 @@ bun install
 bun scripts/link-amira.ts D:/dev/Amira
 bun test
 bun run typecheck
-bunx biome check .
+bunx --package @biomejs/biome biome check .
 ```
 
-The helper links `@amira/api` and its transitive `@amira/ai` dependency, plus `@amira/tui` and `@amira/tui-kit` for the render test when the checkout has them. Extension runtime imports remain API-only; the linking script uses Node filesystem utilities, and tests use `bun:test`. Tests use fake sessions and event buses, no models, network requests, process killing or changes to core. Snapshot updates: `bun test --update-snapshots` after inspecting intentional widget changes.
+The helper links `@amira/api` and its transitive `@amira/ai` dependency, plus `@amira/tui` and `@amira/tui-kit` for the render test when the checkout has them. Extension runtime imports remain API-only; the linking script uses Node filesystem utilities, and tests use `bun:test`. Tests use fake sessions and event buses, no models, network requests, process killing or changes to core. Snapshot updates: `bun test --update-snapshots` after inspecting intentional widget changes. Regenerate the README's first-frame captures with `UPDATE_DASHBOARD_README=1 bun test test/tui-render.test.ts` (PowerShell: set `$env:UPDATE_DASHBOARD_README = "1"` before running the test).
 
 License: Apache-2.0.

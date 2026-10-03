@@ -2,7 +2,7 @@
 
 exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeline widget contract 1`] = `
 {
-  "contract": "Public UiNode tree; viewport rows are metadata only",
+  "contract": "Public UiNode tree; body height excludes the host key bar",
   "state": {
     "activeTabs": {
       "detail": "summary",
@@ -49,7 +49,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
           "right": [
             {
               "kind": "muted",
-              "text": "? help · b back · q quit",
+              "text": "? help · q close",
             },
           ],
           "type": "bar",
@@ -65,6 +65,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
       },
       {
         "node": {
+          "expanded": "all",
           "id": "timeline",
           "items": [
             {
@@ -714,7 +715,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
           "title": "Details · Payment validation",
           "type": "box",
         },
-        "size": 14,
+        "size": 18,
       },
       {
         "node": {
@@ -745,34 +746,16 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
 
 exports[`public semantic rendering (not terminal raster snapshots) 180x52 agent widget contract 1`] = `
 {
-  "contract": "Public UiNode tree; viewport rows are metadata only",
+  "contract": "Public UiNode tree; body height excludes the host key bar",
   "state": {
     "activeTabs": {
-      "detail": "summary",
+      "[\\"agent-page\\",\\"payments\\",\\"detail\\"]": "summary",
     },
-    "expanded": {
-      "timeline": [
-        "phase:implementation",
-        "group:implementation:workers",
-        "agent:payments",
-        "agent:receipts",
-        "phase:review",
-        "group:review:workers",
-        "agent:audit",
-      ],
-    },
-    "focused": "detail",
+    "expanded": {},
+    "focused": "["agent-page","payments","detail"]",
     "inputValues": {},
-    "scroll": {
-      "logs": {
-        "following": true,
-        "top": 0,
-      },
-    },
-    "selected": {
-      "actions": "open-diff",
-      "timeline": "agent:payments",
-    },
+    "scroll": {},
+    "selected": {},
   },
   "title": "Dashboard · Agent",
   "tree": {
@@ -792,7 +775,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 agent 
           "right": [
             {
               "kind": "muted",
-              "text": "? help · b back · q quit",
+              "text": "? help · q close",
             },
           ],
           "type": "bar",
@@ -809,11 +792,11 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 agent 
       {
         "node": {
           "child": {
-            "id": "detail",
+            "id": "["agent-page","payments","detail"]",
             "tabs": [
               {
                 "body": {
-                  "id": "summary",
+                  "id": "["agent-page","payments","summary"]",
                   "lines": [
                     {
                       "kind": "text",
@@ -839,7 +822,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 agent 
               },
               {
                 "body": {
-                  "id": "diff",
+                  "id": "["agent-page","payments","diff"]",
                   "lines": [
                     {
                       "kind": "accent",
@@ -874,7 +857,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 agent 
               {
                 "body": {
                   "follow": true,
-                  "id": "logs",
+                  "id": "["agent-page","payments","logs"]",
                   "lines": [
                     {
                       "kind": "text",
@@ -907,7 +890,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 agent 
                       "label": "Availability",
                     },
                   ],
-                  "id": "actions",
+                  "id": "["agent-page","payments","actions"]",
                   "rows": [
                     {
                       "cells": {
@@ -949,7 +932,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 agent 
               },
               {
                 "body": {
-                  "id": "stats",
+                  "id": "["agent-page","payments","stats"]",
                   "lines": [
                     {
                       "kind": "text",
@@ -1050,7 +1033,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 agent 
             },
             {
               "kind": "muted",
-              "text": "←→ tabs · b back to dashboard · Esc/q closes dashboard",
+              "text": "o Open diff · p Pause · r Request changes · x Stop · a ⋮ Actions · Esc back",
             },
           ],
           "type": "text",
@@ -1069,34 +1052,16 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 agent 
 
 exports[`public semantic rendering (not terminal raster snapshots) 180x52 stats widget contract 1`] = `
 {
-  "contract": "Public UiNode tree; viewport rows are metadata only",
+  "contract": "Public UiNode tree; body height excludes the host key bar",
   "state": {
     "activeTabs": {
-      "detail": "stats",
+      "[\\"agent-page\\",\\"payments\\",\\"detail\\"]": "stats",
     },
-    "expanded": {
-      "timeline": [
-        "phase:implementation",
-        "group:implementation:workers",
-        "agent:payments",
-        "agent:receipts",
-        "phase:review",
-        "group:review:workers",
-        "agent:audit",
-      ],
-    },
-    "focused": "detail",
+    "expanded": {},
+    "focused": "["agent-page","payments","detail"]",
     "inputValues": {},
-    "scroll": {
-      "logs": {
-        "following": true,
-        "top": 0,
-      },
-    },
-    "selected": {
-      "actions": "open-diff",
-      "timeline": "agent:payments",
-    },
+    "scroll": {},
+    "selected": {},
   },
   "title": "Dashboard · Agent",
   "tree": {
@@ -1116,7 +1081,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 stats 
           "right": [
             {
               "kind": "muted",
-              "text": "? help · b back · q quit",
+              "text": "? help · q close",
             },
           ],
           "type": "bar",
@@ -1133,11 +1098,11 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 stats 
       {
         "node": {
           "child": {
-            "id": "detail",
+            "id": "["agent-page","payments","detail"]",
             "tabs": [
               {
                 "body": {
-                  "id": "summary",
+                  "id": "["agent-page","payments","summary"]",
                   "lines": [
                     {
                       "kind": "text",
@@ -1163,7 +1128,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 stats 
               },
               {
                 "body": {
-                  "id": "diff",
+                  "id": "["agent-page","payments","diff"]",
                   "lines": [
                     {
                       "kind": "accent",
@@ -1198,7 +1163,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 stats 
               {
                 "body": {
                   "follow": true,
-                  "id": "logs",
+                  "id": "["agent-page","payments","logs"]",
                   "lines": [
                     {
                       "kind": "text",
@@ -1231,7 +1196,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 stats 
                       "label": "Availability",
                     },
                   ],
-                  "id": "actions",
+                  "id": "["agent-page","payments","actions"]",
                   "rows": [
                     {
                       "cells": {
@@ -1273,7 +1238,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 stats 
               },
               {
                 "body": {
-                  "id": "stats",
+                  "id": "["agent-page","payments","stats"]",
                   "lines": [
                     {
                       "kind": "text",
@@ -1374,7 +1339,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 stats 
             },
             {
               "kind": "muted",
-              "text": "←→ tabs · b back to dashboard · Esc/q closes dashboard",
+              "text": "o Open diff · p Pause · r Request changes · x Stop · a ⋮ Actions · Esc back",
             },
           ],
           "type": "text",
@@ -1393,7 +1358,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 stats 
 
 exports[`public semantic rendering (not terminal raster snapshots) 80x24 timeline widget contract 1`] = `
 {
-  "contract": "Public UiNode tree; viewport rows are metadata only",
+  "contract": "Public UiNode tree; body height excludes the host key bar",
   "state": {
     "activeTabs": {
       "detail": "summary",
@@ -1476,6 +1441,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 timelin
       },
       {
         "node": {
+          "expanded": "all",
           "id": "timeline",
           "items": [
             {
@@ -1969,7 +1935,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 timelin
           "title": "Details · Payment validation",
           "type": "box",
         },
-        "size": 7,
+        "size": 8,
       },
       {
         "node": {
@@ -2000,34 +1966,16 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 timelin
 
 exports[`public semantic rendering (not terminal raster snapshots) 80x24 agent widget contract 1`] = `
 {
-  "contract": "Public UiNode tree; viewport rows are metadata only",
+  "contract": "Public UiNode tree; body height excludes the host key bar",
   "state": {
     "activeTabs": {
-      "detail": "summary",
+      "[\\"agent-page\\",\\"payments\\",\\"detail\\"]": "summary",
     },
-    "expanded": {
-      "timeline": [
-        "phase:implementation",
-        "group:implementation:workers",
-        "agent:payments",
-        "agent:receipts",
-        "phase:review",
-        "group:review:workers",
-        "agent:audit",
-      ],
-    },
-    "focused": "detail",
+    "expanded": {},
+    "focused": "["agent-page","payments","detail"]",
     "inputValues": {},
-    "scroll": {
-      "logs": {
-        "following": true,
-        "top": 0,
-      },
-    },
-    "selected": {
-      "actions": "open-diff",
-      "timeline": "agent:payments",
-    },
+    "scroll": {},
+    "selected": {},
   },
   "title": "Dashboard · Agent",
   "tree": {
@@ -2084,11 +2032,11 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 agent w
       {
         "node": {
           "child": {
-            "id": "detail",
+            "id": "["agent-page","payments","detail"]",
             "tabs": [
               {
                 "body": {
-                  "id": "summary",
+                  "id": "["agent-page","payments","summary"]",
                   "lines": [
                     {
                       "kind": "text",
@@ -2114,7 +2062,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 agent w
               },
               {
                 "body": {
-                  "id": "diff",
+                  "id": "["agent-page","payments","diff"]",
                   "lines": [
                     {
                       "kind": "accent",
@@ -2149,7 +2097,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 agent w
               {
                 "body": {
                   "follow": true,
-                  "id": "logs",
+                  "id": "["agent-page","payments","logs"]",
                   "lines": [
                     {
                       "kind": "text",
@@ -2182,7 +2130,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 agent w
                       "label": "Availability",
                     },
                   ],
-                  "id": "actions",
+                  "id": "["agent-page","payments","actions"]",
                   "rows": [
                     {
                       "cells": {
@@ -2224,7 +2172,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 agent w
               },
               {
                 "body": {
-                  "id": "stats",
+                  "id": "["agent-page","payments","stats"]",
                   "lines": [
                     {
                       "kind": "text",
@@ -2325,7 +2273,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 agent w
             },
             {
               "kind": "muted",
-              "text": "←→ tabs · b back to dashboard · Esc/q closes dashboard",
+              "text": "o Open diff · p Pause · r Request changes · x Stop · a ⋮ Actions · Esc back",
             },
           ],
           "type": "text",
@@ -2344,34 +2292,16 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 agent w
 
 exports[`public semantic rendering (not terminal raster snapshots) 80x24 stats widget contract 1`] = `
 {
-  "contract": "Public UiNode tree; viewport rows are metadata only",
+  "contract": "Public UiNode tree; body height excludes the host key bar",
   "state": {
     "activeTabs": {
-      "detail": "stats",
+      "[\\"agent-page\\",\\"payments\\",\\"detail\\"]": "stats",
     },
-    "expanded": {
-      "timeline": [
-        "phase:implementation",
-        "group:implementation:workers",
-        "agent:payments",
-        "agent:receipts",
-        "phase:review",
-        "group:review:workers",
-        "agent:audit",
-      ],
-    },
-    "focused": "detail",
+    "expanded": {},
+    "focused": "["agent-page","payments","detail"]",
     "inputValues": {},
-    "scroll": {
-      "logs": {
-        "following": true,
-        "top": 0,
-      },
-    },
-    "selected": {
-      "actions": "open-diff",
-      "timeline": "agent:payments",
-    },
+    "scroll": {},
+    "selected": {},
   },
   "title": "Dashboard · Agent",
   "tree": {
@@ -2428,11 +2358,11 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 stats w
       {
         "node": {
           "child": {
-            "id": "detail",
+            "id": "["agent-page","payments","detail"]",
             "tabs": [
               {
                 "body": {
-                  "id": "summary",
+                  "id": "["agent-page","payments","summary"]",
                   "lines": [
                     {
                       "kind": "text",
@@ -2458,7 +2388,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 stats w
               },
               {
                 "body": {
-                  "id": "diff",
+                  "id": "["agent-page","payments","diff"]",
                   "lines": [
                     {
                       "kind": "accent",
@@ -2493,7 +2423,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 stats w
               {
                 "body": {
                   "follow": true,
-                  "id": "logs",
+                  "id": "["agent-page","payments","logs"]",
                   "lines": [
                     {
                       "kind": "text",
@@ -2526,7 +2456,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 stats w
                       "label": "Availability",
                     },
                   ],
-                  "id": "actions",
+                  "id": "["agent-page","payments","actions"]",
                   "rows": [
                     {
                       "cells": {
@@ -2568,7 +2498,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 stats w
               },
               {
                 "body": {
-                  "id": "stats",
+                  "id": "["agent-page","payments","stats"]",
                   "lines": [
                     {
                       "kind": "text",
@@ -2669,7 +2599,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 stats w
             },
             {
               "kind": "muted",
-              "text": "←→ tabs · b back to dashboard · Esc/q closes dashboard",
+              "text": "o Open diff · p Pause · r Request changes · x Stop · a ⋮ Actions · Esc back",
             },
           ],
           "type": "text",

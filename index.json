@@ -4,9 +4,9 @@
     {
       "name": "dashboard",
       "description": "Experimental default dashboard: live sub-agent timeline, agent detail pages and trace replay statistics: /dashboard",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/dashboard" },
-      "engines": { "amira": "^0.1.23" },
+      "engines": { "amira": "^0.1.24" },
       "tags": ["dashboard", "agents", "orchestration", "trace", "statistics"],
       "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/dashboard"
     },

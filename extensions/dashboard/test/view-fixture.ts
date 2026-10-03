@@ -160,7 +160,31 @@ export function viewFixture() {
     inputValues: {},
     focused: "timeline",
   }
+  const pages: { data?: unknown; state: UiState }[] = []
+  const widgetId = (id: string) => {
+    const agentId = pages.at(-1)?.data
+    return typeof agentId === "string" ? JSON.stringify(["agent-page", agentId, id]) : id
+  }
   const control = {
+    pushPage: mock((page: Parameters<UiControl["pushPage"]>[0]) => {
+      pages.push({ data: page.data, state: structuredClone(state) })
+      Object.assign(
+        state,
+        {
+          selected: {},
+          expanded: {},
+          activeTabs: {},
+          scroll: {},
+          inputValues: {},
+          focused: undefined,
+        },
+        page.state,
+      )
+    }),
+    popPage: mock(() => {
+      const previous = pages.pop()
+      if (previous) Object.assign(state, previous.state)
+    }),
     close: mock(() => {}),
     requestRender: mock(() => {}),
     print: mock(() => {}),
@@ -173,6 +197,12 @@ export function viewFixture() {
       state.focused = id
     }),
   } satisfies UiControl
-  const context = (width = 180): UiContext => ({ width, now: NOW, state })
-  return { data, snapshot, details, stats, act, state, control, context }
+  const context = (width = 180, height = 51): UiContext => ({
+    width,
+    height,
+    now: NOW,
+    state,
+    ...(pages.length ? { page: { depth: pages.length, data: pages.at(-1)?.data } } : {}),
+  })
+  return { data, snapshot, details, stats, act, state, control, context, widgetId }
 }

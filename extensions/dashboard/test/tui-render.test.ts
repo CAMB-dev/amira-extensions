@@ -1,9 +1,8 @@
 /**
- * Renders the dashboard through the real TUI ExtensionViewer, as plain text. It runs only when
- * the linked Amira checkout provides @amira/tui and @amira/tui-kit (`bun run link-amira <checkout>`
- * links them when present); otherwise the tests are skipped. Extension runtime code never imports them.
+ * Real TUI output from the linked checkout, never imported by extension runtime code.
+ * UPDATE_DASHBOARD_README=1 bun test test/tui-render.test.ts refreshes the README captures.
  */
-import { describe, expect, test } from "bun:test"
+import { describe, expect, mock, test } from "bun:test"
 import { dashboardView } from "../src/view.ts"
 import { viewFixture } from "./view-fixture.ts"
 
@@ -16,14 +15,37 @@ const available = Boolean(tui && kit)
 
 function open(width: number, height: number) {
   const fixture = viewFixture()
-  const viewer = new tui.ExtensionViewer(dashboardView, fixture.data, { now: () => fixture.context().now })
+  const closed = mock(() => {})
+  const viewer = new tui.ExtensionViewer(dashboardView, fixture.data, {
+    now: () => fixture.context().now,
+    onClose: closed,
+  })
+  viewer.mount()
   const ctx = { theme: kit.monoTheme, color: false, rows: height }
   const render = (): string[] => viewer.render(width, ctx).map(kit.stripAnsi)
   const press = (...names: string[]) => {
-    for (const name of names) viewer.handleInput(kit.key(name))
+    for (const name of names) {
+      viewer.handleInput(kit.key(name))
+      render()
+    }
   }
-  render()
-  return { render, press, fixture }
+  const first = render()
+  return { render, press, fixture, first, closed, viewer }
+}
+
+async function capture(size: string, rows: string[]) {
+  if (process.env.UPDATE_DASHBOARD_README !== "1") return
+  const file = Bun.file(new URL("../README.md", import.meta.url))
+  const readme = await file.text()
+  const start = `<!-- render:${size} -->`
+  const end = `<!-- /render:${size} -->`
+  const before = readme.indexOf(start)
+  const after = readme.indexOf(end)
+  if (before < 0 || after < before) throw new Error(`Missing README capture markers: ${size}`)
+  await Bun.write(
+    file,
+    `${readme.slice(0, before + start.length)}\n\n\`\`\`text\n${rows.map((row) => row.trimEnd()).join("\n")}\n\`\`\`\n\n${readme.slice(after)}`,
+  )
 }
 
 describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
@@ -31,39 +53,91 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
     [180, 52],
     [80, 24],
   ] as const) {
-    test(`${width}x${height}: every row fits the terminal`, () => {
-      const { render, press } = open(width, height)
-      for (const keys of [[], ["e"], ["e", "down", "down"], ["e", "down", "down", "enter"]]) {
+    test(`${width}x${height}: first frame shows expanded cards without input`, async () => {
+      const { first, viewer } = open(width, height)
+      const text = first.join("\n")
+      expect(text).toContain("◉ Implementation")
+      expect(text).toMatch(/09:00:30\s+●\s+└─◉ Checkout workers ×2/)
+      expect(text).toContain("╭ ● Payment validation  [TypeScript]")
+      expect(text).toContain("╭ Details")
+      expect(text).toContain("Esc close")
+      expect(text).not.toContain("b back")
+      await capture(`${width}x${height}`, first)
+      viewer.dispose()
+    })
+
+    test(`${width}x${height}: every row fits the terminal on both pages`, () => {
+      const { render, press, viewer } = open(width, height)
+      for (const keys of [[], ["down", "down"], ["enter"], ["5"], ["escape"]]) {
         press(...keys)
         const rows = render()
         expect(rows.length).toBeLessThanOrEqual(height)
         for (const row of rows) expect(kit.visibleWidth(row)).toBeLessThanOrEqual(width)
       }
+      viewer.dispose()
     })
   }
 
-  test("180x52 expanded timeline matches the mockup: top bar, time column, nodes, cards, details", () => {
-    const { render, press } = open(180, 52)
-    press("e")
-    const text = render().join("\n")
-    expect(text).toContain("amira · acme/checkout")
-    expect(text).toContain("1/3 running")
-    expect(text).toMatch(/09:00:30\s+●\s+└─◉ Checkout workers ×2/)
-    expect(text).toContain("◉ Implementation")
-    expect(text).toMatch(/─{20}/) // underlines after phase and group rows
-    expect(text).toContain("╭ ● Payment validation  [TypeScript]")
-    expect(text).toMatch(/━+─+ 60%/)
-    expect(text).toContain("o Open diff · p Pause · r Request changes · x Stop · a ⋮ Actions")
-    expect(text).toContain("╭ Details")
+  test("Enter pushes an agent page; Esc restores selection, expansion, tabs and scroll before closing", () => {
+    const { render, press, closed } = open(180, 52)
+    press("down", "down", "left", "3", "end")
+    const root = render()
+    expect(root.join("\n")).toContain("[Logs]")
+    press("enter")
+    expect(render().join("\n")).toContain("[Summary]  Diff  Logs  Actions  Stats")
+    expect(render().join("\n")).toContain("Esc back")
+    press("5")
+    expect(render().join("\n")).toContain("First token wait")
+    press("escape")
+    expect(closed).not.toHaveBeenCalled()
+    expect(render()).toEqual(root)
+    press("escape")
+    expect(closed).toHaveBeenCalledTimes(1)
   })
 
-  test("an opened agent page shows the detail tabs and the Stats tab on 5", () => {
-    const { render, press } = open(80, 24)
-    press("e", "down", "down", "enter")
-    expect(render().join("\n")).toContain("[Summary]  Diff  Logs  Actions  Stats")
-    press("5")
+  test("an opened agent page shows Stats on 5 and prompts cancel before Esc goes back", async () => {
+    const { render, press, fixture, viewer, closed } = open(80, 24)
+    press("down", "down", "enter", "5")
     const stats = render().join("\n")
     expect(stats).toContain("First token wait")
     expect(stats).toContain("bash  2  25.00s / 12.50s / 15.00s")
+    press("r")
+    expect(render().join("\n")).toContain("Request changes from Payment validation")
+    press("escape")
+    await Promise.resolve()
+    expect(fixture.act).not.toHaveBeenCalled()
+    expect(render().join("\n")).toContain("Esc back")
+    expect(closed).not.toHaveBeenCalled()
+    press("escape")
+    expect(render().join("\n")).toContain("Esc close")
+    viewer.dispose()
+  })
+
+  test("Stats uses retained host selection after same-kind data replacement and repairs absent tabs", () => {
+    const { render, press, fixture, viewer } = open(180, 52)
+    press("down", "down")
+    viewer.show({ source: fixture.data.source })
+    render()
+    press("5")
+    expect(render().join("\n")).toContain("[Stats]")
+    expect(render().join("\n")).toContain("First token wait")
+    press("down", "5")
+    expect(render().join("\n")).toContain("[Summary]  Diff  Logs  Actions")
+    expect(render().join("\n")).not.toContain("[Stats]")
+    viewer.dispose()
+  })
+
+  test("page shortcuts do not retain an agent target after Esc returns to the timeline", async () => {
+    const { render, press, fixture, viewer } = open(180, 52)
+    press("down", "down", "enter", "p")
+    await Promise.resolve()
+    expect(fixture.act).toHaveBeenLastCalledWith("payments", "pause", undefined)
+    press("escape", "down", "p")
+    expect(fixture.act).toHaveBeenCalledTimes(1)
+    expect(render().join("\n")).toContain("Resume · Receipt templates")
+    press("enter")
+    await Promise.resolve()
+    expect(fixture.act).toHaveBeenLastCalledWith("receipts", "resume", undefined)
+    viewer.dispose()
   })
 })
