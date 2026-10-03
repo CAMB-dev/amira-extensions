@@ -142,6 +142,8 @@ const extension: Extension = (api) => {
     name: "btw",
     description: "Ask a side question without interrupting the main agent",
     args: { hint: "<question> | clear | show | history" },
+    // A side question leaves no line in the transcript (Amira API 0.1.26).
+    echo: false,
     run(args, ctx) {
       const id = ctx.session.info().id
       let state = states.get(id)
