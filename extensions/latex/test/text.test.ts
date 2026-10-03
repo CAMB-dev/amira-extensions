@@ -211,4 +211,16 @@ describe("latexToText", () => {
     const unknown = `${String.raw`\unknown` + "{x^2}".repeat(10000)} + y`
     expect(latexToText(unknown)).toBe(unknown)
   })
+
+  test("applies a script to the whole fraction before it", () => {
+    expect(latexToText(String.raw`\frac{a}{b}^2 + \frac{a}{b}_i + \frac{a}{b} x`)).toBe("(a/b)² + (a/b)ᵢ + a/b x")
+  })
+
+  test("drops layout environment wrappers but keeps rows", () => {
+    expect(latexToText(String.raw`\begin{aligned} a &= b \\ c &= d \end{aligned}`)).toBe(" a &= b \n c &= d ")
+    expect(latexToText(String.raw`\begin{array}{cc} 1 & 2 \end{array}`)).toBe(" 1 & 2 ")
+    const unknown = String.raw`\begin{unknownenv} x \end{unknownenv}`
+    expect(latexToText(unknown)).toBe(unknown)
+    expect(latexToText(String.raw`\lvert x \rvert \| v \|`)).toBe("| x | ‖ v ‖")
+  })
 })

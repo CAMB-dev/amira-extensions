@@ -123,6 +123,11 @@ const symbols: Record<string, string> = {
   rfloor: "⌋",
   vert: "|",
   Vert: "‖",
+  lvert: "|",
+  rvert: "|",
+  lVert: "‖",
+  rVert: "‖",
+  "|": "‖",
   lbrace: "{",
   rbrace: "}",
   backslash: "\\",
@@ -164,6 +169,8 @@ const symbols: Record<string, string> = {
   "\\": "\n",
 }
 
+const ENVIRONMENTS = /^(?:aligned|align|alignat|split|gather|gathered|equation|array|cases|[pbBvV]?matrix|smallmatrix)\*?$/
+
 function characterMap(from: string, to: string): Map<string, string> {
   const values = [...to]
   return new Map([...from].map((char, index) => [char, values[index]!]))
@@ -195,6 +202,8 @@ function operand(text: string): string {
 interface Token {
   text: string
   end: number
+  /** A fraction: a following script applies to the whole of it. */
+  compound?: boolean
 }
 
 interface Group {
@@ -290,6 +299,16 @@ export function latexToText(source: string): string {
     }
     const name = source.slice(start + 1, cursor)
     if (Object.hasOwn(symbols, name)) return { text: symbols[name]!, end: cursor }
+    if (name === "begin" || name === "end") {
+      // Layout environments keep their rows (a double backslash breaks lines); the wrapper is noise.
+      const value = group(cursor, end)
+      const env = value && source.slice(value.start + 1, value.end - 1)
+      if (value && env && ENVIRONMENTS.test(env)) {
+        let next = value.end
+        if (name === "begin" && env === "array") next = group(next, end)?.end ?? next
+        return { text: "", end: next }
+      }
+    }
     if (name === "left" || name === "right") {
       const next = skipSpace(cursor, end)
       return { text: "", end: source[next] === "." ? next + 1 : cursor }
@@ -302,6 +321,7 @@ export function latexToText(source: string): string {
         return {
           text: `${operand(contents(numerator, depth))}/${operand(contents(denominator, depth))}`,
           end: denominator.end,
+          compound: true,
         }
       }
     } else if (name === "sqrt") {
@@ -362,7 +382,9 @@ export function latexToText(source: string): string {
         cursor++
       } else {
         const value = atom(cursor, end, depth)
-        output.push(value.text)
+        const after = skipSpace(value.end, end)
+        const scripted = value.compound && after < end && (source[after] === "^" || source[after] === "_")
+        output.push(scripted ? `(${value.text})` : value.text)
         cursor = value.end
       }
     }
