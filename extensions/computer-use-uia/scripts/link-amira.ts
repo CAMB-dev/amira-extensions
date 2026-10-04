@@ -26,3 +26,11 @@ for (const name of ["api", "ai", "core", "proc"]) {
   symlinkSync(target, link, "junction")
   console.log(`@amira/${name} -> ${target}`)
 }
+// Reuse the checkout's verification tools without adding runtime dependencies.
+for (const name of [".bun", "@types", "@biomejs", "typescript", ".bin"]) {
+  const target = path.resolve(repo, "node_modules", name)
+  if (!existsSync(target)) continue
+  const link = path.join(dir, "..", name)
+  rmSync(link, { recursive: true, force: true })
+  symlinkSync(target, link, "junction")
+}

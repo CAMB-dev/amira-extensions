@@ -26,6 +26,17 @@ function Get-ExactProcess($identity) {
     return $null
 }
 
+function Test-IdentityGone($identity) {
+    $process = $null
+    try {
+        $process = [Diagnostics.Process]::GetProcessById([int]$identity.Pid)
+        $null = $process.Handle
+        return ($process.HasExited -or $process.StartTime.ToUniversalTime().Ticks -ne [long]$identity.Started)
+    } catch [ArgumentException] { return $true }
+    catch { return $false }
+    finally { if ($null -ne $process) { $process.Dispose() } }
+}
+
 if ($Sentinel) {
     $self = [Diagnostics.Process]::GetCurrentProcess()
     try {
@@ -37,9 +48,14 @@ if ($Sentinel) {
 }
 
 $lifetime = @{ Pid = $LifetimePid; Started = $LifetimeStarted }
+$verified = Get-ExactProcess $lifetime
+if ($null -eq $verified) { exit 1 }
+$verified.Dispose()
+[Console]::WriteLine('UIA watchdog ready')
 $reader = New-Object IO.StreamReader([Console]::OpenStandardInput(), $utf8, $false, 4096, $true)
 $inputLine = $reader.ReadLineAsync()
 $endingSince = $null
+$cleanupIncomplete = $false
 try {
     while ($true) {
         $sentinelProcess = Get-ExactProcess $lifetime
@@ -55,29 +71,40 @@ try {
                 $helperProcess = Get-ExactProcess $state.Helper
                 $helperDead = $null -eq $helperProcess
                 if ($helperDead -or $force) {
+                    $cleanupIncomplete = $false
                     foreach ($identity in $state.Processes) {
                         $process = Get-ExactProcess $identity
                         if ($null -ne $process) {
-                            try { $process.Kill() } catch { }
+                            try {
+                                $process.Kill()
+                                if (-not $process.WaitForExit(1000)) { $cleanupIncomplete = $true }
+                            } catch { $cleanupIncomplete = $true }
                             finally { $process.Dispose() }
-                        }
+                        } elseif (-not (Test-IdentityGone $identity)) { $cleanupIncomplete = $true }
                     }
                     if ($force -and $null -ne $helperProcess) {
-                        try { $helperProcess.Kill() } catch { }
-                    }
+                        try {
+                            $helperProcess.Kill()
+                            if (-not $helperProcess.WaitForExit(1000)) { $cleanupIncomplete = $true }
+                        } catch { $cleanupIncomplete = $true }
+                    } elseif ($force -and -not (Test-IdentityGone $state.Helper)) { $cleanupIncomplete = $true }
                 }
                 if ($null -ne $helperProcess) { $helperProcess.Dispose() }
             }
         } catch {
             # Atomic replacement may race this read; retry, never guess process identities.
+            if ($force) { $cleanupIncomplete = $true }
         }
         if ($force) { break }
         Start-Sleep -Milliseconds 100
     }
 } finally {
     # Only the private per-client journal. Do not delete while a replacement is running.
-    if ($null -ne $endingSince) {
+    if ($null -ne $endingSince -and -not $cleanupIncomplete) {
         Remove-Item -LiteralPath $StatePath -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath ($StatePath + '.tmp') -Force -ErrorAction SilentlyContinue
+    } elseif ($cleanupIncomplete) {
+        # Retain the only record of unresolved launches; never kill a guessed PID.
+        [Console]::Error.WriteLine('UIA cleanup incomplete; launch journal retained.')
     }
 }

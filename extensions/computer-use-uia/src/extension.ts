@@ -1,4 +1,4 @@
-import { type ExtensionAPI, textResult, type ToolDefinition } from "@amira/api"
+import { type ExtensionAPI, type ToolDefinition, textResult } from "@amira/api"
 import { type TreeResult, UiaClient } from "./client.ts"
 import { readSettings } from "./settings.ts"
 
@@ -41,7 +41,8 @@ function tools(client: UiaClient): ToolDefinition<Record<string, unknown>>[] {
     },
     {
       name: "tree",
-      description: "Read a launched window's UI Automation tree, with snapshot refs, values, flags and traversal timing. A new tree replaces the old refs. No screenshots.",
+      description:
+        "Read a launched window's UI Automation tree, with snapshot refs, values, flags and traversal timing. A new tree replaces the old refs. No screenshots.",
       properties: {
         window,
         depth: { type: "integer", minimum: 0, maximum: 30, default: 8 },
@@ -51,25 +52,29 @@ function tools(client: UiaClient): ToolDefinition<Record<string, unknown>>[] {
     },
     {
       name: "click",
-      description: "Activate a snapshot element via its UIA pattern, or its on-screen clickable point. Reports the path used.",
+      description:
+        "Activate a snapshot element via its UIA pattern, or its on-screen clickable point. Reports the path used.",
       properties: { window, ref },
       required: ["window", "ref"],
     },
     {
       name: "type",
-      description: "Set an element's value with ValuePattern, or focus it and send Unicode text. Without ref, type into the launched window's focused control. Reports the path used.",
+      description:
+        "Set an element's value with ValuePattern, or focus it and send Unicode text. Without ref, type into the launched window's focused control. Reports the path used.",
       properties: { window, ref, text: { type: "string", maxLength: 20_000 } },
       required: ["window", "text"],
     },
     {
       name: "key",
-      description: "Focus a launched window and send a single key or chord (ctrl+s, enter, shift+tab). alt+f4 and desktop-switching chords are refused; close with ui_close.",
+      description:
+        "Focus a launched window and send a single key or chord (ctrl+s, enter, shift+tab). alt+f4 and desktop-switching chords are refused; close with ui_close.",
       properties: { window, keys: { type: "string" } },
       required: ["window", "keys"],
     },
     {
       name: "close",
-      description: "Close a launched window via WindowPattern.Close, then kill only its owned process by PID if it does not exit promptly. Unsaved changes may be discarded.",
+      description:
+        "Close a launched window via WindowPattern.Close, then kill only its owned process by PID if it does not exit promptly. Unsaved changes may be discarded.",
       properties: { window },
       required: ["window"],
     },
@@ -92,11 +97,13 @@ function tools(client: UiaClient): ToolDefinition<Record<string, unknown>>[] {
         const result = await client.call(definition.name, params)
         if (definition.name === "tree") {
           const tree = result as TreeResult
-          return textResult([
-            tree.text,
-            ...(tree.cut ? ["… tree cut at the node/character limit"] : []),
-            `Traversal: ${tree.ms} ms; ${tree.nodes} nodes; ${tree.chars} characters.`,
-          ].join("\n"))
+          return textResult(
+            [
+              tree.text,
+              ...(tree.cut ? ["… tree cut (node/character/time limit or unowned child skipped)"] : []),
+              `Traversal: ${tree.ms} ms; ${tree.nodes} nodes; ${tree.chars} characters.`,
+            ].join("\n"),
+          )
         }
         return textResult(JSON.stringify(result))
       } catch (error) {
