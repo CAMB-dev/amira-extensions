@@ -1,0 +1,16 @@
+{
+  "name": "computer-use-uia",
+  "license": "Apache-2.0",
+  "version": "0.1.0",
+  "description": "Experimental Windows UI Automation for apps Amira launched; off by default",
+  "type": "module",
+  "scripts": {
+    "link-amira": "bun scripts/link-amira.ts",
+    "typecheck": "bunx tsc --noEmit",
+    "test": "bun test"
+  },
+  "amira": {
+    "engines": { "amira": "^0.1.27" },
+    "extensions": ["./src/index.ts"]
+  }
+}
