@@ -123,8 +123,43 @@ function Save-OwnedState {
     else { [IO.File]::Move($StatePath + '.tmp', $StatePath) }
 }
 
+# Reap abandoned journals from earlier clients, not just this client's restart.
+# Active or inaccessible helpers are not stale. Validate the entire identity list
+# before killing anything; malformed/foreign files are left alone.
+function Clear-StaleJournals {
+    foreach ($file in [IO.Directory]::GetFiles([IO.Path]::GetTempPath(), 'amira-uia-*.json*')) {
+        if ([IO.Path]::GetFileName($file) -notmatch '^amira-uia-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json(\.tmp)?$' -or
+            [string]::Equals($file, $StatePath, [StringComparison]::OrdinalIgnoreCase) -or
+            [string]::Equals($file, $StatePath + '.tmp', [StringComparison]::OrdinalIgnoreCase)) { continue }
+        try {
+            $state = [IO.File]::ReadAllText($file) | ConvertFrom-Json
+            $helper = Get-Argument $state 'Helper'
+            $records = Get-Argument $state 'Processes'
+            if ($null -eq $helper -or $records -isnot [System.Array]) { continue }
+            $valid = $true
+            foreach ($identity in (@($helper) + @($records))) {
+                $processId = 0
+                $started = 0L
+                if (-not [int]::TryParse([string](Get-Argument $identity 'Pid'), [ref]$processId) -or
+                    $processId -le 0 -or
+                    -not [long]::TryParse([string](Get-Argument $identity 'Started'), [ref]$started) -or
+                    $started -le 0) { $valid = $false; break }
+            }
+            if (-not $valid -or -not (Test-IdentityGone $helper)) { continue }
+            $gone = $true
+            foreach ($identity in $records) {
+                Stop-ExactProcess $identity
+                if (-not (Test-IdentityGone $identity)) { $gone = $false }
+            }
+            # Do not lose identities on an inaccessible process or failed kill.
+            if ($gone) { [IO.File]::Delete($file) }
+        } catch { } # Retain invalid/unreadable journals; never infer ownership.
+    }
+}
+
 try {
     $script:self = Get-Identity $PID
+    Clear-StaleJournals
     if ($LifetimePid -lt 0) { Deny 'Invalid lifetime process.' }
     if ($LifetimePid -gt 0) {
         $script:lifetime = Get-Identity $LifetimePid
@@ -229,6 +264,27 @@ namespace OwnedUia {
         public static extern IntPtr WindowFromPoint(POINT point);
         [DllImport("user32.dll")]
         public static extern bool SetCursorPos(int x, int y);
+        [DllImport("user32.dll")]
+        public static extern bool GetCursorPos(out POINT point);
+        [DllImport("ntdll.dll")]
+        private static extern int NtQueryInformationProcess(IntPtr process, int infoClass,
+            ref PROCESS_BASIC_INFORMATION info, int size, out int returned);
+        [StructLayout(LayoutKind.Sequential)]
+        private struct PROCESS_BASIC_INFORMATION {
+            public IntPtr Reserved1, Peb, Reserved2, Reserved3, Pid, Parent;
+        }
+        // -1 means unavailable, not a positive parent/activation correlation.
+        public static int ParentPid(int pid) {
+            try {
+                using (var process = System.Diagnostics.Process.GetProcessById(pid)) {
+                    var info = new PROCESS_BASIC_INFORMATION();
+                    int returned;
+                    if (NtQueryInformationProcess(process.Handle, 0, ref info,
+                        Marshal.SizeOf(typeof(PROCESS_BASIC_INFORMATION)), out returned) != 0) return -1;
+                    return checked((int)info.Parent.ToInt64());
+                }
+            } catch { return -1; }
+        }
         [DllImport("user32.dll")]
         public static extern short GetAsyncKeyState(int key);
         [DllImport("user32.dll")]
@@ -386,13 +442,23 @@ namespace OwnedUia {
         Deny 'Element ancestry cannot be verified.'
     }
 
-    function Read-Property($window, $element, $property) {
-        Assert-Element $window $element
+    function Assert-TreeBudget($clock) {
+        if ($null -ne $clock -and $clock.ElapsedMilliseconds -ge 20000) {
+            # Not a safety Deny: the snapshot can return a partial/unreadable node.
+            throw [TimeoutException]::new('Tree traversal budget exhausted.')
+        }
+    }
+
+    function Read-Property($window, $element, $property, [switch] $Verified, $Clock = $null) {
+        if (-not $Verified) { Assert-Element $window $element }
+        Assert-TreeBudget $Clock
         return $element.GetCurrentPropertyValue($property, $true)
     }
 
-    function Get-Pattern($window, $element, $patternId) {
-        Assert-Element $window $element
+    function Get-Pattern($window, $element, $patternId, [switch] $Verified, $Clock = $null) {
+        # Snapshot traversal verifies this node once; actions always revalidate.
+        if (-not $Verified) { Assert-Element $window $element }
+        Assert-TreeBudget $Clock
         $pattern = $null
         if ($element.TryGetCurrentPattern($patternId, [ref]$pattern)) { return $pattern }
         return $null
@@ -548,17 +614,27 @@ namespace OwnedUia {
             elseif ($leaf -ieq 'notepad.exe') { $handoff = 'notepad' }
         }
 
-        if ($handoff -eq 'calculator' -and (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue)) {
-            # Legacy UWP Calculator windows belong to a shared ApplicationFrameHost,
-            # not CalculatorApp.exe. Refuse BEFORE launch rather than opening a window
-            # whose process we cannot own, inspect, or safely terminate.
-            $packages = @(Get-AppxPackage -Name Microsoft.WindowsCalculator)
-            if ($packages.Count -eq 1) {
-                [xml]$manifest = [IO.File]::ReadAllText([IO.Path]::Combine($packages[0].InstallLocation, 'AppxManifest.xml'))
-                $application = $manifest.Package.Applications.Application
-                if ($application.GetAttribute('EntryPoint') -eq 'Calculator.App') {
-                    Deny 'Calculator uses shared ApplicationFrameHost; refused before launch because its window process cannot be owned.'
+        if ($handoff -eq 'calculator') {
+            # Fail closed: only a positively identified full-trust Calculator can
+            # own its window. Missing cmdlets/packages/manifest data are not consent.
+            $adoptable = $false
+            try {
+                if (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue) {
+                    $packages = @(Get-AppxPackage -Name Microsoft.WindowsCalculator -ErrorAction Stop)
+                    if ($packages.Count -eq 1) {
+                        [xml]$manifest = [IO.File]::ReadAllText([IO.Path]::Combine($packages[0].InstallLocation, 'AppxManifest.xml'))
+                        $applications = @($manifest.Package.Applications.Application)
+                        if ($applications.Count -eq 1) {
+                            $application = $applications[0]
+                            $executable = [IO.Path]::Combine($packages[0].InstallLocation, $application.GetAttribute('Executable'))
+                            $adoptable = ($application.GetAttribute('EntryPoint') -eq 'Windows.FullTrustApplication' -and
+                                (Test-AppPath $executable '' $handoff) -and [IO.File]::Exists($executable))
+                        }
+                    }
                 }
+            } catch { $adoptable = $false }
+            if (-not $adoptable) {
+                Deny 'Calculator refused before launch: a full-trust owned-window app could not be established (stock UWP uses shared ApplicationFrameHost).'
             }
         }
         Assert-Lifetime
@@ -578,6 +654,8 @@ namespace OwnedUia {
         }
         $launcher = Start-Process @startOptions
         $launcherIdentity = $null
+        $launchKeys = @{}
+        $windowRef = $null
         try {
             # Keep Start-Process's original handle even if a short-lived launcher exits.
             $null = $launcher.Handle
@@ -589,65 +667,122 @@ namespace OwnedUia {
                 Pid = $launcher.Id; Started = $started
                 Key = ('{0}:{1}' -f $launcher.Id, $started); Path = $path
             }
+            $launchKeys[$launcherIdentity.Key] = $true
             $script:processes[$launcherIdentity.Key] = $launcherIdentity
             Save-OwnedState
-        } finally { $launcher.Dispose() }
 
-        $clock = [Diagnostics.Stopwatch]::StartNew()
-        $stableKey = ''
-        $stableSince = 0L
-        $sharedFrameHost = $false
-        while ($clock.ElapsedMilliseconds -lt 15000) {
-            Assert-Lifetime
-            $candidates = New-Object System.Collections.Generic.List[object]
-            foreach ($native in [OwnedUia.Native]::Windows()) {
-                if (-not $native.Visible -or
-                    $beforeHandles.ContainsKey($native.Handle.ToInt64().ToString()) -or
-                    [OwnedUia.Native]::GetAncestor($native.Handle, 2) -ne $native.Handle) { continue }
-                $identity = Get-Identity ([int]$native.Pid) -WithPath
-                if ($null -ne $identity -and $identity.Started -lt $began -and
-                    [IO.Path]::GetFileName($identity.Path) -ieq 'ApplicationFrameHost.exe') {
-                    $sharedFrameHost = $true
-                }
-                if ($null -eq $identity -or $identity.Started -lt $began -or
-                    $beforeProcesses.ContainsKey($identity.Pid) -or
-                    -not (Test-AppPath $identity.Path $path $handoff)) { continue }
-                # Ordinary launches require the exact Start-Process identity. Only
-                # the explicit Windows packaged mappings may resolve a different PID.
-                if ($identity.Key -ne $launcherIdentity.Key -and
-                    ([string]::IsNullOrEmpty($handoff) -or
-                    -not (Test-AppPath $identity.Path '' $handoff))) { continue }
-                $candidates.Add([pscustomobject]@{ Native = $native; Identity = $identity })
-            }
-            if ($candidates.Count -gt 1) { Deny 'Launch discovery is ambiguous; no window was adopted.' }
-            if ($candidates.Count -eq 1) {
-                $candidate = $candidates[0]
-                $key = $candidate.Identity.Key + ':' + $candidate.Native.Handle.ToInt64()
-                if ($key -ne $stableKey) {
-                    $stableKey = $key
-                    $stableSince = $clock.ElapsedMilliseconds
-                } elseif ($clock.ElapsedMilliseconds - $stableSince -ge 500) {
-                    # Ownership is recorded before any UIA call, including failure.
-                    $script:processes[$candidate.Identity.Key] = $candidate.Identity
-                    Save-OwnedState
-                    $windowRef = 'w' + $script:windowGeneration + '_' + $candidate.Native.Handle.ToInt64()
-                    $window = [pscustomobject]@{
-                        Ref = $windowRef; Handle = $candidate.Native.Handle
-                        Identity = $candidate.Identity; Root = $null; Refs = @{}
-                        ProcessKeys = @($launcherIdentity.Key, $candidate.Identity.Key)
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            $stableKey = ''
+            $stableSince = 0L
+            while ($clock.ElapsedMilliseconds -lt 15000) {
+                Assert-Lifetime
+                # Journal hand-off targets even before they have a visible window.
+                # A timeout, ambiguity or provider failure must not strand them.
+                if (-not [string]::IsNullOrEmpty($handoff)) {
+                    foreach ($process in [Diagnostics.Process]::GetProcesses()) {
+                        try {
+                            if ($beforeProcesses.ContainsKey($process.Id)) { continue }
+                            $identity = Get-Identity $process.Id -WithPath
+                            if ($null -ne $identity -and $identity.Started -ge $began -and
+                                (Test-AppPath $identity.Path '' $handoff) -and
+                                -not $launchKeys.ContainsKey($identity.Key)) {
+                                $launchKeys[$identity.Key] = $true
+                                $script:processes[$identity.Key] = $identity
+                                Save-OwnedState
+                            }
+                        } finally { $process.Dispose() }
                     }
-                    $script:windows[$windowRef] = $window
-                    Assert-Window $window
-                    $window.Root = [System.Windows.Automation.AutomationElement]::FromHandle($window.Handle)
-                    Assert-Element $window $window.Root
-                    $title = Read-Property $window $window.Root ([System.Windows.Automation.AutomationElement]::NameProperty)
-                    return @{ window = $windowRef; pid = $window.Identity.Pid; title = (Escape-Field $title) }
                 }
-            } else { $stableKey = '' }
-            Start-Sleep -Milliseconds 100
-        }
-        if ($sharedFrameHost) { Deny 'Refused: a new window uses an existing shared ApplicationFrameHost; it cannot be adopted.' }
-        Deny 'No new, unambiguous owned window appeared; old process handoff is refused.'
+                $candidates = New-Object System.Collections.Generic.List[object]
+                foreach ($native in [OwnedUia.Native]::Windows()) {
+                    if (-not $native.Visible -or
+                        $beforeHandles.ContainsKey($native.Handle.ToInt64().ToString()) -or
+                        [OwnedUia.Native]::GetAncestor($native.Handle, 2) -ne $native.Handle) { continue }
+                    $identity = Get-Identity ([int]$native.Pid) -WithPath
+                    if ($null -eq $identity -or $identity.Started -lt $began -or
+                        $beforeProcesses.ContainsKey($identity.Pid) -or
+                        -not (Test-AppPath $identity.Path $path $handoff)) { continue }
+                    # Ordinary launches require the exact Start-Process identity.
+                    if ($identity.Key -ne $launcherIdentity.Key) {
+                        if ([string]::IsNullOrEmpty($handoff) -or
+                            -not (Test-AppPath $identity.Path '' $handoff)) { continue }
+                        # A process can appear between the process and HWND snapshots.
+                        if (-not $launchKeys.ContainsKey($identity.Key)) {
+                            $launchKeys[$identity.Key] = $true
+                            $script:processes[$identity.Key] = $identity
+                            Save-OwnedState
+                        }
+                        if (-not $launcher.HasExited) { continue }
+                        if ($identity.Started -lt $started -or
+                            $identity.Started - $started -gt [TimeSpan]::FromSeconds(3).Ticks) {
+                            Deny 'Hand-off cannot be correlated with an exited launcher within three seconds.'
+                        }
+                        $parentPid = [OwnedUia.Native]::ParentPid($identity.Pid)
+                        if ($parentPid -ge 0 -and $parentPid -ne $launcherIdentity.Pid) {
+                            Deny 'Hand-off parent does not match the launcher; activation provenance is unavailable.'
+                        }
+                    }
+                    $candidates.Add([pscustomobject]@{ Native = $native; Identity = $identity })
+                }
+                if ($candidates.Count -gt 1) { Deny 'Launch discovery is ambiguous; no window was adopted.' }
+                if ($candidates.Count -eq 1) {
+                    $candidate = $candidates[0]
+                    $key = $candidate.Identity.Key + ':' + $candidate.Native.Handle.ToInt64()
+                    if ($key -ne $stableKey) {
+                        $stableKey = $key
+                        $stableSince = $clock.ElapsedMilliseconds
+                    } elseif ($clock.ElapsedMilliseconds - $stableSince -ge 500) {
+                        $windowRef = 'w' + $script:windowGeneration + '_' + $candidate.Native.Handle.ToInt64()
+                        $window = [pscustomobject]@{
+                            Ref = $windowRef; Handle = $candidate.Native.Handle
+                            Identity = $candidate.Identity; Root = $null; Refs = @{}
+                            ProcessKeys = @($launchKeys.Keys)
+                        }
+                        $script:windows[$windowRef] = $window
+                        Assert-Window $window
+                        $window.Root = [System.Windows.Automation.AutomationElement]::FromHandle($window.Handle)
+                        Assert-Element $window $window.Root
+                        $title = Read-Property $window $window.Root ([System.Windows.Automation.AutomationElement]::NameProperty)
+                        return @{ window = $windowRef; pid = $window.Identity.Pid; title = (Escape-Field $title) }
+                    }
+                } else { $stableKey = '' }
+                Start-Sleep -Milliseconds 100
+            }
+            Deny 'No new, unambiguous owned window appeared; old process handoff is refused.'
+        } catch {
+            if ($null -ne $windowRef) { $script:windows.Remove($windowRef) }
+            # Stop the original handle too if identity capture/journaling failed.
+            if ($null -eq $launcherIdentity) {
+                try { if (-not $launcher.HasExited) { $launcher.Kill() } } catch { }
+            } else { Stop-ExactProcess $launcherIdentity }
+            # One final process-only sweep catches targets that appeared between
+            # polls, or when launcher identity capture failed before discovery.
+            if (-not [string]::IsNullOrEmpty($handoff)) {
+                $cleanupProcesses = @()
+                try { $cleanupProcesses = [Diagnostics.Process]::GetProcesses() } catch { }
+                foreach ($process in $cleanupProcesses) {
+                    try {
+                        if ($beforeProcesses.ContainsKey($process.Id)) { continue }
+                        $identity = Get-Identity $process.Id -WithPath
+                        if ($null -ne $identity -and $identity.Started -ge $began -and
+                            (Test-AppPath $identity.Path '' $handoff)) {
+                            $launchKeys[$identity.Key] = $true
+                            $script:processes[$identity.Key] = $identity
+                            Save-OwnedState
+                        }
+                    } catch { } # A failed journal write must not prevent exact cleanup.
+                    finally { $process.Dispose() }
+                }
+            }
+            foreach ($key in @($launchKeys.Keys)) {
+                $identity = $script:processes[$key]
+                Stop-ExactProcess $identity
+                # Failed kills stay discoverable by the watchdog, never forgotten.
+                if (Test-IdentityGone $identity) { $script:processes.Remove($key) }
+            }
+            Save-OwnedState
+            throw
+        } finally { $launcher.Dispose() }
     }
 
     function Escape-Field($value) {
@@ -682,27 +817,44 @@ namespace OwnedUia {
         $cut = $false
         try {
             while ($stack.Count -gt 0) {
-                if ($window.Refs.Count -ge $maxNodes -or $clock.ElapsedMilliseconds -ge 40000) {
+                if ($lines.Count -ge $maxNodes -or $clock.ElapsedMilliseconds -ge 20000) {
                     $cut = $true
                     break
                 }
                 $item = $stack.Pop()
                 $element = $item.Element
-                Assert-Window $window
-                # Identity-only check on a foreign child; never read its name/state,
-                # ask for its children, or call any of its patterns.
-                $elementPid = $element.GetCurrentPropertyValue(
-                    [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $true)
-                $foreign = ($elementPid -isnot [int] -or $elementPid -ne $window.Identity.Pid)
-                if (-not $foreign) {
+                # Queue already-fetched siblings first, so an unreadable node does
+                # not prevent visiting the rest. No provider call on the parent.
+                if ($item.Sibling) {
+                    $siblings = $item.Siblings
+                    $next = $item.Index + 1
+                    if ($next -lt $siblings.Count) {
+                        $stack.Push([pscustomobject]@{
+                            Element = $siblings[$next]; Depth = $item.Depth; Sibling = $true
+                            Siblings = $siblings; Index = $next
+                        })
+                    }
+                }
+                $script:nextElement++
+                $ref = 'e' + $script:nextElement
+                $lineIndex = $lines.Count
+                try {
+                    Assert-Window $window
+                    # Identity-only check on a foreign child; never read its name/state.
+                    $elementPid = $element.GetCurrentPropertyValue(
+                        [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $true)
+                    if ($elementPid -isnot [int] -or $elementPid -ne $window.Identity.Pid) {
+                        $cut = $true
+                        continue
+                    }
+                    # One ancestry verification per node per snapshot. Actions still
+                    # reverify every property/pattern access; this trust is tree-local.
                     Assert-Element $window $element
-                    $script:nextElement++
-                    $ref = 'e' + $script:nextElement
-                    $type = Read-Property $window $element ([System.Windows.Automation.AutomationElement]::ControlTypeProperty)
-                    $name = Read-Property $window $element ([System.Windows.Automation.AutomationElement]::NameProperty)
-                    $automationId = Read-Property $window $element ([System.Windows.Automation.AutomationElement]::AutomationIdProperty)
-                    $enabled = Read-Property $window $element ([System.Windows.Automation.AutomationElement]::IsEnabledProperty)
-                    $offscreen = Read-Property $window $element ([System.Windows.Automation.AutomationElement]::IsOffscreenProperty)
+                    $type = Read-Property $window $element ([System.Windows.Automation.AutomationElement]::ControlTypeProperty) -Verified -Clock $clock
+                    $name = Read-Property $window $element ([System.Windows.Automation.AutomationElement]::NameProperty) -Verified -Clock $clock
+                    $automationId = Read-Property $window $element ([System.Windows.Automation.AutomationElement]::AutomationIdProperty) -Verified -Clock $clock
+                    $enabled = Read-Property $window $element ([System.Windows.Automation.AutomationElement]::IsEnabledProperty) -Verified -Clock $clock
+                    $offscreen = Read-Property $window $element ([System.Windows.Automation.AutomationElement]::IsOffscreenProperty) -Verified -Clock $clock
                     $typeName = 'Unknown'
                     if ($type -is [System.Windows.Automation.ControlType]) {
                         $typeName = $type.ProgrammaticName.Replace('ControlType.', '')
@@ -716,59 +868,50 @@ namespace OwnedUia {
                     if ($automationId -is [string] -and $automationId.Length -gt 0) {
                         $line += ' automationId="' + (Escape-Field $automationId) + '"'
                     }
-                    $valuePattern = Get-Pattern $window $element ([System.Windows.Automation.ValuePattern]::Pattern)
+                    $valuePattern = Get-Pattern $window $element ([System.Windows.Automation.ValuePattern]::Pattern) -Verified -Clock $clock
                     if ($null -ne $valuePattern) {
-                        Assert-Element $window $element
                         $line += ' value="' + (Escape-Field $valuePattern.Current.Value) + '"'
                         $line += ' readonly=' + ([string]$valuePattern.Current.IsReadOnly).ToLowerInvariant()
                     } elseif ($typeName -eq 'Document' -or $typeName -eq 'Edit') {
-                        # Multiline Notepad exposes TextPattern rather than ValuePattern.
-                        # Bound the read in the provider itself, not only after fetching text.
-                        $textPattern = Get-Pattern $window $element ([System.Windows.Automation.TextPattern]::Pattern)
+                        # Bound the provider read, not only the rendered text.
+                        $textPattern = Get-Pattern $window $element ([System.Windows.Automation.TextPattern]::Pattern) -Verified -Clock $clock
                         if ($null -ne $textPattern) {
-                            Assert-Element $window $element
                             $line += ' text="' + (Escape-Field $textPattern.DocumentRange.GetText(512)) + '"'
                         }
                     }
-                    $togglePattern = Get-Pattern $window $element ([System.Windows.Automation.TogglePattern]::Pattern)
+                    $togglePattern = Get-Pattern $window $element ([System.Windows.Automation.TogglePattern]::Pattern) -Verified -Clock $clock
                     if ($null -ne $togglePattern) {
-                        Assert-Element $window $element
                         $line += ' toggle=' + (Escape-Field $togglePattern.Current.ToggleState)
                     }
+                    Assert-TreeBudget $clock
                     $window.Refs[$ref] = $element
                     $lines.Add($line)
-                } else { $cut = $true }
-
-                # A sibling navigation request is made on the owned parent, not on
-                # a foreign provider. The frame keeps that parent and child index.
-                if ($item.Sibling) {
-                    Assert-Element $window $item.Parent
-                    $siblings = $item.Siblings
-                    $next = $item.Index + 1
-                    if ($next -lt $siblings.Count) {
-                        $stack.Push([pscustomobject]@{
-                            Element = $siblings[$next]; Depth = $item.Depth; Sibling = $true
-                            Parent = $item.Parent; Siblings = $siblings; Index = $next
-                        })
-                    }
-                }
-                if (-not $foreign -and $item.Depth -lt $depth) {
-                    Assert-Element $window $element
-                    # FindAll is *Children* only, scoped to the proven owned element.
-                    # Unlike Descendants, it never traverses a foreign child provider.
-                    $children = $element.FindAll([System.Windows.Automation.TreeScope]::Children,
-                        [System.Windows.Automation.Condition]::TrueCondition)
-                    if ($children.Count -gt 0) {
-                        $stack.Push([pscustomobject]@{
-                            Element = $children[0]; Depth = $item.Depth + 1; Sibling = $true
-                            Parent = $element; Siblings = $children; Index = 0
-                        })
-                    }
+                    if ($item.Depth -lt $depth -and $lines.Count -lt $maxNodes -and $clock.ElapsedMilliseconds -lt 20000) {
+                        # Children only, scoped to the proven owned element.
+                        $children = $element.FindAll([System.Windows.Automation.TreeScope]::Children,
+                            [System.Windows.Automation.Condition]::TrueCondition)
+                        Assert-TreeBudget $clock
+                        if ($children.Count -gt 0) {
+                            $stack.Push([pscustomobject]@{
+                                Element = $children[0]; Depth = $item.Depth + 1; Sibling = $true
+                                Siblings = $children; Index = 0
+                            })
+                        }
+                    } elseif ($item.Depth -lt $depth) { $cut = $true }
+                } catch {
+                    if ($_.Exception.Message.StartsWith('UIA_SAFE: ', [StringComparison]::Ordinal)) { throw }
+                    # Provider errors reveal no exception details and grant no ref.
+                    $window.Refs.Remove($ref)
+                    $unreadable = ('{0}{1} unreadable' -f ('  ' * $item.Depth), $ref)
+                    if ($lines.Count -gt $lineIndex) { $lines[$lineIndex] = $unreadable }
+                    else { $lines.Add($unreadable) }
+                    $cut = $true
                 }
             }
-            if ($cut) { $lines.Add('[cut: node/time limit or foreign child provider skipped]') }
+            $nodes = $lines.Count
+            if ($cut) { $lines.Add('[cut: node/time limit, unreadable node or foreign child provider skipped]') }
             $text = [string]::Join("`n", $lines.ToArray())
-            return @{ text = $text; nodes = $window.Refs.Count; chars = $text.Length;
+            return @{ text = $text; nodes = $nodes; chars = $text.Length;
                 ms = $clock.ElapsedMilliseconds; cut = $cut }
         } catch {
             $window.Refs = @{}
@@ -828,7 +971,12 @@ namespace OwnedUia {
         if ((Read-Property $window $element ([System.Windows.Automation.AutomationElement]::IsOffscreenProperty)) -ne $false) {
             Deny 'Element is offscreen.'
         }
-        Assert-ClickPoint $window $nativePoint
+        $actualPoint = [OwnedUia.Native+POINT]::new(0, 0)
+        if (-not [OwnedUia.Native]::GetCursorPos([ref]$actualPoint) -or
+            $actualPoint.X -ne $nativePoint.X -or $actualPoint.Y -ne $nativePoint.Y) {
+            Deny 'Pointer moved before input; click refused.'
+        }
+        Assert-ClickPoint $window $actualPoint
         try {
             if (-not [OwnedUia.Native]::Mouse($false)) { Deny 'Pointer input was refused.' }
         } finally { $null = [OwnedUia.Native]::Mouse($true) }
@@ -1046,7 +1194,6 @@ namespace OwnedUia {
             }
             $reply = @{ id = $id; result = $result }
         } catch {
-            if ($method -eq 'key') { [Console]::Error.WriteLine('[DEBUG-uia-key] ' + $_.Exception.GetType().FullName + ' ' + $_.ScriptStackTrace) }
             $message = 'Operation failed or ownership could not be verified.'
             if ($_.Exception.Message.StartsWith('UIA_SAFE: ', [StringComparison]::Ordinal)) {
                 $message = $_.Exception.Message.Substring(10)

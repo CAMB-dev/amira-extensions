@@ -51,6 +51,11 @@ function host() {
     tools: new ToolRegistry(),
     interceptors: new InterceptorRegistry(),
     settings: { extensions: { "computer-use-uia": { enabled: true } } },
+    settingsLayers: {
+      extensions: [
+        { scope: "user", file: "test:user-settings", value: { "computer-use-uia": { enabled: true } } },
+      ],
+    },
     cwd: process.cwd(),
   })
   return { instance, bus }

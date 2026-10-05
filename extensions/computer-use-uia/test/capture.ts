@@ -14,7 +14,6 @@ export function captureHelper(api: ExtensionAPI) {
       pipe = api.openPipe(argv, {
         ...options,
         onEvent(event) {
-          if (event.type === "stderr" && event.data.includes("[DEBUG-uia-key]")) console.error(event.data.trim())
           if (event.type === "spawned") pid = event.pid
           if (event.type === "exit") {
             pid = 0

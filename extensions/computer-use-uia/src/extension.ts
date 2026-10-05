@@ -14,7 +14,11 @@ export function setup(api: ExtensionAPI, platform = process.platform): UiaClient
   }
   let settings: ReturnType<typeof readSettings>
   try {
-    settings = readSettings(api.settings.extensions?.["computer-use-uia"])
+    // Never trust merged/project settings for desktop opt-in or executable commands.
+    // Hosts without provenance fail closed rather than treating merged values as user input.
+    const layers = api.settings.layers?.("extensions") ?? []
+    const user = layers.filter((layer) => layer.scope === "user").at(-1)
+    settings = readSettings(user?.value["computer-use-uia"])
   } catch (error) {
     api.reportError(String(error))
     return

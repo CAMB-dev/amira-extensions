@@ -109,7 +109,7 @@ export class UiaClient {
       const formatted = formatTree(tree, safe.maxNodes as number)
       for (const line of formatted.text.split("\n")) {
         const ref = /^\s*(e\d+)\s/.exec(line)?.[1]
-        if (ref) owned.refs.add(ref)
+        if (ref && !/^\s*e\d+\s+unreadable\b/.test(line)) owned.refs.add(ref)
       }
       return formatted
     }

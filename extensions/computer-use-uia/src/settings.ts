@@ -10,7 +10,6 @@ export interface UiaSettings {
 
 const DEFAULT_APPS: Record<string, App> = {
   notepad: { command: "notepad.exe" },
-  calculator: { command: "calc.exe" },
 }
 
 export function readSettings(value: unknown): UiaSettings {

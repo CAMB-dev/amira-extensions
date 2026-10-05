@@ -1,12 +1,12 @@
 import { expect, test } from "bun:test"
-import type { ExtensionAPI, OpenPipeOptions, ToolContext, ToolDefinition } from "@amira/api"
+import type { ExtensionAPI, OpenPipeOptions, SettingsLayer, ToolContext, ToolDefinition } from "@amira/api"
 import { formatTree, UiaClient, validateKeys } from "../src/client.ts"
 import { setup } from "../src/extension.ts"
 import { readSettings } from "../src/settings.ts"
 
 const WINDOW = `w${"1".padStart(32, "0")}_123`
 
-function fake(settings: unknown = { enabled: true }) {
+function fake(settings: unknown = { enabled: true }, layers?: SettingsLayer[]) {
   const pipes: { options: OpenPipeOptions; closed: number[] }[] = []
   const watchdogs: { options: OpenPipeOptions; closed: number[] }[] = []
   const requests: { id: number; method: string; params: Record<string, unknown> }[] = []
@@ -22,7 +22,13 @@ function fake(settings: unknown = { enabled: true }) {
   const job = { id: "lifetime", pid: 42, status: "running" }
   const api = {
     cwd: process.cwd(),
-    settings: { extensions: { "computer-use-uia": settings } },
+    settings: {
+      extensions: { "computer-use-uia": settings },
+      layers: () =>
+        layers ?? [
+          { scope: "user", file: "~/.amira/settings.json", value: { "computer-use-uia": settings } },
+        ],
+    },
     backgroundJobs: {
       start: (options: { argv: string[] }) => {
         started.push(options.argv)
@@ -127,7 +133,7 @@ const ctx: ToolContext = {
 
 test("off by default; apps settings replace defaults and validate without partial enablement", () => {
   expect(readSettings(undefined).enabled).toBe(false)
-  expect(Object.keys(readSettings(undefined).apps)).toEqual(["notepad", "calculator"])
+  expect(Object.keys(readSettings(undefined).apps)).toEqual(["notepad"])
   expect(readSettings({ enabled: true, apps: {} })).toEqual({ enabled: true, apps: {} })
   expect(readSettings({ apps: { demo: { command: "demo.exe", args: ["--x"] } } }).apps.demo).toEqual({
     command: "demo.exe",
@@ -144,6 +150,47 @@ test("off by default; apps settings replace defaults and validate without partia
   setup(disabled.api, "win32")
   expect(disabled.tools.size).toBe(0)
   expect(disabled.pipes.length).toBe(0)
+})
+
+test("only explicit user settings can enable tools or supply launch commands", () => {
+  const malicious = { enabled: true, apps: { evil: { command: "evil.exe" } } }
+  for (const scope of ["project", "project-local", "flags"] as const) {
+    const h = fake(malicious, [
+      { scope, file: "untrusted/settings.json", value: { "computer-use-uia": malicious } },
+    ])
+    expect(setup(h.api, "win32")).toBeUndefined()
+    expect(h.tools.size).toBe(0)
+    expect(h.started).toHaveLength(0)
+  }
+  const missing = fake(malicious, [])
+  expect(setup(missing.api, "win32")).toBeUndefined()
+  Object.assign(missing.api.settings, { layers: undefined })
+  expect(setup(missing.api, "win32")).toBeUndefined()
+
+  const user = { enabled: true, apps: { safe: { command: "safe.exe", args: ["--user"] } } }
+  const h = fake(malicious, [
+    { scope: "user", file: "~/.amira/settings.json", value: { "computer-use-uia": user } },
+    { scope: "project", file: ".amira/settings.json", value: { "computer-use-uia": malicious } },
+  ])
+  const client = setup(h.api, "win32")!
+  expect(client.apps).toEqual(user.apps)
+  expect(h.tools.get("ui_launch")!.parameters).toMatchObject({ properties: { app: { enum: ["safe"] } } })
+  expect(h.pipes).toHaveLength(0)
+
+  const defaults = fake(malicious, [
+    { scope: "user", file: "~/.amira/settings.json", value: { "computer-use-uia": { enabled: true } } },
+    { scope: "project-local", file: ".amira/settings.local.json", value: { "computer-use-uia": malicious } },
+  ])
+  expect(Object.keys(setup(defaults.api, "win32")!.apps)).toEqual(["notepad"])
+})
+
+test("Calculator is opt-in rather than a default launch entry", () => {
+  expect(readSettings(undefined).apps.calculator).toBeUndefined()
+  expect(
+    readSettings({ enabled: true, apps: { calculator: { command: "calc.exe" } } }).apps.calculator,
+  ).toEqual({
+    command: "calc.exe",
+  })
 })
 
 test("non-Windows loads without tools and gives at most one notice", () => {
@@ -174,7 +221,7 @@ test("allowlist and ownership refusals never send a request to the helper", asyn
   const h = fake()
   const c = new UiaClient(h.api, readSettings(undefined).apps)
   for (const name of ["unknown", "__proto__", "constructor", "notepad.exe"])
-    await expect(c.call("launch", { app: name })).rejects.toThrow("Allowed apps: notepad, calculator")
+    await expect(c.call("launch", { app: name })).rejects.toThrow("Allowed apps: notepad")
   for (const method of ["tree", "click", "type", "key", "close"])
     await expect(c.call(method, { window: "999", ref: "e1" })).rejects.toThrow("not obtained")
   expect(h.requests).toHaveLength(0)
@@ -218,6 +265,20 @@ test("tree cutting retains whole node lines with honest metrics and a cut note",
   await c.stop()
 })
 
+test("unreadable tree nodes preserve readable siblings but do not grant actionable refs", async () => {
+  const h = fake()
+  const c = new UiaClient(h.api, readSettings(undefined).apps)
+  await c.call("launch", { app: "notepad" })
+  h.tree('e1 unreadable\ne2 Edit "readable sibling"')
+  const tree = await c.call("tree", { window: WINDOW })
+  expect(tree).toMatchObject({ nodes: 2, text: expect.stringContaining("unreadable") })
+  const before = h.requests.length
+  await expect(c.call("click", { window: WINDOW, ref: "e1" })).rejects.toThrow("latest tree")
+  expect(h.requests).toHaveLength(before)
+  await c.call("click", { window: WINDOW, ref: "e2" })
+  await c.stop()
+})
+
 test("closing key and desktop-switching variants are refused before helper input", () => {
   expect(validateKeys(" CTRL + s ")).toBe("ctrl+s")
   expect(validateKeys("shift+tab")).toBe("shift+tab")
@@ -249,7 +310,7 @@ test("helper death rejects pending work, invalidates ownership, restarts lazily;
   await expect(c.call("tree", { window: WINDOW })).rejects.toThrow("not obtained")
   expect(h.pipes).toHaveLength(1)
   h.response(true)
-  const replacement = (await c.call("launch", { app: "calculator" })) as { window: string }
+  const replacement = (await c.call("launch", { app: "notepad" })) as { window: string }
   expect(h.pipes).toHaveLength(2)
   expect(h.watchdogs).toHaveLength(1)
   expect(replacement.window).not.toBe(WINDOW)
@@ -320,7 +381,7 @@ test("session end cancels startup and queued calls before creating any sentinel"
   const h = fake()
   const c = new UiaClient(h.api, readSettings(undefined).apps)
   const launch = c.call("launch", { app: "notepad" })
-  const queued = c.call("launch", { app: "calculator" })
+  const queued = c.call("launch", { app: "notepad" })
   await Promise.resolve() // start is suspended at its retirement barrier
   const stopping = c.stop()
   await expect(launch).rejects.toThrow("session ended")
