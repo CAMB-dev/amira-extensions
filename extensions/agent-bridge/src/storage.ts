@@ -266,7 +266,7 @@ export async function listStates(
         id: name.slice(0, -5),
         status: "invalid",
         identityStatus: "unknown",
-        error: errorMessage(error).replace(/[a-f0-9]{64}/g, "[redacted]"),
+        error: errorMessage(error).replace(/[a-f0-9]{64}/g, "[redacted]"),
       } as unknown as (typeof result)[number])
       continue
     }
