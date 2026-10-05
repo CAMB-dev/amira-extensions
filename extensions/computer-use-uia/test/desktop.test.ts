@@ -3,6 +3,7 @@ import type { ExtensionAPI } from "@amira/api"
 import { EventBus, ExtensionHost, InterceptorRegistry, ToolRegistry } from "@amira/core"
 import type { LaunchResult, TreeResult, UiaClient } from "../src/client.ts"
 import { setup } from "../src/extension.ts"
+import { readSettings } from "../src/settings.ts"
 import { captureHelper } from "./capture.ts"
 
 const helper = `${import.meta.dir}/../helper/uia.ps1`
@@ -61,13 +62,16 @@ function host() {
   return { instance, bus }
 }
 
-function editRef(tree: TreeResult): string {
-  const lines = tree.text.split("\n")
-  const line =
-    lines.find((line) => /\b(?:Edit|Document)\b/.test(line) && /readonly=false/.test(line)) ??
-    lines.find((line) => /\bDocument\b/.test(line) && /text="/.test(line))
-  const ref = line && /^\s*(e\d+)\s/.exec(line)?.[1]
-  if (!ref) throw new Error(`No Edit element in the owned Notepad tree:\n${tree.text}`)
+function controlLine(tree: TreeResult, type: string, name: string): string {
+  const matches = tree.text.split("\n").filter((line) => line.includes(` ${type} name="${name}" `))
+  if (matches.length !== 1) throw new Error(`Expected one ${type} named "${name}":\n${tree.text}`)
+  return matches[0]!
+}
+
+function controlRef(tree: TreeResult, type: string, name: string): string {
+  const line = controlLine(tree, type, name)
+  const ref = /^\s*(e\d+)\s/.exec(line)?.[1]
+  if (!ref) throw new Error(`No ref for ${type} named "${name}":\n${tree.text}`)
   return ref
 }
 
@@ -89,7 +93,7 @@ function alive(pid: number): boolean {
 }
 
 test.skipIf(!interactive)(
-  "real helper: owned Notepad Unicode round trip using the available pattern, guards, close",
+  "real helper: owned testWindow named edits, button, checkbox, guards and close",
   async () => {
     const { instance } = host()
     let client: UiaClient | undefined
@@ -103,37 +107,57 @@ test.skipIf(!interactive)(
     const launched: LaunchResult[] = []
     try {
       await expect(c.call("tree", { window: "1" })).rejects.toThrow("not obtained")
-      const notepad = (await c.call("launch", { app: "notepad" })) as LaunchResult
-      launched.push(notepad)
-      let tree = (await c.call("tree", { window: notepad.window })) as TreeResult
-      console.log(`UIA manual measurement: notepad ${tree.nodes} nodes, ${tree.chars} chars, ${tree.ms} ms`)
-      const message = "Amira UIA owned-window test — héllo 你好"
-      const oldRef = editRef(tree)
-      const editor = tree.text.split("\n").find((line) => line.trimStart().startsWith(`${oldRef} `))!
-      const expectedPath = editor.includes('value="') ? "ValuePattern.SetValue" : "SendInput"
-      const typed = await c.call("type", { window: notepad.window, ref: oldRef, text: message })
-      expect(typed).toMatchObject({ path: expectedPath })
-      if (expectedPath !== "ValuePattern.SetValue")
-        console.log(
-          "Notepad exposes TextPattern only: native ValuePattern not verified; exercising Unicode fallback",
+      const testWindow = (await c.call("launch", { app: "testWindow" })) as LaunchResult
+      launched.push(testWindow)
+      let tree = (await c.call("tree", { window: testWindow.window })) as TreeResult
+      console.log(
+        `UIA manual measurement: testWindow ${tree.nodes} nodes, ${tree.chars} chars, ${tree.ms} ms`,
+      )
+      for (const [name, message] of [
+        ["Multiline text", "Amira UIA owned-window test — héllo 你好\nSecond line"],
+        ["Single-line text", "Single-line Unicode — héllo 你好"],
+      ] as const) {
+        const oldRef = controlRef(tree, "Edit", name)
+        const editor = controlLine(tree, "Edit", name)
+        const expectedPath = editor.includes('value="') ? "ValuePattern.SetValue" : "SendInput"
+        const typed = await c.call("type", { window: testWindow.window, ref: oldRef, text: message })
+        expect(typed).toMatchObject({ path: expectedPath })
+        tree = (await c.call("tree", { window: testWindow.window })) as TreeResult
+        expect(controlLine(tree, "Edit", name).replaceAll("\\r\\n", "\\n")).toContain(
+          message.replaceAll("\n", "\\n"),
         )
-      tree = (await c.call("tree", { window: notepad.window })) as TreeResult
-      expect(tree.text).toContain(message)
-      expect(editRef(tree)).not.toBe(oldRef)
-      const stale = await captured!.raw("click", { window: notepad.window, ref: oldRef })
-      expect(stale.error).toContain("Unknown element")
+        expect(controlRef(tree, "Edit", name)).not.toBe(oldRef)
+        const stale = await captured!.raw("click", { window: testWindow.window, ref: oldRef })
+        expect(stale.error).toContain("Unknown element")
+      }
+      expect(controlLine(tree, "Text", "Button not clicked")).toContain("enabled=true")
+      const button = await c.call("click", {
+        window: testWindow.window,
+        ref: controlRef(tree, "Button", "Change label"),
+      })
+      expect(button).toMatchObject({ path: "InvokePattern" })
+      tree = (await c.call("tree", { window: testWindow.window })) as TreeResult
+      expect(controlLine(tree, "Text", "Button clicked")).toContain("enabled=true")
+      const checkbox = controlLine(tree, "CheckBox", "Enable option")
+      expect(checkbox).toContain("toggle=Off")
+      const toggled = await c.call("click", {
+        window: testWindow.window,
+        ref: controlRef(tree, "CheckBox", "Enable option"),
+      })
+      expect(toggled).toMatchObject({ path: "TogglePattern" })
+      tree = (await c.call("tree", { window: testWindow.window })) as TreeResult
+      expect(controlLine(tree, "CheckBox", "Enable option")).toContain("toggle=On")
       for (const keys of ["ALT+F4", "shift+alt+f4", "alt+tab", "ctrl+escape"]) {
-        const refused = await captured!.raw("key", { window: notepad.window, keys })
+        const refused = await captured!.raw("key", { window: testWindow.window, keys })
         expect(refused.error).toContain("not permitted")
       }
-      const key = await c.call("key", { window: notepad.window, keys: "ctrl+a" })
+      const key = await c.call("key", { window: testWindow.window, keys: "ctrl+a" })
       expect(key).toMatchObject({ path: "SendInput" })
-      console.log(`UIA round trip: ${expectedPath} + tree read-back matched Unicode text`)
       for (const app of launched) {
         await c.call("close", { window: app.window })
         await until(() => !alive(app.pid))
       }
-      console.log("UIA close: owned Notepad PID exited")
+      console.log("UIA close: owned testWindow PID exited")
     } finally {
       await c.stop()
       instance.unload("test:uia")
@@ -143,7 +167,7 @@ test.skipIf(!interactive)(
 )
 
 test.skipIf(!interactive)(
-  "real host unload stops sentinel; helper closes only its launched Notepad",
+  "real host unload stops sentinel; helper closes only its launched testWindow",
   async () => {
     const { instance } = host()
     let client: UiaClient | undefined
@@ -154,7 +178,7 @@ test.skipIf(!interactive)(
     }, "test:uia-unload")
     let launched: LaunchResult | undefined
     try {
-      launched = (await client!.call("launch", { app: "notepad" })) as LaunchResult
+      launched = (await client!.call("launch", { app: "testWindow" })) as LaunchResult
       const jobs = api!.backgroundJobs.running()
       expect(jobs).toHaveLength(1)
       expect(instance.unload("test:uia-unload")).toBe(true)
@@ -179,14 +203,14 @@ test.skipIf(!interactive)(
       client = setup(captured.api)
     }, "test:uia-crash")
     try {
-      const original = (await client!.call("launch", { app: "notepad" })) as LaunchResult
+      const original = (await client!.call("launch", { app: "testWindow" })) as LaunchResult
       const helperPid = captured!.pid()
       expect(helperPid).toBeGreaterThan(0)
       // Only the helper this test started, never an image-name or desktop-process search.
       process.kill(helperPid)
       await until(() => captured!.pid() === 0 && !alive(original.pid))
       await expect(client!.call("tree", { window: original.window })).rejects.toThrow("not obtained")
-      const replacement = (await client!.call("launch", { app: "notepad" })) as LaunchResult
+      const replacement = (await client!.call("launch", { app: "testWindow" })) as LaunchResult
       expect(replacement.window).not.toBe(original.window)
       await client!.call("close", { window: replacement.window })
       await until(() => !alive(replacement.pid))
@@ -213,7 +237,7 @@ test.skipIf(process.platform !== "win32")(
         "-File",
         helper,
         "-AppsJson",
-        JSON.stringify({ notepad: { command: "notepad.exe" } }),
+        JSON.stringify(readSettings(undefined).apps),
       ],
       { stdin: "pipe", stdout: "pipe", stderr: "pipe" },
     )
@@ -237,7 +261,7 @@ test.skipIf(process.platform !== "win32")(
         .split("\n")
         .map((line) => JSON.parse(line))
       expect(responses).toHaveLength(requests.length)
-      expect(responses[0].error).toContain("notepad")
+      expect(responses[0].error).toContain("testWindow")
       for (const response of responses.slice(1))
         expect(response.error).toMatch(/Refused|not owned|not obtained/i)
     } finally {

@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test"
+import { fileURLToPath } from "node:url"
 import type { ExtensionAPI, OpenPipeOptions, SettingsLayer, ToolContext, ToolDefinition } from "@amira/api"
 import { formatTree, UiaClient, validateKeys } from "../src/client.ts"
 import { setup } from "../src/extension.ts"
@@ -17,6 +18,7 @@ function fake(settings: unknown = { enabled: true }, layers?: SettingsLayer[]) {
   const notices: string[] = []
   const errors: string[] = []
   let respond = true
+  let launchError: string | undefined
   let watchdogReady = true
   let text = 'e1 Window "owned" enabled=true offscreen=false\ne2 Edit "Text" enabled=true offscreen=false'
   const job = { id: "lifetime", pid: 42, status: "running" }
@@ -70,7 +72,11 @@ function fake(settings: unknown = { enabled: true }, layers?: SettingsLayer[]) {
                 ? { text, nodes: 2, chars: text.length, ms: 12, cut: false }
                 : { path: "ValuePattern.SetValue" }
           // Exercise line framing, with both fragmented and CRLF responses.
-          const line = `${JSON.stringify({ id: request.id, result })}\r\n`
+          const response =
+            request.method === "launch" && launchError
+              ? { id: request.id, error: launchError }
+              : { id: request.id, result }
+          const line = `${JSON.stringify(response)}\r\n`
           queueMicrotask(() => {
             options.onEvent({ type: "stdout", data: line.slice(0, 15) })
             options.onEvent({ type: "stdout", data: line.slice(15) })
@@ -115,6 +121,9 @@ function fake(settings: unknown = { enabled: true }, layers?: SettingsLayer[]) {
     response(value: boolean) {
       respond = value
     },
+    launchError(value: string | undefined) {
+      launchError = value
+    },
     watchdogReady(value: boolean) {
       watchdogReady = value
     },
@@ -133,7 +142,19 @@ const ctx: ToolContext = {
 
 test("off by default; apps settings replace defaults and validate without partial enablement", () => {
   expect(readSettings(undefined).enabled).toBe(false)
-  expect(Object.keys(readSettings(undefined).apps)).toEqual(["notepad"])
+  expect(readSettings(undefined).apps).toEqual({
+    testWindow: {
+      command: "powershell.exe",
+      args: [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        fileURLToPath(new URL("../helper/test-window.ps1", import.meta.url)),
+      ],
+    },
+  })
+  expect(readSettings({ enabled: true }).apps).toEqual(readSettings(undefined).apps)
   expect(readSettings({ enabled: true, apps: {} })).toEqual({ enabled: true, apps: {} })
   expect(readSettings({ apps: { demo: { command: "demo.exe", args: ["--x"] } } }).apps.demo).toEqual({
     command: "demo.exe",
@@ -181,15 +202,14 @@ test("only explicit user settings can enable tools or supply launch commands", (
     { scope: "user", file: "~/.amira/settings.json", value: { "computer-use-uia": { enabled: true } } },
     { scope: "project-local", file: ".amira/settings.local.json", value: { "computer-use-uia": malicious } },
   ])
-  expect(Object.keys(setup(defaults.api, "win32")!.apps)).toEqual(["notepad"])
+  expect(Object.keys(setup(defaults.api, "win32")!.apps)).toEqual(["testWindow"])
 })
 
-test("Calculator is opt-in rather than a default launch entry", () => {
+test("desktop applications require an explicit allowlist entry", () => {
+  expect(readSettings(undefined).apps.notepad).toBeUndefined()
   expect(readSettings(undefined).apps.calculator).toBeUndefined()
-  expect(
-    readSettings({ enabled: true, apps: { calculator: { command: "calc.exe" } } }).apps.calculator,
-  ).toEqual({
-    command: "calc.exe",
+  expect(readSettings({ apps: { demo: { command: "demo.exe" } } }).apps).toEqual({
+    demo: { command: "demo.exe" },
   })
 })
 
@@ -211,7 +231,7 @@ test("only tree declares readOnly; normal permissions handle every action", asyn
     expect(tool.concurrency).toBe("serial")
   }
   expect(h.pipes).toHaveLength(0)
-  await h.tools.get("ui_launch")!.execute({ app: "notepad" }, ctx)
+  await h.tools.get("ui_launch")!.execute({ app: "testWindow" }, ctx)
   const tree = await h.tools.get("ui_tree")!.execute({ window: WINDOW }, ctx)
   expect(tree.content).toEqual([{ type: "text", text: expect.stringContaining("12 ms; 2 nodes;") }])
   await client.stop()
@@ -220,21 +240,58 @@ test("only tree declares readOnly; normal permissions handle every action", asyn
 test("allowlist and ownership refusals never send a request to the helper", async () => {
   const h = fake()
   const c = new UiaClient(h.api, readSettings(undefined).apps)
-  for (const name of ["unknown", "__proto__", "constructor", "notepad.exe"])
-    await expect(c.call("launch", { app: name })).rejects.toThrow("Allowed apps: notepad")
+  for (const name of ["unknown", "__proto__", "constructor", "powershell.exe"])
+    await expect(c.call("launch", { app: name })).rejects.toThrow("Allowed apps: testWindow")
   for (const method of ["tree", "click", "type", "key", "close"])
     await expect(c.call(method, { window: "999", ref: "e1" })).rejects.toThrow("not obtained")
   expect(h.requests).toHaveLength(0)
   expect(h.pipes).toHaveLength(0)
-  await c.call("launch", { app: "notepad", command: "evil.exe", window: "999" })
-  expect(h.requests[0]?.params).toEqual({ app: "notepad" })
+  await c.call("launch", { app: "testWindow", command: "evil.exe", window: "999" })
+  expect(h.requests[0]?.params).toEqual({ app: "testWindow" })
   await c.stop()
 })
+
+for (const [scenario, error] of [
+  [
+    "handoff refusal",
+    "This app hands its window to another process, which this extension does not support. Use an app that owns its launched window.",
+  ],
+  [
+    "launcher identity capture failed",
+    "Launched process identity is unavailable; no window was adopted. Apps that hand off to another process are not supported.",
+  ],
+  [
+    "launched process exited without own window",
+    "Launched process exited without owning a window. Apps that hand off to another process are not supported.",
+  ],
+  [
+    "timeout no own window",
+    "Launched process never owned a new, unambiguous window. Apps that hand off to another process are not supported.",
+  ],
+] as const) {
+  test(`helper launch refusal: ${scenario} never grants ownership`, async () => {
+    const h = fake()
+    h.launchError(error)
+    const c = new UiaClient(h.api, readSettings(undefined).apps)
+    await expect(c.call("launch", { app: "testWindow" })).rejects.toThrow(error)
+    expect(h.requests).toHaveLength(1)
+    for (const method of ["tree", "click", "type", "key", "close"])
+      await expect(c.call(method, { window: WINDOW, ref: "e1", text: "x", keys: "enter" })).rejects.toThrow(
+        "not obtained",
+      )
+    expect(h.requests).toHaveLength(1)
+    h.launchError(undefined)
+    const launched = await c.call("launch", { app: "testWindow" })
+    expect(launched).toMatchObject({ window: WINDOW })
+    await c.call("tree", { window: WINDOW })
+    await c.stop()
+  })
+}
 
 test("refs are window-local and invalidated on a new snapshot or close; enforce bounds", async () => {
   const h = fake()
   const c = new UiaClient(h.api, readSettings(undefined).apps)
-  await c.call("launch", { app: "notepad" })
+  await c.call("launch", { app: "testWindow" })
   await expect(c.call("click", { window: WINDOW, ref: "e1" })).rejects.toThrow("latest tree")
   await c.call("tree", { window: WINDOW, maxNodes: 1 })
   await expect(c.call("type", { window: WINDOW, ref: "e2", text: "x" })).rejects.toThrow("latest tree")
@@ -259,7 +316,7 @@ test("tree cutting retains whole node lines with honest metrics and a cut note",
   ).toBe(true)
   const h = fake()
   const c = setup(h.api, "win32")!
-  await h.tools.get("ui_launch")!.execute({ app: "notepad" }, ctx)
+  await h.tools.get("ui_launch")!.execute({ app: "testWindow" }, ctx)
   const result = await h.tools.get("ui_tree")!.execute({ window: WINDOW, maxNodes: 1 }, ctx)
   expect(result.content[0]).toMatchObject({ text: expect.stringContaining("tree cut") })
   await c.stop()
@@ -268,7 +325,7 @@ test("tree cutting retains whole node lines with honest metrics and a cut note",
 test("unreadable tree nodes preserve readable siblings but do not grant actionable refs", async () => {
   const h = fake()
   const c = new UiaClient(h.api, readSettings(undefined).apps)
-  await c.call("launch", { app: "notepad" })
+  await c.call("launch", { app: "testWindow" })
   h.tree('e1 unreadable\ne2 Edit "readable sibling"')
   const tree = await c.call("tree", { window: WINDOW })
   expect(tree).toMatchObject({ nodes: 2, text: expect.stringContaining("unreadable") })
@@ -301,7 +358,7 @@ test("closing key and desktop-switching variants are refused before helper input
 test("helper death rejects pending work, invalidates ownership, restarts lazily; old events ignored", async () => {
   const h = fake()
   const c = new UiaClient(h.api, readSettings(undefined).apps)
-  await c.call("launch", { app: "notepad" })
+  await c.call("launch", { app: "testWindow" })
   h.response(false)
   const pending = c.call("tree", { window: WINDOW })
   await Bun.sleep(10)
@@ -310,7 +367,7 @@ test("helper death rejects pending work, invalidates ownership, restarts lazily;
   await expect(c.call("tree", { window: WINDOW })).rejects.toThrow("not obtained")
   expect(h.pipes).toHaveLength(1)
   h.response(true)
-  const replacement = (await c.call("launch", { app: "notepad" })) as { window: string }
+  const replacement = (await c.call("launch", { app: "testWindow" })) as { window: string }
   expect(h.pipes).toHaveLength(2)
   expect(h.watchdogs).toHaveLength(1)
   expect(replacement.window).not.toBe(WINDOW)
@@ -324,12 +381,14 @@ test("timeout closes the helper; session end and exit close stdin and stop the l
   const h = fake()
   const c = new UiaClient(h.api, readSettings(undefined).apps, 20)
   h.response(false)
-  await expect(c.call("launch", { app: "notepad" })).rejects.toThrow("timed out")
+  await expect(c.call("launch", { app: "testWindow" })).rejects.toThrow("timed out")
   expect(h.pipes[0]!.closed).toEqual([5000])
+  await expect(c.call("tree", { window: WINDOW })).rejects.toThrow("not obtained")
+  expect(h.requests).toHaveLength(1)
   await c.stop()
   const enabled = fake()
   setup(enabled.api, "win32")
-  await enabled.tools.get("ui_launch")!.execute({ app: "notepad" }, ctx)
+  await enabled.tools.get("ui_launch")!.execute({ app: "testWindow" }, ctx)
   // The session-end callback expects an envelope, unlike onExit.
   const sessionEnd = enabled.handlers.get("session.end") as unknown as (event: object) => void
   sessionEnd({})
@@ -342,7 +401,7 @@ test("timeout closes the helper; session end and exit close stdin and stop the l
 test("watchdog loss fails closed and cleanup closes both pipes", async () => {
   const h = fake()
   const c = new UiaClient(h.api, readSettings(undefined).apps)
-  await c.call("launch", { app: "notepad" })
+  await c.call("launch", { app: "testWindow" })
   h.watchdogs[0]!.options.onEvent({ type: "exit", code: 1 })
   expect(h.pipes[0]!.closed).toEqual([5000])
   await expect(c.call("tree", { window: WINDOW })).rejects.toThrow("not obtained")
@@ -356,7 +415,7 @@ test("tool refusals and pre-start cancellation are returned as errors without st
   const refused = await h.tools.get("ui_tree")!.execute({ window: "999" }, ctx)
   expect(refused.isError).toBe(true)
   const cancelled = await h.tools.get("ui_launch")!.execute(
-    { app: "notepad" },
+    { app: "testWindow" },
     {
       ...ctx,
       signal: AbortSignal.abort(),
@@ -370,7 +429,7 @@ test("tool refusals and pre-start cancellation are returned as errors without st
 test("fake host unload stops the sentinel, retires the helper and invalidates owned handles", async () => {
   const h = fake()
   const c = new UiaClient(h.api, readSettings(undefined).apps)
-  await c.call("launch", { app: "notepad" })
+  await c.call("launch", { app: "testWindow" })
   await h.api.backgroundJobs.stop("lifetime", 0)
   expect(h.pipes[0]!.closed).toEqual([5000])
   await expect(c.call("tree", { window: WINDOW })).rejects.toThrow("not obtained")
@@ -380,8 +439,8 @@ test("fake host unload stops the sentinel, retires the helper and invalidates ow
 test("session end cancels startup and queued calls before creating any sentinel", async () => {
   const h = fake()
   const c = new UiaClient(h.api, readSettings(undefined).apps)
-  const launch = c.call("launch", { app: "notepad" })
-  const queued = c.call("launch", { app: "notepad" })
+  const launch = c.call("launch", { app: "testWindow" })
+  const queued = c.call("launch", { app: "testWindow" })
   await Promise.resolve() // start is suspended at its retirement barrier
   const stopping = c.stop()
   await expect(launch).rejects.toThrow("session ended")
@@ -395,11 +454,11 @@ test("watchdog startup failure is retired before a retry can start a helper", as
   const h = fake()
   h.watchdogReady(false)
   const c = new UiaClient(h.api, readSettings(undefined).apps, 20)
-  await expect(c.call("launch", { app: "notepad" })).rejects.toThrow("watchdog failed to start")
+  await expect(c.call("launch", { app: "testWindow" })).rejects.toThrow("watchdog failed to start")
   expect(h.watchdogs[0]!.closed).toEqual([5000])
   expect(h.pipes).toHaveLength(0)
   h.watchdogReady(true)
-  await c.call("launch", { app: "notepad" })
+  await c.call("launch", { app: "testWindow" })
   expect(h.watchdogs).toHaveLength(2)
   expect(h.pipes).toHaveLength(1)
   await c.stop()

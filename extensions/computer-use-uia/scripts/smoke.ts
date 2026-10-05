@@ -9,11 +9,7 @@ if (process.platform !== "win32") {
   process.exit(0)
 }
 
-// This explicit smoke run opts into Calculator; normal user defaults do not.
-const settings = {
-  enabled: true,
-  apps: { notepad: { command: "notepad.exe" }, calculator: { command: "calc.exe" } },
-}
+const settings = { enabled: true }
 const host = new ExtensionHost({
   bus: new EventBus(),
   tools: new ToolRegistry(),
@@ -58,33 +54,19 @@ try {
     console.log("computer-use-uia smoke: skipped (no active, unlocked interactive desktop)")
   } else {
     const apps: LaunchResult[] = []
-    for (const app of ["notepad", "calculator"]) {
-      let launched: LaunchResult
-      try {
-        launched = (await client!.call("launch", { app })) as LaunchResult
-      } catch (error) {
-        if (app === "calculator") {
-          console.log(`calculator: skipped (launch refused; not a smoke failure): ${String(error)}`)
-          continue
-        }
-        throw error
-      }
+    for (const app of Object.keys(client!.apps)) {
+      const launched = (await client!.call("launch", { app })) as LaunchResult
       apps.push(launched)
       const tree = (await client!.call("tree", { window: launched.window })) as TreeResult
       console.log(`${app}: ${tree.nodes} nodes, ${tree.chars} chars, ${tree.ms} ms`)
-      if (app === "notepad") {
-        const lines = tree.text.split("\n")
-        const edit =
-          lines.find((line) => /\b(?:Edit|Document)\b/.test(line) && /readonly=false/.test(line)) ??
-          lines.find((line) => /\bDocument\b/.test(line) && /text="/.test(line))
-        const ref = edit && /^\s*(e\d+)\s/.exec(edit)?.[1]
-        if (!ref) throw new Error("No Edit control in the launched Notepad")
-        const text = "Amira owned-window smoke — héllo 你好"
-        const typed = await client!.call("type", { window: launched.window, ref, text })
-        const read = (await client!.call("tree", { window: launched.window })) as TreeResult
-        if (!read.text.includes(text)) throw new Error("Owned Notepad read-back did not match")
-        console.log(`notepad type + read-back: matched; ${JSON.stringify(typed)}`)
-      }
+      const edits = tree.text.split("\n").filter((line) => line.includes(' Edit name="Multiline text" '))
+      const ref = edits.length === 1 && /^\s*(e\d+)\s/.exec(edits[0]!)?.[1]
+      if (!ref) throw new Error("Expected one named multiline Edit control in the launched testWindow")
+      const text = "Amira owned-window smoke — héllo 你好"
+      const typed = await client!.call("type", { window: launched.window, ref, text })
+      const read = (await client!.call("tree", { window: launched.window })) as TreeResult
+      if (!read.text.includes(text)) throw new Error("Owned testWindow read-back did not match")
+      console.log(`testWindow type + read-back: matched; ${JSON.stringify(typed)}`)
     }
     for (const app of apps) {
       const closed = (await client!.call("close", { window: app.window })) as { closed: boolean }

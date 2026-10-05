@@ -46,7 +46,7 @@ function Get-Argument($object, [string] $name, $default = $null) {
     return ,$property.Value
 }
 
-function Get-Identity([int] $processId, [switch] $WithPath) {
+function Get-Identity([int] $processId) {
     $process = $null
     try {
         $process = [System.Diagnostics.Process]::GetProcessById($processId)
@@ -54,13 +54,10 @@ function Get-Identity([int] $processId, [switch] $WithPath) {
         $null = $process.Handle
         $started = $process.StartTime.ToUniversalTime().Ticks
         if ($process.HasExited) { return $null }
-        $path = $null
-        if ($WithPath) { $path = $process.MainModule.FileName }
         return [pscustomobject]@{
             Pid = $processId
             Started = $started
             Key = ('{0}:{1}' -f $processId, $started)
-            Path = $path
         }
     } catch { return $null }
     finally { if ($null -ne $process) { $process.Dispose() } }
@@ -113,6 +110,7 @@ function Save-OwnedState {
         @{ Pid = $_.Pid; Started = $_.Started.ToString() }
     })
     $state = @{
+        OwnershipVersion = 2
         Helper = @{ Pid = $script:self.Pid; Started = $script:self.Started.ToString() }
         Processes = $records
     } | ConvertTo-Json -Depth 4 -Compress
@@ -121,6 +119,25 @@ function Save-OwnedState {
     # null backup path to .NET rather than an invalid empty path.
     if ([IO.File]::Exists($StatePath)) { [IO.File]::Replace($StatePath + '.tmp', $StatePath, [NullString]::Value) }
     else { [IO.File]::Move($StatePath + '.tmp', $StatePath) }
+}
+
+# Version 2 records only Start-Process identities and the helper itself. Older
+# journals may contain heuristically discovered processes and must never be reaped.
+function Test-OwnedState($state) {
+    $version = Get-Argument $state 'OwnershipVersion'
+    $helper = Get-Argument $state 'Helper'
+    $records = Get-Argument $state 'Processes'
+    if ($version -isnot [int] -or $version -ne 2 -or
+        $null -eq $helper -or $records -isnot [System.Array]) { return $false }
+    foreach ($identity in (@($helper) + @($records))) {
+        $processId = 0
+        $started = 0L
+        if (-not [int]::TryParse([string](Get-Argument $identity 'Pid'), [ref]$processId) -or
+            $processId -le 0 -or
+            -not [long]::TryParse([string](Get-Argument $identity 'Started'), [ref]$started) -or
+            $started -le 0) { return $false }
+    }
+    return $true
 }
 
 # Reap abandoned journals from earlier clients, not just this client's restart.
@@ -133,19 +150,10 @@ function Clear-StaleJournals {
             [string]::Equals($file, $StatePath + '.tmp', [StringComparison]::OrdinalIgnoreCase)) { continue }
         try {
             $state = [IO.File]::ReadAllText($file) | ConvertFrom-Json
-            $helper = Get-Argument $state 'Helper'
-            $records = Get-Argument $state 'Processes'
-            if ($null -eq $helper -or $records -isnot [System.Array]) { continue }
-            $valid = $true
-            foreach ($identity in (@($helper) + @($records))) {
-                $processId = 0
-                $started = 0L
-                if (-not [int]::TryParse([string](Get-Argument $identity 'Pid'), [ref]$processId) -or
-                    $processId -le 0 -or
-                    -not [long]::TryParse([string](Get-Argument $identity 'Started'), [ref]$started) -or
-                    $started -le 0) { $valid = $false; break }
-            }
-            if (-not $valid -or -not (Test-IdentityGone $helper)) { continue }
+            if (-not (Test-OwnedState $state)) { continue }
+            $helper = $state.Helper
+            $records = $state.Processes
+            if (-not (Test-IdentityGone $helper)) { continue }
             $gone = $true
             foreach ($identity in $records) {
                 Stop-ExactProcess $identity
@@ -171,13 +179,14 @@ try {
     if (-not [string]::IsNullOrEmpty($StatePath) -and [IO.File]::Exists($StatePath)) {
         # Restart cleans old launch identities, never adopts their windows or refs.
         $previous = [IO.File]::ReadAllText($StatePath) | ConvertFrom-Json
+        if (-not (Test-OwnedState $previous)) { Deny 'Untrusted or older launch journal; cleanup refused.' }
         foreach ($identity in (@($previous.Helper) + @($previous.Processes))) {
             Stop-ExactProcess $identity
             if (-not (Test-IdentityGone $identity)) {
                 # Never discard a failed kill or grant it a window/ref on restart.
                 $record = [pscustomobject]@{
                     Pid = [int]$identity.Pid; Started = [long]$identity.Started
-                    Key = ('{0}:{1}' -f $identity.Pid, $identity.Started); Path = $null
+                    Key = ('{0}:{1}' -f $identity.Pid, $identity.Started)
                 }
                 $script:processes[$record.Key] = $record
             }
@@ -266,25 +275,6 @@ namespace OwnedUia {
         public static extern bool SetCursorPos(int x, int y);
         [DllImport("user32.dll")]
         public static extern bool GetCursorPos(out POINT point);
-        [DllImport("ntdll.dll")]
-        private static extern int NtQueryInformationProcess(IntPtr process, int infoClass,
-            ref PROCESS_BASIC_INFORMATION info, int size, out int returned);
-        [StructLayout(LayoutKind.Sequential)]
-        private struct PROCESS_BASIC_INFORMATION {
-            public IntPtr Reserved1, Peb, Reserved2, Reserved3, Pid, Parent;
-        }
-        // -1 means unavailable, not a positive parent/activation correlation.
-        public static int ParentPid(int pid) {
-            try {
-                using (var process = System.Diagnostics.Process.GetProcessById(pid)) {
-                    var info = new PROCESS_BASIC_INFORMATION();
-                    int returned;
-                    if (NtQueryInformationProcess(process.Handle, 0, ref info,
-                        Marshal.SizeOf(typeof(PROCESS_BASIC_INFORMATION)), out returned) != 0) return -1;
-                    return checked((int)info.Parent.ToInt64());
-                }
-            } catch { return -1; }
-        }
         [DllImport("user32.dll")]
         public static extern short GetAsyncKeyState(int key);
         [DllImport("user32.dll")]
@@ -545,26 +535,6 @@ namespace OwnedUia {
         }
     }
 
-    function Test-AppPath([string] $path, [string] $expected, [string] $handoff) {
-        if ([string]::IsNullOrEmpty($path)) { return $false }
-        if ([string]::Equals($path, $expected, [StringComparison]::OrdinalIgnoreCase)) { return $true }
-        if ([string]::IsNullOrEmpty($handoff)) { return $false }
-        $programFiles = [Environment]::GetEnvironmentVariable('ProgramW6432')
-        if ([string]::IsNullOrEmpty($programFiles)) { $programFiles = $env:ProgramFiles }
-        $windowsApps = [IO.Path]::Combine($programFiles, 'WindowsApps')
-        if ($handoff -eq 'calculator') {
-            $package = 'Microsoft.WindowsCalculator'
-            $executable = 'CalculatorApp.exe'
-        } else {
-            $package = 'Microsoft.WindowsNotepad'
-            $executable = 'Notepad.exe'
-        }
-        $expression = '^' + [regex]::Escape($windowsApps) + '\\' +
-            [regex]::Escape($package) + '_[^\\]+\\(?:[^\\]+\\)*' +
-            [regex]::Escape($executable) + '$'
-        return [regex]::IsMatch($path, $expression, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
-    }
-
     function Quote-ProcessArgument([string] $argument) {
         # Start-Process joins ArgumentList with spaces in Windows PowerShell 5.1.
         # Quote every argv entry, doubling backslashes before quotes/the final quote.
@@ -590,8 +560,7 @@ namespace OwnedUia {
         # Resolve an executable, not a PowerShell command, expression, or script.
         $resolved = @(Get-Command -Name $command -CommandType Application -ErrorAction SilentlyContinue)
         if ($resolved.Count -eq 0) { Deny 'Allowlisted executable is unavailable.' }
-        # Get-Command can return both System32 and Windows copies of Notepad. Use
-        # the first PATH resolution, as launching this executable name normally does.
+        # Use the first PATH resolution, as launching this executable name normally does.
         $path = [IO.Path]::GetFullPath($resolved[0].Path)
         if ([IO.Path]::GetExtension($path) -ine '.exe') { Deny 'Allowlisted command must be an executable.' }
         $arguments = Get-Argument $entry.Value 'args' @()
@@ -603,49 +572,10 @@ namespace OwnedUia {
             if ($argument -isnot [string]) { Deny 'Allowlisted args must be a string array.' }
         }
 
-        # Only known Windows launchers may hand off into the two packaged apps.
-        $handoff = ''
-        $leaf = [IO.Path]::GetFileName($path)
-        $directory = [IO.Path]::GetDirectoryName($path)
-        $windowsDirectories = @($env:WINDIR, ([IO.Path]::Combine($env:WINDIR, 'System32')),
-            ([IO.Path]::Combine($env:WINDIR, 'SysWOW64')))
-        if ($windowsDirectories -icontains $directory) {
-            if ($leaf -ieq 'calc.exe') { $handoff = 'calculator' }
-            elseif ($leaf -ieq 'notepad.exe') { $handoff = 'notepad' }
-        }
-
-        if ($handoff -eq 'calculator') {
-            # Fail closed: only a positively identified full-trust Calculator can
-            # own its window. Missing cmdlets/packages/manifest data are not consent.
-            $adoptable = $false
-            try {
-                if (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue) {
-                    $packages = @(Get-AppxPackage -Name Microsoft.WindowsCalculator -ErrorAction Stop)
-                    if ($packages.Count -eq 1) {
-                        [xml]$manifest = [IO.File]::ReadAllText([IO.Path]::Combine($packages[0].InstallLocation, 'AppxManifest.xml'))
-                        $applications = @($manifest.Package.Applications.Application)
-                        if ($applications.Count -eq 1) {
-                            $application = $applications[0]
-                            $executable = [IO.Path]::Combine($packages[0].InstallLocation, $application.GetAttribute('Executable'))
-                            $adoptable = ($application.GetAttribute('EntryPoint') -eq 'Windows.FullTrustApplication' -and
-                                (Test-AppPath $executable '' $handoff) -and [IO.File]::Exists($executable))
-                        }
-                    }
-                }
-            } catch { $adoptable = $false }
-            if (-not $adoptable) {
-                Deny 'Calculator refused before launch: a full-trust owned-window app could not be established (stock UWP uses shared ApplicationFrameHost).'
-            }
-        }
         Assert-Lifetime
         $beforeHandles = @{}
         foreach ($native in [OwnedUia.Native]::Windows()) {
             $beforeHandles[$native.Handle.ToInt64().ToString()] = $true
-        }
-        $beforeProcesses = @{}
-        foreach ($process in [Diagnostics.Process]::GetProcesses()) {
-            try { $beforeProcesses[$process.Id] = $true }
-            finally { $process.Dispose() }
         }
         $began = [DateTime]::UtcNow.Ticks
         $startOptions = @{ FilePath = $path; PassThru = $true; ErrorAction = 'Stop' }
@@ -654,75 +584,43 @@ namespace OwnedUia {
         }
         $launcher = Start-Process @startOptions
         $launcherIdentity = $null
-        $launchKeys = @{}
         $windowRef = $null
         try {
             # Keep Start-Process's original handle even if a short-lived launcher exits.
-            $null = $launcher.Handle
-            $started = $launcher.StartTime.ToUniversalTime().Ticks
-            if ($started -lt $began -or $beforeProcesses.ContainsKey($launcher.Id)) {
-                Deny 'Already-running process handoff is not permitted.'
+            try {
+                $null = $launcher.Handle
+                $started = $launcher.StartTime.ToUniversalTime().Ticks
+            } catch {
+                Deny 'Launched process identity is unavailable; no window was adopted. Apps that hand off to another process are not supported.'
             }
+            if ($started -lt $began) { Deny 'Start-Process did not return a newly launched process; launch refused.' }
             $launcherIdentity = [pscustomobject]@{
                 Pid = $launcher.Id; Started = $started
-                Key = ('{0}:{1}' -f $launcher.Id, $started); Path = $path
+                Key = ('{0}:{1}' -f $launcher.Id, $started)
             }
-            $launchKeys[$launcherIdentity.Key] = $true
             $script:processes[$launcherIdentity.Key] = $launcherIdentity
             Save-OwnedState
 
             $clock = [Diagnostics.Stopwatch]::StartNew()
             $stableKey = ''
             $stableSince = 0L
+            $exitedSince = $null
             while ($clock.ElapsedMilliseconds -lt 15000) {
                 Assert-Lifetime
-                # Journal hand-off targets even before they have a visible window.
-                # A timeout, ambiguity or provider failure must not strand them.
-                if (-not [string]::IsNullOrEmpty($handoff)) {
-                    foreach ($process in [Diagnostics.Process]::GetProcesses()) {
-                        try {
-                            if ($beforeProcesses.ContainsKey($process.Id)) { continue }
-                            $identity = Get-Identity $process.Id -WithPath
-                            if ($null -ne $identity -and $identity.Started -ge $began -and
-                                (Test-AppPath $identity.Path '' $handoff) -and
-                                -not $launchKeys.ContainsKey($identity.Key)) {
-                                $launchKeys[$identity.Key] = $true
-                                $script:processes[$identity.Key] = $identity
-                                Save-OwnedState
-                            }
-                        } finally { $process.Dispose() }
-                    }
-                }
                 $candidates = New-Object System.Collections.Generic.List[object]
                 foreach ($native in [OwnedUia.Native]::Windows()) {
                     if (-not $native.Visible -or
                         $beforeHandles.ContainsKey($native.Handle.ToInt64().ToString()) -or
                         [OwnedUia.Native]::GetAncestor($native.Handle, 2) -ne $native.Handle) { continue }
-                    $identity = Get-Identity ([int]$native.Pid) -WithPath
-                    if ($null -eq $identity -or $identity.Started -lt $began -or
-                        $beforeProcesses.ContainsKey($identity.Pid) -or
-                        -not (Test-AppPath $identity.Path $path $handoff)) { continue }
-                    # Ordinary launches require the exact Start-Process identity.
-                    if ($identity.Key -ne $launcherIdentity.Key) {
-                        if ([string]::IsNullOrEmpty($handoff) -or
-                            -not (Test-AppPath $identity.Path '' $handoff)) { continue }
-                        # A process can appear between the process and HWND snapshots.
-                        if (-not $launchKeys.ContainsKey($identity.Key)) {
-                            $launchKeys[$identity.Key] = $true
-                            $script:processes[$identity.Key] = $identity
-                            Save-OwnedState
-                        }
-                        if (-not $launcher.HasExited) { continue }
-                        if ($identity.Started -lt $started -or
-                            $identity.Started - $started -gt [TimeSpan]::FromSeconds(3).Ticks) {
-                            Deny 'Hand-off cannot be correlated with an exited launcher within three seconds.'
-                        }
-                        $parentPid = [OwnedUia.Native]::ParentPid($identity.Pid)
-                        if ($parentPid -ge 0 -and $parentPid -ne $launcherIdentity.Pid) {
-                            Deny 'Hand-off parent does not match the launcher; activation provenance is unavailable.'
-                        }
+                    # Foreign windows are metadata-only evidence of an unsupported
+                    # launch. Never resolve their process identity, path, title or UIA.
+                    if ($native.Pid -ne $launcherIdentity.Pid) {
+                        Deny 'This app hands its window to another process, which this extension does not support. Use an app that owns its launched window.'
                     }
-                    $candidates.Add([pscustomobject]@{ Native = $native; Identity = $identity })
+                    if (-not (Test-Identity $launcherIdentity)) {
+                        Deny 'Launched process exited or its identity changed before owning a window.'
+                    }
+                    $candidates.Add([pscustomobject]@{ Native = $native; Identity = $launcherIdentity })
                 }
                 if ($candidates.Count -gt 1) { Deny 'Launch discovery is ambiguous; no window was adopted.' }
                 if ($candidates.Count -eq 1) {
@@ -736,7 +634,7 @@ namespace OwnedUia {
                         $window = [pscustomobject]@{
                             Ref = $windowRef; Handle = $candidate.Native.Handle
                             Identity = $candidate.Identity; Root = $null; Refs = @{}
-                            ProcessKeys = @($launchKeys.Keys)
+                            ProcessKeys = @($launcherIdentity.Key)
                         }
                         $script:windows[$windowRef] = $window
                         Assert-Window $window
@@ -746,41 +644,26 @@ namespace OwnedUia {
                         return @{ window = $windowRef; pid = $window.Identity.Pid; title = (Escape-Field $title) }
                     }
                 } else { $stableKey = '' }
+                if ($launcher.HasExited) {
+                    # Briefly observe metadata so a delayed foreign window can get
+                    # the clear unsupported-launch error, without inspecting it.
+                    if ($null -eq $exitedSince) { $exitedSince = $clock.ElapsedMilliseconds }
+                    if ($clock.ElapsedMilliseconds - $exitedSince -ge 3000) {
+                        Deny 'Launched process exited without owning a window. Apps that hand off to another process are not supported.'
+                    }
+                }
                 Start-Sleep -Milliseconds 100
             }
-            Deny 'No new, unambiguous owned window appeared; old process handoff is refused.'
+            Deny 'Launched process never owned a new, unambiguous window. Apps that hand off to another process are not supported.'
         } catch {
             if ($null -ne $windowRef) { $script:windows.Remove($windowRef) }
-            # Stop the original handle too if identity capture/journaling failed.
-            if ($null -eq $launcherIdentity) {
-                try { if (-not $launcher.HasExited) { $launcher.Kill() } } catch { }
-            } else { Stop-ExactProcess $launcherIdentity }
-            # One final process-only sweep catches targets that appeared between
-            # polls, or when launcher identity capture failed before discovery.
-            if (-not [string]::IsNullOrEmpty($handoff)) {
-                $cleanupProcesses = @()
-                try { $cleanupProcesses = [Diagnostics.Process]::GetProcesses() } catch { }
-                foreach ($process in $cleanupProcesses) {
-                    try {
-                        if ($beforeProcesses.ContainsKey($process.Id)) { continue }
-                        $identity = Get-Identity $process.Id -WithPath
-                        if ($null -ne $identity -and $identity.Started -ge $began -and
-                            (Test-AppPath $identity.Path '' $handoff)) {
-                            $launchKeys[$identity.Key] = $true
-                            $script:processes[$identity.Key] = $identity
-                            Save-OwnedState
-                        }
-                    } catch { } # A failed journal write must not prevent exact cleanup.
-                    finally { $process.Dispose() }
-                }
-            }
-            foreach ($key in @($launchKeys.Keys)) {
-                $identity = $script:processes[$key]
-                Stop-ExactProcess $identity
+            # If identity capture failed, ownership is unproven: do not guess or kill.
+            if ($null -ne $launcherIdentity) {
+                Stop-ExactProcess $launcherIdentity
                 # Failed kills stay discoverable by the watchdog, never forgotten.
-                if (Test-IdentityGone $identity) { $script:processes.Remove($key) }
+                if (Test-IdentityGone $launcherIdentity) { $script:processes.Remove($launcherIdentity.Key) }
+                Save-OwnedState
             }
-            Save-OwnedState
             throw
         } finally { $launcher.Dispose() }
     }

@@ -15,30 +15,31 @@ Install with `amira ext install computer-use-uia`, then opt in in **`~/.amira/se
 {
   "extensions": {
     "computer-use-uia": {
-      "enabled": true,
-      "apps": {
-        "notepad": { "command": "notepad.exe" }
-      }
+      "enabled": true
     }
   }
 }
 ```
 
-`enabled` defaults to `false`, even after installation. Omitting `apps` permits only Notepad;
-supplying it **replaces** the defaults. `{}` permits no launches. Both `enabled` and `apps`
-come only from the explicit **user** layer exposed by `api.settings.layers("extensions")`;
+`enabled` defaults to `false`, even after installation. Omitting `apps` permits only `testWindow`,
+the bundled `helper/test-window.ps1` WinForms window owned by its launched `powershell.exe` PID.
+Its script path is resolved from the installed extension, not the working directory, and it
+runs with `powershell.exe -NoProfile -ExecutionPolicy Bypass -File <script path>`. The fixture
+has named multiline/single-line text fields, a button/status label, a checkbox and an item list.
+You can add classic Win32 apps with entries such as `"editor": { "command": "C:\\Tools\\editor.exe" }`
+(using JSON-escaped backslashes in settings); each app must keep its window in the launched process.
+A custom `apps` allowlist **replaces** the defaults. `{}` permits no launches.
+Both `enabled` and `apps` come only from the explicit **user** layer exposed by
+`api.settings.layers("extensions")`;
 project, project-local and flag layers are ignored, even when they override user values.
 Without settings provenance the extension stays disabled. Configure executable paths and
 optional argument arrays (`"args": ["--force-renderer-accessibility"]`) yourself; the model
 can only select an allowed **name**, not supply a command or launch arguments.
 Non-Windows hosts register no tools and print at most one short notice.
 
-Calculator is **not a default app**: stock Windows 11 Calculator is refused before launch
-because its window uses shared ApplicationFrameHost. You can explicitly add
-`"calculator": { "command": "calc.exe" }` to your user allowlist, but it may not work.
-Missing/inaccessible package or manifest information also causes refusal before launch;
-only positively identified full-trust Calculator packages with a matching executable pass
-preflight, and they must still satisfy the hand-off discovery checks.
+**D109 — user decision, 2026-10-05:** packaged Notepad/Calculator, packaged/UWP apps, and
+apps that hand off to an existing process are unsupported. This includes most browsers and
+VS Code when already running. Adding them to the allowlist does not make them supported.
 
 ## Safety boundary
 
@@ -49,31 +50,15 @@ PID, process creation time (PID reuse), top-level status, and the ancestry/PID o
 node/ref before reading or acting. Element refs are local to the latest tree of that window.
 All tools are serialized and main-session-only, avoiding competing sub-agent keyboard focus.
 
-Internally during launch discovery, the helper **enumerates top-level window handles/PIDs
-and process paths to find its own new window**. It does not read other windows' titles or UIA
-trees; nothing about other windows is returned to the model or logged. Ordinary launches
-require the exact PID/creation time returned by Start-Process and a new visible top-level HWND.
-For packaged-app hand-off, the known mappings are `notepad.exe` → `Notepad.exe` and
-`calc.exe` → `CalculatorApp.exe`, restricted to the corresponding Microsoft WindowsApps
-package. New matching process identities are journaled immediately, even before a visible
-window appears, so the watchdog can clean them up if discovery fails. Every failed launch
-terminates its launcher and journaled matches by exact PID/start time; failed kills remain
-journaled for retry rather than being forgotten.
-
-A hand-off window is adopted only after the launcher stub exits, with the candidate's process
-start time between the launcher's start and three seconds later. Available native parent
-information must match the launcher; brokered activation with a different parent is refused
-because this helper has no activation token to correlate it. The window must also remain the
-sole match for 500 ms. Already-running/single-instance hand-offs, unknown targets and ambiguous
-matches are refused. An existing/shared frame host is never adopted. You may need to close an
-already-running instance **yourself** first; do not use apps that hand work to an existing process.
-
-**Remaining adoption race:** when parent information is unavailable, path/start-time matching
-and an exited stub are still a heuristic, not proof of activation provenance. A concurrent
-independent launch of the same packaged app can match the discovery journal and may be adopted
-or terminated during failed-launch cleanup. Even available parent PIDs lack an activation token.
-Do not launch the same app concurrently while discovery is running. This experimental guard
-is conservative, not a general process-provenance sandbox.
+During launch discovery, the helper enumerates top-level window handles/PIDs to find its
+own new visible top-level HWND. Ownership requires the **exact PID returned by Start-Process
+and its process start time**; no other process is adopted. Foreign new-window metadata can
+cause a generic launch refusal, but is not evidence of launch provenance. The helper does not
+read foreign window names/content, return or log their metadata, or adopt or kill their processes.
+A concurrent unrelated new window can conservatively refuse the launch; no attempt is made
+to attribute that foreign window to the app. Failed-launch cleanup terminates only the exact
+launched PID/start-time identity; failed kills remain journaled for retry. If the launch identity
+cannot be captured, cleanup does not guess or kill; the launched app may remain running.
 
 `ui_tree` declares `traits: { readOnly: true }`. Launch, click, type, key and close do not:
 Amira's normal permission policy asks in default mode and runs in auto mode. There is no
@@ -109,9 +94,9 @@ on the TypeScript side. Timing covers the helper traversal/rendering, not PowerS
 or IPC. The appended character count is the rendered node text, excluding the timing/cut note.
 `ui_type` allows at most 20,000 UTF-16 code units per call. Document/Edit controls exposing
 TextPattern instead of ValuePattern include a bounded `text` field (512 characters); writable
-ValuePattern controls show `readonly=false`. Notepad's multiline editor commonly exposes
-TextPattern only, so typing uses Unicode SendInput and read-back uses TextPattern. This is
-**not** reported as ValuePattern.SetValue. Unknown enabled/offscreen flags are shown as `?`.
+ValuePattern controls show `readonly=false`. For TextPattern-only editors, typing uses
+Unicode SendInput and read-back uses TextPattern; this is **not** reported as
+ValuePattern.SetValue. Unknown enabled/offscreen flags are shown as `?`.
 Unreadable provider nodes are marked `unreadable`, receive no actionable helper ref, and do
 not abort their siblings; an ownership/lifetime Deny still aborts the whole snapshot. Each
 node's ancestry is verified once per tree, not again for each property. A cooperative **20 s**
@@ -128,16 +113,18 @@ extension-owned background job acts as a lifetime sentinel. Amira kills that job
 the helper watches its exact process identity while waiting for input, then cleans up and
 exits. An independent headless watchdog, also started through `api.openPipe`, reads a private
 per-client journal containing **only launch PID/creation-time identities**. It reaps those
-identities after helper death (including packaged hand-offs). On unload/session end it gives
+identities after helper death. On unload/session end it gives
 the helper three seconds to close gracefully, then terminates remaining recorded processes
 and the helper even if a UIA provider is stuck. The sentinel's original creation time travels
 with its PID to prevent PID-reuse mistakes. This lifecycle bridge adds two headless PowerShell
 processes while in use; neither enumerates or reads desktop windows. A restarted helper first
-cleans the old journal and never adopts old window handles. Temporary journals are removed by
+cleans the previous current-schema journal and never adopts old window handles. Temporary journals are removed by
 the watchdog on session end/unload. If termination cannot be confirmed, it reports incomplete
 cleanup and retains the journal instead of silently forgetting the owned process identities.
-On startup the helper also scans `%TEMP%` for this extension's `amira-uia-<UUID>.json` journals
-(and atomic-write `.tmp` files). It skips live/inaccessible helpers, validates all recorded
+Journals retain the `amira-uia-<UUID>.json` prefix (and atomic-write `.tmp` files), but require
+`OwnershipVersion=2`. Old heuristic journals are ignored by stale cleanup, helper restart and
+the watchdog; their recorded processes are not treated as owned. On startup the helper scans
+`%TEMP%` for current-schema journals. It skips live/inaccessible helpers, validates all recorded
 PID/start-time identities, kills only those exact recorded processes if necessary, and removes
 a stale journal only after confirming every recorded process is gone. Invalid/unreadable
 journals and failed kills are retained; journals belonging to active helpers are left alone.
@@ -154,15 +141,14 @@ journals and failed kills are retained; journals belonging to active helpers are
 - Electron apps generally need `--force-renderer-accessibility`. Custom-drawn controls may
   expose little or no UIA tree; stale providers and expensive UIA calls can fail or time out.
 - This uses the managed .NET `System.Windows.Automation` client (commonly called **UIA2**),
-  not COM UIA3. Some modern WinUI/UWP providers behave differently or lack ValuePattern;
+  not COM UIA3. Some providers behave differently or lack ValuePattern;
   there is no UIA3/FlaUI dependency and no screenshot fallback. Typing then uses guarded
   Unicode keyboard input, not a pretend ValuePattern success.
-- Packaged UWP/WinUI launch hand-off is restricted as described above. Multi-window,
+- Packaged/UWP apps and process hand-offs are unsupported (D109). Multi-window,
   multi-process, single-instance reuse, and arbitrary application activation chains are not
   generally supported. Closing kills only recorded process identities, never by executable
-  name. A machine crash, forced termination of both helper and watchdog, or a crash before a
-  packaged hand-off PID can be resolved may leave an app alive; an unproven process is never
-  adopted or killed speculatively.
+  name. A machine crash or forced termination of both helper and watchdog may leave an app
+  alive; a foreign process is never adopted or killed speculatively.
 - Allowlisted apps can access files/network and respond to keys in application-specific ways.
   The window guard is not an application sandbox. UIA calls are synchronous; cancellation
   before a tool starts is honored, but an already-issued pattern action cannot be rolled back.
@@ -177,26 +163,21 @@ bun test test
 bun scripts/smoke.ts   # explicit launch/tree/type/read-back/close run, owned apps only
 ```
 
-Unit tests use a fake JSON-line helper and cover ownership/allowlist/ref guards, permissions,
-cutting, lazy restart, timeout and session cleanup, and the entry-point export snapshot.
+Tests are updated for D109 to target the deterministic bundled WinForms `testWindow`, not
+Notepad or Calculator. Unit tests use a fake JSON-line helper to cover launch refusals,
+ownership/allowlist/ref guards, permissions, cutting, lazy restart, timeout and session
+cleanup, user-only settings provenance, and the entry-point export snapshot.
 The desktop tests probe the input desktop **without enumerating windows** and automatically
-skip desktop work on other platforms or when no interactive desktop is available. On Windows
-they also check helper-side refusals without touching any app. With an interactive desktop,
-they launch their own Notepad, set/read Unicode text using native ValuePattern when available
-or the documented Unicode/TextPattern fallback otherwise, verify snapshot/key guards, close it,
-and verify real extension-host unload and helper-crash cleanup. The tests do not skip merely
-because ValuePattern is absent: they report the actual path, without claiming native
-ValuePattern coverage. Desktop-free helper **source contract tests** cover discovery journal
-ordering, failure cleanup, correlation checks, cursor checks, tree budgets/provider errors and
-stale-journal safeguards; they are not runtime PowerShell/provider tests. Unit tests also cover
-user-only settings provenance and Calculator opt-in. The explicit smoke script opts into
-Calculator and reports its launch refusal as a **skip, not a failed smoke run**; supported apps
-still report tree nodes/characters/milliseconds, and Notepad/read-back/close failures still
-fail the run. Never test against a window you did not launch.
+skip desktop work on other platforms or when no interactive desktop is available. With an
+interactive desktop, they launch only the bundled window for tree/type/read-back/key/close,
+extension-host unload and helper-crash cleanup checks. Desktop-free helper **source contract
+tests** cover exact launched-PID ownership, foreign-window refusal, failure cleanup,
+`OwnershipVersion=2` journal safeguards, cursor checks and tree budgets/provider errors;
+they are not runtime PowerShell/provider tests. The explicit smoke script also targets the
+bundled window. Never test against a window you did not launch.
 
-The Windows verification here found Notepad exposing TextPattern, and legacy UWP Calculator
-requiring a shared frame host. Accordingly, **native Notepad ValuePattern round-trip and
-Calculator tree timing were not verified**; the owned Notepad fallback was exercised instead.
+**D109 verification status:** tests have not been run for this change; verification is limited
+to TypeScript and Biome checks. No current desktop measurements or runtime success are claimed.
 
 Provider initialization is called through a typed, non-inlined frame: the managed UIA
 [default proxy loader](https://source.dot.net/UIAutomationClient/MS/Internal/Automation/ProxyManager.cs.html)

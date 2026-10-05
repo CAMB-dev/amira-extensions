@@ -321,7 +321,7 @@ export class UiaClient {
     this.failPending(new Error(message))
     // Never overlap helpers writing the same launch journal during a restart.
     this.retired = this.pipeExited
-    // EOF gives the helper a chance to close even packaged launch hand-offs.
+    // EOF gives the helper a chance to close its exact launched windows.
     pipe?.close(5000)
   }
 

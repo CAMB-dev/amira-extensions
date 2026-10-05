@@ -37,6 +37,21 @@ function Test-IdentityGone($identity) {
     finally { if ($null -ne $process) { $process.Dispose() } }
 }
 
+# Never consume pre-D109 journals: they may contain unproven hand-off targets.
+function Test-OwnedState($state) {
+    try {
+        if ($state.OwnershipVersion -isnot [int] -or $state.OwnershipVersion -ne 2 -or
+            $null -eq $state.Helper -or $state.Processes -isnot [System.Array]) { return $false }
+        foreach ($identity in (@($state.Helper) + @($state.Processes))) {
+            $processId = 0
+            $started = 0L
+            if (-not [int]::TryParse([string]$identity.Pid, [ref]$processId) -or $processId -le 0 -or
+                -not [long]::TryParse([string]$identity.Started, [ref]$started) -or $started -le 0) { return $false }
+        }
+        return $true
+    } catch { return $false }
+}
+
 if ($Sentinel) {
     $self = [Diagnostics.Process]::GetCurrentProcess()
     try {
@@ -68,6 +83,7 @@ try {
         try {
             if (Test-Path -LiteralPath $StatePath) {
                 $state = [IO.File]::ReadAllText($StatePath) | ConvertFrom-Json
+                if (-not (Test-OwnedState $state)) { throw 'Untrusted or older launch journal; cleanup refused.' }
                 $helperProcess = Get-ExactProcess $state.Helper
                 $helperDead = $null -eq $helperProcess
                 if ($helperDead -or $force) {

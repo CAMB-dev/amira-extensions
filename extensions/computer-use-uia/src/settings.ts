@@ -1,3 +1,5 @@
+import { fileURLToPath } from "node:url"
+
 export interface App {
   command: string
   args?: string[]
@@ -9,7 +11,16 @@ export interface UiaSettings {
 }
 
 const DEFAULT_APPS: Record<string, App> = {
-  notepad: { command: "notepad.exe" },
+  testWindow: {
+    command: "powershell.exe",
+    args: [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      fileURLToPath(new URL("../helper/test-window.ps1", import.meta.url)),
+    ],
+  },
 }
 
 export function readSettings(value: unknown): UiaSettings {

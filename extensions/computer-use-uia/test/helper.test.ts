@@ -37,7 +37,7 @@ function ordered(text: string, ...fragments: string[]) {
 }
 
 describe("helper launch source contracts (not runtime behavior)", () => {
-  test("journals the launcher identity before discovery or provider access", () => {
+  test("journals only the Start-Process identity before discovery or provider access", () => {
     const launch = helperFunction("Start-OwnedApp")
     ordered(
       launch,
@@ -45,9 +45,9 @@ describe("helper launch source contracts (not runtime behavior)", () => {
       "try {",
       "$null = $launcher.Handle",
       "$started = $launcher.StartTime.ToUniversalTime().Ticks",
-      "$started -lt $began -or $beforeProcesses.ContainsKey($launcher.Id)",
+      "if ($started -lt $began) { Deny",
       "$launcherIdentity = [pscustomobject]@{",
-      "$launchKeys[$launcherIdentity.Key] = $true",
+      "Pid = $launcher.Id; Started = $started",
       "$script:processes[$launcherIdentity.Key] = $launcherIdentity",
       "Save-OwnedState",
       "while ($clock.ElapsedMilliseconds -lt 15000)",
@@ -55,111 +55,118 @@ describe("helper launch source contracts (not runtime behavior)", () => {
       "Assert-Element $window $window.Root",
       "$title = Read-Property",
     )
-  })
-
-  test("journals new handoff targets before visible-window discovery and provenance checks", () => {
-    const launch = helperFunction("Start-OwnedApp")
+    expect(launch.match(/\$script:processes\[[^\n]+\] = /g)).toHaveLength(1)
+    // The only other insertion is retention of previously launched current-schema records.
+    expect(code(source).match(/\$script:processes\[[^\n]+\] = /g)).toHaveLength(2)
     const discovery = launch.slice(launch.indexOf("while ($clock.ElapsedMilliseconds -lt 15000)"))
-    ordered(
-      discovery,
-      "foreach ($process in [Diagnostics.Process]::GetProcesses())",
-      "$beforeProcesses.ContainsKey($process.Id)",
-      "$identity = Get-Identity $process.Id -WithPath",
-      "$identity.Started -ge $began",
-      "(Test-AppPath $identity.Path '' $handoff)",
-      "$launchKeys[$identity.Key] = $true",
-      "$script:processes[$identity.Key] = $identity",
-      "Save-OwnedState",
-      "foreach ($native in [OwnedUia.Native]::Windows())",
-      "$identity.Key -ne $launcherIdentity.Key",
-      "if (-not $launchKeys.ContainsKey($identity.Key))",
-      "$script:processes[$identity.Key] = $identity",
-      "Save-OwnedState",
-      "if (-not $launcher.HasExited) { continue }",
-    )
+    expect(discovery).not.toContain("Get-Identity")
+    expect(discovery).not.toMatch(/\$script:processes\[[^\n]+\] = /)
   })
 
-  test("rejects stale, ambiguous, uncorrelated or wrong-parent handoffs before adoption", () => {
+  test("rejects foreign new windows using only metadata before any provider access", () => {
     const launch = helperFunction("Start-OwnedApp")
     ordered(
       launch,
       "$beforeHandles.ContainsKey($native.Handle.ToInt64().ToString())",
-      "$identity.Started -lt $began",
-      "$beforeProcesses.ContainsKey($identity.Pid)",
-      "-not (Test-AppPath $identity.Path $path $handoff)",
-      "$identity.Key -ne $launcherIdentity.Key",
-      "[string]::IsNullOrEmpty($handoff)",
-      "-not (Test-AppPath $identity.Path '' $handoff)",
-      "if (-not $launcher.HasExited) { continue }",
-      "$identity.Started -lt $started",
-      "$identity.Started - $started -gt [TimeSpan]::FromSeconds(3).Ticks",
-      "Deny 'Hand-off cannot be correlated",
-      "$parentPid = [OwnedUia.Native]::ParentPid($identity.Pid)",
-      "$parentPid -ge 0 -and $parentPid -ne $launcherIdentity.Pid",
-      "Deny 'Hand-off parent does not match",
-      "$candidates.Add(",
+      "GetAncestor($native.Handle, 2) -ne $native.Handle",
+      "if ($native.Pid -ne $launcherIdentity.Pid)",
+      "Deny 'This app hands its window to another process, which this extension does not support.",
+      "if (-not (Test-Identity $launcherIdentity))",
+      "Deny 'Launched process exited or its identity changed",
+      "$candidates.Add([pscustomobject]@{ Native = $native; Identity = $launcherIdentity })",
       "if ($candidates.Count -gt 1) { Deny",
       "$clock.ElapsedMilliseconds - $stableSince -ge 500",
+      "ProcessKeys = @($launcherIdentity.Key)",
       "$script:windows[$windowRef] = $window",
+      "Assert-Window $window",
+      "AutomationElement]::FromHandle($window.Handle)",
     )
   })
 
-  test("failed launches revoke the window, clean exact identities and retain failed kills", () => {
+  test("refuses failed identity capture, exited launchers and timeouts without adopting another process", () => {
+    ordered(
+      helperFunction("Start-OwnedApp"),
+      "Deny 'Launched process identity is unavailable; no window was adopted.",
+      "if ($launcher.HasExited)",
+      "if ($null -eq $exitedSince) { $exitedSince = $clock.ElapsedMilliseconds }",
+      "$clock.ElapsedMilliseconds - $exitedSince -ge 3000",
+      "Deny 'Launched process exited without owning a window.",
+      "Deny 'Launched process never owned a new, unambiguous window.",
+    )
+  })
+
+  test("failed launches revoke the window, clean only the exact launcher and retain failed kills", () => {
     const launch = helperFunction("Start-OwnedApp")
     ordered(
       launch,
-      "Deny 'No new, unambiguous owned window appeared",
+      "Deny 'Launched process never owned",
       "} catch {",
       "if ($null -ne $windowRef) { $script:windows.Remove($windowRef) }",
-      "if ($null -eq $launcherIdentity)",
-      "if (-not $launcher.HasExited) { $launcher.Kill() }",
-      "else { Stop-ExactProcess $launcherIdentity }",
-      "$cleanupProcesses = [Diagnostics.Process]::GetProcesses()",
-      "$identity = Get-Identity $process.Id -WithPath",
-      "$identity.Started -ge $began",
-      "(Test-AppPath $identity.Path '' $handoff)",
-      "$script:processes[$identity.Key] = $identity",
-      "Save-OwnedState",
-      "foreach ($key in @($launchKeys.Keys))",
-      "$identity = $script:processes[$key]",
-      "Stop-ExactProcess $identity",
-      "if (Test-IdentityGone $identity) { $script:processes.Remove($key) }",
+      "if ($null -ne $launcherIdentity)",
+      "Stop-ExactProcess $launcherIdentity",
+      "if (Test-IdentityGone $launcherIdentity) { $script:processes.Remove($launcherIdentity.Key) }",
       "Save-OwnedState",
       "throw",
       "finally { $launcher.Dispose() }",
     )
+    expect(launch.match(/Stop-ExactProcess /g)).toHaveLength(1)
+    expect(launch).not.toContain(".Kill()")
   })
 
-  test("Calculator requires positive full-trust manifest evidence before Start-Process", () => {
-    const launch = helperFunction("Start-OwnedApp")
-    ordered(
-      launch,
-      "if ($handoff -eq 'calculator')",
-      "$adoptable = $false",
-      "if (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue)",
-      "Get-AppxPackage -Name Microsoft.WindowsCalculator -ErrorAction Stop",
-      "if ($packages.Count -eq 1)",
-      "[xml]$manifest = [IO.File]::ReadAllText",
-      "if ($applications.Count -eq 1)",
-      "$adoptable = ($application.GetAttribute('EntryPoint') -eq 'Windows.FullTrustApplication' -and",
-      "(Test-AppPath $executable '' $handoff) -and [IO.File]::Exists($executable))",
-      "catch { $adoptable = $false }",
-      "if (-not $adoptable)",
-      "Deny 'Calculator refused before launch:",
-      "$launcher = Start-Process @startOptions",
-    )
+  test("no hand-off mappings, process sweeps, parent correlation or package preflight remain", () => {
+    for (const fragment of [
+      "$handoff",
+      "$launchKeys",
+      "$cleanupProcesses",
+      "$beforeProcesses",
+      "Test-AppPath",
+      "GetProcesses()",
+      "ParentPid",
+      "NtQueryInformationProcess",
+      "Get-AppxPackage",
+      "WindowsApps",
+      "CalculatorApp.exe",
+      "notepad.exe",
+      "-WithPath",
+    ])
+      expect(code(source)).not.toContain(fragment)
+    expect(helperFunction("Get-Identity")).not.toContain("MainModule")
   })
 })
 
-test("debug key output is absent and Calculator smoke refusal is a skip (source contracts)", () => {
+test("debug key output is absent (source contracts)", () => {
   const capture = readFileSync(new URL("./capture.ts", import.meta.url), "utf8")
   const debugMarker = ["[DEBUG", "uia-key]"].join("-")
   expect(source).not.toContain(debugMarker)
   expect(capture).not.toContain(debugMarker)
   expect(source).not.toContain("ScriptStackTrace")
-  const smoke = readFileSync(new URL("../scripts/smoke.ts", import.meta.url), "utf8")
-  ordered(smoke, 'if (app === "calculator")', "skipped (launch refused; not a smoke failure)", "continue")
-  expect(smoke).not.toContain("process.exitCode = 1")
+})
+
+test("bundled fixture has deterministic native controls and never starts another process", () => {
+  const fixture = code(readFileSync(new URL("../helper/test-window.ps1", import.meta.url), "utf8"))
+  for (const name of [
+    "testWindow",
+    "multilineText",
+    "singlelineText",
+    "changeLabelButton",
+    "statusLabel",
+    "testCheckbox",
+    "testItems",
+  ])
+    expect(fixture).toContain(`.Name = '${name}'`)
+  for (const name of [
+    "Multiline text",
+    "Single-line text",
+    "Change label",
+    "Enable option",
+    "Choose an item",
+  ])
+    expect(fixture).toContain(`.AccessibleName = '${name}'`)
+  expect(fixture).toContain("$multiline.Multiline = $true")
+  ordered(fixture, "$button.Add_Click({", "$status.Text = 'Button clicked'")
+  expect(fixture).toContain("@('Alpha', 'Beta', 'Gamma')")
+  expect(fixture).toContain("[System.Windows.Forms.Application]::Run($form)")
+  expect(fixture).not.toMatch(/Start-Process|Bun\.spawn|-TypeDefinition/)
 })
 
 describe("helper pointer source contracts (not runtime behavior)", () => {
@@ -275,6 +282,7 @@ describe("helper stale journal source contracts (not runtime behavior)", () => {
       "$script:self = Get-Identity $PID",
       "\n    Clear-StaleJournals\n",
       "$previous = [IO.File]::ReadAllText($StatePath) | ConvertFrom-Json",
+      "if (-not (Test-OwnedState $previous)) { Deny",
       "Stop-ExactProcess $identity",
       "if (-not (Test-IdentityGone $identity))",
       "$script:processes[$record.Key] = $record",
@@ -295,15 +303,52 @@ describe("helper stale journal source contracts (not runtime behavior)", () => {
       "[string]::Equals($file, $StatePath, [StringComparison]::OrdinalIgnoreCase)",
       "[string]::Equals($file, $StatePath + '.tmp', [StringComparison]::OrdinalIgnoreCase)) { continue }",
       "[IO.File]::ReadAllText($file) | ConvertFrom-Json",
-      "if ($null -eq $helper -or $records -isnot [System.Array]) { continue }",
+      "if (-not (Test-OwnedState $state)) { continue }",
+      "$helper = $state.Helper",
+      "$records = $state.Processes",
+      "if (-not (Test-IdentityGone $helper)) { continue }",
+      "foreach ($identity in $records)",
+      "Stop-ExactProcess $identity",
+    )
+  })
+
+  test("current-schema journals validate every identity and reject legacy ownership rules", () => {
+    ordered(
+      helperFunction("Test-OwnedState"),
+      "$version = Get-Argument $state 'OwnershipVersion'",
+      "$version -isnot [int] -or $version -ne 2",
+      "$null -eq $helper -or $records -isnot [System.Array]) { return $false }",
       "foreach ($identity in (@($helper) + @($records)))",
       "[int]::TryParse([string](Get-Argument $identity 'Pid'), [ref]$processId)",
       "$processId -le 0",
       "[long]::TryParse([string](Get-Argument $identity 'Started'), [ref]$started)",
-      "$started -le 0) { $valid = $false; break }",
-      "if (-not $valid -or -not (Test-IdentityGone $helper)) { continue }",
-      "foreach ($identity in $records)",
-      "Stop-ExactProcess $identity",
+      "$started -le 0) { return $false }",
+      "return $true",
+    )
+    expect(helperFunction("Save-OwnedState")).toContain("OwnershipVersion = 2")
+    const watchdog = code(readFileSync(new URL("../helper/lifetime.ps1", import.meta.url), "utf8"))
+    ordered(
+      watchdog,
+      "$state.OwnershipVersion -isnot [int] -or $state.OwnershipVersion -ne 2",
+      "$state.Processes -isnot [System.Array]) { return $false }",
+      "foreach ($identity in (@($state.Helper) + @($state.Processes)))",
+      "[int]::TryParse([string]$identity.Pid, [ref]$processId)",
+      "[long]::TryParse([string]$identity.Started, [ref]$started)",
+      "return $true",
+      "$state = [IO.File]::ReadAllText($StatePath) | ConvertFrom-Json",
+      "if (-not (Test-OwnedState $state)) { throw",
+      "$helperProcess = Get-ExactProcess $state.Helper",
+      "foreach ($identity in $state.Processes)",
+      "$process = Get-ExactProcess $identity",
+      "$process.Kill()",
+      "$helperProcess.Kill()",
+    )
+    ordered(
+      watchdog,
+      "GetProcessById([int]$identity.Pid)",
+      "$null = $process.Handle",
+      "$process.StartTime.ToUniversalTime().Ticks.ToString() -eq [string]$identity.Started",
+      "return $process",
     )
   })
 
@@ -320,13 +365,36 @@ describe("helper stale journal source contracts (not runtime behavior)", () => {
     )
     ordered(
       helperFunction("Clear-StaleJournals"),
-      "if (-not $valid -or -not (Test-IdentityGone $helper)) { continue }",
+      "if (-not (Test-IdentityGone $helper)) { continue }",
       "$gone = $true",
       "Stop-ExactProcess $identity",
       "if (-not (Test-IdentityGone $identity)) { $gone = $false }",
       "if ($gone) { [IO.File]::Delete($file) }",
       "catch { }",
     )
+  })
+
+  test("window close revalidates the recorded identity, HWND, PID and UIA ancestry", () => {
+    ordered(
+      helperFunction("Request-WindowClose"),
+      "Test-Identity $window.Identity",
+      "IsWindow($window.Handle)",
+      "GetAncestor($window.Handle, 2) -ne $window.Handle",
+      "WindowPid($window.Handle) -ne $window.Identity.Pid",
+      "Get-Pattern $window $window.Root",
+      "Assert-Element $window $window.Root",
+      "$pattern.Close()",
+    )
+    ordered(
+      helperFunction("Close-OwnedWindow"),
+      "$window = Get-Window $parameters",
+      "Request-WindowClose $window",
+      "foreach ($key in $window.ProcessKeys)",
+      "$identity = $script:processes[$key]",
+      "Stop-ExactProcess $identity",
+    )
+    expect(code(source).match(/\.Kill\(\)/g)).toHaveLength(1)
+    expect(code(source).match(/\$pattern\.Close\(\)/g)).toHaveLength(1)
   })
 
   test("cleanup kills only through a cached handle with matching PID and start time", () => {
