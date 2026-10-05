@@ -15,6 +15,9 @@ const DEFAULT_APPS: Record<string, App> = {
     command: "powershell.exe",
     args: [
       "-NoProfile",
+      "-STA",
+      "-WindowStyle",
+      "Hidden",
       "-ExecutionPolicy",
       "Bypass",
       "-File",

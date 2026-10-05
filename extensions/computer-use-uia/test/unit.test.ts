@@ -147,6 +147,9 @@ test("off by default; apps settings replace defaults and validate without partia
       command: "powershell.exe",
       args: [
         "-NoProfile",
+        "-STA",
+        "-WindowStyle",
+        "Hidden",
         "-ExecutionPolicy",
         "Bypass",
         "-File",

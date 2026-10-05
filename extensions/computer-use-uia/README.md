@@ -24,7 +24,7 @@ Install with `amira ext install computer-use-uia`, then opt in in **`~/.amira/se
 `enabled` defaults to `false`, even after installation. Omitting `apps` permits only `testWindow`,
 the bundled `helper/test-window.ps1` WinForms window owned by its launched `powershell.exe` PID.
 Its script path is resolved from the installed extension, not the working directory, and it
-runs with `powershell.exe -NoProfile -ExecutionPolicy Bypass -File <script path>`. The fixture
+runs with `powershell.exe -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File <script path>` (hidden console, so the only visible window is the form). The fixture
 has named multiline/single-line text fields, a button/status label, a checkbox and an item list.
 You can add classic Win32 apps with entries such as `"editor": { "command": "C:\\Tools\\editor.exe" }`
 (using JSON-escaped backslashes in settings); each app must keep its window in the launched process.
