@@ -9,6 +9,7 @@ moves every installed one to its newest commit, and `--project` installs into
 
 | Extension | What it does | Install |
 |---|---|---|
+| [agent-bridge](extensions/agent-bridge/README.md) | Experimental: a long-lived Amira session driven by short CLI calls (`amira agent`), with steering, cursors, and approval responses | `amira ext install agent-bridge` |
 | [mcp-server](extensions/mcp-server/README.md) | Amira as an MCP server (`amira mcp serve`), so Claude Code, Codex, Gemini CLI and others can hand it tasks | `amira ext install mcp-server` |
 | [workflow](extensions/workflow/README.md) | `/workflow` and a `workflow` tool: TypeScript scripts that orchestrate many sub-agents, with limits, a progress view and resume | `amira ext install workflow` |
 | [swarm](extensions/swarm/README.md) | `/swarm <goal>`: long-lived agents that work on one goal together through a shared blackboard and messages | `amira ext install swarm` |

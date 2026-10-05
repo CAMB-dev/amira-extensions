@@ -1,0 +1,15 @@
+{
+  "name": "agent-bridge",
+  "license": "Apache-2.0",
+  "version": "0.0.1",
+  "description": "A local, persistent Amira session for external agents, through short-lived CLI calls",
+  "type": "module",
+  "scripts": {
+    "link-amira": "bun scripts/link-amira.ts",
+    "test": "bun test"
+  },
+  "amira": {
+    "engines": { "amira": "^0.1.27" },
+    "commands": { "agent": "./src/command.ts" }
+  }
+}
