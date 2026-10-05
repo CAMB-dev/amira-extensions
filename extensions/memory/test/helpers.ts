@@ -8,9 +8,10 @@ export function sandbox() {
   const root = mkdtempSync(path.join(os.tmpdir(), "amira-memory-"))
   const home = path.join(root, "home")
   const cwd = path.join(root, "work")
-  mkdirSync(home)
+  const dataDir = path.join(home, "extension-data", "memory-test")
+  mkdirSync(dataDir, { recursive: true })
   mkdirSync(cwd)
-  return { root, home, cwd, cleanup: () => rmSync(root, { recursive: true, force: true }) }
+  return { root, home, dataDir, cwd, cleanup: () => rmSync(root, { recursive: true, force: true }) }
 }
 
 export const signal = () => new AbortController().signal

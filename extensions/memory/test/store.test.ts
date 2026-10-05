@@ -1,5 +1,13 @@
 import { expect, test } from "bun:test"
-import { existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs"
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs"
 import path from "node:path"
 import { MemoryStore, projectKey } from "../src/store.ts"
 import { fact, gitResult, sandbox, signal } from "./helpers.ts"
@@ -42,7 +50,8 @@ test("main checkout, subdirectories and linked worktrees share a safe readable k
 test("create, replace and delete keep the authoritative index synchronized", async () => {
   const h = sandbox()
   try {
-    const store = new MemoryStore(h.home, "project", "example-012345678abc")
+    const store = new MemoryStore(h.dataDir, "project", "example-012345678abc")
+    expect(store.dir).toBe(path.join(h.dataDir, "projects", "example-012345678abc"))
     expect((await store.snapshot()).memories).toEqual([])
     expect(existsSync(store.dir)).toBe(false)
     const saved = await store.write(fact(), 0, signal())
@@ -73,7 +82,7 @@ test("create, replace and delete keep the authoritative index synchronized", asy
 test("missing, damaged and externally stale indexes recover without read side effects", async () => {
   const h = sandbox()
   try {
-    const store = new MemoryStore(h.home, "global", "test")
+    const store = new MemoryStore(h.dataDir, "global", "test")
     mkdirSync(store.dir)
     const { serialize } = await import("../src/format.ts")
     writeFileSync(store.file("writing-style"), serialize(fact()).text)
@@ -105,7 +114,7 @@ test("missing, damaged and externally stale indexes recover without read side ef
 test("subagents and unknown callers cannot mutate or repair storage", async () => {
   const h = sandbox()
   try {
-    const store = new MemoryStore(h.home, "global", "test")
+    const store = new MemoryStore(h.dataDir, "global", "test")
     for (const depth of [1, 2, undefined]) {
       await expect(store.write(fact(), depth, signal())).rejects.toThrow("Subagents are read-only")
       await expect(store.delete("writing-style", depth, signal())).rejects.toThrow("Subagents are read-only")
@@ -126,14 +135,14 @@ test("subagents and unknown callers cannot mutate or repair storage", async () =
 test("bad names, secrets and aborted writes create no storage", async () => {
   const h = sandbox()
   try {
-    const store = new MemoryStore(h.home, "global", "test")
+    const store = new MemoryStore(h.dataDir, "global", "test")
     await expect(store.write(fact("../escape"), 0, signal())).rejects.toThrow()
     await expect(store.write({ ...fact(), body: "password=secret" }, 0, signal())).rejects.toThrow()
     const abort = new AbortController()
     abort.abort()
     await expect(store.write(fact(), 0, abort.signal)).rejects.toThrow()
     expect(existsSync(store.dir)).toBe(false)
-    expect(() => new MemoryStore(h.home, "project", "../escape")).toThrow()
+    expect(() => new MemoryStore(h.dataDir, "project", "../escape")).toThrow()
   } finally {
     h.cleanup()
   }
@@ -142,8 +151,10 @@ test("bad names, secrets and aborted writes create no storage", async () => {
 test("global and project collisions are independent", async () => {
   const h = sandbox()
   try {
-    const global = new MemoryStore(h.home, "global", "test")
-    const project = new MemoryStore(h.home, "project", "test")
+    const global = new MemoryStore(h.dataDir, "global", "test")
+    const project = new MemoryStore(h.dataDir, "project", "test")
+    expect(global.dir).toBe(path.join(h.dataDir, "global"))
+    expect(project.dir).toBe(path.join(h.dataDir, "projects", "test"))
     await global.write(fact(), 0, signal())
     await project.write({ ...fact(), body: "A project-specific fact." }, 0, signal())
     expect((await global.read("writing-style")).body).not.toBe((await project.read("writing-style")).body)
@@ -154,10 +165,41 @@ test("global and project collisions are independent", async () => {
   }
 })
 
+test("atomic writes use only reported temp names and never overwrite abandoned temps", async () => {
+  const h = sandbox()
+  try {
+    const store = new MemoryStore(h.dataDir, "global", "test")
+    await store.write(fact(), 0, signal())
+    const temps = store.writtenPaths("writing-style", "write").filter((file) => file.endsWith(".tmp"))
+    expect(temps).toHaveLength(2)
+    for (const temp of temps) {
+      writeFileSync(temp, "abandoned; do not overwrite")
+      await expect(store.write(fact(), 0, signal())).rejects.toThrow()
+      expect(readFileSync(temp, "utf8")).toBe("abandoned; do not overwrite")
+      expect((await store.read("writing-style")).body).toBe(fact().body)
+      expect(existsSync(path.join(store.dir, ".memory.lock"))).toBe(false)
+      unlinkSync(temp)
+      await store.write(fact(), 0, signal())
+    }
+    const indexTemp = store.writtenPaths("writing-style", "delete").find((file) => file.endsWith(".tmp"))!
+    writeFileSync(indexTemp, "abandoned index")
+    await expect(store.delete("writing-style", 0, signal())).rejects.toThrow()
+    expect(readFileSync(indexTemp, "utf8")).toBe("abandoned index")
+    expect(existsSync(store.file("writing-style"))).toBe(false)
+    expect((await store.snapshot()).needsRepair).toBe(true)
+    unlinkSync(indexTemp)
+    await store.write(fact(), 0, signal())
+    expect((await store.snapshot()).needsRepair).toBe(false)
+    expect(readdirSync(store.dir).sort()).toEqual(["MEMORY.md", "writing-style.md"])
+  } finally {
+    h.cleanup()
+  }
+})
+
 test("directory symlinks/junctions cannot redirect storage into a repository", async () => {
   const h = sandbox()
   try {
-    const store = new MemoryStore(h.home, "global", "test")
+    const store = new MemoryStore(h.dataDir, "global", "test")
     symlinkSync(h.cwd, store.dir, process.platform === "win32" ? "junction" : "dir")
     await expect(store.write(fact(), 0, signal())).rejects.toThrow("real directories")
     await expect(store.snapshot()).rejects.toThrow("real directories")

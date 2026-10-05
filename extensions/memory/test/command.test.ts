@@ -28,8 +28,8 @@ test("all command subcommands, explicit scopes, defaults and invalid syntax", as
   const h = sandbox()
   try {
     const stores = {
-      global: new MemoryStore(h.home, "global", "test"),
-      project: new MemoryStore(h.home, "project", "test"),
+      global: new MemoryStore(h.dataDir, "global", "test"),
+      project: new MemoryStore(h.dataDir, "project", "test"),
     }
     const notices: string[] = []
     const run = async (args: string) => {
@@ -92,8 +92,8 @@ test("TUI requires confirmation; print/RPC require --yes; child deletion fails b
   const h = sandbox()
   try {
     const stores = {
-      global: new MemoryStore(h.home, "global", "test"),
-      project: new MemoryStore(h.home, "project", "test"),
+      global: new MemoryStore(h.dataDir, "global", "test"),
+      project: new MemoryStore(h.dataDir, "project", "test"),
     }
     await stores.project.write(fact(), 0, signal())
     for (const answer of [false, undefined]) {

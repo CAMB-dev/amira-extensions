@@ -1,8 +1,8 @@
-import { createHash, randomUUID } from "node:crypto"
+import { createHash } from "node:crypto"
 import { lstat, mkdir, open, readdir, readFile, realpath, rename, rmdir, unlink } from "node:fs/promises"
 import path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
-import type { ExtensionAPI } from "@amira/api"
+import type { ExtensionAPI, MutateFiles } from "@amira/api"
 import {
   checkName,
   FILE_BYTES,
@@ -79,13 +79,13 @@ export interface Snapshot {
 /** All reads, including recovery of a missing/damaged index, are strictly disk-read-only. */
 export class MemoryStore {
   readonly dir: string
-  private readonly home: string
+  private readonly dataDir: string
 
-  constructor(home: string, scope: Scope, key: string) {
+  constructor(dataDir: string, scope: Scope, key: string) {
     if (!/^[a-z0-9][a-z0-9-]{0,80}$/.test(key)) throw new MemoryError("Invalid project key.")
-    this.home = path.resolve(home)
+    this.dataDir = path.resolve(dataDir)
     this.dir =
-      scope === "global" ? path.join(this.home, "memory") : path.join(this.home, "projects", key, "memory")
+      scope === "global" ? path.join(this.dataDir, "global") : path.join(this.dataDir, "projects", key)
   }
 
   file(name: string): string {
@@ -93,12 +93,37 @@ export class MemoryStore {
     return path.join(this.dir, `${name}.md`)
   }
 
-  /** Refuse symlinks/junctions below (and at) home, including metadata and destination files. */
+  private directoryPaths(): string[] {
+    const dirs = [this.dataDir]
+    let current = this.dataDir
+    for (const part of path.relative(this.dataDir, this.dir).split(path.sep)) {
+      current = path.join(current, part)
+      dirs.push(current)
+    }
+    return dirs
+  }
+
+  private temp(file: string): string {
+    return path.join(this.dir, `.${path.basename(file)}.tmp`)
+  }
+
+  /** Include directory creation, lock cleanup and every atomic-rename destination/source. */
+  writtenPaths(name: string, operation: "write" | "delete"): string[] {
+    const file = this.file(name)
+    const index = path.join(this.dir, "MEMORY.md")
+    return [
+      ...this.directoryPaths(),
+      file,
+      index,
+      path.join(this.dir, ".memory.lock"),
+      ...(operation === "write" ? [this.temp(file)] : []),
+      this.temp(index),
+    ]
+  }
+
+  /** Refuse symlinks/junctions below (and at) dataDir, including metadata and destination files. */
   private async directories(create = false): Promise<boolean> {
-    const relative = path.relative(this.home, this.dir)
-    let current = this.home
-    for (const part of ["", ...relative.split(path.sep)]) {
-      if (part) current = path.join(current, part)
+    for (const current of this.directoryPaths()) {
       if (create) {
         try {
           await mkdir(current, { mode: 0o700 })
@@ -207,49 +232,74 @@ export class MemoryStore {
     }
   }
 
-  private async atomic(file: string, text: string): Promise<void> {
+  private async atomic(file: string, text: string, mutate?: MutateFiles): Promise<void> {
     await this.regular(file)
-    const temp = path.join(this.dir, `.memory-${randomUUID()}.tmp`)
-    const handle = await open(temp, "wx", 0o600)
-    try {
-      await handle.writeFile(text, "utf8")
-      await handle.sync()
-      await handle.close()
-      await rename(temp, file)
-    } finally {
-      await handle.close()
-      await unlink(temp).catch((error: unknown) => {
-        if (!isMissing(error)) throw error
-      })
+    // The directory lock serializes these deterministic names; wx refuses stale files or links.
+    const temp = this.temp(file)
+    const write = async () => {
+      const handle = await open(temp, "wx", 0o600)
+      try {
+        await handle.writeFile(text, "utf8")
+        await handle.sync()
+        await handle.close()
+        await rename(temp, file)
+      } finally {
+        await handle.close()
+        await unlink(temp).catch((error: unknown) => {
+          if (!isMissing(error)) throw error
+        })
+      }
     }
+    // Rewind captures file images, not the directories/lock in the permission path report.
+    if (mutate) {
+      await mutate(
+        [
+          { path: file, after: Buffer.from(text) },
+          { path: temp, after: null },
+        ],
+        write,
+      )
+    } else await write()
   }
 
-  private async syncIndex(): Promise<void> {
+  private async syncIndex(mutate?: MutateFiles): Promise<void> {
     const snapshot = await this.snapshot()
-    await this.atomic(path.join(this.dir, "MEMORY.md"), snapshot.index)
+    await this.atomic(path.join(this.dir, "MEMORY.md"), snapshot.index, mutate)
   }
 
-  async write(input: MemoryInput, depth: number | undefined, signal: AbortSignal): Promise<Memory> {
+  async write(
+    input: MemoryInput,
+    depth: number | undefined,
+    signal: AbortSignal,
+    mutate?: MutateFiles,
+  ): Promise<Memory> {
     requireMain(depth)
     const memory = serialize(input)
     await this.locked(depth, signal, async () => {
       // Refuse a linked index before touching any memory file.
       await this.regular(path.join(this.dir, "MEMORY.md"))
-      await this.atomic(this.file(memory.name), memory.text)
-      await this.syncIndex()
+      await this.atomic(this.file(memory.name), memory.text, mutate)
+      await this.syncIndex(mutate)
     })
     return memory
   }
 
-  async delete(name: string, depth: number | undefined, signal: AbortSignal): Promise<void> {
+  async delete(
+    name: string,
+    depth: number | undefined,
+    signal: AbortSignal,
+    mutate?: MutateFiles,
+  ): Promise<void> {
     requireMain(depth)
     const file = this.file(name)
     await this.locked(depth, signal, async () => {
       await this.regular(path.join(this.dir, "MEMORY.md"))
       if (!(await this.regular(file)))
         throw new MemoryError("Memory not found. Use /memory list to check the name and scope.")
-      await unlink(file)
-      await this.syncIndex()
+      const remove = () => unlink(file)
+      if (mutate) await mutate([{ path: file, after: null }], remove)
+      else await remove()
+      await this.syncIndex(mutate)
     })
   }
 }

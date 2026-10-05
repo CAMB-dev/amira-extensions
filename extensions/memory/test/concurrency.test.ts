@@ -6,7 +6,7 @@ import { sandbox } from "./helpers.ts"
 
 test("two independent processes serialize writes, replacements, deletes and index repair", async () => {
   const h = sandbox()
-  const store = new MemoryStore(h.home, "global", "test")
+  const store = new MemoryStore(h.dataDir, "global", "test")
   mkdirSync(store.dir)
   writeFileSync(path.join(store.dir, "MEMORY.md"), "damaged")
   const children = ["alpha", "beta"].map((id) => {

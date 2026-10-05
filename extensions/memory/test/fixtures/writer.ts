@@ -4,7 +4,7 @@ import { MemoryStore } from "../../src/store.ts"
 
 const [home, id, barrier] = process.argv.slice(2)
 if (!home || !id || !barrier || process.env.AMIRA_HOME !== home) throw new Error("Temporary home required")
-const store = new MemoryStore(home, "global", "test")
+const store = new MemoryStore(path.join(home, "extension-data", "memory-test"), "global", "test")
 const signal = new AbortController().signal
 writeFileSync(path.join(barrier, `${id}.ready`), "ready")
 const deadline = Date.now() + 30_000

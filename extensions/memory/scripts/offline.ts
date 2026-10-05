@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import type { EventMap } from "@amira/api"
 
 interface RpcLine {
   id?: unknown
@@ -8,7 +9,8 @@ interface RpcLine {
   type?: string
   seq?: number
   output?: string[]
-  data?: { requestId?: string; title?: string; text?: string; reason?: string }
+  commands?: Array<{ name: string }>
+  data?: Partial<EventMap["tool.execute.end"]> & { text?: string; reason?: string }
 }
 
 export interface Capture {
@@ -16,8 +18,12 @@ export interface Capture {
   systemPrompt: string
 }
 
-/** Real CLI, offline mock model, explicit RPC approval, and a disposable home/cwd. */
-export async function offlineDemo(core: string, log: (text: string) => void = () => {}) {
+/** Real CLI, offline mock model, no approval requests, and a disposable home/cwd. */
+export async function offlineDemo(
+  core: string,
+  log: (text: string) => void = () => {},
+  mode: "default" | "plan" = "default",
+) {
   const main = path.join(path.resolve(core), "packages", "cli", "src", "main.ts")
   if (!existsSync(main))
     throw new Error("Pass the path to a linked Amira checkout with its dependencies installed.")
@@ -29,21 +35,19 @@ export async function offlineDemo(core: string, log: (text: string) => void = ()
   writeFileSync(path.join(home, "settings.json"), JSON.stringify({ sessions: { autoTitle: false } }))
   const replies = [
     {
-      toolCalls: [
-        {
-          name: "memory_write",
-          args: {
-            scope: "project",
-            name: "writing-style",
-            type: "user",
-            description: "Preferred writing style",
-            body: "The user prefers brief explanations with concrete examples.",
-          },
+      toolCalls: (mode === "plan" ? ["global", "project"] : ["project"]).map((scope) => ({
+        name: "memory_write",
+        args: {
+          scope,
+          name: "writing-style",
+          type: "user",
+          description: "Preferred writing style",
+          body: "The user prefers brief explanations with concrete examples.",
         },
-      ],
+      })),
     },
-    { text: "Saved the preference." },
-    { text: "I can recall the preference on the next turn." },
+    { text: mode === "plan" ? "The memory writes were refused." : "Saved the preference." },
+    { text: "I checked the memory index on the next turn." },
   ]
   const child = Bun.spawn(
     [
@@ -53,6 +57,7 @@ export async function offlineDemo(core: string, log: (text: string) => void = ()
       "-m",
       "mock/m",
       "--no-builtins",
+      ...(mode === "plan" ? ["--permission-mode", "plan"] : []),
       "-e",
       path.resolve(import.meta.dir, "../src/index.ts"),
       "-e",
@@ -82,13 +87,20 @@ export async function offlineDemo(core: string, log: (text: string) => void = ()
       let nl = buffer.indexOf("\n")
       while (nl !== -1) {
         const line = buffer.slice(0, nl).trim()
-        if (line) lines.push(JSON.parse(line) as RpcLine)
+        if (line) {
+          const value = JSON.parse(line) as RpcLine
+          lines.push(value)
+          if (value.type === "ui.request") {
+            throw new Error(`Unexpected approval/UI request in ${mode} mode: ${line}`)
+          }
+        }
         buffer = buffer.slice(nl + 1)
         nl = buffer.indexOf("\n")
       }
     }
   })().catch((error: unknown) => {
     readError = error
+    if (child.exitCode === null) child.kill()
   })
   let nextId = 0
   const send = (value: unknown) => {
@@ -98,9 +110,9 @@ export async function offlineDemo(core: string, log: (text: string) => void = ()
   const wait = async (match: (line: RpcLine) => boolean, label: string) => {
     const deadline = Date.now() + 90_000
     while (true) {
+      if (readError) throw readError
       const found = lines.find(match)
       if (found) return found
-      if (readError) throw readError
       if (timedOut || Date.now() > deadline || child.exitCode !== null) {
         throw new Error(
           `Offline CLI did not produce ${label}.\n${JSON.stringify(lines)}\n${child.exitCode !== null ? await stderr : ""}`,
@@ -121,12 +133,14 @@ export async function offlineDemo(core: string, log: (text: string) => void = ()
   }
   try {
     await event("session.start")
-    log("Temporary AMIRA_HOME created; using the offline mock model.")
-    send({ id: ++nextId, cmd: "prompt", text: "Remember my writing preference in project memory." })
-    const approval = await event("ui.request")
-    if (approval.data?.title !== "Allow memory_write?") throw new Error("Unexpected approval request")
-    log("The host requires approval for memory_write; explicitly approving this demo call.")
-    send({ id: ++nextId, cmd: "ui.respond", requestId: approval.data.requestId, value: true })
+    log(`Temporary AMIRA_HOME created; using the offline mock model in ${mode} permission mode.`)
+    const listId = ++nextId
+    send({ id: listId, cmd: "command.list" })
+    const listing = await response(listId)
+    if (!listing.ok || !listing.commands?.some((item) => item.name === "memory")) {
+      throw new Error(`Memory command was not listed: ${JSON.stringify(listing)}`)
+    }
+    send({ id: ++nextId, cmd: "prompt", text: "Remember my writing preference in memory." })
     const firstEnd = await event("turn.end")
     if (firstEnd.data?.reason !== "done") throw new Error("The first turn failed")
     send({ id: ++nextId, cmd: "prompt", text: "What preference is available on this next turn?" })
@@ -135,21 +149,71 @@ export async function offlineDemo(core: string, log: (text: string) => void = ()
     const captures: Capture[] = JSON.parse(await command("/memory-captures"))
     const latest = captures.at(-1)
     // The host trims section boundaries while assembling the final system prompt.
-    if (!latest?.memory.includes("writing-style.md") || !latest.systemPrompt.includes(latest.memory.trim())) {
-      throw new Error("The next turn did not receive the saved memory index")
+    if (!latest?.memory || !latest.systemPrompt.includes(latest.memory.trim())) {
+      throw new Error("The next turn did not receive the memory section")
     }
+    if (latest.memory.includes("writing-style.md") !== (mode === "default")) {
+      throw new Error(`Unexpected next-turn memory index in ${mode} mode`)
+    }
+    const writes = lines.filter(
+      (line) => line.type === "tool.execute.end" && line.data?.name === "memory_write",
+    )
+    if (writes.length !== (mode === "plan" ? 2 : 1)) throw new Error("Missing memory_write results")
+    for (const write of writes) {
+      const data = write.data!
+      if (mode === "plan") {
+        const text = data.result?.content
+          .flatMap((part) => (part.type === "text" ? [part.text] : []))
+          .join("\n")
+        if (
+          data.rejected !== "blocked" ||
+          !data.result?.isError ||
+          !text?.includes('mode "plan" is read-only')
+        ) {
+          throw new Error(`Expected a plan-mode denial: ${JSON.stringify(write)}`)
+        }
+        log(`Host denied memory_write:\n${text}`)
+      } else if (!data.result || data.result.isError || data.rejected || data.approval) {
+        throw new Error(`Expected an autonomous memory_write: ${JSON.stringify(write)}`)
+      }
+    }
+    if (mode === "default") log("memory_write completed without an approval request.")
     log(`Next-turn injected memory section:\n${latest.memory}`)
+    // Read the extension's public paths instead of duplicating its identity/project-key calculation.
+    const paths = await command("/memory path")
+    const storage = (["global", "project"] as const).map((scope) => {
+      const label = scope === "global" ? "Global: " : "Project: "
+      const dir = paths
+        .split("\n")
+        .find((line) => line.startsWith(label))
+        ?.slice(label.length)
+      if (!dir) throw new Error(`Missing ${scope} memory path: ${paths}`)
+      const relative = path.relative(path.join(home, "extension-data"), dir)
+      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+        throw new Error(`Memory path escaped temporary extension data: ${dir}`)
+      }
+      const exists = existsSync(dir)
+      const entries = exists ? readdirSync(dir, { recursive: true }).map(String).sort() : []
+      if (mode === "plan" && entries.length) {
+        throw new Error(`Plan mode created memory files/index: ${JSON.stringify({ scope, entries })}`)
+      }
+      return { scope, dir, exists, entries }
+    })
     const outputs: Record<string, string> = {}
     const steps: Array<{ command: string; output: string }> = []
-    for (const text of [
-      "/memory list",
-      "/memory show writing-style",
-      "/memory edit writing-style",
-      "/memory path",
-      "/memory rm writing-style",
-      "/memory rm writing-style --yes",
-      "/memory list",
-    ]) {
+    const commands =
+      mode === "plan"
+        ? ["/memory list", "/memory path"]
+        : [
+            "/memory list",
+            "/memory show writing-style",
+            "/memory edit writing-style",
+            "/memory path",
+            "/memory rm writing-style",
+            "/memory rm writing-style --yes",
+            "/memory list",
+          ]
+    for (const text of commands) {
       const output = await command(text)
       outputs[text] = output
       steps.push({ command: text, output })
@@ -158,12 +222,26 @@ export async function offlineDemo(core: string, log: (text: string) => void = ()
     child.stdin.end()
     const [code, err] = await Promise.all([child.exited, stderr])
     await reading
+    if (readError) throw readError
     if (code !== 0) throw new Error(`Offline CLI exited ${code}: ${err}`)
+    // Recheck after listing and shutdown: neither may repair/create an index in plan mode.
+    if (mode === "plan") {
+      for (const store of storage) {
+        store.exists = existsSync(store.dir)
+        store.entries = store.exists ? readdirSync(store.dir, { recursive: true }).map(String).sort() : []
+        if (store.entries.length) {
+          throw new Error(`Plan mode created memory files/index: ${JSON.stringify(store)}`)
+        }
+      }
+    }
     return {
       captures,
       outputs,
       steps,
-      approved: true,
+      storage,
+      commands: listing.commands,
+      writes,
+      approvals: lines.filter((line) => line.type === "ui.request"),
       notices: lines.filter((line) => line.type === "extension.notice"),
     }
   } finally {

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { existsSync, readFileSync, writeFileSync } from "node:fs"
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import type {
   CommandDefinition,
@@ -12,9 +12,10 @@ import type {
 } from "@amira/api"
 import { emptyUsage } from "@amira/api"
 import extension from "../src/index.ts"
+import { projectKey } from "../src/store.ts"
 import { fact, gitResult, sandbox, signal, toolContext } from "./helpers.ts"
 
-function host(home: string, cwd: string) {
+function host(dataDir: string, cwd: string, run: ExtensionAPI["runCommand"] = gitResult()) {
   const tools = new Map<string, ToolDefinition>()
   const interceptors = new Map<string, unknown>()
   const events = new Map<string, unknown>()
@@ -22,11 +23,11 @@ function host(home: string, cwd: string) {
   const notices: string[] = []
   const queriedCwds: string[] = []
   const api = {
-    home,
+    dataDir,
     cwd,
     runCommand: async (argv, options) => {
       queriedCwds.push(options.cwd)
-      return gitResult()(argv, options)
+      return run(argv, options)
     },
     registerTool(tool: ToolDefinition) {
       tools.set(tool.name, tool)
@@ -52,7 +53,7 @@ function host(home: string, cwd: string) {
     },
   } satisfies Pick<
     ExtensionAPI,
-    | "home"
+    | "dataDir"
     | "cwd"
     | "runCommand"
     | "registerTool"
@@ -85,14 +86,14 @@ function host(home: string, cwd: string) {
 test("honest tool traits, explicit child defense and safe preflight refusal", async () => {
   const h = sandbox()
   try {
-    const api = host(h.home, h.cwd)
+    const api = host(h.dataDir, h.cwd)
     const write = api.tools.get("memory_write")!
     const remove = api.tools.get("memory_delete")!
     const read = api.tools.get("memory_read")!
     expect(write.mainOnly).toBe(true)
     expect(remove.mainOnly).toBe(true)
-    expect(write.traits).toEqual({ writesFiles: true })
-    expect(remove.traits).toEqual({ writesFiles: true })
+    expect(write.traits).toEqual({ writesFiles: "paths", usesMutationHook: true })
+    expect(remove.traits).toEqual({ writesFiles: "paths", usesMutationHook: true })
     expect(read.traits).toEqual({ readOnly: true })
     for (const depth of [1, 2]) {
       for (const tool of [write, remove]) {
@@ -104,7 +105,7 @@ test("honest tool traits, explicit child defense and safe preflight refusal", as
     const unknown = toolContext(h.cwd)
     delete unknown.session
     expect((await write.execute({ ...fact(), scope: "global" }, unknown)).isError).toBe(true)
-    expect(existsSync(path.join(h.home, "memory"))).toBe(false)
+    expect(existsSync(path.join(h.dataDir, "global"))).toBe(false)
     for (const secret of [
       "password=never-store-this",
       '{"password":"hunter2"}',
@@ -118,7 +119,7 @@ test("honest tool traits, explicit child defense and safe preflight refusal", as
         const direct = await write.execute(args, toolContext(h.cwd))
         expect(direct.isError).toBe(true)
         expect(JSON.stringify(direct)).not.toContain(secret)
-        expect(existsSync(path.join(h.home, "memory"))).toBe(false)
+        expect(existsSync(path.join(h.dataDir, "global"))).toBe(false)
         expect(api.notices).toEqual([])
       }
     }
@@ -138,14 +139,104 @@ test("honest tool traits, explicit child defense and safe preflight refusal", as
   }
 })
 
+test("writers report every directory, file, index, lock and deterministic temp in the calling cwd", async () => {
+  const h = sandbox()
+  try {
+    const api = host(h.dataDir, path.join(h.root, "other-project"))
+    const key = await projectKey(h.cwd, gitResult(), signal())
+    for (const scope of ["global", "project"] as const) {
+      const dir = path.join(h.dataDir, ...(scope === "global" ? ["global"] : ["projects", key]))
+      const dirs = scope === "global" ? [h.dataDir, dir] : [h.dataDir, path.dirname(dir), dir]
+      const file = path.join(dir, "writing-style.md")
+      const index = path.join(dir, "MEMORY.md")
+      const lock = path.join(dir, ".memory.lock")
+      const temp = path.join(dir, ".writing-style.md.tmp")
+      const indexTemp = path.join(dir, ".MEMORY.md.tmp")
+      for (const name of ["memory_write", "memory_delete"]) {
+        const tool = api.tools.get(name)!
+        const args = { ...fact(), scope }
+        const expected = [...dirs, file, index, lock, ...(name === "memory_write" ? [temp] : []), indexTemp]
+        expect(await tool.getWrittenPaths!(args, { cwd: h.cwd })).toEqual(expected)
+        expect(await tool.getWrittenPaths!(args, { cwd: h.cwd })).toEqual(expected)
+        // Path reporting itself never creates scope directories or lock/temp files.
+        if (name === "memory_write") expect(existsSync(dir)).toBe(false)
+        const ctx = toolContext(h.cwd)
+        const captured: string[] = []
+        ctx.mutateFiles = async (changes, mutate) => {
+          for (const change of changes) {
+            expect(expected).toContain(change.path)
+            expect(dirs).not.toContain(change.path)
+            expect(change.path).not.toBe(lock)
+            captured.push(change.path)
+          }
+          await mutate()
+          for (const change of changes) {
+            if (change.after === null) expect(existsSync(change.path)).toBe(false)
+            else expect(readFileSync(change.path)).toEqual(Buffer.from(change.after))
+          }
+        }
+        expect((await tool.execute(args, ctx)).isError).not.toBe(true)
+        expect(captured.sort()).toEqual(
+          [file, index, ...(name === "memory_write" ? [temp] : []), indexTemp].sort(),
+        )
+        expect(readdirSync(dir).sort()).toEqual(
+          name === "memory_write" ? ["MEMORY.md", "writing-style.md"] : ["MEMORY.md"],
+        )
+        expect(readFileSync(index, "utf8").includes("writing-style.md")).toBe(name === "memory_write")
+        for (const invalid of [
+          { ...args, name: "../escape" },
+          { ...args, scope: "other" },
+        ]) {
+          await expect(tool.getWrittenPaths!(invalid, { cwd: h.cwd })).rejects.toThrow()
+        }
+      }
+    }
+    expect(readdirSync(h.home)).toEqual(["extension-data"])
+    expect(readdirSync(h.cwd)).toEqual([])
+  } finally {
+    h.cleanup()
+  }
+})
+
+test("a changing Git probe cannot change paths between permission reporting and execution", async () => {
+  const h = sandbox()
+  try {
+    const cwd = path.join(h.cwd, "nested")
+    for (const firstSucceeds of [true, false]) {
+      let probes = 0
+      const api = host(h.dataDir, h.cwd, async (argv, options) => {
+        const succeeds = probes++ === 0 ? firstSucceeds : !firstSucceeds
+        return gitResult(path.join(h.cwd, ".git"), succeeds ? 0 : 1)(argv, options)
+      })
+      const write = api.tools.get("memory_write")!
+      const remove = api.tools.get("memory_delete")!
+      const args = { ...fact(), scope: "project" }
+      const [reported, deleted] = await Promise.all([
+        write.getWrittenPaths!(args, { cwd }),
+        remove.getWrittenPaths!(args, { cwd }),
+      ])
+      expect((await write.execute(args, toolContext(cwd))).isError).not.toBe(true)
+      const file = reported!.find((file) => path.basename(file) === "writing-style.md")!
+      expect(existsSync(file)).toBe(true)
+      expect(deleted).toContain(file)
+      expect(await write.getWrittenPaths!(args, { cwd })).toEqual(reported)
+      expect((await remove.execute(args, toolContext(cwd))).isError).not.toBe(true)
+      expect(existsSync(file)).toBe(false)
+      expect(probes).toBe(1)
+    }
+  } finally {
+    h.cleanup()
+  }
+})
+
 test("one stable replaceable section, ordered scopes, pure child reads and recovery", async () => {
   const h = sandbox()
   try {
-    const api = host(h.home, h.cwd)
+    const api = host(h.dataDir, h.cwd)
     const ctx = { sessionId: "test-main", signal: signal() }
     const empty = await api.build({ sections: [{ name: "role", text: "role" }] }, ctx)
     expect(empty.action).toBe("modify")
-    expect(existsSync(path.join(h.home, "memory"))).toBe(false)
+    expect(existsSync(path.join(h.dataDir, "global"))).toBe(false)
     await api.tools.get("memory_write")!.execute({ ...fact(), scope: "global" }, toolContext(h.cwd))
     await api.tools
       .get("memory_write")!
@@ -161,7 +252,7 @@ test("one stable replaceable section, ordered scopes, pure child reads and recov
     expect(memory.text.indexOf("global memory index")).toBeLessThan(
       memory.text.indexOf("project memory index"),
     )
-    const index = path.join(h.home, "memory", "MEMORY.md")
+    const index = path.join(h.dataDir, "global", "MEMORY.md")
     writeFileSync(index, "damaged")
     api.start({
       seq: 2,
@@ -174,7 +265,7 @@ test("one stable replaceable section, ordered scopes, pure child reads and recov
     const child = await api.build(first.value, { sessionId: "child", signal: signal() })
     expect(child).toEqual(first)
     expect(readFileSync(index, "utf8")).toBe("damaged")
-    expect(existsSync(path.join(h.home, "memory", ".memory.lock"))).toBe(false)
+    expect(existsSync(path.join(h.dataDir, "global", ".memory.lock"))).toBe(false)
   } finally {
     h.cleanup()
   }
@@ -183,7 +274,7 @@ test("one stable replaceable section, ordered scopes, pure child reads and recov
 test("child completion releases routing state without deleting the parent", async () => {
   const h = sandbox()
   try {
-    const api = host(h.home, h.cwd)
+    const api = host(h.dataDir, h.cwd)
     const parentCwd = path.join(h.cwd, "parent")
     const childCwd = path.join(h.cwd, "child")
     const nestedCwd = path.join(h.cwd, "nested")
@@ -201,9 +292,18 @@ test("child completion releases routing state without deleting the parent", asyn
         data: { cwd, reason: "startup", model: { provider: "mock", model: "m" } },
       })
     }
+    for (const cwd of [h.cwd, parentCwd, childCwd, nestedCwd]) {
+      await api.tools
+        .get("memory_write")!
+        .execute({ ...fact(path.basename(cwd)), scope: "project" }, toolContext(cwd))
+    }
     const route = async (sessionId: string) => {
-      await api.build({ sections: [] }, { sessionId, signal: signal() })
-      return api.queriedCwds.at(-1)
+      const built = await api.build({ sections: [] }, { sessionId, signal: signal() })
+      if (built.action !== "modify") throw new Error("Expected memory section")
+      const text = built.value.sections.find((section) => section.name === "memory")!.text
+      return [h.cwd, parentCwd, childCwd, nestedCwd].find((cwd) =>
+        text.includes(`[${path.basename(cwd)}](${path.basename(cwd)}.md)`),
+      )
     }
     expect(await route("nested")).toBe(nestedCwd)
     api.endChild({
