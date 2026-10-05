@@ -189,3 +189,18 @@ test.skipIf(process.platform === "win32")(
     }
   },
 )
+
+test("list reports a damaged state file without hiding other bridges or echoing it", async () => {
+  const h = stored()
+  try {
+    const secret = "a".repeat(64)
+    writeFileSync(path.join(h.home, "agents", "broken.json"), `{"token":"${secret}"`)
+    const listed = await listStates(h.home, async () => ({ kind: "alive", identity: "x" }))
+    expect(listed.map((entry) => entry.id)).toContain(h.state.id)
+    const broken = listed.find((entry) => entry.id === "broken")
+    expect(broken?.status).toBe("invalid")
+    expect(JSON.stringify(listed)).not.toContain(secret)
+  } finally {
+    h.cleanup()
+  }
+})

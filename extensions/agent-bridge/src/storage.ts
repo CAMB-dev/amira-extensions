@@ -257,7 +257,19 @@ export async function listStates(
   const result = []
   for (const name of readdirSync(agentsDir(home))) {
     if (!/^[a-zA-Z0-9_-]+\.json$/.test(name)) continue
-    const state = readState(home, name.slice(0, -5))
+    let state: BridgeState
+    try {
+      state = readState(home, name.slice(0, -5))
+    } catch (error) {
+      // One damaged file must not hide the other bridges; never echo its contents.
+      result.push({
+        id: name.slice(0, -5),
+        status: "invalid",
+        identityStatus: "unknown",
+        error: errorMessage(error).replace(/[a-f0-9]{64}/g, "[redacted]"),
+      } as unknown as (typeof result)[number])
+      continue
+    }
     const identity = await probe(state.pid)
     const mismatch =
       identity.kind === "alive" && state.processStart !== null && identity.identity !== state.processStart

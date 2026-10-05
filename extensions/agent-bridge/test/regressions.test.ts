@@ -42,6 +42,11 @@ test("event-loss uncertainty prevents idle success and automatic shutdown", asyn
     expect(h.child.closed).toEqual([])
     expect(h.daemon.status().idleSeconds).toBeNull()
     expect(object(h.daemon.status().usage).currentRunTree).toMatchObject({ uncertain: true })
+    // A completed turn restores exact projections, so idle exit is possible again.
+    h.child.emit("turn.start")
+    h.child.emit("turn.end", { reason: "done" })
+    expect(h.daemon.status().projectionsUncertain).toBe(false)
+    expect(await h.call("wait", { until: "idle", timeout: 0 })).toMatchObject({ timedOut: false })
   } finally {
     await h.cleanup()
   }

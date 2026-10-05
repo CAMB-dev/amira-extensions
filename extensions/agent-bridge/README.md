@@ -251,9 +251,9 @@ On `events.lost`, the bridge fetches RPC state and session history and appends a
 `bridge.recovered` snapshot. It reconciles session/model, work state, requests, and
 completed messages. Recovery cannot recreate every lost streaming/tool/subagent event;
 tool and subagent projections are marked uncertain rather than presented as complete.
-While that uncertainty remains, automatic idle exit and successful `wait --until idle`
+Until the next root turn completes, automatic idle exit and successful `wait --until idle`
 are suspended: use explicit `stop` when you have finished. This avoids cancelling unseen
-background work. Tree usage is marked uncertain until a new cumulative budget event.
+background work; the next completed turn makes the projections exact again. Tree usage is marked uncertain until a new cumulative budget event.
 Status refreshes root-session usage from history rather than adding possibly overlapping
 events. It separates `usage.rootSession` from `usage.currentRunTree`; do not add those
 totals together. Unknown cost is `null`, not a claim of zero cost. History reads return a

@@ -236,6 +236,8 @@ export class BridgeDaemon {
       this.revision++
     }
     if (root && type === "turn.end") {
+      // A completed turn is a fresh boundary; the lists are exact again unless a loss is being recovered.
+      if (!this.recovering) this.projectionsUncertain = false
       this.busy = false
       delete this.snapshot.turnId
       this.revision++
