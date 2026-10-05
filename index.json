@@ -20,6 +20,15 @@
       "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/agent-bridge"
     },
     {
+      "name": "memory",
+      "description": "Experimental local persistent memories with global and project scopes: /memory",
+      "version": "0.0.2",
+      "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/memory" },
+      "engines": { "amira": "^0.1.28" },
+      "tags": ["experimental", "memory", "context"],
+      "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/memory"
+    },
+    {
       "name": "mcp-server",
       "description": "Serve Amira over MCP (stdio) so other coding agents can delegate tasks to it: amira mcp serve",
       "version": "0.1.0",
