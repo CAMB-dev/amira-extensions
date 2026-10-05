@@ -11,6 +11,15 @@
       "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/dashboard"
     },
     {
+      "name": "agent-bridge",
+      "description": "Experimental: a persistent local Amira session for external agents through short-lived CLI calls: amira agent",
+      "version": "0.0.1",
+      "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/agent-bridge" },
+      "engines": { "amira": "^0.1.27" },
+      "tags": ["experimental", "agents", "integration", "delegation", "rpc"],
+      "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/agent-bridge"
+    },
+    {
       "name": "mcp-server",
       "description": "Serve Amira over MCP (stdio) so other coding agents can delegate tasks to it: amira mcp serve",
       "version": "0.1.0",
