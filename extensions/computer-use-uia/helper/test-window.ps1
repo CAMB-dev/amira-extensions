@@ -1,5 +1,11 @@
 # Windows PowerShell 5.1 WinForms fixture. This process owns every control/window;
 # no child processes, compiled code, file access, or save/confirmation dialogs.
+param(
+    [string] $Title = 'Amira UIA test window',
+    [switch] $IgnoreClose,
+    [int] $Left = [int]::MinValue,
+    [int] $Top = [int]::MinValue
+)
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
@@ -8,10 +14,22 @@ Add-Type -AssemblyName System.Drawing
 
 $form = New-Object System.Windows.Forms.Form
 $form.Name = 'testWindow'
-$form.AccessibleName = 'Amira UIA test window'
-$form.Text = 'Amira UIA test window'
-$form.ClientSize = [System.Drawing.Size]::new(560, 400)
+$form.AccessibleName = $Title
+$form.Text = $Title
+$form.ClientSize = [System.Drawing.Size]::new(560, 440)
 $form.StartPosition = 'CenterScreen'
+if ($Left -ne [int]::MinValue -and $Top -ne [int]::MinValue) {
+    $form.StartPosition = 'Manual'
+    $form.Location = [System.Drawing.Point]::new($Left, $Top)
+}
+if ($IgnoreClose) { $form.Add_FormClosing({ $_.Cancel = $true }) }
+$form.KeyPreview = $true
+$form.Add_KeyDown({
+    if ($_.Control -and $_.KeyCode -eq [System.Windows.Forms.Keys]::M) {
+        $form.WindowState = [System.Windows.Forms.FormWindowState]::Minimized
+        $_.Handled = $true
+    }
+})
 
 $multilineLabel = New-Object System.Windows.Forms.Label
 $multilineLabel.Name = 'multilineLabel'
@@ -79,9 +97,17 @@ $list.SetBounds(200, 320, 336, 28)
 $list.Items.AddRange([object[]]@('Alpha', 'Beta', 'Gamma'))
 $list.SelectedIndex = 0
 
+$password = New-Object System.Windows.Forms.TextBox
+$password.Name = 'passwordText'
+$password.AccessibleName = 'Password'
+$password.UseSystemPasswordChar = $true
+$password.Text = 'fixture-secret-never-returned'
+$password.TabIndex = 5
+$password.SetBounds(16, 368, 520, 28)
+
 $form.Controls.AddRange([System.Windows.Forms.Control[]]@(
     $multilineLabel, $multiline, $singlelineLabel, $singleline,
-    $button, $status, $checkbox, $listLabel, $list
+    $button, $status, $checkbox, $listLabel, $list, $password
 ))
 try { [System.Windows.Forms.Application]::Run($form) }
 finally { $form.Dispose() }

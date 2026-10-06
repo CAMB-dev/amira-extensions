@@ -88,6 +88,23 @@ try {
                 $helperDead = $null -eq $helperProcess
                 if ($helperDead -or $force) {
                     $cleanupIncomplete = $false
+                    # Quiesce the writer BEFORE the authoritative snapshot. Otherwise
+                    # a launch published during cleanup could be deleted without being reaped.
+                    if ($force -and $null -ne $helperProcess) {
+                        try {
+                            $helperProcess.Kill()
+                            if (-not $helperProcess.WaitForExit(1000)) { throw 'Helper is still running.' }
+                        } catch { $cleanupIncomplete = $true; throw }
+                    }
+                    if (-not (Test-IdentityGone $state.Helper)) {
+                        $cleanupIncomplete = $true
+                        throw 'Helper identity cannot be confirmed exited.'
+                    }
+                    $state = [IO.File]::ReadAllText($StatePath) | ConvertFrom-Json
+                    if (-not (Test-OwnedState $state) -or -not (Test-IdentityGone $state.Helper)) {
+                        $cleanupIncomplete = $true
+                        throw 'Journal changed or helper is still active.'
+                    }
                     foreach ($identity in $state.Processes) {
                         $process = Get-ExactProcess $identity
                         if ($null -ne $process) {
@@ -98,12 +115,6 @@ try {
                             finally { $process.Dispose() }
                         } elseif (-not (Test-IdentityGone $identity)) { $cleanupIncomplete = $true }
                     }
-                    if ($force -and $null -ne $helperProcess) {
-                        try {
-                            $helperProcess.Kill()
-                            if (-not $helperProcess.WaitForExit(1000)) { $cleanupIncomplete = $true }
-                        } catch { $cleanupIncomplete = $true }
-                    } elseif ($force -and -not (Test-IdentityGone $state.Helper)) { $cleanupIncomplete = $true }
                 }
                 if ($null -ne $helperProcess) { $helperProcess.Dispose() }
             }

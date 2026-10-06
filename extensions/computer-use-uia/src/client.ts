@@ -1,10 +1,23 @@
 import type { ExtensionAPI, PipeEvent, PipeProcess } from "@amira/api"
-import type { App } from "./settings.ts"
+import type { UiaSettings } from "./settings.ts"
+import { overlayReply, STOP_MESSAGE, StopState } from "./stop.ts"
 
 export interface LaunchResult {
-  window: string
+  window?: string
   pid: number
+  title?: string
+  instruction?: string
+}
+
+export interface WindowResult {
+  window: string
   title: string
+  process: string
+  pid: number
+  class: string
+  bounds: { x: number; y: number; width: number; height: number }
+  minimized: boolean
+  foreground: boolean
 }
 
 export interface TreeResult {
@@ -15,7 +28,7 @@ export interface TreeResult {
   cut: boolean
 }
 
-interface OwnedWindow extends LaunchResult {
+interface Snapshot {
   refs: Set<string>
 }
 
@@ -26,7 +39,7 @@ interface Pending {
   timer: ReturnType<typeof setTimeout>
 }
 
-/** Both sides guard ownership; a crashed helper invalidates all handles and snapshots. */
+/** Window-local snapshots; only exact launched identities are eligible for cleanup. */
 export class UiaClient {
   private pipe?: PipeProcess
   private lifetime?: string
@@ -35,7 +48,11 @@ export class UiaClient {
   private generation = 0
   private sessionEpoch = 0
   private readonly pending = new Map<number, Pending>()
-  private readonly windows = new Map<string, OwnedWindow>()
+  private readonly windows = new Map<string, Snapshot>()
+  readonly emergency = new StopState()
+  private overlay?: PipeProcess
+  private helperIdentity?: { event: "owner"; pid: number; started: string }
+  private overlayExited: Promise<void> = Promise.resolve()
   private queue: Promise<unknown> = Promise.resolve()
   private stopping = false
   private statePath: string
@@ -48,8 +65,9 @@ export class UiaClient {
 
   constructor(
     private readonly host: Host,
-    readonly apps: Record<string, App>,
+    readonly settings: UiaSettings,
     private readonly timeoutMs = 60_000,
+    private readonly onStopped: () => void = () => {},
   ) {
     this.statePath = `${process.env.TEMP ?? process.env.TMP ?? host.cwd}/amira-uia-${crypto.randomUUID()}.json`
   }
@@ -58,7 +76,10 @@ export class UiaClient {
   call(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
     const epoch = this.sessionEpoch
     const run = this.queue.then(() => {
-      if (epoch !== this.sessionEpoch) throw new Error("UIA session ended before the request started")
+      if (epoch !== this.sessionEpoch)
+        throw new Error(
+          this.emergency.stopped ? STOP_MESSAGE : "UIA session ended before the request started",
+        )
       return this.execute(method, params)
     })
     this.queue = run.catch(() => {})
@@ -67,33 +88,54 @@ export class UiaClient {
 
   private async execute(method: string, params: Record<string, unknown>): Promise<unknown> {
     if (this.stopping) throw new Error("computer-use-uia is stopping")
+    if (!["windows", "tree"].includes(method)) this.emergency.assertAction()
+    if (method === "windows") {
+      if (params.filter !== undefined && typeof params.filter !== "string")
+        throw new Error("filter must be a string")
+      return this.request(method, params.filter === undefined ? {} : { filter: params.filter })
+    }
     if (method === "launch") {
-      if (typeof params.app !== "string" || !Object.hasOwn(this.apps, params.app))
-        throw new Error(`Unknown app. Allowed apps: ${Object.keys(this.apps).join(", ") || "(none)"}`)
-      const result = (await this.request(method, { app: params.app })) as LaunchResult
+      if (typeof params.command !== "string" || !params.command.trim())
+        throw new Error("command must be a program name or path")
+      if (
+        params.args !== undefined &&
+        (!Array.isArray(params.args) || params.args.some((arg) => typeof arg !== "string"))
+      )
+        throw new Error("args must be a string array")
+      if (params.cwd !== undefined && typeof params.cwd !== "string") throw new Error("cwd must be a string")
+      const safe = {
+        command: params.command,
+        ...(params.args === undefined ? {} : { args: params.args }),
+        ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
+      }
+      const result = (await this.request(method, safe)) as LaunchResult
       if (
         !result ||
-        !/^w[0-9a-f]{32}_\d+$/.test(result.window) ||
         !Number.isInteger(result.pid) ||
         result.pid <= 0 ||
-        typeof result.title !== "string"
+        (result.window !== undefined && !/^[1-9]\d*$/.test(result.window))
       )
         throw new Error("Invalid helper launch response")
-      this.windows.set(result.window, { ...result, refs: new Set() })
-      return { window: result.window, pid: result.pid, title: result.title }
+      return result
     }
-    if (!["tree", "click", "type", "key", "close"].includes(method)) throw new Error("Unknown UIA request")
-    const owned = typeof params.window === "string" ? this.windows.get(params.window) : undefined
-    if (!owned) throw new Error("Refused: window was not obtained from this extension's launch")
-    const safe: Record<string, unknown> = { window: owned.window }
+    if (!["tree", "click", "type", "key", "focus", "close"].includes(method))
+      throw new Error("Unknown UIA request")
+    if (typeof params.window !== "string" || !/^[1-9]\d*$/.test(params.window))
+      throw new Error("window must be a native window handle from ui_windows or ui_launch")
+    let snapshot = this.windows.get(params.window)
+    if (!snapshot) {
+      snapshot = { refs: new Set() }
+      this.windows.set(params.window, snapshot)
+    }
+    const safe: Record<string, unknown> = { window: params.window }
     if (method === "tree") {
       safe.depth = boundedInt(params.depth, 8, 0, 30, "depth")
       safe.maxNodes = boundedInt(params.maxNodes, 300, 1, 1000, "maxNodes")
       // A failed traversal also invalidates the previous snapshot.
-      owned.refs.clear()
+      snapshot.refs.clear()
     }
     if (method === "click" || (method === "type" && params.ref !== undefined)) {
-      if (typeof params.ref !== "string" || !owned.refs.has(params.ref))
+      if (typeof params.ref !== "string" || !snapshot.refs.has(params.ref))
         throw new Error("Refused: ref is not in this window's latest tree; call ui_tree first")
       safe.ref = params.ref
     }
@@ -109,11 +151,11 @@ export class UiaClient {
       const formatted = formatTree(tree, safe.maxNodes as number)
       for (const line of formatted.text.split("\n")) {
         const ref = /^\s*(e\d+)\s/.exec(line)?.[1]
-        if (ref && !/^\s*e\d+\s+unreadable\b/.test(line)) owned.refs.add(ref)
+        if (ref && !/^\s*e\d+\s+unreadable\b/.test(line)) snapshot.refs.add(ref)
       }
       return formatted
     }
-    if (method === "close") this.windows.delete(owned.window)
+    if (method === "close") this.windows.delete(params.window)
     return result
   }
 
@@ -123,7 +165,7 @@ export class UiaClient {
     await this.retired
     if (this.stopping || previousGeneration !== this.generation)
       throw new Error("UIA session ended during startup")
-    // API 0.1.27 lacks an unload hook. Background jobs DO have an unload lifetime.
+    // Background jobs have an unload lifetime; pipes require this sentinel/watchdog bridge.
     let job = this.lifetime ? this.host.backgroundJobs.get(this.lifetime) : undefined
     if (!job || !["starting", "running"].includes(job.status)) {
       this.statePath = `${process.env.TEMP ?? process.env.TMP ?? this.host.cwd}/amira-uia-${crypto.randomUUID()}.json`
@@ -177,8 +219,6 @@ export class UiaClient {
         "Bypass",
         "-File",
         `${import.meta.dir}/../helper/uia.ps1`,
-        "-AppsJson",
-        JSON.stringify(this.apps),
         "-LifetimePid",
         String(job.pid),
         "-LifetimeStarted",
@@ -194,6 +234,102 @@ export class UiaClient {
         },
       },
     )
+    await this.startOverlay(job.pid, this.lifetimeStarted)
+    if (this.stopping || generation !== this.generation) throw new Error("UIA session ended during startup")
+  }
+
+  /** Stop is out-of-band: retire even a helper blocked inside a synchronous UIA provider. */
+  emergencyStop(): void {
+    const changed = this.emergency.stop()
+    if (!changed && !this.pipe && !this.overlay) return
+    this.sessionEpoch++
+    this.breakPipe(STOP_MESSAGE)
+    if (changed) this.onStopped()
+  }
+
+  resume(): void {
+    this.emergency.resume()
+  }
+
+  private async startOverlay(pid: number, started: string): Promise<void> {
+    const ready = Promise.withResolvers<void>()
+    const exited = Promise.withResolvers<void>()
+    this.overlayExited = exited.promise
+    let buffer = ""
+    const timer = setTimeout(
+      () => ready.reject(new Error("UIA stop monitor failed to start")),
+      this.timeoutMs,
+    )
+    const overlay = this.host.openPipe(
+      [
+        "powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-STA",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        `${import.meta.dir}/../helper/overlay.ps1`,
+        "-Render",
+        String(this.settings.overlay),
+        "-StopHotkey",
+        this.settings.stopHotkey,
+        "-LifetimePid",
+        String(pid),
+        "-LifetimeStarted",
+        started,
+      ],
+      {
+        cwd: this.host.cwd,
+        onEvent: (event) => {
+          if (event.type === "exit") {
+            exited.resolve()
+            ready.reject(new Error("UIA stop monitor exited"))
+            if (this.overlay === overlay) {
+              this.overlay = undefined
+              this.emergencyStop()
+            }
+          }
+          if (event.type === "stderr" && event.data.includes("UIA input cleanup incomplete"))
+            this.host.reportError(
+              "computer-use-uia: input cleanup incomplete; release held keys/buttons manually",
+            )
+          if (event.type !== "stdout" || this.overlay !== overlay) return
+          buffer += event.data
+          if (buffer.length > 20_000) {
+            this.emergencyStop()
+            return
+          }
+          let newline = buffer.indexOf("\n")
+          while (newline >= 0) {
+            const line = buffer.slice(0, newline).trim()
+            buffer = buffer.slice(newline + 1)
+            newline = buffer.indexOf("\n")
+            if (!line) continue
+            try {
+              const reply = overlayReply(line)
+              if (reply.event === "ready") ready.resolve()
+              else if (reply.event === "stop") this.emergencyStop()
+              else if (reply.event === "glided")
+                this.pipe?.write(`${JSON.stringify({ method: "overlay_ack", id: reply.id })}\n`)
+            } catch {
+              this.emergencyStop()
+            }
+          }
+        },
+      },
+    )
+    this.overlay = overlay
+    if (this.helperIdentity) overlay.write(`${JSON.stringify(this.helperIdentity)}\n`)
+    try {
+      await ready.promise
+    } catch (error) {
+      this.breakPipe("UIA stop monitor unavailable", 0)
+      throw error
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   private async startWatchdog(pid: number, started: string): Promise<void> {
@@ -257,9 +393,9 @@ export class UiaClient {
 
   private event(event: PipeEvent) {
     if (event.type === "exit") {
-      this.pipe = undefined
-      this.windows.clear()
-      this.failPending(new Error("UIA helper exited; old windows and refs are invalid. Launch again."))
+      // A stop-monitor kill and a helper exit may arrive on different pipes in either order.
+      // Unexpected helper death must latch too, never let that race reopen desktop control.
+      this.emergencyStop()
       return
     }
     if (event.type !== "stdout") return
@@ -275,7 +411,36 @@ export class UiaClient {
       newline = this.buffer.indexOf("\n")
       if (!line) continue
       try {
-        const response = JSON.parse(line) as { id: number | null; result?: unknown; error?: string }
+        const response = JSON.parse(line) as {
+          id: number | null
+          result?: unknown
+          error?: string
+          event?: string
+          pid?: number
+          started?: string
+        }
+        if (response.event === "helper") {
+          if (
+            !Number.isInteger(response.pid) ||
+            !response.pid ||
+            !response.started ||
+            !/^\d+$/.test(response.started)
+          ) {
+            this.breakPipe("Invalid helper identity")
+            return
+          }
+          this.helperIdentity = { event: "owner", pid: response.pid, started: response.started }
+          this.overlay?.write(`${JSON.stringify(this.helperIdentity)}\n`)
+          continue
+        }
+        if (response.event === "overlay" || response.event === "done") {
+          if (!this.overlay) {
+            this.emergencyStop()
+            return
+          }
+          this.overlay.write(`${line}\n`)
+          continue
+        }
         if (response.id === null && response.error) {
           this.breakPipe(response.error)
           return
@@ -295,12 +460,19 @@ export class UiaClient {
   }
 
   private async request(method: string, params: Record<string, unknown>): Promise<unknown> {
-    await this.start()
+    try {
+      await this.start()
+    } catch (error) {
+      if (this.emergency.stopped) throw new Error(STOP_MESSAGE)
+      throw error
+    }
+    if (!["windows", "tree"].includes(method)) this.emergency.assertAction()
     if (!this.pipe || this.stopping) throw new Error("UIA helper exited before the request started")
     const id = ++this.nextId
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => this.breakPipe("UIA helper timed out"), this.timeoutMs)
       this.pending.set(id, { resolve, reject, timer })
+      if (!["windows", "tree"].includes(method)) this.overlay?.write(`${JSON.stringify({ event: "busy" })}\n`)
       this.pipe?.write(`${JSON.stringify({ id, method, params })}\n`)
     })
   }
@@ -313,16 +485,23 @@ export class UiaClient {
     this.pending.clear()
   }
 
-  private breakPipe(message: string) {
+  private breakPipe(message: string, graceMs = 0) {
     const pipe = this.pipe
+    const overlay = this.overlay
+    // Failed in-flight requests must not continue acting after their error is returned.
+    // Keep the independent input-release monitor alive long enough to process abort/EOF.
+    overlay?.write(`${JSON.stringify({ event: "abort" })}\n`)
     this.pipe = undefined
+    this.overlay = undefined
+    overlay?.close(5000)
+    this.helperIdentity = undefined
     this.generation++
     this.windows.clear()
     this.failPending(new Error(message))
     // Never overlap helpers writing the same launch journal during a restart.
-    this.retired = this.pipeExited
-    // EOF gives the helper a chance to close its exact launched windows.
-    pipe?.close(5000)
+    this.retired = Promise.all([this.pipeExited, this.overlayExited]).then(() => {})
+    // No grace for failed actions: close(0) also covers startup before owner identity arrives.
+    pipe?.close(graceMs)
   }
 
   /** EOF triggers helper finally cleanup. The sentinel covers host-driven unload too. */
@@ -331,17 +510,23 @@ export class UiaClient {
     this.stopping = true
     const pipe = this.pipe
     const watchdog = this.watchdog
+    const overlay = this.overlay
+    overlay?.write(`${JSON.stringify({ event: "abort" })}\n`)
     this.pipe = undefined
     this.watchdog = undefined
+    this.overlay = undefined
+    overlay?.close(5000)
+    this.helperIdentity = undefined
     this.generation++
     this.sessionEpoch++
     this.windows.clear()
     this.failPending(new Error("UIA session ended"))
-    pipe?.close(5000)
+    pipe?.close(0)
     watchdog?.close(5000)
     this.stopWait = Promise.all([
       this.pipeExited,
       this.watchdogExited,
+      this.overlayExited,
       ...(this.lifetime ? [this.host.backgroundJobs.stop(this.lifetime, 1000)] : []),
     ]).then(() => {})
     try {

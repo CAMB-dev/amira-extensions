@@ -1,12 +1,11 @@
-# Windows PowerShell 5.1; no UIA desktop/root enumeration and no shipped binaries.
-# stdin/stdout are UTF-8 JSON lines. Only the app allowlist can start a process.
+# Windows PowerShell 5.1; any-window UIA, no shipped binaries.
+# stdin/stdout are UTF-8 JSON lines. Kill eligibility comes only from launch identities.
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
-    [string] $AppsJson,
     [int] $LifetimePid = 0,
     [string] $LifetimeStarted,
-    [string] $StatePath
+    [string] $StatePath,
+    [switch] $TestMode
 )
 
 Set-StrictMode -Version 2.0
@@ -27,14 +26,13 @@ $writer = New-Object System.IO.StreamWriter([Console]::OpenStandardOutput(), $ut
 $writer.AutoFlush = $true
 $script:windows = @{}
 $script:processes = @{}
-$script:windowGeneration = [Guid]::NewGuid().ToString('N')
 $script:nextElement = 0
 $script:self = $null
 $script:lifetime = $null
 $script:stopping = $false
 
 function Deny([string] $message) {
-    # Never expose provider exceptions, process paths, or unowned window titles.
+    # Never expose raw provider exceptions or process paths.
     throw [System.InvalidOperationException]::new('UIA_SAFE: ' + $message)
 }
 
@@ -96,6 +94,7 @@ function Stop-ExactProcess($identity) {
         if (-not $process.HasExited -and
             $process.StartTime.ToUniversalTime().Ticks -eq $identity.Started) {
             $process.Kill()
+            $null = $process.WaitForExit(1000)
         }
     } catch {
         # Cleanup is best effort (the process may already have exited).
@@ -167,7 +166,8 @@ function Clear-StaleJournals {
 
 try {
     $script:self = Get-Identity $PID
-    Clear-StaleJournals
+    # Desktop tests must not reap a previous real session's launched apps.
+    if (-not $TestMode) { Clear-StaleJournals }
     if ($LifetimePid -lt 0) { Deny 'Invalid lifetime process.' }
     if ($LifetimePid -gt 0) {
         $script:lifetime = Get-Identity $LifetimePid
@@ -180,7 +180,15 @@ try {
         # Restart cleans old launch identities, never adopts their windows or refs.
         $previous = [IO.File]::ReadAllText($StatePath) | ConvertFrom-Json
         if (-not (Test-OwnedState $previous)) { Deny 'Untrusted or older launch journal; cleanup refused.' }
-        foreach ($identity in (@($previous.Helper) + @($previous.Processes))) {
+        # As in forced watchdog cleanup, quiesce the journal writer BEFORE taking
+        # the authoritative launch snapshot. Do not overwrite a still-active helper.
+        Stop-ExactProcess $previous.Helper
+        if (-not (Test-IdentityGone $previous.Helper)) { Deny 'Previous helper is still active; journal retained.' }
+        $previous = [IO.File]::ReadAllText($StatePath) | ConvertFrom-Json
+        if (-not (Test-OwnedState $previous) -or -not (Test-IdentityGone $previous.Helper)) {
+            Deny 'Previous journal changed or helper is still active; journal retained.'
+        }
+        foreach ($identity in $previous.Processes) {
             Stop-ExactProcess $identity
             if (-not (Test-IdentityGone $identity)) {
                 # Never discard a failed kill or grant it a window/ref on restart.
@@ -195,10 +203,6 @@ try {
     Save-OwnedState
     if ($script:processes.Count -gt 0) { Deny 'Previous launch cleanup is incomplete; no new apps launched.' }
 
-    $apps = $AppsJson | ConvertFrom-Json
-    if ($null -eq $apps -or $apps -isnot [pscustomobject]) {
-        Deny 'AppsJson must be an app map.'
-    }
     Add-Type -AssemblyName UIAutomationClient | Out-Null
     Add-Type -AssemblyName UIAutomationTypes | Out-Null
     Add-Type -AssemblyName UIAutomationClientsideProviders | Out-Null
@@ -320,7 +324,26 @@ namespace OwnedUia {
             public bool Visible;
         }
 
-        // Native metadata only: never GetWindowText, MainWindowTitle, or UIA root.
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern int GetWindowText(IntPtr hwnd, System.Text.StringBuilder text, int count);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern int GetClassName(IntPtr hwnd, System.Text.StringBuilder text, int count);
+        [DllImport("user32.dll")]
+        public static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+        [StructLayout(LayoutKind.Sequential)]
+        public struct WINDOWPLACEMENT {
+            public uint Length, Flags, ShowCommand;
+            public POINT MinPosition, MaxPosition;
+            public RECT NormalPosition;
+        }
+        [DllImport("user32.dll")]
+        public static extern bool GetWindowPlacement(IntPtr hwnd, ref WINDOWPLACEMENT placement);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr wparam, IntPtr lparam);
+        [DllImport("user32.dll")]
+        public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+
+        // Enumeration itself is metadata only; ui_windows reads titles after enumeration.
         public static Window[] Windows() {
             var windows = new List<Window>();
             EnumWindowsProc callback = delegate(IntPtr hwnd, IntPtr data) {
@@ -348,15 +371,33 @@ namespace OwnedUia {
             if (thread == 0 || !GetGUIThreadInfo(thread, ref info)) return IntPtr.Zero;
             return info.Focus;
         }
-        public static bool Key(ushort key, bool up) {
+        static readonly UIntPtr InputTag = new UIntPtr(0xA1120000u ^ (uint)System.Diagnostics.Process.GetCurrentProcess().Id);
+        static INPUT KeyInput(ushort key, bool up) {
             var input = new INPUT();
             input.Type = 1;
             input.Data.Keyboard.Key = key;
             input.Data.Keyboard.Flags = up ? 2u : 0u;
-            // Navigation keys use the extended-key flag.
+            input.Data.Keyboard.Extra = InputTag;
             if ((key >= 0x21 && key <= 0x28) || key == 0x2E)
                 input.Data.Keyboard.Flags |= 1u;
-            return SendInput(1, new INPUT[] { input }, Marshal.SizeOf(typeof(INPUT))) == 1;
+            return input;
+        }
+        public static bool Chord(ushort[] modifiers, ushort key) {
+            // One native batch: never call a blocking provider with injected keys held.
+            var inputs = new List<INPUT>();
+            foreach (ushort modifier in modifiers) inputs.Add(KeyInput(modifier, false));
+            inputs.Add(KeyInput(key, false)); inputs.Add(KeyInput(key, true));
+            for (int i = modifiers.Length - 1; i >= 0; i--) inputs.Add(KeyInput(modifiers[i], true));
+            uint sent = SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf(typeof(INPUT)));
+            if (sent != inputs.Count) {
+                var held = new HashSet<ushort>();
+                for (int i = 0; i < sent; i++) {
+                    var k = inputs[i].Data.Keyboard;
+                    if ((k.Flags & 2) == 0) held.Add(k.Key); else held.Remove(k.Key);
+                }
+                foreach (ushort heldKey in held) SendInput(1, new INPUT[] { KeyInput(heldKey, true) }, Marshal.SizeOf(typeof(INPUT)));
+            }
+            return sent == inputs.Count;
         }
         public static bool Unicode(string text) {
             var inputs = new INPUT[text.Length * 2];
@@ -366,6 +407,7 @@ namespace OwnedUia {
                 inputs[i * 2 + 1].Data.Keyboard.Scan = text[i];
                 inputs[i * 2].Data.Keyboard.Flags = 4;
                 inputs[i * 2 + 1].Data.Keyboard.Flags = 4 | 2;
+                inputs[i * 2].Data.Keyboard.Extra = inputs[i * 2 + 1].Data.Keyboard.Extra = InputTag;
             }
             if (inputs.Length == 0) return true;
             uint sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
@@ -375,20 +417,31 @@ namespace OwnedUia {
             }
             return sent == inputs.Length;
         }
-        public static bool Mouse(bool up) {
-            var input = new INPUT();
-            input.Data.Mouse.Flags = up ? 4u : 2u;
-            return SendInput(1, new INPUT[] { input }, Marshal.SizeOf(typeof(INPUT))) == 1;
+        public static bool Click() {
+            var inputs = new INPUT[2];
+            inputs[0].Data.Mouse.Flags = 2; inputs[1].Data.Mouse.Flags = 4;
+            inputs[0].Data.Mouse.Extra = inputs[1].Data.Mouse.Extra = InputTag;
+            uint sent = SendInput(2, inputs, Marshal.SizeOf(typeof(INPUT)));
+            if (sent == 1) SendInput(1, new INPUT[] { inputs[1] }, Marshal.SizeOf(typeof(INPUT)));
+            return sent == 2;
         }
     }
 }
 '@ | Out-Null
+
+    . "$PSScriptRoot/launch.ps1"
 
     $proxies = [AppDomain]::CurrentDomain.GetAssemblies() | Where-Object {
         $_.GetName().Name -eq 'UIAutomationClientsideProviders'
     }
     [OwnedUia.Native]::InitializeProviders($proxies.GetName())
     $script:walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+    # Per-monitor v2: UIA points/rectangles and native cursor coordinates are physical pixels.
+    if ([OwnedUia.Native]::SetThreadDpiAwarenessContext([IntPtr]::new(-4)) -eq [IntPtr]::Zero) {
+        Deny 'Per-monitor DPI awareness is unavailable.'
+    }
+    $writer.WriteLine((@{ event = 'helper'; pid = $script:self.Pid; started = $script:self.Started.ToString() } | ConvertTo-Json -Compress))
+    $script:actionId = 0
 
     function Assert-Window($window) {
         Assert-Lifetime
@@ -396,7 +449,7 @@ namespace OwnedUia {
             -not [OwnedUia.Native]::IsWindow($window.Handle) -or
             [OwnedUia.Native]::GetAncestor($window.Handle, 2) -ne $window.Handle -or
             [OwnedUia.Native]::WindowPid($window.Handle) -ne $window.Identity.Pid) {
-            Deny 'Window ownership is no longer valid.'
+            Deny 'Target window is no longer valid.'
         }
     }
 
@@ -407,11 +460,6 @@ namespace OwnedUia {
         # our FromHandle root; never ask for its parent (the desktop/foreign UIA).
         $cursor = $element
         for ($i = 0; $i -lt 128; $i++) {
-            $elementPid = $cursor.GetCurrentPropertyValue(
-                [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $true)
-            if ($elementPid -isnot [int] -or $elementPid -ne $window.Identity.Pid) {
-                Deny 'Element is outside the owned window.'
-            }
             if ([System.Windows.Automation.Automation]::Compare($cursor, $window.Root)) {
                 Assert-Window $window
                 return
@@ -421,9 +469,8 @@ namespace OwnedUia {
                 [System.Windows.Automation.AutomationElement]::NativeWindowHandleProperty, $true)
             if ($handleValue -is [int] -and $handleValue -ne 0) {
                 $handle = [IntPtr]::new([long]$handleValue)
-                if ([OwnedUia.Native]::GetAncestor($handle, 2) -ne $window.Handle -or
-                    [OwnedUia.Native]::WindowPid($handle) -ne $window.Identity.Pid) {
-                    Deny 'Element is outside the owned window.'
+                if ([OwnedUia.Native]::GetAncestor($handle, 2) -ne $window.Handle) {
+                    Deny 'Element is outside the target window.'
                 }
             }
             $cursor = $script:walker.GetParent($cursor)
@@ -446,7 +493,7 @@ namespace OwnedUia {
     }
 
     function Get-Pattern($window, $element, $patternId, [switch] $Verified, $Clock = $null) {
-        # Snapshot traversal verifies this node once; actions always revalidate.
+        # Snapshot nodes come from the target's Children traversal; actions always revalidate.
         if (-not $Verified) { Assert-Element $window $element }
         Assert-TreeBudget $Clock
         $pattern = $null
@@ -456,12 +503,117 @@ namespace OwnedUia {
 
     function Get-Window($parameters) {
         $ref = Get-Argument $parameters 'window'
-        if ($ref -isnot [string] -or -not $script:windows.ContainsKey($ref)) {
-            Deny 'Refused: window was not obtained from this helper launch.'
+        $number = 0L
+        if ($ref -isnot [string] -or -not [long]::TryParse($ref, [ref]$number) -or $number -le 0) {
+            Deny 'Invalid native window handle; use ui_windows.'
         }
-        $window = $script:windows[$ref]
+        $handle = [IntPtr]::new($number)
+        if (-not [OwnedUia.Native]::IsWindow($handle) -or [OwnedUia.Native]::GetAncestor($handle, 2) -ne $handle) {
+            Deny 'Target is not a top-level window; use ui_windows.'
+        }
+        $identity = Get-Identity ([OwnedUia.Native]::WindowPid($handle))
+        if ($null -eq $identity) { Deny 'Target process is inaccessible or exited.' }
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($handle)
+        if ($script:windows.ContainsKey($ref)) {
+            $window = $script:windows[$ref]
+            $sameRoot = $false
+            try { $sameRoot = [System.Windows.Automation.Automation]::Compare($window.Root, $root) } catch { }
+            if ($window.Identity.Key -eq $identity.Key -and $sameRoot) {
+                Assert-Window $window
+                return $window
+            }
+            # HWND reuse, even in the same process, invalidates the root and every ref.
+            $script:windows.Remove($ref)
+        }
+        $window = [pscustomobject]@{
+            Ref = $ref; Handle = $handle; Identity = $identity
+            Root = $root; Refs = @{}
+        }
         Assert-Window $window
+        $script:windows[$ref] = $window
         return $window
+    }
+
+    function Get-WindowInfo($native) {
+        $title = New-Object Text.StringBuilder 1024
+        $class = New-Object Text.StringBuilder 256
+        $null = [OwnedUia.Native]::GetWindowText($native.Handle, $title, $title.Capacity)
+        $null = [OwnedUia.Native]::GetClassName($native.Handle, $class, $class.Capacity)
+        $bounds = New-Object OwnedUia.Native+RECT
+        $null = [OwnedUia.Native]::GetWindowRect($native.Handle, [ref]$bounds)
+        $processName = ''
+        $process = $null
+        try { $process = [Diagnostics.Process]::GetProcessById($native.Pid); $processName = $process.ProcessName }
+        catch { } finally { if ($null -ne $process) { $process.Dispose() } }
+        return @{
+            window = $native.Handle.ToInt64().ToString(); title = $title.ToString(); process = $processName
+            pid = $native.Pid; class = $class.ToString()
+            bounds = @{ x = $bounds.Left; y = $bounds.Top; width = $bounds.Right - $bounds.Left; height = $bounds.Bottom - $bounds.Top }
+            minimized = [OwnedUia.Native]::IsIconic($native.Handle)
+            foreground = [OwnedUia.Native]::GetForegroundWindow() -eq $native.Handle
+        }
+    }
+
+    function Get-Windows($parameters) {
+        $filter = Get-Argument $parameters 'filter' ''
+        if ($filter -isnot [string]) { Deny 'Filter must be a substring.' }
+        $matches = New-Object System.Collections.Generic.List[object]
+        foreach ($native in [OwnedUia.Native]::Windows()) {
+            if (-not $native.Visible) { continue }
+            $info = Get-WindowInfo $native
+            $search = $info.window + ' ' + $info.title + ' ' + $info.process + ' ' + $info.pid + ' ' + $info.class
+            if ($search.IndexOf($filter, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $matches.Add($info) }
+        }
+        return @{ windows = @($matches.ToArray()) }
+    }
+
+    function Show-Action($window, $element, [string] $kind, [string] $label) {
+        $point = @{ X = 32; Y = 64 }
+        if ($null -ne $window) {
+            Assert-Window $window
+            if ($null -eq $element) { $element = $window.Root }
+            Assert-Element $window $element
+            $point = $null
+            try { $point = $element.GetClickablePoint() } catch { }
+            if ($null -eq $point) {
+                $bounds = $null
+                try { $bounds = $element.Current.BoundingRectangle } catch { }
+                if ($null -ne $bounds -and -not $bounds.IsEmpty -and $bounds.Width -gt 0 -and $bounds.Height -gt 0) {
+                    $point = @{ X = $bounds.X + $bounds.Width / 2; Y = $bounds.Y + $bounds.Height / 2 }
+                } else {
+                    # Minimized roots can have an empty UIA rectangle. Use restored native bounds.
+                    $nativeBounds = New-Object OwnedUia.Native+RECT
+                    $null = [OwnedUia.Native]::GetWindowRect($window.Handle, [ref]$nativeBounds)
+                    if ([OwnedUia.Native]::IsIconic($window.Handle)) {
+                        $placement = New-Object OwnedUia.Native+WINDOWPLACEMENT
+                        $placement.Length = [Runtime.InteropServices.Marshal]::SizeOf($placement)
+                        if ([OwnedUia.Native]::GetWindowPlacement($window.Handle, [ref]$placement)) {
+                            $nativeBounds = $placement.NormalPosition
+                        }
+                    }
+                    $point = @{ X = ($nativeBounds.Left + $nativeBounds.Right) / 2; Y = ($nativeBounds.Top + $nativeBounds.Bottom) / 2 }
+                }
+            }
+        }
+        if ([double]::IsNaN($point.X) -or [double]::IsInfinity($point.X) -or
+            [double]::IsNaN($point.Y) -or [double]::IsInfinity($point.Y)) { Deny 'Target point is unavailable.' }
+        $script:actionId++
+        $writer.WriteLine((@{ event = 'overlay'; id = $script:actionId; kind = $kind; label = $label
+            x = $point.X; y = $point.Y } | ConvertTo-Json -Compress))
+        # The client forwards the overlay's glide acknowledgement. No input until it arrives.
+        $ack = $reader.ReadLineAsync()
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        while (-not $ack.IsCompleted -and $clock.ElapsedMilliseconds -lt 1500) {
+            Assert-Lifetime
+            Start-Sleep -Milliseconds 10
+        }
+        if (-not $ack.IsCompleted) { $script:stopping = $true; Deny 'Overlay glide acknowledgement timed out.' }
+        $reply = $ack.GetAwaiter().GetResult() | ConvertFrom-Json
+        if ((Get-Argument $reply 'method') -cne 'overlay_ack' -or (Get-Argument $reply 'id') -ne $script:actionId) {
+            $script:stopping = $true
+            Deny 'Invalid overlay acknowledgement.'
+        }
+        if ($null -ne $window) { Assert-Window $window }
     }
 
     function Get-Element($window, $parameters, [switch] $Optional) {
@@ -485,7 +637,7 @@ namespace OwnedUia {
         $foreground = [OwnedUia.Native]::GetForegroundWindow()
         if ($foreground -ne $window.Handle -or
             [OwnedUia.Native]::WindowPid($foreground) -ne $window.Identity.Pid) {
-            Deny 'Owned window is not in the foreground.'
+            Deny 'Target window is not in the foreground.'
         }
     }
 
@@ -493,9 +645,8 @@ namespace OwnedUia {
         Assert-Foreground $window
         $focus = [OwnedUia.Native]::FocusWindow($window.Handle)
         if ($focus -eq [IntPtr]::Zero -or
-            [OwnedUia.Native]::GetAncestor($focus, 2) -ne $window.Handle -or
-            [OwnedUia.Native]::WindowPid($focus) -ne $window.Identity.Pid) {
-            Deny 'Owned window does not have keyboard focus.'
+            [OwnedUia.Native]::GetAncestor($focus, 2) -ne $window.Handle) {
+            Deny 'Target window does not have keyboard focus.'
         }
         Assert-Foreground $window
     }
@@ -543,33 +694,33 @@ namespace OwnedUia {
         return '"' + $escaped + '"'
     }
 
-    # launch: allowlisted executable only; claim identities before reading an owned title.
+    # launch: arbitrary executable/argv; journal only the exact process actually started.
     function Start-OwnedApp($parameters) {
-        $name = Get-Argument $parameters 'app'
-        if ($name -isnot [string]) { Deny 'An allowlisted app name is required.' }
-        $entry = $apps.PSObject.Properties[$name]
-        # Match names ordinally, just like the TypeScript allowlist.
-        if ($null -eq $entry -or $entry.Name -cne $name) {
-            Deny ('Unknown app. Allowed apps: ' + (($apps.PSObject.Properties | ForEach-Object { $_.Name }) -join ', '))
-        }
         if (-not [OwnedUia.Native]::InteractiveDesktop()) { Deny 'No interactive input desktop is available.' }
-        $command = Get-Argument $entry.Value 'command'
+        $command = Get-Argument $parameters 'command'
         if ($command -isnot [string] -or [string]::IsNullOrWhiteSpace($command)) {
-            Deny 'Invalid allowlisted command.'
+            Deny 'Invalid launch command.'
         }
-        # Resolve an executable, not a PowerShell command, expression, or script.
+        $cwd = Get-Argument $parameters 'cwd'
+        if ($null -ne $cwd -and ($cwd -isnot [string] -or -not [IO.Directory]::Exists($cwd))) {
+            Deny 'Launch cwd must be an existing directory.'
+        }
+        if ($null -ne $cwd -and -not [IO.Path]::IsPathRooted($command) -and
+            ($command.Contains('\') -or $command.Contains('/'))) {
+            $command = [IO.Path]::Combine($cwd, $command)
+        }
+        # Resolve a program, not a PowerShell expression. Scripts can be passed to their interpreter.
         $resolved = @(Get-Command -Name $command -CommandType Application -ErrorAction SilentlyContinue)
-        if ($resolved.Count -eq 0) { Deny 'Allowlisted executable is unavailable.' }
+        if ($resolved.Count -eq 0) { Deny 'Launch executable is unavailable.' }
         # Use the first PATH resolution, as launching this executable name normally does.
         $path = [IO.Path]::GetFullPath($resolved[0].Path)
-        if ([IO.Path]::GetExtension($path) -ine '.exe') { Deny 'Allowlisted command must be an executable.' }
-        $arguments = Get-Argument $entry.Value 'args' @()
+        $arguments = Get-Argument $parameters 'args' @()
         if ($null -eq $arguments) { $arguments = @() }
         if ($arguments -is [string] -or $arguments -isnot [System.Array]) {
-            Deny 'Allowlisted args must be a string array.'
+            Deny 'Launch args must be a string array.'
         }
         foreach ($argument in $arguments) {
-            if ($argument -isnot [string]) { Deny 'Allowlisted args must be a string array.' }
+            if ($argument -isnot [string]) { Deny 'Launch args must be a string array.' }
         }
 
         Assert-Lifetime
@@ -578,92 +729,58 @@ namespace OwnedUia {
             $beforeHandles[$native.Handle.ToInt64().ToString()] = $true
         }
         $began = [DateTime]::UtcNow.Ticks
-        # No console window: with Windows Terminal as the default terminal, a console app's
-        # window belongs to another process and would look like a hand-off. GUI apps still
-        # show their own windows; CreateNoWindow only affects consoles.
-        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-        $startInfo.FileName = $path
-        $startInfo.UseShellExecute = $false
-        $startInfo.CreateNoWindow = $true
-        if ($arguments.Count -gt 0) {
-            $startInfo.Arguments = ($arguments | ForEach-Object { Quote-ProcessArgument $_ }) -join ' '
-        }
-        $launcher = [System.Diagnostics.Process]::Start($startInfo)
-        if ($null -eq $launcher) { Deny 'The app did not start a new process; launch refused.' }
+        $argumentLine = ($arguments | ForEach-Object { Quote-ProcessArgument $_ }) -join ' '
+        Show-Action $null $null 'launch' 'Launch'
+        # Atomically guarded and suspended: helper death before publication closes the
+        # private job and kills only this created process, never guessed PID/name matches.
+        $launcher = [OwnedUia.LaunchGuard]::Start($path, $argumentLine, $cwd)
         $launcherIdentity = $null
-        $windowRef = $null
         try {
-            # Keep Start-Process's original handle even if a short-lived launcher exits.
-            try {
-                $null = $launcher.Handle
-                $started = $launcher.StartTime.ToUniversalTime().Ticks
-            } catch {
-                Deny 'Launched process identity is unavailable; no window was adopted. Apps that hand off to another process are not supported.'
-            }
-            if ($started -lt $began) { Deny 'Start-Process did not return a newly launched process; launch refused.' }
+            $started = $launcher.Started
+            if ($started -lt $began) { Deny 'Launch did not return a newly created process.' }
             $launcherIdentity = [pscustomobject]@{
                 Pid = $launcher.Id; Started = $started
                 Key = ('{0}:{1}' -f $launcher.Id, $started)
             }
             $script:processes[$launcherIdentity.Key] = $launcherIdentity
             Save-OwnedState
+            $launcher.Commit() # Run only after durable exact-identity publication.
 
             $clock = [Diagnostics.Stopwatch]::StartNew()
             $stableKey = ''
             $stableSince = 0L
-            $exitedSince = $null
-            while ($clock.ElapsedMilliseconds -lt 15000) {
+            $executable = [IO.Path]::GetFileNameWithoutExtension($path)
+            while ($clock.ElapsedMilliseconds -lt 10000) {
                 Assert-Lifetime
                 $candidates = New-Object System.Collections.Generic.List[object]
                 foreach ($native in [OwnedUia.Native]::Windows()) {
                     if (-not $native.Visible -or
-                        $beforeHandles.ContainsKey($native.Handle.ToInt64().ToString()) -or
-                        [OwnedUia.Native]::GetAncestor($native.Handle, 2) -ne $native.Handle) { continue }
-                    # Foreign windows are metadata-only evidence of an unsupported
-                    # launch. Never resolve their process identity, path, title or UIA.
-                    if ($native.Pid -ne $launcherIdentity.Pid) {
-                        Deny 'This app hands its window to another process, which this extension does not support. Use an app that owns its launched window.'
+                        $beforeHandles.ContainsKey($native.Handle.ToInt64().ToString())) { continue }
+                    $matches = $native.Pid -eq $launcherIdentity.Pid -and (Test-Identity $launcherIdentity)
+                    if (-not $matches) {
+                        $candidateProcess = $null
+                        try {
+                            $candidateProcess = [Diagnostics.Process]::GetProcessById($native.Pid)
+                            $matches = $candidateProcess.ProcessName -ieq $executable
+                        } catch { } finally { if ($null -ne $candidateProcess) { $candidateProcess.Dispose() } }
                     }
-                    if (-not (Test-Identity $launcherIdentity)) {
-                        Deny 'Launched process exited or its identity changed before owning a window.'
-                    }
-                    $candidates.Add([pscustomobject]@{ Native = $native; Identity = $launcherIdentity })
+                    if ($matches) { $candidates.Add($native) }
                 }
-                if ($candidates.Count -gt 1) { Deny 'Launch discovery is ambiguous; no window was adopted.' }
+                # Handoff matching grants a handle, NOT launch/kill eligibility.
                 if ($candidates.Count -eq 1) {
                     $candidate = $candidates[0]
-                    $key = $candidate.Identity.Key + ':' + $candidate.Native.Handle.ToInt64()
-                    if ($key -ne $stableKey) {
-                        $stableKey = $key
-                        $stableSince = $clock.ElapsedMilliseconds
-                    } elseif ($clock.ElapsedMilliseconds - $stableSince -ge 500) {
-                        $windowRef = 'w' + $script:windowGeneration + '_' + $candidate.Native.Handle.ToInt64()
-                        $window = [pscustomobject]@{
-                            Ref = $windowRef; Handle = $candidate.Native.Handle
-                            Identity = $candidate.Identity; Root = $null; Refs = @{}
-                            ProcessKeys = @($launcherIdentity.Key)
-                        }
-                        $script:windows[$windowRef] = $window
-                        Assert-Window $window
-                        $window.Root = [System.Windows.Automation.AutomationElement]::FromHandle($window.Handle)
-                        Assert-Element $window $window.Root
-                        $title = Read-Property $window $window.Root ([System.Windows.Automation.AutomationElement]::NameProperty)
-                        return @{ window = $windowRef; pid = $window.Identity.Pid; title = (Escape-Field $title) }
+                    $key = $candidate.Handle.ToInt64().ToString()
+                    if ($key -ne $stableKey) { $stableKey = $key; $stableSince = $clock.ElapsedMilliseconds }
+                    elseif ($clock.ElapsedMilliseconds - $stableSince -ge 500) {
+                        $info = Get-WindowInfo $candidate
+                        return @{ window = $info.window; pid = $launcherIdentity.Pid; title = $info.title
+                            windowPid = $info.pid; handoff = $info.pid -ne $launcherIdentity.Pid }
                     }
                 } else { $stableKey = '' }
-                if ($launcher.HasExited) {
-                    # Briefly observe metadata so a delayed foreign window can get
-                    # the clear unsupported-launch error, without inspecting it.
-                    if ($null -eq $exitedSince) { $exitedSince = $clock.ElapsedMilliseconds }
-                    if ($clock.ElapsedMilliseconds - $exitedSince -ge 3000) {
-                        Deny 'Launched process exited without owning a window. Apps that hand off to another process are not supported.'
-                    }
-                }
                 Start-Sleep -Milliseconds 100
             }
-            Deny 'Launched process never owned a new, unambiguous window. Apps that hand off to another process are not supported.'
+            return @{ pid = $launcherIdentity.Pid; instruction = 'No unambiguous new window found; use ui_windows with an executable/title filter.' }
         } catch {
-            if ($null -ne $windowRef) { $script:windows.Remove($windowRef) }
             # If identity capture failed, ownership is unproven: do not guess or kill.
             if ($null -ne $launcherIdentity) {
                 Stop-ExactProcess $launcherIdentity
@@ -730,29 +847,8 @@ namespace OwnedUia {
                 $lineIndex = $lines.Count
                 try {
                     Assert-Window $window
-                    # Identity-only check on a foreign child; never read its name/state.
-                    $elementPid = $element.GetCurrentPropertyValue(
-                        [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $true)
-                    if ($elementPid -isnot [int] -or $elementPid -ne $window.Identity.Pid) {
-                        $cut = $true
-                        continue
-                    }
-                    # Win32 proxies can expose a same-PID popup (e.g. ComboLBox)
-                    # as a UIA child. Skip native windows outside this exact form,
-                    # without reading content, granting refs or traversing children.
-                    $handleValue = $element.GetCurrentPropertyValue(
-                        [System.Windows.Automation.AutomationElement]::NativeWindowHandleProperty, $true)
-                    if ($handleValue -is [int] -and $handleValue -ne 0) {
-                        $handle = [IntPtr]::new([long]$handleValue)
-                        if ([OwnedUia.Native]::GetAncestor($handle, 2) -ne $window.Handle -or
-                            [OwnedUia.Native]::WindowPid($handle) -ne $window.Identity.Pid) {
-                            $cut = $true
-                            continue
-                        }
-                    }
-                    # One ancestry verification per node per snapshot. Actions still
-                    # reverify every property/pattern access; this trust is tree-local.
-                    Assert-Element $window $element
+                    # FindAll(Children) scopes this read to the target's UIA subtree.
+                    # Include cross-process/pop-up providers; refs are revalidated before actions.
                     $type = Read-Property $window $element ([System.Windows.Automation.AutomationElement]::ControlTypeProperty) -Verified -Clock $clock
                     $name = Read-Property $window $element ([System.Windows.Automation.AutomationElement]::NameProperty) -Verified -Clock $clock
                     $automationId = Read-Property $window $element ([System.Windows.Automation.AutomationElement]::AutomationIdProperty) -Verified -Clock $clock
@@ -771,15 +867,19 @@ namespace OwnedUia {
                     if ($automationId -is [string] -and $automationId.Length -gt 0) {
                         $line += ' automationId="' + (Escape-Field $automationId) + '"'
                     }
-                    $valuePattern = Get-Pattern $window $element ([System.Windows.Automation.ValuePattern]::Pattern) -Verified -Clock $clock
-                    if ($null -ne $valuePattern) {
-                        $line += ' value="' + (Escape-Field $valuePattern.Current.Value) + '"'
-                        $line += ' readonly=' + ([string]$valuePattern.Current.IsReadOnly).ToLowerInvariant()
-                    } elseif ($typeName -eq 'Document' -or $typeName -eq 'Edit') {
-                        # Bound the provider read, not only the rendered text.
-                        $textPattern = Get-Pattern $window $element ([System.Windows.Automation.TextPattern]::Pattern) -Verified -Clock $clock
-                        if ($null -ne $textPattern) {
-                            $line += ' text="' + (Escape-Field $textPattern.DocumentRange.GetText(512)) + '"'
+                    $password = Read-Property $window $element ([System.Windows.Automation.AutomationElement]::IsPasswordProperty) -Verified -Clock $clock
+                    # Unknown password state fails closed: never query Value/Text patterns.
+                    if ($password -ne $false) { $line += ' password=true' }
+                    else {
+                        $valuePattern = Get-Pattern $window $element ([System.Windows.Automation.ValuePattern]::Pattern) -Verified -Clock $clock
+                        if ($null -ne $valuePattern) {
+                            $line += ' value="' + (Escape-Field $valuePattern.Current.Value) + '"'
+                            $line += ' readonly=' + ([string]$valuePattern.Current.IsReadOnly).ToLowerInvariant()
+                        } elseif ($typeName -eq 'Document' -or $typeName -eq 'Edit') {
+                            $textPattern = Get-Pattern $window $element ([System.Windows.Automation.TextPattern]::Pattern) -Verified -Clock $clock
+                            if ($null -ne $textPattern) {
+                                $line += ' text="' + (Escape-Field $textPattern.DocumentRange.GetText(512)) + '"'
+                            }
                         }
                     }
                     $togglePattern = Get-Pattern $window $element ([System.Windows.Automation.TogglePattern]::Pattern) -Verified -Clock $clock
@@ -790,7 +890,7 @@ namespace OwnedUia {
                     $window.Refs[$ref] = $element
                     $lines.Add($line)
                     if ($item.Depth -lt $depth -and $lines.Count -lt $maxNodes -and $clock.ElapsedMilliseconds -lt 20000) {
-                        # Children only, scoped to the proven owned element.
+                        # Children only, scoped to the target's UIA subtree.
                         $children = $element.FindAll([System.Windows.Automation.TreeScope]::Children,
                             [System.Windows.Automation.Condition]::TrueCondition)
                         Assert-TreeBudget $clock
@@ -812,7 +912,7 @@ namespace OwnedUia {
                 }
             }
             $nodes = $lines.Count
-            if ($cut) { $lines.Add('[cut: node/time limit, unreadable node or foreign child provider skipped]') }
+            if ($cut) { $lines.Add('[cut: node/character/time limit or unreadable node]') }
             $text = [string]::Join("`n", $lines.ToArray())
             return @{ text = $text; nodes = $nodes; chars = $text.Length;
                 ms = $clock.ElapsedMilliseconds; cut = $cut }
@@ -822,10 +922,11 @@ namespace OwnedUia {
         }
     }
 
-    # click: prefer UIA patterns; only use input on a proven owned clickable point.
+    # click: prefer UIA patterns; fallback requires a verified target-window clickable point.
     function Invoke-OwnedClick($parameters) {
         $window = Get-Window $parameters
         $element = Get-Element $window $parameters
+        Show-Action $window $element 'click' 'Click'
         $pattern = Get-Pattern $window $element ([System.Windows.Automation.InvokePattern]::Pattern)
         if ($null -ne $pattern) {
             Assert-Element $window $element
@@ -880,9 +981,8 @@ namespace OwnedUia {
             Deny 'Pointer moved before input; click refused.'
         }
         Assert-ClickPoint $window $actualPoint
-        try {
-            if (-not [OwnedUia.Native]::Mouse($false)) { Deny 'Pointer input was refused.' }
-        } finally { $null = [OwnedUia.Native]::Mouse($true) }
+        if (([int][OwnedUia.Native]::GetAsyncKeyState(0x01) -band 0x8000) -ne 0) { Deny 'Release the mouse button before clicking.' }
+        if (-not [OwnedUia.Native]::Click()) { Deny 'Pointer input was refused.' }
         return @{ path = 'SendInput' }
     }
 
@@ -890,20 +990,20 @@ namespace OwnedUia {
         Assert-Foreground $window
         $hit = [OwnedUia.Native]::WindowFromPoint($point)
         if ($hit -eq [IntPtr]::Zero -or
-            [OwnedUia.Native]::GetAncestor($hit, 2) -ne $window.Handle -or
-            [OwnedUia.Native]::WindowPid($hit) -ne $window.Identity.Pid) {
-            Deny 'Clickable point is obscured or outside the owned window.'
+            [OwnedUia.Native]::GetAncestor($hit, 2) -ne $window.Handle) {
+            Deny 'Clickable point is obscured or outside the target window.'
         }
         # Last foreground check immediately before input, after the hit test.
         Assert-Foreground $window
     }
 
-    # type: use writable ValuePattern, otherwise focused Unicode input in the owned window.
+    # type: use writable ValuePattern, otherwise focused Unicode input in the target window.
     function Set-OwnedText($parameters) {
         $window = Get-Window $parameters
         $element = Get-Element $window $parameters -Optional
         $text = Get-Argument $parameters 'text'
         if ($text -isnot [string] -or $text.Length -gt 20000) { Deny 'Text must be a string of at most 20000 characters.' }
+        Show-Action $window $element 'type' 'Typing'
         $pattern = Get-Pattern $window $element ([System.Windows.Automation.ValuePattern]::Pattern)
         if ($null -ne $pattern) {
             Assert-Element $window $element
@@ -915,7 +1015,7 @@ namespace OwnedUia {
         $exact = $null -ne (Get-Argument $parameters 'ref')
         if ($exact) { Focus-Element $window $element $true }
         else {
-            # Without a ref, retain the owned window's currently focused control.
+            # Without a ref, retain the target window's currently focused control.
             # A top-level Window provider need not itself be keyboard-focusable.
             Focus-Window $window
             Assert-NativeFocus $window
@@ -968,6 +1068,7 @@ namespace OwnedUia {
         elseif ($key -cmatch '^f([1-9]|1[0-2])$') { $code = 0x70 + [int]$key.Substring(1) - 1 }
         else { Deny 'Key is not allowlisted.' }
 
+        Show-Action $window $window.Root 'key' $chord
         $elementRef = Get-Argument $parameters 'ref'
         $element = $null
         if ($null -ne $elementRef) {
@@ -976,30 +1077,16 @@ namespace OwnedUia {
         } else { Focus-Window $window }
         Assert-NoHeldModifiers
         Assert-NativeFocus $window
-        $pressed = New-Object System.Collections.Generic.List[int]
-        try {
-            foreach ($modifierCode in $modifiers) {
-                Assert-NativeFocus $window
-                # Add before SendInput: even a reported failure merits a release.
-                $pressed.Add($modifierCode)
-                if (-not [OwnedUia.Native]::Key([uint16]$modifierCode, $false)) { Deny 'Key input was refused.' }
-            }
-            if ($null -ne $element) {
-                Assert-Element $window $element
-                if ((Read-Property $window $element ([System.Windows.Automation.AutomationElement]::HasKeyboardFocusProperty)) -ne $true) {
-                    Deny 'Element lost keyboard focus.'
-                }
-            }
-            Assert-NativeFocus $window
-            try {
-                if (-not [OwnedUia.Native]::Key([uint16]$code, $false)) { Deny 'Key input was refused.' }
-            } finally { $null = [OwnedUia.Native]::Key([uint16]$code, $true) }
-        } finally {
-            # Release even if ownership/focus/lifetime was lost during the chord.
-            for ($i = $pressed.Count - 1; $i -ge 0; $i--) {
-                $null = [OwnedUia.Native]::Key([uint16]$pressed[$i], $true)
+        if ($null -ne $element) {
+            Assert-Element $window $element
+            if ((Read-Property $window $element ([System.Windows.Automation.AutomationElement]::HasKeyboardFocusProperty)) -ne $true) {
+                Deny 'Element lost keyboard focus.'
             }
         }
+        if (([int][OwnedUia.Native]::GetAsyncKeyState($code) -band 0x8000) -ne 0) { Deny 'Release the target key before sending input.' }
+        Assert-NoHeldModifiers
+        Assert-NativeFocus $window
+        if (-not [OwnedUia.Native]::Chord([uint16[]]$modifiers.ToArray(), [uint16]$code)) { Deny 'Key input was refused.' }
         return @{ path = 'SendInput' }
     }
 
@@ -1010,7 +1097,6 @@ namespace OwnedUia {
             [OwnedUia.Native]::GetAncestor($window.Handle, 2) -ne $window.Handle -or
             [OwnedUia.Native]::WindowPid($window.Handle) -ne $window.Identity.Pid -or
             $null -eq $window.Root) { return }
-        # Temporarily bypass only the lifetime check, never the ownership checks.
         $savedLifetime = $script:lifetime
         $script:lifetime = $null
         try {
@@ -1018,32 +1104,49 @@ namespace OwnedUia {
             if ($null -ne $pattern) {
                 Assert-Element $window $window.Root
                 $pattern.Close()
+                return 'WindowPattern.Close'
             }
         } catch { }
         finally { $script:lifetime = $savedLifetime }
+        # A provider call may have blocked before throwing; revalidate before native fallback.
+        if (-not (Test-Identity $window.Identity) -or
+            -not [OwnedUia.Native]::IsWindow($window.Handle) -or
+            [OwnedUia.Native]::GetAncestor($window.Handle, 2) -ne $window.Handle -or
+            [OwnedUia.Native]::WindowPid($window.Handle) -ne $window.Identity.Pid) {
+            Deny 'Target window is no longer valid.'
+        }
+        # Asynchronous WM_CLOSE, never WM_QUIT or an image-name/process sweep.
+        if ([OwnedUia.Native]::PostMessage($window.Handle, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)) { return 'WM_CLOSE' }
+        Deny 'Close request was refused.'
     }
 
     # close: WindowPattern first, then only recorded PID/creation-time identities.
     function Close-OwnedWindow($parameters) {
         $window = Get-Window $parameters
-        Request-WindowClose $window
-        # Give WindowPattern.Close a second, including save/confirmation dialogs.
+        Show-Action $window $window.Root 'close' 'Close'
+        $path = Request-WindowClose $window
         Start-Sleep -Milliseconds 1000
-        foreach ($key in $window.ProcessKeys) {
-            if ($script:processes.ContainsKey($key)) {
-                $identity = $script:processes[$key]
+        $terminated = $false
+        # Reading or acting on a window never adds kill eligibility. Match BOTH fields.
+        $key = $window.Identity.Key
+        if ($script:processes.ContainsKey($key)) {
+            $identity = $script:processes[$key]
+            if ($identity.Pid -eq $window.Identity.Pid -and $identity.Started -eq $window.Identity.Started) {
                 Stop-ExactProcess $identity
-                if (Test-IdentityGone $identity) { $script:processes.Remove($key) }
+                $terminated = Test-IdentityGone $identity
+                if ($terminated) { $script:processes.Remove($key) }
             }
         }
-        $script:windows.Remove($window.Ref)
+        $closed = -not [OwnedUia.Native]::IsWindow($window.Handle)
+        if ($closed) { $script:windows.Remove($window.Ref) }
         Save-OwnedState
-        if (-not (Test-IdentityGone $window.Identity)) { Deny 'Owned process cleanup is incomplete; identity retained.' }
-        return @{ closed = $true }
+        return @{ closed = $closed; path = $path; terminated = $terminated }
     }
 
     function Clear-OwnedApps {
-        foreach ($window in @($script:windows.Values)) { Request-WindowClose $window }
+        foreach ($window in @($script:windows.Values)) {
+            if ($script:processes.ContainsKey($window.Identity.Key)) { $null = Request-WindowClose $window }
+        }
         if ($script:processes.Count -gt 0) { Start-Sleep -Milliseconds 1000 }
         foreach ($identity in @($script:processes.Values)) { Stop-ExactProcess $identity }
         $script:windows.Clear()
@@ -1069,6 +1172,7 @@ namespace OwnedUia {
         $line = $pending.GetAwaiter().GetResult()
         if ($null -eq $line) { break }
         $id = $null
+        $method = ''
         try {
             $request = $line | ConvertFrom-Json
             if ($null -eq $request -or $request -isnot [pscustomobject]) { Deny 'Request must be a JSON object.' }
@@ -1085,11 +1189,18 @@ namespace OwnedUia {
                 Deny 'Invalid method or params.'
             }
             $result = switch -CaseSensitive ($method) {
+                'windows' { Get-Windows $parameters; break }
                 'launch' { Start-OwnedApp $parameters; break }
                 'tree' { Get-OwnedTree $parameters; break }
                 'click' { Invoke-OwnedClick $parameters; break }
                 'type' { Set-OwnedText $parameters; break }
                 'key' { Send-OwnedKey $parameters; break }
+                'focus' {
+                    $window = Get-Window $parameters
+                    Show-Action $window $window.Root 'focus' 'Focus'
+                    Focus-Window $window
+                    @{ focused = $true }; break
+                }
                 'close' { Close-OwnedWindow $parameters; break }
                 'desktop' { @{ interactive = [OwnedUia.Native]::InteractiveDesktop() }; break }
                 'shutdown' { Clear-OwnedApps; $script:stopping = $true; @{ shutdown = $true }; break }
@@ -1097,11 +1208,14 @@ namespace OwnedUia {
             }
             $reply = @{ id = $id; result = $result }
         } catch {
-            $message = 'Operation failed or ownership could not be verified.'
+            $message = 'Operation failed or target could not be verified.'
             if ($_.Exception.Message.StartsWith('UIA_SAFE: ', [StringComparison]::Ordinal)) {
                 $message = $_.Exception.Message.Substring(10)
             }
             $reply = @{ id = $id; error = $message }
+        }
+        if ($method -in @('launch', 'click', 'type', 'key', 'focus', 'close')) {
+            $writer.WriteLine((@{ event = 'done' } | ConvertTo-Json -Compress))
         }
         $writer.WriteLine(($reply | ConvertTo-Json -Depth 8 -Compress))
     }
