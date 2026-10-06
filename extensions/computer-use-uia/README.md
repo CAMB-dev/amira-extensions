@@ -1,5 +1,8 @@
 # computer-use-uia (experimental)
 
+> **Experimental (0.0.x).** Unstable, Windows only, off by default. Interfaces, settings and safety
+> limits may change without notice. Read the limitations before enabling it.
+
 Windows desktop control through the built-in .NET UI Automation client. **Off by default**,
 Windows only, tree only: no screenshots, OCR, browser driver, native npm modules or shipped
 compiled binaries. Requires Amira API **0.1.27** and Windows PowerShell 5.1. The helper uses
@@ -51,7 +54,7 @@ node/ref before reading or acting. Element refs are local to the latest tree of 
 All tools are serialized and main-session-only, avoiding competing sub-agent keyboard focus.
 
 During launch discovery, the helper enumerates top-level window handles/PIDs to find its
-own new visible top-level HWND. Ownership requires the **exact PID returned by Start-Process
+own new visible top-level HWND. Ownership requires the **exact PID returned by the launch
 and its process start time**; no other process is adopted. Foreign new-window metadata can
 cause a generic launch refusal, but is not evidence of launch provenance. The helper does not
 read foreign window names/content, return or log their metadata, or adopt or kill their processes.
@@ -131,6 +134,12 @@ journals and failed kills are retained; journals belonging to active helpers are
 
 ## Limitations
 
+- Apps are launched with `CreateNoWindow` and no shell, so console apps do not get a console
+  window. This matters when Windows Terminal is the default terminal: its window would belong
+  to another process and be refused as a hand-off. Console apps are generally not useful here.
+- Popups that are separate top-level windows (for example a ComboBox dropdown list) are
+  **not visible** in `ui_tree` and cannot be driven, even in the same process: nodes outside
+  the owned top-level window are skipped before their content is read.
 - Requires an active connected session and an interactive, unlocked Windows input desktop.
   Session 0, disconnected RDP sessions, headless and locked desktops are not supported. Elevated apps and secure desktops are not supported; run at matching
   integrity levels and do not use this to operate permission prompts.
@@ -175,9 +184,6 @@ tests** cover exact launched-PID ownership, foreign-window refusal, failure clea
 `OwnershipVersion=2` journal safeguards, cursor checks and tree budgets/provider errors;
 they are not runtime PowerShell/provider tests. The explicit smoke script also targets the
 bundled window. Never test against a window you did not launch.
-
-**D109 verification status:** tests have not been run for this change; verification is limited
-to TypeScript and Biome checks. No current desktop measurements or runtime success are claimed.
 
 Provider initialization is called through a typed, non-inlined frame: the managed UIA
 [default proxy loader](https://source.dot.net/UIAutomationClient/MS/Internal/Automation/ProxyManager.cs.html)

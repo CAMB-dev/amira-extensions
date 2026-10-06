@@ -4,7 +4,7 @@
     {
       "name": "computer-use-uia",
       "description": "Experimental Windows desktop UI Automation, only for apps Amira launched; off by default",
-      "version": "0.1.0",
+      "version": "0.0.1",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/computer-use-uia" },
       "engines": { "amira": "^0.1.27" },
       "tags": ["experimental", "windows", "desktop", "uia", "automation"],
