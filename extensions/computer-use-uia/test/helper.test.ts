@@ -41,7 +41,7 @@ describe("helper launch source contracts (not runtime behavior)", () => {
     const launch = helperFunction("Start-OwnedApp")
     ordered(
       launch,
-      "$launcher = Start-Process @startOptions",
+      "$launcher = [System.Diagnostics.Process]::Start($startInfo)",
       "try {",
       "$null = $launcher.Handle",
       "$started = $launcher.StartTime.ToUniversalTime().Ticks",
@@ -132,6 +132,12 @@ describe("helper launch source contracts (not runtime behavior)", () => {
       expect(code(source)).not.toContain(fragment)
     expect(helperFunction("Get-Identity")).not.toContain("MainModule")
   })
+})
+
+test("key injection uses the Windows PowerShell 5.1 uint16 type (source contracts)", () => {
+  const key = helperFunction("Send-OwnedKey")
+  expect(key).not.toContain("[ushort]")
+  expect(key.match(/\[uint16\]/g)).toHaveLength(4)
 })
 
 test("debug key output is absent (source contracts)", () => {
@@ -248,6 +254,32 @@ describe("helper tree source contracts (not runtime behavior)", () => {
     expect(helperFunction("Read-Property")).toContain("Assert-Element $window $element")
     expect(helperFunction("Invoke-OwnedClick")).not.toContain(" -Verified")
     expect(helperFunction("Set-OwnedText")).not.toContain(" -Verified")
+  })
+
+  test("skips out-of-scope native children before ancestry, content, refs or child traversal", () => {
+    ordered(
+      helperFunction("Get-OwnedTree"),
+      "NativeWindowHandleProperty, $true)",
+      "if ($handleValue -is [int] -and $handleValue -ne 0)",
+      "GetAncestor($handle, 2) -ne $window.Handle -or",
+      "WindowPid($handle) -ne $window.Identity.Pid)",
+      "$cut = $true",
+      "continue",
+      "Assert-Element $window $element",
+      "ControlTypeProperty",
+      "NameProperty",
+      "$window.Refs[$ref] = $element",
+      "$element.FindAll(",
+    )
+    // Action checks still reject these nodes rather than trusting a shared PID.
+    ordered(
+      helperFunction("Assert-Element"),
+      "GetAncestor($handle, 2) -ne $window.Handle -or",
+      "WindowPid($handle) -ne $window.Identity.Pid)",
+      "Deny 'Element is outside the owned window.'",
+      "$cursor = $script:walker.GetParent($cursor)",
+      "Deny 'Element ancestry cannot be verified.'",
+    )
   })
 
   test("bounds traversal at 20 seconds, node/depth limits and owned children only", () => {

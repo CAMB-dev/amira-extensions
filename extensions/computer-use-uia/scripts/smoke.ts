@@ -59,9 +59,12 @@ try {
       apps.push(launched)
       const tree = (await client!.call("tree", { window: launched.window })) as TreeResult
       console.log(`${app}: ${tree.nodes} nodes, ${tree.chars} chars, ${tree.ms} ms`)
-      const edits = tree.text.split("\n").filter((line) => line.includes(' Edit name="Multiline text" '))
+      const edits = tree.text
+        .split("\n")
+        .filter((line) => / (?:Document|Edit) name="Multiline text" /.test(line))
       const ref = edits.length === 1 && /^\s*(e\d+)\s/.exec(edits[0]!)?.[1]
-      if (!ref) throw new Error("Expected one named multiline Edit control in the launched testWindow")
+      if (!ref)
+        throw new Error("Expected one named multiline Document/Edit control in the launched testWindow")
       const text = "Amira owned-window smoke — héllo 你好"
       const typed = await client!.call("type", { window: launched.window, ref, text })
       const read = (await client!.call("tree", { window: launched.window })) as TreeResult

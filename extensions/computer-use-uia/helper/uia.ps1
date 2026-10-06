@@ -578,11 +578,18 @@ namespace OwnedUia {
             $beforeHandles[$native.Handle.ToInt64().ToString()] = $true
         }
         $began = [DateTime]::UtcNow.Ticks
-        $startOptions = @{ FilePath = $path; PassThru = $true; ErrorAction = 'Stop' }
+        # No console window: with Windows Terminal as the default terminal, a console app's
+        # window belongs to another process and would look like a hand-off. GUI apps still
+        # show their own windows; CreateNoWindow only affects consoles.
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $path
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
         if ($arguments.Count -gt 0) {
-            $startOptions.ArgumentList = ($arguments | ForEach-Object { Quote-ProcessArgument $_ }) -join ' '
+            $startInfo.Arguments = ($arguments | ForEach-Object { Quote-ProcessArgument $_ }) -join ' '
         }
-        $launcher = Start-Process @startOptions
+        $launcher = [System.Diagnostics.Process]::Start($startInfo)
+        if ($null -eq $launcher) { Deny 'The app did not start a new process; launch refused.' }
         $launcherIdentity = $null
         $windowRef = $null
         try {
@@ -729,6 +736,19 @@ namespace OwnedUia {
                     if ($elementPid -isnot [int] -or $elementPid -ne $window.Identity.Pid) {
                         $cut = $true
                         continue
+                    }
+                    # Win32 proxies can expose a same-PID popup (e.g. ComboLBox)
+                    # as a UIA child. Skip native windows outside this exact form,
+                    # without reading content, granting refs or traversing children.
+                    $handleValue = $element.GetCurrentPropertyValue(
+                        [System.Windows.Automation.AutomationElement]::NativeWindowHandleProperty, $true)
+                    if ($handleValue -is [int] -and $handleValue -ne 0) {
+                        $handle = [IntPtr]::new([long]$handleValue)
+                        if ([OwnedUia.Native]::GetAncestor($handle, 2) -ne $window.Handle -or
+                            [OwnedUia.Native]::WindowPid($handle) -ne $window.Identity.Pid) {
+                            $cut = $true
+                            continue
+                        }
                     }
                     # One ancestry verification per node per snapshot. Actions still
                     # reverify every property/pattern access; this trust is tree-local.
@@ -962,7 +982,7 @@ namespace OwnedUia {
                 Assert-NativeFocus $window
                 # Add before SendInput: even a reported failure merits a release.
                 $pressed.Add($modifierCode)
-                if (-not [OwnedUia.Native]::Key([ushort]$modifierCode, $false)) { Deny 'Key input was refused.' }
+                if (-not [OwnedUia.Native]::Key([uint16]$modifierCode, $false)) { Deny 'Key input was refused.' }
             }
             if ($null -ne $element) {
                 Assert-Element $window $element
@@ -972,12 +992,12 @@ namespace OwnedUia {
             }
             Assert-NativeFocus $window
             try {
-                if (-not [OwnedUia.Native]::Key([ushort]$code, $false)) { Deny 'Key input was refused.' }
-            } finally { $null = [OwnedUia.Native]::Key([ushort]$code, $true) }
+                if (-not [OwnedUia.Native]::Key([uint16]$code, $false)) { Deny 'Key input was refused.' }
+            } finally { $null = [OwnedUia.Native]::Key([uint16]$code, $true) }
         } finally {
             # Release even if ownership/focus/lifetime was lost during the chord.
             for ($i = $pressed.Count - 1; $i -ge 0; $i--) {
-                $null = [OwnedUia.Native]::Key([ushort]$pressed[$i], $true)
+                $null = [OwnedUia.Native]::Key([uint16]$pressed[$i], $true)
             }
         }
         return @{ path = 'SendInput' }

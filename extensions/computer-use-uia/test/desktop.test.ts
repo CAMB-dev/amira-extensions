@@ -110,6 +110,11 @@ test.skipIf(!interactive)(
       const testWindow = (await c.call("launch", { app: "testWindow" })) as LaunchResult
       launched.push(testWindow)
       let tree = (await c.call("tree", { window: testWindow.window })) as TreeResult
+      // Win32 proxies expose the ComboLBox popup as a child, but its native root
+      // is outside the form: keep the ComboBox, never publish the popup or its items.
+      expect(controlRef(tree, "ComboBox", "Choose an item")).toMatch(/^e\d+$/)
+      expect(tree.text).not.toMatch(/\b(?:List|ListItem) name=/)
+      expect(tree.cut).toBe(true)
       console.log(
         `UIA manual measurement: testWindow ${tree.nodes} nodes, ${tree.chars} chars, ${tree.ms} ms`,
       )
@@ -117,16 +122,17 @@ test.skipIf(!interactive)(
         ["Multiline text", "Amira UIA owned-window test — héllo 你好\nSecond line"],
         ["Single-line text", "Single-line Unicode — héllo 你好"],
       ] as const) {
-        const oldRef = controlRef(tree, "Edit", name)
-        const editor = controlLine(tree, "Edit", name)
+        const type = tree.text.includes(` Document name="${name}" `) ? "Document" : "Edit"
+        const oldRef = controlRef(tree, type, name)
+        const editor = controlLine(tree, type, name)
         const expectedPath = editor.includes('value="') ? "ValuePattern.SetValue" : "SendInput"
         const typed = await c.call("type", { window: testWindow.window, ref: oldRef, text: message })
         expect(typed).toMatchObject({ path: expectedPath })
         tree = (await c.call("tree", { window: testWindow.window })) as TreeResult
-        expect(controlLine(tree, "Edit", name).replaceAll("\\r\\n", "\\n")).toContain(
+        expect(controlLine(tree, type, name).replaceAll("\\r\\n", "\\n")).toContain(
           message.replaceAll("\n", "\\n"),
         )
-        expect(controlRef(tree, "Edit", name)).not.toBe(oldRef)
+        expect(controlRef(tree, type, name)).not.toBe(oldRef)
         const stale = await captured!.raw("click", { window: testWindow.window, ref: oldRef })
         expect(stale.error).toContain("Unknown element")
       }
