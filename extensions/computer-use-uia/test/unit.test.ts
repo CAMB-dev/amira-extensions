@@ -25,6 +25,12 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
   let launchWindow = true
   let heldStage: string | undefined
   let holdOverlayCleanup = false
+  let overlayError: string | undefined
+  let overlayThrow: string | undefined
+  let armError: string | undefined
+  let holdGlide = false
+  let windowResults: Record<string, unknown>[] = [{ window: WINDOW, pid: 17, title: "fixture" }]
+  let closeResult = { closed: false, instruction: "Window is still open; a save prompt may need attention" }
   const overlayCleanup: (() => void)[] = []
   const readiness: (() => void)[] = []
   function ready(stage: string, callback: () => void) {
@@ -71,15 +77,28 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
         }
       }
       if (argv.some((arg) => arg.endsWith("overlay.ps1"))) {
+        if (overlayThrow) throw new Error(overlayThrow)
         started.push(argv)
         const overlay = { ...pipe, writes: [] as Record<string, unknown>[] }
         overlays.push(overlay)
-        ready("overlay", () => options.onEvent({ type: "stdout", data: '{"event":"ready"}\n' }))
+        ready("overlay", () =>
+          options.onEvent({
+            type: "stdout",
+            data: `${JSON.stringify(overlayError ? { event: "error", error: overlayError } : { event: "ready" })}\n`,
+          }),
+        )
         return {
           write(line: string) {
             const message = JSON.parse(line)
             overlay.writes.push(message)
-            if (message.event === "overlay")
+            if (message.event === "busy")
+              ready("armed", () =>
+                options.onEvent({
+                  type: "stdout",
+                  data: `${JSON.stringify(armError ? { event: "error", error: armError } : { event: "armed", id: message.id })}\n`,
+                }),
+              )
+            if (message.event === "overlay" && !holdGlide)
               queueMicrotask(() =>
                 options.onEvent({
                   type: "stdout",
@@ -118,10 +137,12 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
                     : { instruction: "use ui_windows" }),
                 }
               : request.method === "windows"
-                ? { windows: [{ window: WINDOW, pid: 17, title: "fixture" }] }
+                ? { windows: windowResults }
                 : request.method === "tree"
                   ? { text, nodes: 2, chars: text.length, ms: 12, cut: false }
-                  : { path: "ValuePattern.SetValue" }
+                  : request.method === "close"
+                    ? closeResult
+                    : { path: "ValuePattern.SetValue" }
           const line = `${JSON.stringify({ id: request.id, result })}\r\n`
           queueMicrotask(() => {
             options.onEvent({ type: "stdout", data: line.slice(0, 15) })
@@ -153,7 +174,9 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
     notify(message: string) {
       notices.push(message)
     },
-    reportError() {},
+    reportError(message: string) {
+      notices.push(message)
+    },
     intercept(type: string, handler: (value: { sections: { name: string; text: string }[] }) => unknown) {
       interceptors.set(type, handler)
       return () => {}
@@ -173,6 +196,24 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
     interceptors,
     tools,
     notices,
+    overlayFailure(error?: string) {
+      overlayError = error
+    },
+    overlaySpawnFailure(error?: string) {
+      overlayThrow = error
+    },
+    armFailure(error: string) {
+      armError = error
+    },
+    slowGlide() {
+      holdGlide = true
+    },
+    windows(value: Record<string, unknown>[]) {
+      windowResults = value
+    },
+    closeResult(value: typeof closeResult) {
+      closeResult = value
+    },
     holdOverlayCleanup() {
       holdOverlayCleanup = true
     },
@@ -398,15 +439,30 @@ test("fake stop state: double Escape within 500ms, hotkey latch, explicit resume
   expect(stop.stop()).toBe(true)
 })
 
-test("overlay protocol fake: ready/glide forwarding, monitor runs even with rendering off", async () => {
+test("physical-only Escape fake rejects injected input and presses outside the control window", () => {
+  const stop = new StopState()
+  expect(stop.escape(0, 0, false)).toBe(false)
+  expect(stop.escape(100, 0, false)).toBe(false)
+  expect(stop.escape(200, 0x10)).toBe(false)
+  expect(stop.escape(300, 0x2)).toBe(false)
+  expect(stop.escape(400)).toBe(false)
+  expect(stop.escape(500, 0x10)).toBe(false)
+  expect(stop.escape(600)).toBe(true)
+  stop.resume()
+  expect(stop.escape(700)).toBe(false)
+  expect(stop.escape(800, 0, false)).toBe(false)
+  expect(stop.escape(900)).toBe(false)
+})
+
+test("overlay protocol fake: ready/glide forwarding and actions wait for armed hooks", async () => {
   expect(overlayReply('{"event":"glided","id":3}')).toEqual({ event: "glided", id: 3 })
   expect(() => overlayReply('{"event":"unknown"}')).toThrow()
   const h = fake()
-  const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+  const c = new UiaClient(h.api, settings)
   await c.call("tree", { window: WINDOW })
   expect(h.overlays).toHaveLength(1)
   const argv = h.started.find((argv) => argv.some((arg) => arg.endsWith("overlay.ps1")))!
-  expect(argv[argv.indexOf("-Render") + 1]).toBe("false")
+  expect(argv[argv.indexOf("-Render") + 1]).toBe("true")
   expect(argv[argv.indexOf("-StopHotkey") + 1]).toBe("ctrl+alt+q")
   expect(h.overlays[0]!.writes).toContainEqual({ event: "owner", pid: 70, started: "1000" })
   h.pipes[0]!.options.onEvent({
@@ -415,6 +471,13 @@ test("overlay protocol fake: ready/glide forwarding, monitor runs even with rend
   })
   await Bun.sleep(0)
   expect(h.acks).toContainEqual({ method: "overlay_ack", id: 9 })
+  h.holdReady("armed")
+  const action = c.call("focus", { window: WINDOW })
+  await Bun.sleep(0)
+  expect(h.requests.map((request) => request.method)).toEqual(["tree"])
+  h.releaseReady()
+  await action
+  expect(h.requests.map((request) => request.method)).toEqual(["tree", "focus"])
   await c.stop()
 })
 
@@ -489,7 +552,7 @@ for (const stage of ["lifetime", "watchdog", "overlay"]) {
   })
 }
 
-test("fragmented stop and malformed monitor replies fail closed", async () => {
+test("fragmented stop latches, but malformed monitor replies refuse actions without a user stop", async () => {
   for (const reply of ['{"event":"stop"}\n', '{"event":"unknown"}\n', "not-json\n"]) {
     const h = fake()
     const c = new UiaClient(h.api, settings)
@@ -497,8 +560,15 @@ test("fragmented stop and malformed monitor replies fail closed", async () => {
     h.overlays[0]!.options.onEvent({ type: "stdout", data: reply.slice(0, 5) })
     expect(c.emergency.stopped).toBe(false)
     h.overlays[0]!.options.onEvent({ type: "stdout", data: reply.slice(5) })
-    await expect(c.call("focus", { window: WINDOW })).rejects.toThrow("the user stopped desktop control")
-    expect(h.pipes[0]!.closed).toEqual([0])
+    if (reply.includes('"stop"')) {
+      await expect(c.call("focus", { window: WINDOW })).rejects.toThrow("the user stopped desktop control")
+      expect(h.pipes[0]!.closed).toEqual([0])
+    } else {
+      expect(c.emergency.stopped).toBe(false)
+      expect(h.pipes[0]!.closed).toEqual([])
+      // A later action can start a fresh monitor after the protocol failure.
+      await c.call("focus", { window: WINDOW })
+    }
     await c.stop()
   }
 })
@@ -539,6 +609,236 @@ test("pre-start cancellation never starts desktop processes", async () => {
     .execute({ command: "x.exe" }, { ...ctx, signal: AbortSignal.abort() })
   expect(result.isError).toBe(true)
   expect(h.pipes).toHaveLength(0)
+  await c.stop()
+})
+
+test("overlay startup failure preserves its error, permits reads, and retries without a stop latch", async () => {
+  const h = fake()
+  const error = "Stop hotkey ctrl+alt+q is unavailable — set stopHotkey or disable the overlay"
+  h.overlayFailure(error)
+  const c = new UiaClient(h.api, settings, 100)
+  await c.call("windows")
+  await c.call("tree", { window: WINDOW })
+  await expect(c.call("focus", { window: WINDOW })).rejects.toThrow(error)
+  expect(c.emergency.stopped).toBe(false)
+  expect(h.requests.map((request) => request.method)).toEqual(["windows", "tree"])
+  h.overlayFailure()
+  await c.call("focus", { window: WINDOW })
+  await c.stop()
+})
+
+test("overlay spawn failure and startup timeout leave reads available without a latch", async () => {
+  for (const failure of ["spawn", "timeout"]) {
+    const h = fake()
+    if (failure === "spawn") h.overlaySpawnFailure("overlay process could not start")
+    else h.holdReady("overlay")
+    const c = new UiaClient(h.api, settings, 50)
+    await c.call("windows")
+    await c.call("tree", { window: WINDOW })
+    await expect(c.call("focus", { window: WINDOW })).rejects.toThrow(
+      failure === "spawn" ? "could not start" : "failed to start",
+    )
+    expect(c.emergency.stopped).toBe(false)
+    h.overlaySpawnFailure()
+    h.releaseReady()
+    await c.call("focus", { window: WINDOW })
+    await c.stop()
+  }
+})
+
+test("aborting a read retires the helper but does not latch the action stop", async () => {
+  const h = fake()
+  const c = setup(h.api, "win32")!
+  await c.call("windows")
+  h.response(false)
+  const controller = new AbortController()
+  const read = h.tools.get("ui_tree")!.execute({ window: WINDOW }, { ...ctx, signal: controller.signal })
+  await Bun.sleep(0)
+  controller.abort()
+  expect((await read).isError).toBe(true)
+  expect(c.emergency.stopped).toBe(false)
+  h.response(true)
+  await c.call("focus", { window: WINDOW })
+  await c.stop()
+})
+
+test("cancelling a queued read does not execute it or interrupt the active request", async () => {
+  const h = fake()
+  const c = setup(h.api, "win32")!
+  await c.call("windows")
+  h.response(false)
+  const active = c.call("windows")
+  await Bun.sleep(0)
+  const controller = new AbortController()
+  const queued = h.tools.get("ui_tree")!.execute({ window: WINDOW }, { ...ctx, signal: controller.signal })
+  controller.abort()
+  expect(h.pipes[0]!.closed).toEqual([])
+  const id = h.requests.at(-1)!.id
+  h.pipes[0]!.options.onEvent({
+    type: "stdout",
+    data: `${JSON.stringify({ id, result: { windows: [] } })}\n`,
+  })
+  await active
+  expect((await queued).isError).toBe(true)
+  expect(h.requests.map((request) => request.method)).toEqual(["windows", "windows"])
+  expect(c.emergency.stopped).toBe(false)
+  await c.stop()
+})
+
+test("aborting an in-flight action latches but aborting ui_windows does not", async () => {
+  for (const method of ["focus", "windows"]) {
+    const h = fake()
+    const c = setup(h.api, "win32")!
+    await c.call("windows")
+    h.response(false)
+    const controller = new AbortController()
+    const action = h.tools
+      .get(`ui_${method}`)!
+      .execute({ window: WINDOW }, { ...ctx, signal: controller.signal })
+    await Bun.sleep(0)
+    controller.abort()
+    expect((await action).isError).toBe(true)
+    expect(c.emergency.stopped).toBe(method === "focus")
+    await c.stop()
+  }
+})
+
+test("armed then failed in the same reply batch cannot start a desktop action", async () => {
+  const h = fake()
+  const c = new UiaClient(h.api, settings)
+  await c.call("windows")
+  h.holdReady("armed")
+  const action = c.call("focus", { window: WINDOW })
+  await Bun.sleep(0)
+  const busy = h.overlays[0]!.writes.find((message) => message.event === "busy")!
+  h.overlays[0]!.options.onEvent({
+    type: "stdout",
+    data: `${JSON.stringify({ event: "armed", id: busy.id })}\n${JSON.stringify({ event: "error", error: "monitor failed after arming" })}\n`,
+  })
+  await expect(action).rejects.toThrow("monitor failed after arming")
+  expect(h.requests.map((request) => request.method)).toEqual(["windows"])
+  expect(c.emergency.stopped).toBe(false)
+  h.releaseReady()
+  await c.stop()
+})
+
+test("overlay false explicitly runs actions without a pointer or overlay stop process", async () => {
+  const h = fake()
+  const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+  await c.call("key", { window: WINDOW, keys: "escape" })
+  await c.call("key", { window: WINDOW, keys: "escape" })
+  expect(h.overlays).toHaveLength(0)
+  expect(c.emergency.stopped).toBe(false)
+  const argv = h.started.find((args) => args.some((arg) => arg.endsWith("uia.ps1")))!
+  expect(argv[argv.indexOf("-Overlay") + 1]).toBe("false")
+  expect(argv[argv.indexOf("-AmiraPid") + 1]).toBe(String(process.pid))
+  await c.stop()
+})
+
+test("hook arming failure refuses the action without latching or closing launched apps", async () => {
+  const h = fake()
+  h.armFailure("Input cleanup hooks unavailable")
+  const c = new UiaClient(h.api, settings)
+  await expect(c.call("launch", { command: "fixture.exe" })).rejects.toThrow("hooks unavailable")
+  expect(h.requests).toHaveLength(0)
+  expect(h.pipes[0]!.closed).toEqual([])
+  expect(c.emergency.stopped).toBe(false)
+  await c.call("windows")
+  await c.stop()
+})
+
+test("a slow glide acknowledgement is advisory and never stops control or retires apps", async () => {
+  const h = fake()
+  h.slowGlide()
+  const c = new UiaClient(h.api, settings)
+  await c.call("launch", { command: "fixture.exe" })
+  h.pipes[0]!.options.onEvent({
+    type: "stdout",
+    data: '{"event":"overlay","id":9,"x":0,"y":0,"kind":"key"}\n',
+  })
+  await c.call("key", { window: WINDOW, keys: "escape" })
+  await c.call("key", { window: WINDOW, keys: "escape" })
+  expect(h.acks).toEqual([])
+  h.pipes[0]!.options.onEvent({
+    type: "stderr",
+    data: "Overlay glide acknowledgement timed out; skipping animation wait.\n",
+  })
+  expect(h.notices).toContainEqual(expect.stringContaining("skipping animation wait"))
+  expect(c.emergency.stopped).toBe(false)
+  expect(h.pipes[0]!.closed).toEqual([])
+  // A late acknowledgement is still forwarded; helper contracts cover retaining its read.
+  h.overlays[0]!.options.onEvent({ type: "stdout", data: '{"event":"glided","id":9}\n' })
+  expect(h.acks).toContainEqual({ method: "overlay_ack", id: 9 })
+  await c.stop()
+})
+
+test("shell, overlay and Amira windows remain readable but cached targets refuse all actions", async () => {
+  for (const metadata of [
+    ...["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "AmiraPointerOverlay"].map(
+      (name) => ({ class: name, pid: 17 }),
+    ),
+    { class: "ConsoleWindowClass", pid: process.pid },
+  ]) {
+    const h = fake()
+    h.windows([{ window: WINDOW, title: "protected", ...metadata }])
+    const c = new UiaClient(h.api, settings)
+    await c.call("windows")
+    await c.call("tree", { window: WINDOW })
+    for (const method of ["close", "focus", "click", "type", "key"])
+      await expect(c.call(method, { window: WINDOW, ref: "e2", text: "x", keys: "enter" })).rejects.toThrow(
+        "cannot be controlled",
+      )
+    expect(h.requests.map((request) => request.method)).toEqual(["windows", "tree"])
+    await c.stop()
+  }
+})
+
+test("the native overlay class is protected only in its own process, not other WinForms apps", async () => {
+  const h = fake()
+  const c = new UiaClient(h.api, settings)
+  await c.call("windows")
+  h.overlays[0]!.options.onEvent({
+    type: "stdout",
+    data: '{"event":"ready","class":"WindowsForms10.Window","pid":88}\n',
+  })
+  h.windows([
+    { window: "88", title: "overlay", class: "WindowsForms10.Window", pid: 88 },
+    { window: "99", title: "fixture", class: "WindowsForms10.Window", pid: 99 },
+  ])
+  await c.call("windows")
+  await expect(c.call("focus", { window: "88" })).rejects.toThrow("cannot be controlled")
+  await c.call("focus", { window: "99" })
+  expect(h.requests.at(-1)!.params).toEqual({
+    window: "99",
+    overlayClass: "WindowsForms10.Window",
+    overlayPid: 88,
+  })
+  await c.stop()
+})
+
+test("ui_close reports a still-open save prompt without retiring processes", async () => {
+  const h = fake()
+  const c = new UiaClient(h.api, settings)
+  await c.call("launch", { command: "fixture.exe" })
+  const result = await c.call("close", { window: WINDOW })
+  expect(result).toMatchObject({ closed: false, instruction: expect.stringContaining("save prompt") })
+  expect(h.pipes[0]!.closed).toEqual([])
+  h.closeResult({ closed: true, instruction: "Window closed" })
+  expect(await c.call("close", { window: WINDOW })).toMatchObject({ closed: true })
+  await c.stop()
+})
+
+test("ui_windows caps fake output and truncates titles with a cut note", async () => {
+  const h = fake()
+  h.windows(
+    Array.from({ length: 201 }, (_, index) => ({ window: String(index + 1), title: "x".repeat(121) })),
+  )
+  const c = new UiaClient(h.api, settings)
+  const result = (await c.call("windows")) as { windows: { title: string }[]; cut: boolean; note: string }
+  expect(result.windows).toHaveLength(200)
+  expect(result.windows.every((window) => window.title.length <= 120)).toBe(true)
+  expect(result.cut).toBe(true)
+  expect(result.note).toContain("cut")
   await c.stop()
 })
 

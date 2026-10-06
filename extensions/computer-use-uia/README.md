@@ -16,8 +16,9 @@ eligible for termination.
 
 - Window titles, UIA names, text and values from **any app** may be read and sent to your model
   provider. This can include private documents, messages and account details. Password controls
-  report `password=true` and do not query ValuePattern/TextPattern values; other sensitive fields
-  are not automatically redacted. A provider that mislabels secrets can still expose them.
+  report `password=true` and do not query ValuePattern/TextPattern values. Edit/Document controls
+  with an unknown password flag report `password=unknown` and also hide their values; other
+  sensitive fields are not automatically redacted. A provider that mislabels secrets can still expose them.
 - In **auto mode**, desktop actions can run **without asking**, including launching arbitrary
   programs, entering text, clicking controls and closing windows. Amira's normal permission
   policy applies; there is no extension-specific approval path. Only `ui_windows` and `ui_tree`
@@ -55,7 +56,7 @@ Install with `amira ext install computer-use-uia`, then opt in in **`~/.amira/se
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `false` | Register desktop tools on Windows |
-| `overlay` | `true` | Show the virtual pointer and action banner |
+| `overlay` | `true` | Run the virtual pointer, action banner and emergency-stop monitor; `false` disables all three |
 | `stopHotkey` | `ctrl+alt+q` | Emergency stop; ctrl/alt/shift modifiers plus a letter, digit or F1–F12 |
 
 Settings come **only from the explicit user layer** of `api.settings.layers("extensions")`.
@@ -65,22 +66,42 @@ An old `apps` entry is ignored; it no longer restricts launches or window access
 
 ## Stop and resume
 
-Press **Ctrl+Alt+Q** (or your configured chord), or press **Esc twice within 500 ms**.
-The independent PowerShell WinForms stop monitor registers the global chord and observes Escape
-with `GetAsyncKeyState` without swallowing it or taking focus. **Emergency stop still works when
-`overlay` is false.** If the hotkey cannot be registered, desktop control refuses to start.
+With the overlay enabled, press **Ctrl+Alt+Q** (or your configured chord), or press
+**Esc twice within 500 ms** while an action is running or within **three seconds after it ends**.
+Outside that control window these keys do not stop desktop control. Escape detection uses physical
+key-down edges from the low-level keyboard hook and ignores both injected-input flags; a model-sent
+`ui_key escape` cannot trigger the stop. Input is not swallowed and the monitor does not take focus.
+
+Keyboard/mouse low-level hooks are installed **during actions and the three-second post-action
+window**, then removed when idle. Anti-cheat software may notice these global hooks; do not enable
+this extension while gaming or using software that prohibits input hooks. The chord uses
+`RegisterHotKey`, not a hook, and remains registered while the overlay process is alive.
+
+If registration fails, the error is **“Stop hotkey ctrl+alt+q is unavailable — set stopHotkey or
+disable the overlay”** (with your configured chord). Other startup failures report their real error.
+These failures are **not user stops** and do not latch. `ui_windows` and `ui_tree` still work without
+an overlay; actions require a working stop monitor and retry startup on the next action.
+
+Set **`overlay: false` explicitly** to disable the pointer, banner, hotkey, Escape stop and low-level
+hooks together. Actions then run **without an overlay-based emergency stop or independent input
+release monitor**. Normal tool cancellation still works, but already-delivered input cannot be undone.
+Set `enabled: false` to disable all desktop tools.
 
 Stopping immediately terminates the **exact helper PID/creation-time identity**, including when a
 synchronous UIA provider blocks. The model receives **“the user stopped desktop control”**. Further
-actions are refused until you run **`/uia resume`**. New or queued messages do not resume control. Read tools remain
-available while stopped; they may start a fresh helper/monitor, but do not clear the action latch.
+actions are refused until you run **`/uia resume`**. Cancelling an in-flight action (including an
+action timeout) also latches the stop; cancelling `ui_windows` or `ui_tree` does **not**. Cancelling
+a queued read neither runs that read nor interrupts another request. New or queued messages do
+not resume control. Read tools remain available while stopped; they may start a fresh helper/monitor,
+but do not clear the action latch.
 A system-prompt notice also tells the model that control is stopped. Use `/uia resume` only when
 you want actions to be allowed again.
 
 Stop is not rollback: an action already issued may have completed, and typing may be partial.
-Clicks/chords use a single native input batch; an independent input-hook ledger releases only
-observed extension-injected downs after interruption, without releasing physically held user keys.
-The hidden release-only monitor can remain for up to four seconds after helper death/EOF to retry
+Clicks/chords use a single native input batch; with the overlay enabled, an independent input-hook
+ledger releases only observed extension-injected downs after interruption, without releasing
+physically held user keys. The hidden release-only monitor can retain hooks for up to four additional
+seconds during idle/interruption cleanup to retry
 transient failures. If releases still fail (for example across a secure-desktop transition), Amira
 reports incomplete input cleanup; release any held keys/buttons manually before resuming.
 Inspect the target app before resuming. Launched apps are cleaned up by the independent exact-identity watchdog; this can lose
@@ -90,7 +111,10 @@ cleanup just because the extension read or acted on them.
 ## Virtual pointer
 
 Before each action the helper sends a physical-pixel UIA clickable point, or bounds center, to a
-**separate PowerShell WinForms process** and awaits a bounded glide acknowledgement. The purple
+**separate PowerShell WinForms process** and awaits a glide acknowledgement for up to **five seconds**.
+If the overlay is slow, the helper logs the timeout and skips that action's animation wait; it does
+not stop control or kill apps. The pending pipe read is retained to consume a late acknowledgement.
+The purple
 Amira pointer has a small label, a 320 ms ease-out glide, click ripple, typing indicator and key
 chord badge. During actions a thin primary-screen banner reads:
 
@@ -100,14 +124,14 @@ The chord in the banner follows your setting. The overlay covers the full virtua
 including negative monitor coordinates, using per-monitor DPI awareness. Its transparent,
 layered, topmost, toolwindow and no-activate styles keep it click-through, out of Alt+Tab and
 away from keyboard focus. It hides after three idle seconds, and exits with the helper/session.
-Turning rendering off leaves the stop monitor running. This is a **virtual** pointer: pattern
+Setting `overlay: false` prevents the overlay/stop-monitor process from starting. This is a **virtual** pointer: pattern
 operations never reposition your real cursor.
 
 ## Tools
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
-| `ui_windows` | optional `filter` | Visible top-level `windows`: native handle (`window`), title, process name, PID, class, physical bounds, minimized/foreground state. Case-insensitive substring across these identifiers. |
+| `ui_windows` | optional `filter` | Up to 200 visible top-level `windows`: native handle (`window`), title (120 characters), process name, PID, class, physical bounds, minimized/foreground state. Case-insensitive substring across these identifiers; a `cut` flag/note reports truncated output. |
 | `ui_tree` | `window`, optional `depth` (8, 0–30), `maxNodes` (300, 1–1000) | Any target window's UIA tree, unique snapshot refs, names, flags, bounded values/text, password flags, and timing/size footer |
 | `ui_launch` | `command`, optional string-array `args`, `cwd` | New PID plus an unambiguous new window, or a PID and instruction to use `ui_windows` |
 | `ui_click` | `window`, `ref` | Invoke/Toggle/SelectionItem/ExpandCollapse pattern, otherwise guarded clickable-point input; reports path |
@@ -132,10 +156,16 @@ Unreadable nodes receive no actionable ref and do not prevent reading siblings. 
 are escaped onto one line and limited to 512 characters. `ui_type` accepts at most 20,000
 UTF-16 code units. A single synchronous provider call can still exceed the traversal budget.
 
-`ui_close` never kills an arbitrary process. It may terminate only a **process launched by this
-extension with its exact PID and creation time already journaled**, after a brief close timeout.
-For any other window it only requests WindowPattern.Close/WM_CLOSE; save prompts may remain.
-The result can report `closed=false`. There are no image-name kills.
+`ui_close` only requests WindowPattern.Close/WM_CLOSE and reports **closed or still open** after
+its brief observation wait; a save prompt may remain. It **never force-kills**, even for an app
+launched by this extension. Exact PID/creation-time kills of still-running launched processes are
+reserved for **session cleanup**. There are no image-name kills.
+
+`ui_close`, `ui_focus`, `ui_click`, `ui_type` and `ui_key` refuse desktop/taskbar shell classes
+(`Progman`, `WorkerW`, `Shell_TrayWnd`, `Shell_SecondaryTrayWnd`), the overlay's own native window,
+and identifiable Amira console/terminal windows (Amira PID/ancestor identities and console HWND).
+Reads can still list and inspect them. Terminal-host identification is best effort; native window
+ownership varies between console hosts.
 
 ## Lifecycle
 
@@ -193,8 +223,8 @@ Importing/skipping `desktop.test.ts` starts no probes or processes. On a dedicat
 machine, set `AMIRA_UIA_DESKTOP_TESTS=1` and run `bun test ./test/desktop.test.ts` (or the explicit
 `scripts/smoke.ts` wrapper). Tests use only their uniquely titled bundled test window and their
 own overlay/helper processes, filter `ui_windows` before acting, and never log other windows'
-titles. Their overlay runs with **`-TestMode`**, which does not register hotkeys or poll real
-Escape; stop is simulated over its private pipe. The test helper also skips stale-journal sweeps
+titles. Their overlay runs with **`-TestMode`**, which does not register hotkeys or detect physical
+Escape stops; stop is simulated over its private pipe. The test helper also skips stale-journal sweeps
 so it cannot reap a previous real session's launched apps. Every launched process is cleaned up in
 `finally`, through exact identities, never by image name. Coverage includes a test-started fixture
 not launched through the extension (it must remain ineligible for termination), real-cursor
@@ -202,6 +232,9 @@ preservation for pattern actions, glide ID/timing checks and idle hiding. For th
 configure a negative-coordinate secondary monitor at a different scale and set
 `AMIRA_UIA_TEST_LEFT` / `AMIRA_UIA_TEST_TOP` to a location fully inside that monitor. This test
 also checks monitor/fixture cleanup after unexpected helper death. No test registers a stop
-hotkey; release-only input hooks still observe the test helper's tagged input.
+hotkey; input-release hooks observe the test helper's tagged input only during actions and the
+post-action window. Desktop coverage also checks idle hook removal, explicit overlay opt-out,
+polite close of an IgnoreClose fixture, delayed acknowledgements, protected test-owned targets,
+and title truncation.
 Do not use blanket `bun test` as a
 substitute for the explicit fake-only paths on a live desktop.

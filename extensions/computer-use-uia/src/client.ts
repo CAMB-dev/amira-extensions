@@ -49,8 +49,14 @@ export class UiaClient {
   private sessionEpoch = 0
   private readonly pending = new Map<number, Pending>()
   private readonly windows = new Map<string, Snapshot>()
+  private readonly protectedWindows = new Set<string>()
   readonly emergency = new StopState()
   private overlay?: PipeProcess
+  private overlayError?: string
+  private overlayClass?: string
+  private overlayPid?: number
+  private arming?: { id: number; resolve(): void; reject(error: Error): void }
+  private actionActive = false
   private helperIdentity?: { event: "owner"; pid: number; started: string }
   private overlayExited: Promise<void> = Promise.resolve()
   private queue: Promise<unknown> = Promise.resolve()
@@ -73,14 +79,22 @@ export class UiaClient {
   }
 
   /** Serialize even direct callers: snapshots, focus and cleanup must not race. */
-  call(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+  call(method: string, params: Record<string, unknown> = {}, signal?: AbortSignal): Promise<unknown> {
     const epoch = this.sessionEpoch
-    const run = this.queue.then(() => {
+    const run = this.queue.then(async () => {
+      if (signal?.aborted) throw new Error("UIA request cancelled")
       if (epoch !== this.sessionEpoch)
         throw new Error(
           this.emergency.stopped ? STOP_MESSAGE : "UIA session ended before the request started",
         )
-      return this.execute(method, params)
+      // A queued cancellation must not retire another request's provider.
+      const cancel = () => (["windows", "tree"].includes(method) ? this.cancelRead() : this.emergencyStop())
+      signal?.addEventListener("abort", cancel, { once: true })
+      try {
+        return await this.execute(method, params)
+      } finally {
+        signal?.removeEventListener("abort", cancel)
+      }
     })
     this.queue = run.catch(() => {})
     return run
@@ -92,7 +106,45 @@ export class UiaClient {
     if (method === "windows") {
       if (params.filter !== undefined && typeof params.filter !== "string")
         throw new Error("filter must be a string")
-      return this.request(method, params.filter === undefined ? {} : { filter: params.filter })
+      const result = (await this.request(
+        method,
+        params.filter === undefined ? {} : { filter: params.filter },
+      )) as {
+        windows: WindowResult[]
+        cut?: boolean
+        note?: string
+      }
+      // The helper revalidates every target, including handles never listed here.
+      this.protectedWindows.clear()
+      for (const window of result.windows) {
+        if (
+          (typeof window.class === "string" &&
+            ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "AmiraPointerOverlay"].includes(
+              window.class,
+            )) ||
+          (window.class === this.overlayClass &&
+            window.pid === this.overlayPid &&
+            this.overlayPid !== undefined) ||
+          window.pid === process.pid
+        )
+          this.protectedWindows.add(window.window)
+      }
+      const windows = result.windows.slice(0, 200).map((window) => ({
+        ...window,
+        title: window.title.slice(0, 120),
+      }))
+      const cut =
+        result.cut ||
+        result.windows.length > 200 ||
+        result.windows.some((window) => window.title.length > 120)
+      return cut
+        ? {
+            ...result,
+            windows,
+            cut: true,
+            note: result.note ?? "Window output cut (200 windows / 120-character titles)",
+          }
+        : { ...result, windows }
     }
     if (method === "launch") {
       if (typeof params.command !== "string" || !params.command.trim())
@@ -122,6 +174,8 @@ export class UiaClient {
       throw new Error("Unknown UIA request")
     if (typeof params.window !== "string" || !/^[1-9]\d*$/.test(params.window))
       throw new Error("window must be a native window handle from ui_windows or ui_launch")
+    if (method !== "tree" && this.protectedWindows.has(params.window))
+      throw new Error("Refused: shell, system, overlay and Amira windows cannot be controlled")
     let snapshot = this.windows.get(params.window)
     if (!snapshot) {
       snapshot = { refs: new Set() }
@@ -225,6 +279,10 @@ export class UiaClient {
         this.lifetimeStarted,
         "-StatePath",
         this.statePath,
+        "-AmiraPid",
+        String(process.pid),
+        "-Overlay",
+        String(this.settings.overlay),
       ],
       {
         cwd: this.host.cwd,
@@ -234,7 +292,7 @@ export class UiaClient {
         },
       },
     )
-    await this.startOverlay(job.pid, this.lifetimeStarted)
+    if (this.settings.overlay) await this.tryOverlay(job.pid, this.lifetimeStarted)
     if (this.stopping || generation !== this.generation) throw new Error("UIA session ended during startup")
   }
 
@@ -251,7 +309,39 @@ export class UiaClient {
     this.emergency.resume()
   }
 
+  /** Cancelling a read retires its provider without changing the action stop latch. */
+  cancelRead(): void {
+    this.breakPipe("UIA read cancelled")
+  }
+
+  private async tryOverlay(pid: number, started: string): Promise<void> {
+    try {
+      await this.startOverlay(pid, started)
+      this.overlayError = undefined
+    } catch (error) {
+      this.overlayError = error instanceof Error ? error.message : String(error)
+      this.host.reportError(`computer-use-uia: ${this.overlayError}`)
+    }
+  }
+
+  private overlayUnavailable(message: string): void {
+    this.overlayError = message
+    this.arming?.reject(new Error(message))
+    const overlay = this.overlay
+    this.overlay = undefined
+    overlay?.write(`${JSON.stringify({ event: "exit" })}\n`)
+    overlay?.close(5000)
+    this.host.reportError(`computer-use-uia: ${message}`)
+    // A running action cannot continue without its stop monitor. This is an error,
+    // not a user stop; startup/read failures keep the helper available for reads.
+    if (this.actionActive) this.breakPipe(message)
+  }
+
   private async startOverlay(pid: number, started: string): Promise<void> {
+    const generation = this.generation
+    await this.overlayExited
+    if (this.stopping || generation !== this.generation)
+      throw new Error("UIA session ended during overlay startup")
     const ready = Promise.withResolvers<void>()
     const exited = Promise.withResolvers<void>()
     this.overlayExited = exited.promise
@@ -260,72 +350,85 @@ export class UiaClient {
       () => ready.reject(new Error("UIA stop monitor failed to start")),
       this.timeoutMs,
     )
-    const overlay = this.host.openPipe(
-      [
-        "powershell.exe",
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-STA",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        `${import.meta.dir}/../helper/overlay.ps1`,
-        "-Render",
-        String(this.settings.overlay),
-        "-StopHotkey",
-        this.settings.stopHotkey,
-        "-LifetimePid",
-        String(pid),
-        "-LifetimeStarted",
-        started,
-      ],
-      {
-        cwd: this.host.cwd,
-        onEvent: (event) => {
-          if (event.type === "exit") {
-            exited.resolve()
-            ready.reject(new Error("UIA stop monitor exited"))
-            if (this.overlay === overlay) {
-              this.overlay = undefined
-              this.emergencyStop()
-            }
-          }
-          if (event.type === "stderr" && event.data.includes("UIA input cleanup incomplete"))
-            this.host.reportError(
-              "computer-use-uia: input cleanup incomplete; release held keys/buttons manually",
-            )
-          if (event.type !== "stdout" || this.overlay !== overlay) return
-          buffer += event.data
-          if (buffer.length > 20_000) {
-            this.emergencyStop()
-            return
-          }
-          let newline = buffer.indexOf("\n")
-          while (newline >= 0) {
-            const line = buffer.slice(0, newline).trim()
-            buffer = buffer.slice(newline + 1)
-            newline = buffer.indexOf("\n")
-            if (!line) continue
-            try {
-              const reply = overlayReply(line)
-              if (reply.event === "ready") ready.resolve()
-              else if (reply.event === "stop") this.emergencyStop()
-              else if (reply.event === "glided")
-                this.pipe?.write(`${JSON.stringify({ method: "overlay_ack", id: reply.id })}\n`)
-            } catch {
-              this.emergencyStop()
-            }
-          }
-        },
-      },
-    )
-    this.overlay = overlay
-    if (this.helperIdentity) overlay.write(`${JSON.stringify(this.helperIdentity)}\n`)
+    let overlay: PipeProcess | undefined
     try {
+      overlay = this.host.openPipe(
+        [
+          "powershell.exe",
+          "-NoLogo",
+          "-NoProfile",
+          "-NonInteractive",
+          "-STA",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          `${import.meta.dir}/../helper/overlay.ps1`,
+          "-Render",
+          String(this.settings.overlay),
+          "-StopHotkey",
+          this.settings.stopHotkey,
+          "-LifetimePid",
+          String(pid),
+          "-LifetimeStarted",
+          started,
+        ],
+        {
+          cwd: this.host.cwd,
+          onEvent: (event) => {
+            if (event.type === "exit") {
+              exited.resolve()
+              ready.reject(new Error("UIA stop monitor exited"))
+              if (this.overlay === overlay)
+                this.overlayUnavailable(this.overlayError ?? "UIA stop monitor exited")
+            }
+            if (event.type === "stderr" && event.data.includes("UIA input cleanup incomplete"))
+              this.host.reportError(
+                "computer-use-uia: input cleanup incomplete; release held keys/buttons manually",
+              )
+            if (event.type !== "stdout" || this.overlay !== overlay) return
+            buffer += event.data
+            if (buffer.length > 20_000) {
+              const message = "UIA stop monitor response exceeded the limit"
+              ready.reject(new Error(message))
+              this.overlayUnavailable(message)
+              return
+            }
+            let newline = buffer.indexOf("\n")
+            while (newline >= 0) {
+              const line = buffer.slice(0, newline).trim()
+              buffer = buffer.slice(newline + 1)
+              newline = buffer.indexOf("\n")
+              if (!line) continue
+              try {
+                const reply = overlayReply(line)
+                if (reply.event === "ready") {
+                  this.overlayClass = reply.class
+                  this.overlayPid = reply.pid
+                  ready.resolve()
+                } else if (reply.event === "stop") this.emergencyStop()
+                else if (reply.event === "glided")
+                  this.pipe?.write(`${JSON.stringify({ method: "overlay_ack", id: reply.id })}\n`)
+                else if (reply.event === "armed" && reply.id === this.arming?.id) this.arming.resolve()
+                else if (reply.event === "error") {
+                  ready.reject(new Error(reply.error))
+                  this.overlayUnavailable(reply.error)
+                }
+              } catch {
+                const message = "UIA stop monitor sent an invalid response"
+                ready.reject(new Error(message))
+                this.overlayUnavailable(message)
+              }
+            }
+          },
+        },
+      )
+      this.overlay = overlay
+      if (this.helperIdentity) overlay.write(`${JSON.stringify(this.helperIdentity)}\n`)
       await ready.promise
     } catch (error) {
-      this.breakPipe("UIA stop monitor unavailable", 0)
+      if (overlay && this.overlay === overlay)
+        this.overlayUnavailable(error instanceof Error ? error.message : String(error))
+      if (!overlay) exited.resolve()
       throw error
     } finally {
       clearTimeout(timer)
@@ -392,6 +495,8 @@ export class UiaClient {
   }
 
   private event(event: PipeEvent) {
+    if (event.type === "stderr" && event.data.includes("skipping animation wait"))
+      this.host.reportError(`computer-use-uia: ${event.data.trim()}`)
     if (event.type === "exit") {
       // A stop-monitor kill and a helper exit may arrive on different pipes in either order.
       // Unexpected helper death must latch too, never let that race reopen desktop control.
@@ -434,11 +539,8 @@ export class UiaClient {
           continue
         }
         if (response.event === "overlay" || response.event === "done") {
-          if (!this.overlay) {
-            this.emergencyStop()
-            return
-          }
-          this.overlay.write(`${line}\n`)
+          // Rendering acknowledgements are advisory; the helper skips slow animations.
+          this.overlay?.write(`${line}\n`)
           continue
         }
         if (response.id === null && response.error) {
@@ -460,21 +562,63 @@ export class UiaClient {
   }
 
   private async request(method: string, params: Record<string, unknown>): Promise<unknown> {
+    const action = !["windows", "tree"].includes(method)
+    const alreadyStarted = !!this.pipe
     try {
       await this.start()
+      if (action && alreadyStarted && this.settings.overlay && !this.overlay && this.lifetimeStarted) {
+        const job = this.lifetime ? this.host.backgroundJobs.get(this.lifetime) : undefined
+        if (job?.pid) await this.tryOverlay(job.pid, this.lifetimeStarted)
+      }
     } catch (error) {
       if (this.emergency.stopped) throw new Error(STOP_MESSAGE)
       throw error
     }
-    if (!["windows", "tree"].includes(method)) this.emergency.assertAction()
+    if (action) this.emergency.assertAction()
     if (!this.pipe || this.stopping) throw new Error("UIA helper exited before the request started")
     const id = ++this.nextId
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => this.breakPipe("UIA helper timed out"), this.timeoutMs)
-      this.pending.set(id, { resolve, reject, timer })
-      if (!["windows", "tree"].includes(method)) this.overlay?.write(`${JSON.stringify({ event: "busy" })}\n`)
-      this.pipe?.write(`${JSON.stringify({ id, method, params })}\n`)
-    })
+    if (action && this.settings.overlay) {
+      if (!this.overlay) throw new Error(this.overlayError ?? "UIA stop monitor unavailable")
+      const overlay = this.overlay
+      const armed = Promise.withResolvers<void>()
+      this.arming = { id, ...armed }
+      const timer = setTimeout(
+        () => armed.reject(new Error("UIA stop monitor did not arm; desktop action refused")),
+        Math.min(5000, this.timeoutMs),
+      )
+      try {
+        overlay.write(`${JSON.stringify({ event: "busy", id })}\n`)
+        await armed.promise
+        if (this.overlay !== overlay) throw new Error(this.overlayError ?? "UIA stop monitor unavailable")
+      } catch (error) {
+        if (this.emergency.stopped) throw new Error(STOP_MESSAGE)
+        this.overlayUnavailable(error instanceof Error ? error.message : String(error))
+        throw error
+      } finally {
+        clearTimeout(timer)
+        this.arming = undefined
+      }
+      this.emergency.assertAction()
+    }
+    if (!this.pipe || this.stopping) throw new Error("UIA helper exited before the request started")
+    this.actionActive = action
+    try {
+      return await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          if (action) this.emergency.stop()
+          this.breakPipe("UIA helper timed out")
+        }, this.timeoutMs)
+        this.pending.set(id, { resolve, reject, timer })
+        const safe =
+          action && this.overlayClass && this.overlayPid
+            ? { ...params, overlayClass: this.overlayClass, overlayPid: this.overlayPid }
+            : params
+        this.pipe?.write(`${JSON.stringify({ id, method, params: safe })}\n`)
+      })
+    } finally {
+      this.actionActive = false
+      if (action) this.overlay?.write(`${JSON.stringify({ event: "done" })}\n`)
+    }
   }
 
   private failPending(error: Error) {
@@ -497,6 +641,8 @@ export class UiaClient {
     this.helperIdentity = undefined
     this.generation++
     this.windows.clear()
+    this.protectedWindows.clear()
+    this.arming?.reject(new Error(message))
     this.failPending(new Error(message))
     // Never overlap helpers writing the same launch journal during a restart.
     this.retired = Promise.all([this.pipeExited, this.overlayExited]).then(() => {})
@@ -520,6 +666,8 @@ export class UiaClient {
     this.generation++
     this.sessionEpoch++
     this.windows.clear()
+    this.protectedWindows.clear()
+    this.arming?.reject(new Error("UIA session ended"))
     this.failPending(new Error("UIA session ended"))
     pipe?.close(0)
     watchdog?.close(5000)

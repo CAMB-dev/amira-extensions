@@ -122,7 +122,7 @@ function tools(client: UiaClient): ToolDefinition<Record<string, unknown>>[] {
     {
       name: "close",
       description:
-        "Close any target window with WindowPattern.Close or WM_CLOSE. Only a process launched by this extension with its exact PID and journaled creation time may be terminated if it fails to exit. Unsaved changes may be lost.",
+        "Request WindowPattern.Close or WM_CLOSE on an app window. Reports closed or still open (for example a save prompt); never force-kills. Shell, system and Amira windows are refused.",
       properties: { window },
       required: ["window"],
     },
@@ -141,10 +141,8 @@ function tools(client: UiaClient): ToolDefinition<Record<string, unknown>>[] {
     ...(["windows", "tree"].includes(definition.name) ? { traits: { readOnly: true } } : {}),
     async execute(params, ctx) {
       if (ctx.signal.aborted) return textResult("UIA request cancelled", true)
-      const cancel = () => client.emergencyStop()
-      ctx.signal.addEventListener("abort", cancel, { once: true })
       try {
-        const result = await client.call(definition.name, params)
+        const result = await client.call(definition.name, params, ctx.signal)
         if (definition.name === "tree") {
           const tree = result as TreeResult
           return textResult(
@@ -161,8 +159,6 @@ function tools(client: UiaClient): ToolDefinition<Record<string, unknown>>[] {
         )
       } catch (error) {
         return textResult(error instanceof Error ? error.message : String(error), true)
-      } finally {
-        ctx.signal.removeEventListener("abort", cancel)
       }
     },
   }))

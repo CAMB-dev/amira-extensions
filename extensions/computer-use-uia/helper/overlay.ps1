@@ -7,6 +7,7 @@ param(
     [switch] $TestMode
 )
 $ErrorActionPreference = 'Stop'
+try {
 $utf8 = New-Object Text.UTF8Encoding($false)
 [Console]::InputEncoding = $utf8
 [Console]::OutputEncoding = $utf8
@@ -17,9 +18,11 @@ Add-Type -ReferencedAssemblies @('System.dll', 'System.Drawing.dll', 'System.Win
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
@@ -48,6 +51,7 @@ namespace AmiraPointer {
         [DllImport("user32.dll")] static extern uint SendInput(uint count, INPUT[] inputs, int size);
         [DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
         [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern int GetClassName(IntPtr hwnd, StringBuilder name, int size);
         [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT point);
         [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
         [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT point);
@@ -63,7 +67,7 @@ namespace AmiraPointer {
         readonly Color accent = Color.FromArgb(126, 76, 230);
         volatile bool eof;
         bool registered, stopped, escapeDown, active, gliding;
-        long escapeAt = -1000, began, idleAt, rippleAt = -1000, shutdownAt = -1;
+        long escapeAt = -1000, began, idleAt = -1, rippleAt = -1000, shutdownAt = -1, cleanupAt = -1;
         int actionId, ownerPid;
         IntPtr keyboardHook, mouseHook;
         HookProc keyboardCallback, mouseCallback;
@@ -84,11 +88,40 @@ namespace AmiraPointer {
         }
         void Reply(object value) { Console.WriteLine(json.Serialize(value)); Console.Out.Flush(); }
         bool OurInput(UIntPtr extra) { return ownerPid > 0 && extra.ToUInt64() == (0xA1120000u ^ (uint)ownerPid); }
+        bool StopWindow() {
+            return !stopped && shutdownAt < 0 &&
+                (active || (idleAt >= 0 && clock.ElapsedMilliseconds - idleAt <= 3000));
+        }
+        void InstallHooks() {
+            if (keyboardHook != IntPtr.Zero && mouseHook != IntPtr.Zero) return;
+            // Seed held keys conservatively; Escape stop detection itself uses ONLY
+            // non-injected hook rising edges, never the asynchronous key-state poll.
+            physicalKeys.Clear();
+            for (uint vk = 1; vk < 256; vk++)
+                if ((GetAsyncKeyState((int)vk) & 0x8000) != 0) physicalKeys.Add(vk);
+            physicalMouse = (GetAsyncKeyState(1) & 0x8000) != 0;
+            escapeDown = physicalKeys.Contains(0x1B);
+            escapeAt = -1000;
+            try {
+                keyboardHook = SetWindowsHookEx(13, keyboardCallback, GetModuleHandle(null), 0);
+                if (keyboardHook == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+                mouseHook = SetWindowsHookEx(14, mouseCallback, GetModuleHandle(null), 0);
+                if (mouseHook == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+            } catch { UninstallHooks(); throw; }
+        }
+        void UninstallHooks() {
+            if (keyboardHook != IntPtr.Zero) UnhookWindowsHookEx(keyboardHook);
+            if (mouseHook != IntPtr.Zero) UnhookWindowsHookEx(mouseHook);
+            keyboardHook = mouseHook = IntPtr.Zero;
+            physicalKeys.Clear(); physicalMouse = escapeDown = false;
+            escapeAt = -1000;
+        }
         IntPtr Keyboard(int code, IntPtr message, IntPtr data) {
             if (code >= 0) {
                 var key = (KEYHOOK)Marshal.PtrToStructure(data, typeof(KEYHOOK));
                 bool up = (key.Flags & 0x80) != 0;
-                if (OurInput(key.Extra) && (key.Flags & 0x10) != 0) {
+                bool injected = (key.Flags & (0x10 | 0x2)) != 0; // LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED
+                if (OurInput(key.Extra) && injected) {
                     // Suppress ONLY our late injected downs after stop, never user input.
                     if (stopped && !up) return new IntPtr(1);
                     uint identity = key.Key == 0xE7 ? 0x10000u + key.Scan : key.Key;
@@ -100,8 +133,19 @@ namespace AmiraPointer {
                         release.Data.Keyboard.Flags = 2u | (key.Key == 0xE7 ? 4u : (key.Flags & 1));
                         injectedKeys[identity] = release;
                     }
-                } else if ((key.Flags & 0x10) == 0) {
+                } else if (!injected) {
                     if (up) physicalKeys.Remove(key.Key); else physicalKeys.Add(key.Key);
+                    if (key.Key == 0x1B) {
+                        if (up) escapeDown = false;
+                        else if (!escapeDown) {
+                            escapeDown = true;
+                            if (!testMode && StopWindow()) {
+                                long now = clock.ElapsedMilliseconds;
+                                if (now - escapeAt <= 500) { escapeAt = -1000; StopControl(); }
+                                else escapeAt = now;
+                            } else escapeAt = -1000;
+                        }
+                    }
                 }
             }
             return CallNextHookEx(keyboardHook, code, message, data);
@@ -140,21 +184,27 @@ namespace AmiraPointer {
             }} catch { }
         }
         void StopControl() {
-            if (stopped) return;
+            if (stopped || shutdownAt >= 0) return;
             stopped = true;
             active = gliding = false;
+            cleanupAt = clock.ElapsedMilliseconds;
             Hide();
-            // Only the exact helper, even if its UIA thread is blocked. Never kill target apps.
+            // Only an actual stop/explicit abort kills the exact helper identity.
             AbortOwner();
-            ReleaseInputs();
+            if (keyboardHook != IntPtr.Zero || mouseHook != IntPtr.Zero) ReleaseInputs();
             Reply(new { @event = "stop" });
         }
         void BeginShutdown() {
-            StopControl();
-            if (shutdownAt < 0) shutdownAt = clock.ElapsedMilliseconds;
+            if (shutdownAt >= 0) return;
+            active = gliding = false;
+            Hide();
+            shutdownAt = clock.ElapsedMilliseconds;
+            if (cleanupAt < 0) cleanupAt = shutdownAt;
+            // EOF, exit and lifetime expiry are not user stops and never kill the owner.
+            if (keyboardHook != IntPtr.Zero || mouseHook != IntPtr.Zero) ReleaseInputs();
         }
         protected override void WndProc(ref Message message) {
-            if (message.Msg == 0x0312) { StopControl(); return; } // WM_HOTKEY
+            if (message.Msg == 0x0312) { if (StopWindow()) StopControl(); return; } // WM_HOTKEY
             if (message.Msg == 0x0021) { message.Result = new IntPtr(3); return; } // MA_NOACTIVATE
             if (message.Msg == 0x0084) { message.Result = new IntPtr(-1); return; } // HTTRANSPARENT
             base.WndProc(ref message);
@@ -162,71 +212,59 @@ namespace AmiraPointer {
         public Overlay(bool render, string hotkey, int lifetimePid, string lifetimeStarted, bool testMode) {
             this.render = render; this.hotkey = hotkey; this.lifetimePid = lifetimePid;
             this.lifetimeStarted = lifetimeStarted; this.testMode = testMode;
-            FormBorderStyle = FormBorderStyle.None;
-            ShowInTaskbar = false;
-            StartPosition = FormStartPosition.Manual;
-            AutoScaleMode = AutoScaleMode.None;
-            BackColor = TransparencyKey = Color.Magenta;
-            DoubleBuffered = true;
-            Bounds = new Rectangle(GetSystemMetrics(76), GetSystemMetrics(77), GetSystemMetrics(78), GetSystemMetrics(79));
-            var hwnd = Handle; // hidden handle also receives hotkeys when rendering is disabled
-            var chord = hotkey.Split('+');
-            uint modifiers = 0x4000; // MOD_NOREPEAT
-            for (int i = 0; i < chord.Length - 1; i++) {
-                if (chord[i] == "ctrl") modifiers |= 2;
-                else if (chord[i] == "alt") modifiers |= 1;
-                else if (chord[i] == "shift") modifiers |= 4;
-                else throw new InvalidOperationException("Invalid stop modifier.");
-            }
-            string keyName = chord[chord.Length - 1];
-            uint key = keyName.Length == 1 ? (uint)char.ToUpperInvariant(keyName[0]) : (uint)(0x70 + int.Parse(keyName.Substring(1)) - 1);
-            if (!testMode) {
-                registered = RegisterHotKey(hwnd, 1, modifiers, key);
-                if (!registered) throw new InvalidOperationException("Stop hotkey is unavailable; desktop control refused.");
-            }
-            // Independent ledger observes tagged injected downs, including partial SendInput.
-            // Hooks always pass physical input through; test mode disables stop-key detection only.
-            for (uint vk = 1; vk < 256; vk++)
-                if ((GetAsyncKeyState((int)vk) & 0x8000) != 0) physicalKeys.Add(vk);
-            physicalMouse = (GetAsyncKeyState(1) & 0x8000) != 0;
-            keyboardCallback = Keyboard; mouseCallback = Mouse;
-            keyboardHook = SetWindowsHookEx(13, keyboardCallback, GetModuleHandle(null), 0);
-            mouseHook = SetWindowsHookEx(14, mouseCallback, GetModuleHandle(null), 0);
-            if (keyboardHook == IntPtr.Zero || mouseHook == IntPtr.Zero) {
-                if (keyboardHook != IntPtr.Zero) UnhookWindowsHookEx(keyboardHook);
-                if (mouseHook != IntPtr.Zero) UnhookWindowsHookEx(mouseHook);
-                if (registered) UnregisterHotKey(hwnd, 1);
-                throw new InvalidOperationException("Input cleanup monitor unavailable; desktop control refused.");
-            }
-            var reader = new Thread(delegate() {
-                try { string line; while ((line = Console.ReadLine()) != null) input.Enqueue(line); }
-                finally { eof = true; }
-            });
-            reader.IsBackground = true;
-            reader.Start();
-            timer.Interval = 15;
-            timer.Tick += Tick;
-            timer.Start();
-            Reply(new { @event = "ready" });
+            try {
+                Text = "AmiraPointerOverlay";
+                FormBorderStyle = FormBorderStyle.None;
+                ShowInTaskbar = false;
+                StartPosition = FormStartPosition.Manual;
+                AutoScaleMode = AutoScaleMode.None;
+                BackColor = TransparencyKey = Color.Magenta;
+                DoubleBuffered = true;
+                Bounds = new Rectangle(GetSystemMetrics(76), GetSystemMetrics(77), GetSystemMetrics(78), GetSystemMetrics(79));
+                var hwnd = Handle; // hidden handle also receives hotkeys when rendering is disabled
+                var chord = hotkey.Split('+');
+                uint modifiers = 0x4000; // MOD_NOREPEAT
+                for (int i = 0; i < chord.Length - 1; i++) {
+                    if (chord[i] == "ctrl") modifiers |= 2;
+                    else if (chord[i] == "alt") modifiers |= 1;
+                    else if (chord[i] == "shift") modifiers |= 4;
+                    else throw new InvalidOperationException("Invalid stop modifier.");
+                }
+                string keyName = chord[chord.Length - 1];
+                uint key = keyName.Length == 1 ? (uint)char.ToUpperInvariant(keyName[0]) : (uint)(0x70 + int.Parse(keyName.Substring(1)) - 1);
+                if (!testMode) {
+                    registered = RegisterHotKey(hwnd, 1, modifiers, key);
+                    if (!registered) throw new InvalidOperationException("Stop hotkey " + hotkey + " is unavailable \u2014 set stopHotkey or disable the overlay");
+                }
+                // WinForms owns class registration. Do not assign an unregistered ClassName;
+                // publish the actual native class so the helper can refuse this window safely.
+                var windowClass = new StringBuilder(256);
+                if (GetClassName(hwnd, windowClass, windowClass.Capacity) == 0)
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                keyboardCallback = Keyboard; mouseCallback = Mouse;
+                var reader = new Thread(delegate() {
+                    try { string line; while ((line = Console.ReadLine()) != null) input.Enqueue(line); }
+                    catch (Exception ex) { input.Enqueue(new JavaScriptSerializer().Serialize(new { @event = "reader-error", error = ex.GetBaseException().Message })); }
+                    finally { eof = true; }
+                });
+                reader.IsBackground = true;
+                reader.Start();
+                timer.Interval = 15;
+                timer.Tick += Tick;
+                timer.Start();
+                Reply(new { @event = "ready", @class = windowClass.ToString(), pid = Process.GetCurrentProcess().Id });
+            } catch { Dispose(); throw; }
         }
         void Tick(object sender, EventArgs args) {
             if ((lifetimePid > 0 && !ExactAlive(lifetimePid, lifetimeStarted)) ||
                 (ownerPid > 0 && !ExactAlive(ownerPid, ownerStarted))) BeginShutdown();
-            if (stopped) ReleaseInputs();
             long now = clock.ElapsedMilliseconds;
-            if (!testMode) {
-                // Poll rising edges; observes Escape without swallowing or injecting it.
-                bool down = (GetAsyncKeyState(0x1B) & 0x8000) != 0;
-                if (down && !escapeDown) {
-                    if (now - escapeAt <= 500) { escapeAt = -1000; StopControl(); }
-                    else escapeAt = now;
-                }
-                escapeDown = down;
-            }
             string line;
             while (input.TryDequeue(out line)) {
+                object requestId = null;
                 try {
                     var value = json.Deserialize<Dictionary<string, object>>(line);
+                    value.TryGetValue("id", out requestId);
                     string ev = Convert.ToString(value["event"]);
                     if (ev == "owner") {
                         ownerPid = Convert.ToInt32(value["pid"]);
@@ -234,10 +272,20 @@ namespace AmiraPointer {
                         if (stopped) AbortOwner();
                     } else if (ev == "abort" || (ev == "simulate-stop" && testMode)) { StopControl(); }
                     else if (ev == "exit") BeginShutdown();
-                    else if (ev == "busy" && !stopped) {
-                        active = true; kind = ""; label = "Preparing";
+                    else if (ev == "busy") {
+                        if (stopped || shutdownAt >= 0) throw new InvalidOperationException("Overlay is shutting down.");
+                        int busyId = Convert.ToInt32(value["id"]);
+                        if (cleanupAt >= 0 && (injectedKeys.Count != 0 || injectedMouse))
+                            throw new InvalidOperationException("Input cleanup is still pending; desktop action refused.");
+                        InstallHooks();
+                        cleanupAt = -1;
+                        actionId = busyId; active = true; kind = ""; label = "Preparing";
                         if (render) { Show(); Invalidate(); }
-                    } else if (ev == "overlay" && !stopped) {
+                        // The client MUST await this exact id before invoking the helper.
+                        Reply(new { @event = "armed", id = busyId });
+                    } else if (ev == "overlay") {
+                        if (stopped || shutdownAt >= 0 || !active || keyboardHook == IntPtr.Zero || mouseHook == IntPtr.Zero)
+                            throw new InvalidOperationException("Overlay action is not armed.");
                         actionId = Convert.ToInt32(value["id"]);
                         kind = Convert.ToString(value["kind"]);
                         label = Convert.ToString(value["label"]);
@@ -248,31 +296,55 @@ namespace AmiraPointer {
                         if (render) { Show(); Invalidate(); }
                         else Reply(new { @event = "glided", id = actionId });
                     } else if (ev == "done") {
-                        active = false; idleAt = now;
-                        if (kind == "click") rippleAt = now;
+                        if (active && !stopped && shutdownAt < 0) {
+                            active = gliding = false; idleAt = clock.ElapsedMilliseconds;
+                            if (kind == "click") rippleAt = idleAt;
+                        }
                     } else if (ev == "inspect" && testMode) {
                         POINT cursor; GetCursorPos(out cursor);
                         Reply(new { @event = "inspection", styles = CreateParams.ExStyle,
                             foreground = GetForegroundWindow() == Handle, gliding, active, kind,
+                            hooks = keyboardHook != IntPtr.Zero || mouseHook != IntPtr.Zero,
                             visible = Visible, actionId, targetX = target.X, targetY = target.Y,
                             cursorX = cursor.X, cursorY = cursor.Y,
                             ripple = clock.ElapsedMilliseconds - rippleAt < 450,
                             x = pointer.X, y = pointer.Y,
                             hitRoot = GetAncestor(WindowFromPoint(new POINT { X = (int)Math.Round(pointer.X), Y = (int)Math.Round(pointer.Y) }), 2).ToInt64().ToString() });
-                    }
-                } catch { StopControl(); }
+                    } else if (ev == "reader-error") {
+                        throw new InvalidOperationException(Convert.ToString(value["error"]));
+                    } else throw new InvalidOperationException("Unknown overlay event: " + ev);
+                } catch (Exception ex) {
+                    string error = ex.GetBaseException().Message;
+                    if (requestId == null) Reply(new { @event = "error", error });
+                    else Reply(new { @event = "error", id = requestId, error });
+                }
             }
             if (eof) BeginShutdown();
-            if (shutdownAt >= 0) {
-                // Keep the hooks/message loop/ledger alive after helper death or EOF,
-                // allowing transient SendInput failures to recover. Bound session teardown.
-                ReleaseInputs();
-                if (injectedKeys.Count == 0 && !injectedMouse) { Close(); return; }
-                if (now - shutdownAt >= 4000) {
-                    Console.Error.WriteLine("UIA input cleanup incomplete; release held keys/buttons manually.");
-                    Close();
+            now = clock.ElapsedMilliseconds;
+            if (stopped || shutdownAt >= 0) {
+                // Keep cleanup hooks only until releases succeed or the existing 4s
+                // deadline expires. A stop may stay latched without session-long hooks.
+                if (keyboardHook != IntPtr.Zero || mouseHook != IntPtr.Zero) ReleaseInputs();
+                bool released = injectedKeys.Count == 0 && !injectedMouse;
+                if (released || now - cleanupAt >= 4000) {
+                    if (!released && (keyboardHook != IntPtr.Zero || mouseHook != IntPtr.Zero))
+                        Console.Error.WriteLine("UIA input cleanup incomplete; release held keys/buttons manually.");
+                    UninstallHooks();
+                    if (shutdownAt >= 0) { Close(); return; }
                 }
                 return;
+            }
+            if (!active && idleAt >= 0 && now - idleAt > 3000) {
+                if (keyboardHook != IntPtr.Zero || mouseHook != IntPtr.Zero) {
+                    if (cleanupAt < 0) cleanupAt = now;
+                    ReleaseInputs();
+                    bool released = injectedKeys.Count == 0 && !injectedMouse;
+                    if (released || now - cleanupAt >= 4000) {
+                        if (!released) Console.Error.WriteLine("UIA input cleanup incomplete; release held keys/buttons manually.");
+                        UninstallHooks();
+                    }
+                }
+                if (render && Visible) Hide();
             }
             if (gliding) {
                 double t = Math.Min(1, (now - began) / 320.0);
@@ -326,11 +398,10 @@ namespace AmiraPointer {
         }
         protected override void Dispose(bool disposing) {
             if (disposing) {
-                stopped = true;
-                AbortOwner();
-                ReleaseInputs();
-                if (keyboardHook != IntPtr.Zero) UnhookWindowsHookEx(keyboardHook);
-                if (mouseHook != IntPtr.Zero) UnhookWindowsHookEx(mouseHook);
+                timer.Stop();
+                // Disposal (including a failed constructor/startup) is never a stop.
+                if (keyboardHook != IntPtr.Zero || mouseHook != IntPtr.Zero) ReleaseInputs();
+                UninstallHooks();
             }
             if (registered) {
                 if (IsHandleCreated) UnregisterHotKey(Handle, 1);
@@ -355,10 +426,14 @@ namespace AmiraPointer {
     }
 }
 '@
-try {
     if ($StopHotkey -cnotmatch '^(?:(?:ctrl|alt|shift)\+)+(?:[a-z0-9]|f(?:[1-9]|1[0-2]))$') { throw 'Invalid stop hotkey.' }
     [AmiraPointer.Overlay]::Run($Render -eq 'true', $StopHotkey, $LifetimePid, $LifetimeStarted, $TestMode.IsPresent)
 } catch {
-    [Console]::Error.WriteLine('UIA stop monitor failed; desktop control refused.')
+    $failure = $_.Exception
+    while ($null -ne $failure.InnerException) { $failure = $failure.InnerException }
+    $reply = @{ event = 'error'; error = $failure.Message } | ConvertTo-Json -Compress
+    [Console]::Out.WriteLine($reply)
+    [Console]::Out.Flush()
+    [Console]::Error.WriteLine($failure.Message)
     exit 1
 }
