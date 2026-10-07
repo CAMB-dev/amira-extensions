@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test"
+import { existsSync, readFileSync, unlinkSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import type { ExtensionAPI, PipeProcess } from "@amira/api"
 import { EventBus, ExtensionHost, InterceptorRegistry, ToolRegistry } from "@amira/core"
 import type { LaunchResult, TreeResult, UiaClient, WindowResult } from "../src/client.ts"
@@ -550,7 +553,11 @@ test.skipIf(!enabled || !negativePosition)(
       expect(pointer.foreground).toBe(false)
       const monitorPid = captured!.overlayPid()
       captured!.crashHelper()
-      await until(() => client!.emergency.stopped && !alive(monitorPid) && !alive(launchedPid))
+      await until(() => client!.emergency.stopped && !alive(monitorPid))
+      expect(alive(launchedPid)).toBe(true) // Helper crash is not session cleanup.
+      client!.resume()
+      await client!.call("tree", { window: app.window })
+      expect(alive(launchedPid)).toBe(true)
     } finally {
       try {
         await client?.stop()
@@ -589,7 +596,11 @@ for (const overlay of [true]) {
         await expect(client!.call("focus", { window: app.window })).rejects.toThrow(
           "the user stopped desktop control",
         )
-        await until(() => !alive(helperPid) && !alive(overlayPid) && !alive(app!.pid))
+        await until(() => !alive(helperPid) && !alive(overlayPid))
+        expect(alive(app!.pid)).toBe(true) // Visible apps survive emergency stop.
+        client!.resume()
+        await client!.call("tree", { window: app!.window })
+        expect(alive(app!.pid)).toBe(true)
       } finally {
         try {
           await client?.stop()
@@ -602,3 +613,93 @@ for (const overlay of [true]) {
     120_000,
   )
 }
+
+test.skipIf(!enabled)(
+  "modal Invoke returns within a bounded wait and the same helper can find/close the dialog",
+  async () => {
+    const instance = host(false)
+    let client: UiaClient | undefined
+    let captured: ReturnType<typeof captureHelper> | undefined
+    let launchedPid = 0
+    await instance.load((api) => {
+      captured = captureHelper(api)
+      client = setup(captured.api)
+    }, "test:uia-modal")
+    try {
+      const app = await fixture(
+        client!,
+        (pid) => {
+          launchedPid = pid
+        },
+        ["-ModalOnClick"],
+      )
+      const tree = (await client!.call("tree", { window: app.window })) as TreeResult
+      const helperPid = captured!.pid()
+      const began = Date.now()
+      await client!.call("click", { window: app.window, ref: ref(tree, "Change label") })
+      expect(Date.now() - began).toBeLessThan(15_000)
+      const windows = (await client!.call("windows", { filter: `${app.title}-modal` })) as {
+        windows: WindowResult[]
+      }
+      expect(captured!.pid()).toBe(helperPid)
+      const modal = windows.windows.find(
+        (window) => window.pid === app.pid && window.title === `${app.title}-modal`,
+      )
+      expect(modal).toBeDefined()
+      await client!.call("close", { window: modal!.window })
+      expect(alive(app.pid)).toBe(true)
+    } finally {
+      await client?.stop()
+      instance.unload("test:uia-modal")
+      if (launchedPid) await until(() => !alive(launchedPid))
+    }
+  },
+  180_000,
+)
+
+test.skipIf(!enabled)(
+  "cmd start headless descendant survives helper restart, dies on stop; session cleanup kills the whole tree",
+  async () => {
+    const instance = host(false)
+    let client: UiaClient | undefined
+    let captured: ReturnType<typeof captureHelper> | undefined
+    const pidPath = join(tmpdir(), `amira-uia-test-child-${crypto.randomUUID()}.txt`)
+    let childPid = 0
+    await instance.load((api) => {
+      captured = captureHelper(api)
+      client = setup(captured.api)
+    }, "test:uia-descendant")
+    try {
+      const script = `[IO.File]::WriteAllText('${pidPath.replaceAll("'", "''")}', [string]$PID); Start-Sleep -Seconds 600`
+      const launch = () =>
+        client!.call("launch", {
+          command: "cmd.exe",
+          args: ["/c", "start", "", "/b", "powershell.exe", "-NoProfile", "-Command", script],
+        })
+      await launch()
+      await until(() => existsSync(pidPath))
+      childPid = Number(readFileSync(pidPath, "utf8"))
+      expect(childPid).toBeGreaterThan(0)
+      captured!.crashHelper()
+      await until(() => client!.emergency.stopped)
+      client!.resume()
+      await client!.call("windows", { filter: "Amira-UIA-no-such-fixture" })
+      expect(alive(childPid)).toBe(true)
+      client!.emergencyStop()
+      await until(() => !alive(childPid))
+      unlinkSync(pidPath)
+      client!.resume()
+      await launch()
+      await until(() => existsSync(pidPath))
+      childPid = Number(readFileSync(pidPath, "utf8"))
+      await client!.stop()
+      await until(() => !alive(childPid))
+    } finally {
+      await client?.stop()
+      instance.unload("test:uia-descendant")
+      if (childPid) await until(() => !alive(childPid))
+      if (existsSync(pidPath)) unlinkSync(pidPath)
+    }
+  },
+  180_000,
+)

@@ -29,6 +29,7 @@ $writer = New-Object System.IO.StreamWriter([Console]::OpenStandardOutput(), $ut
 $writer.AutoFlush = $true
 $script:windows = @{}
 $script:processes = @{}
+$script:jobs = @{}
 $script:nextElement = 0
 $script:self = $null
 $script:lifetime = $null
@@ -122,73 +123,26 @@ function Stop-ExactProcess($identity) {
     } finally { if ($null -ne $process) { $process.Dispose() } }
 }
 
-# The private journal is written only from our launch records. The independent
-# watchdog can reap these identities without UIA if this helper dies or blocks.
+# The watchdog, not a transient helper, owns session cleanup. Restart only reloads
+# this client's authenticated records; it never kills apps or scans other journals.
 function Save-OwnedState {
     if ([string]::IsNullOrEmpty($StatePath)) { return }
     $records = @($script:processes.Values | ForEach-Object {
         @{ Pid = $_.Pid; Started = $_.Started.ToString() }
     })
-    $state = @{
-        OwnershipVersion = 2
+    Write-OwnedJournal $StatePath @{
+        OwnershipVersion = 3
         Helper = @{ Pid = $script:self.Pid; Started = $script:self.Started.ToString() }
         Processes = $records
-    } | ConvertTo-Json -Depth 4 -Compress
-    [IO.File]::WriteAllText($StatePath + '.tmp', $state, $utf8)
-    # PowerShell coerces $null to an empty string here; NullString supplies a real
-    # null backup path to .NET rather than an invalid empty path.
-    if ([IO.File]::Exists($StatePath)) { [IO.File]::Replace($StatePath + '.tmp', $StatePath, [NullString]::Value) }
-    else { [IO.File]::Move($StatePath + '.tmp', $StatePath) }
-}
-
-# Version 2 records only Start-Process identities and the helper itself. Older
-# journals may contain heuristically discovered processes and must never be reaped.
-function Test-OwnedState($state) {
-    $version = Get-Argument $state 'OwnershipVersion'
-    $helper = Get-Argument $state 'Helper'
-    $records = Get-Argument $state 'Processes'
-    if ($version -isnot [int] -or $version -ne 2 -or
-        $null -eq $helper -or $records -isnot [System.Array]) { return $false }
-    foreach ($identity in (@($helper) + @($records))) {
-        $processId = 0
-        $started = 0L
-        if (-not [int]::TryParse([string](Get-Argument $identity 'Pid'), [ref]$processId) -or
-            $processId -le 0 -or
-            -not [long]::TryParse([string](Get-Argument $identity 'Started'), [ref]$started) -or
-            $started -le 0) { return $false }
-    }
-    return $true
-}
-
-# Reap abandoned journals from earlier clients, not just this client's restart.
-# Active or inaccessible helpers are not stale. Validate the entire identity list
-# before killing anything; malformed/foreign files are left alone.
-function Clear-StaleJournals {
-    foreach ($file in [IO.Directory]::GetFiles([IO.Path]::GetTempPath(), 'amira-uia-*.json*')) {
-        if ([IO.Path]::GetFileName($file) -notmatch '^amira-uia-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json(\.tmp)?$' -or
-            [string]::Equals($file, $StatePath, [StringComparison]::OrdinalIgnoreCase) -or
-            [string]::Equals($file, $StatePath + '.tmp', [StringComparison]::OrdinalIgnoreCase)) { continue }
-        try {
-            $state = [IO.File]::ReadAllText($file) | ConvertFrom-Json
-            if (-not (Test-OwnedState $state)) { continue }
-            $helper = $state.Helper
-            $records = $state.Processes
-            if (-not (Test-IdentityGone $helper)) { continue }
-            $gone = $true
-            foreach ($identity in $records) {
-                Stop-ExactProcess $identity
-                if (-not (Test-IdentityGone $identity)) { $gone = $false }
-            }
-            # Do not lose identities on an inaccessible process or failed kill.
-            if ($gone) { [IO.File]::Delete($file) }
-        } catch { } # Retain invalid/unreadable journals; never infer ownership.
+        Jobs = @($script:jobs.Keys)
     }
 }
 
 try {
+    . "$PSScriptRoot/journal.ps1"
+    $script:journalKey = Read-JournalKey $reader
+    . "$PSScriptRoot/launch.ps1"
     $script:self = Get-Identity $PID
-    # Desktop tests must not reap a previous real session's launched apps.
-    if (-not $TestMode) { Clear-StaleJournals }
     if ($LifetimePid -lt 0) { Deny 'Invalid lifetime process.' }
     if ($LifetimePid -gt 0) {
         $script:lifetime = Get-Identity $LifetimePid
@@ -198,31 +152,23 @@ try {
         }
     }
     if (-not [string]::IsNullOrEmpty($StatePath) -and [IO.File]::Exists($StatePath)) {
-        # Restart cleans old launch identities, never adopts their windows or refs.
-        $previous = [IO.File]::ReadAllText($StatePath) | ConvertFrom-Json
-        if (-not (Test-OwnedState $previous)) { Deny 'Untrusted or older launch journal; cleanup refused.' }
-        # As in forced watchdog cleanup, quiesce the journal writer BEFORE taking
-        # the authoritative launch snapshot. Do not overwrite a still-active helper.
-        Stop-ExactProcess $previous.Helper
+        try { $previous = Read-OwnedJournal $StatePath }
+        catch { Deny 'untrusted launch journal; cleanup refused' }
+        # The client awaits the old helper's exit before starting a replacement.
         if (-not (Test-IdentityGone $previous.Helper)) { Deny 'Previous helper is still active; journal retained.' }
-        $previous = [IO.File]::ReadAllText($StatePath) | ConvertFrom-Json
-        if (-not (Test-OwnedState $previous) -or -not (Test-IdentityGone $previous.Helper)) {
-            Deny 'Previous journal changed or helper is still active; journal retained.'
-        }
         foreach ($identity in $previous.Processes) {
-            Stop-ExactProcess $identity
-            if (-not (Test-IdentityGone $identity)) {
-                # Never discard a failed kill or grant it a window/ref on restart.
-                $record = [pscustomobject]@{
-                    Pid = [int]$identity.Pid; Started = [long]$identity.Started
-                    Key = ('{0}:{1}' -f $identity.Pid, $identity.Started)
-                }
-                $script:processes[$record.Key] = $record
+            $record = [pscustomobject]@{
+                Pid = [int]$identity.Pid; Started = [long]$identity.Started
+                Key = ('{0}:{1}' -f $identity.Pid, $identity.Started)
             }
+            $script:processes[$record.Key] = $record
+        }
+        foreach ($name in $previous.Jobs) {
+            # Opaque IDs only; the watchdog retains the original unnamed kernel jobs.
+            $script:jobs[$name] = $null
         }
     }
     Save-OwnedState
-    if ($script:processes.Count -gt 0) { Deny 'Previous launch cleanup is incomplete; no new apps launched.' }
 
     Add-Type -AssemblyName UIAutomationClient | Out-Null
     Add-Type -AssemblyName UIAutomationTypes | Out-Null
@@ -233,6 +179,62 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 
 namespace OwnedUia {
+    public sealed class PatternCall {
+        static int active;
+        public bool Completed { get; private set; }
+        public bool Failed { get; private set; }
+        public static PatternCall Run(object pattern, string action, string text,
+            System.Windows.Automation.AutomationElement element,
+            System.Windows.Automation.AutomationElement root, IntPtr window, int pid, long started) {
+            if (System.Threading.Interlocked.Increment(ref active) > 8) {
+                System.Threading.Interlocked.Decrement(ref active);
+                throw new InvalidOperationException("UIA_SAFE: Too many busy pattern calls; close the target dialog first.");
+            }
+            var result = new PatternCall();
+            var worker = new System.Threading.Thread(delegate() {
+                try {
+                    // Repeat the existing identity/root/ancestry checks on the worker;
+                    // never act on a recycled HWND or a ref moved to a foreign window.
+                    using (var target = System.Diagnostics.Process.GetProcessById(pid)) {
+                        var handle = target.Handle;
+                        if (target.HasExited || target.StartTime.ToUniversalTime().Ticks != started ||
+                            !Native.IsWindow(window) || Native.WindowPid(window) != pid ||
+                            !System.Windows.Automation.Automation.Compare(root,
+                                System.Windows.Automation.AutomationElement.FromHandle(window))) throw new InvalidOperationException();
+                        var cursor = element;
+                        bool verified = false;
+                        for (int i = 0; cursor != null && i < 128; i++) {
+                            if (System.Windows.Automation.Automation.Compare(cursor, root)) { verified = true; break; }
+                            object value = cursor.GetCurrentPropertyValue(
+                                System.Windows.Automation.AutomationElement.NativeWindowHandleProperty, true);
+                            if (value is int && (int)value != 0 &&
+                                Native.GetAncestor(new IntPtr((int)value), 2) != window) throw new InvalidOperationException();
+                            cursor = System.Windows.Automation.TreeWalker.RawViewWalker.GetParent(cursor);
+                        }
+                        if (!verified || target.HasExited || target.StartTime.ToUniversalTime().Ticks != started ||
+                            Native.WindowPid(window) != pid || !System.Windows.Automation.Automation.Compare(root,
+                                System.Windows.Automation.AutomationElement.FromHandle(window))) throw new InvalidOperationException();
+                        switch (action) {
+                            case "invoke": ((System.Windows.Automation.InvokePattern)pattern).Invoke(); break;
+                            case "toggle": ((System.Windows.Automation.TogglePattern)pattern).Toggle(); break;
+                            case "select": ((System.Windows.Automation.SelectionItemPattern)pattern).Select(); break;
+                            case "expand": ((System.Windows.Automation.ExpandCollapsePattern)pattern).Expand(); break;
+                            case "collapse": ((System.Windows.Automation.ExpandCollapsePattern)pattern).Collapse(); break;
+                            case "value": ((System.Windows.Automation.ValuePattern)pattern).SetValue(text); break;
+                            case "close": ((System.Windows.Automation.WindowPattern)pattern).Close(); break;
+                            default: throw new InvalidOperationException();
+                        }
+                    }
+                } catch { result.Failed = true; }
+                finally { System.Threading.Interlocked.Decrement(ref active); }
+            });
+            worker.IsBackground = true;
+            worker.SetApartmentState(System.Threading.ApartmentState.MTA);
+            worker.Start();
+            result.Completed = worker.Join(5000);
+            return result;
+        }
+    }
     public static class Native {
         // WPF's default proxy loader walks ReflectedType on the calling stack.
         // A PowerShell DynamicMethod has no ReflectedType and causes a null dereference,
@@ -483,7 +485,7 @@ namespace OwnedUia {
 }
 '@ | Out-Null
 
-    . "$PSScriptRoot/launch.ps1"
+
 
     $proxies = [AppDomain]::CurrentDomain.GetAssemblies() | Where-Object {
         $_.GetName().Name -eq 'UIAutomationClientsideProviders'
@@ -848,11 +850,36 @@ namespace OwnedUia {
         $began = [DateTime]::UtcNow.Ticks
         $argumentLine = ($arguments | ForEach-Object { Quote-ProcessArgument $_ }) -join ' '
         Show-Action $null $null 'launch' 'Launch'
-        # Atomically guarded and suspended: helper death before publication closes the
-        # private job and kills only this created process, never guessed PID/name matches.
-        $launcher = [OwnedUia.LaunchGuard]::Start($path, $argumentLine, $cwd)
+        # Request an unnamed job BEFORE process creation. The watchdog authenticates
+        # this helper identity and owns the object even if publication is interrupted.
+        $jobId = 'amira-uia-job-' + [Guid]::NewGuid().ToString()
+        $writer.WriteLine((@{ event = 'create-job'; job = $jobId } | ConvertTo-Json -Compress))
+        $launcher = $null
+        $retainClock = [Diagnostics.Stopwatch]::StartNew()
+        while ($retainClock.ElapsedMilliseconds -lt 5000) {
+            Assert-Lifetime
+            $pending = Get-PendingRead
+            if (-not $pending.IsCompleted) { Start-Sleep -Milliseconds 25; continue }
+            $line = Receive-PendingLine
+            if ($null -eq $line) { break }
+            $ack = $line | ConvertFrom-Json
+            if ((Get-Argument $ack 'method') -ceq 'job_ack' -and
+                (Get-Argument $ack 'job') -ceq $jobId) {
+                $handle = Get-Argument $ack 'handle'
+                if ($handle -isnot [long] -and $handle -isnot [int]) { Deny 'Invalid launch job handle.' }
+                $launcher = [OwnedUia.LaunchGuard]::FromHandle($jobId, [long]$handle)
+                break
+            }
+            if ((Get-Argument $ack 'method') -cne 'job_ack') { $script:queuedLines.Enqueue($line) }
+        }
+        if ($null -eq $launcher) { Deny 'Launch refused: watchdog did not retain the launch job.' }
+        $script:jobs[$jobId] = $launcher
+        Save-OwnedState
         $launcherIdentity = $null
         try {
+            Assert-Lifetime
+            try { $launcher = [OwnedUia.LaunchGuard]::Start($path, $argumentLine, $cwd, $launcher) }
+            catch { Deny 'Launch refused: could not retain a non-breakaway job (nested jobs may be unsupported).' }
             $started = $launcher.Started
             if ($started -lt $began) { Deny 'Launch did not return a newly created process.' }
             $launcherIdentity = [pscustomobject]@{
@@ -861,7 +888,8 @@ namespace OwnedUia {
             }
             $script:processes[$launcherIdentity.Key] = $launcherIdentity
             Save-OwnedState
-            $launcher.Commit() # Run only after durable exact-identity publication.
+            Assert-Lifetime
+            $launcher.Commit() # Already session-owned, atomically assigned, and journaled.
 
             $clock = [Diagnostics.Stopwatch]::StartNew()
             $stableKey = ''
@@ -898,15 +926,10 @@ namespace OwnedUia {
             }
             return @{ pid = $launcherIdentity.Pid; instruction = 'No unambiguous new window found; use ui_windows with an executable/title filter.' }
         } catch {
-            # If identity capture failed, ownership is unproven: do not guess or kill.
-            if ($null -ne $launcherIdentity) {
-                Stop-ExactProcess $launcherIdentity
-                # Failed kills stay discoverable by the watchdog, never forgotten.
-                if (Test-IdentityGone $launcherIdentity) { $script:processes.Remove($launcherIdentity.Key) }
-                Save-OwnedState
-            }
+            # The watchdog retains even failed/pending jobs. A request failure does
+            # not terminate apps or discard the only record of an interrupted launch.
             throw
-        } finally { $launcher.Dispose() }
+        }
     }
 
     function Escape-Field($value) {
@@ -1045,6 +1068,21 @@ namespace OwnedUia {
         }
     }
 
+    # A modal provider may block its calling thread until the dialog closes. Dispatch
+    # on a typed background MTA thread, with a bounded wait; never kill apps on timeout.
+    function Invoke-BoundedPattern($window, $element, $pattern, [string] $action, [string] $path, [string] $text = '') {
+        Assert-ActionWindow $window
+        Assert-Element $window $element
+        $call = [OwnedUia.PatternCall]::Run($pattern, $action, $text, $element, $window.Root,
+            $window.Handle, $window.Identity.Pid, $window.Identity.Started)
+        if ($call.Completed -and $call.Failed) { Deny 'Pattern action failed or target could not be verified.' }
+        $result = @{ path = $path }
+        if (-not $call.Completed) {
+            $result.instruction = 'action sent; the target is busy or opened a modal dialog ¡ª use ui_windows'
+        }
+        return $result
+    }
+
     # click: prefer UIA patterns; fallback requires a verified target-window clickable point.
     function Invoke-OwnedClick($parameters) {
         $window = Get-Window $parameters
@@ -1054,30 +1092,30 @@ namespace OwnedUia {
         $pattern = Get-Pattern $window $element ([System.Windows.Automation.InvokePattern]::Pattern)
         if ($null -ne $pattern) {
             Assert-Element $window $element
-            $pattern.Invoke()
-            return @{ path = 'InvokePattern' }
+            return Invoke-BoundedPattern $window $element $pattern 'invoke' 'InvokePattern'
         }
         $pattern = Get-Pattern $window $element ([System.Windows.Automation.TogglePattern]::Pattern)
         if ($null -ne $pattern) {
             Assert-Element $window $element
-            $pattern.Toggle()
-            return @{ path = 'TogglePattern' }
+            return Invoke-BoundedPattern $window $element $pattern 'toggle' 'TogglePattern'
         }
         $pattern = Get-Pattern $window $element ([System.Windows.Automation.SelectionItemPattern]::Pattern)
         if ($null -ne $pattern) {
             Assert-Element $window $element
-            $pattern.Select()
-            return @{ path = 'SelectionItemPattern' }
+            return Invoke-BoundedPattern $window $element $pattern 'select' 'SelectionItemPattern'
         }
         $pattern = Get-Pattern $window $element ([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
         if ($null -ne $pattern) {
             Assert-Element $window $element
             $state = $pattern.Current.ExpandCollapseState
             Assert-Element $window $element
-            if ($state -eq [System.Windows.Automation.ExpandCollapseState]::Expanded) { $pattern.Collapse() }
-            elseif ($state -eq [System.Windows.Automation.ExpandCollapseState]::Collapsed) { $pattern.Expand() }
+            if ($state -eq [System.Windows.Automation.ExpandCollapseState]::Expanded) {
+                return Invoke-BoundedPattern $window $element $pattern 'collapse' 'ExpandCollapsePattern'
+            }
+            elseif ($state -eq [System.Windows.Automation.ExpandCollapseState]::Collapsed) {
+                return Invoke-BoundedPattern $window $element $pattern 'expand' 'ExpandCollapsePattern'
+            }
             else { Deny 'Element has no safe expand/collapse action.' }
-            return @{ path = 'ExpandCollapsePattern' }
         }
         if ((Read-Property $window $element ([System.Windows.Automation.AutomationElement]::IsOffscreenProperty)) -ne $false) {
             Deny 'Element is offscreen.'
@@ -1134,8 +1172,9 @@ namespace OwnedUia {
             Assert-Element $window $element
             if ($pattern.Current.IsReadOnly) { Deny 'Element value is read-only.' }
             Assert-Element $window $element
-            $pattern.SetValue($text)
-            return @{ path = 'ValuePattern.SetValue'; chars = $text.Length }
+            $result = Invoke-BoundedPattern $window $element $pattern 'value' 'ValuePattern.SetValue' $text
+            $result.chars = $text.Length
+            return $result
         }
         $exact = $null -ne (Get-Argument $parameters 'ref')
         if ($exact) { Focus-Element $window $element $true }
@@ -1222,7 +1261,7 @@ namespace OwnedUia {
             $pattern = Get-Pattern $window $window.Root ([System.Windows.Automation.WindowPattern]::Pattern)
             if ($null -ne $pattern) {
                 Assert-Element $window $window.Root
-                $pattern.Close()
+                $null = Invoke-BoundedPattern $window $window.Root $pattern 'close' 'WindowPattern.Close'
                 return 'WindowPattern.Close'
             }
         } catch { }
@@ -1255,19 +1294,6 @@ namespace OwnedUia {
         return @{ closed = $closed; path = $path; terminated = $false; instruction = $instruction }
     }
 
-    function Clear-OwnedApps {
-        # Cleanup has no UIA/provider calls: only still-running exact launch records.
-        foreach ($identity in @($script:processes.Values)) {
-            if (Test-Identity $identity) { Stop-ExactProcess $identity }
-        }
-        $script:windows.Clear()
-        # Retain any failed kills in the journal for the independent watchdog.
-        foreach ($key in @($script:processes.Keys)) {
-            if (Test-IdentityGone $script:processes[$key]) { $script:processes.Remove($key) }
-        }
-        Save-OwnedState
-    }
-
     while (-not $script:stopping) {
         Assert-Lifetime
         if ($script:queuedLines.Count -gt 0) { $line = $script:queuedLines.Dequeue() }
@@ -1291,7 +1317,7 @@ namespace OwnedUia {
             $request = $line | ConvertFrom-Json
             if ($null -eq $request -or $request -isnot [pscustomobject]) { Deny 'Request must be a JSON object.' }
             # Late animation acknowledgements are protocol events, not RPC requests.
-            if ((Get-Argument $request 'method') -ceq 'overlay_ack') { continue }
+            if ((Get-Argument $request 'method') -cin @('overlay_ack', 'job_ack')) { continue }
             $id = Get-Argument $request 'id'
             if ($null -eq $request.PSObject.Properties['id'] -or
                 ($id -isnot [string] -and $id -isnot [int] -and $id -isnot [long])) {
@@ -1323,7 +1349,7 @@ namespace OwnedUia {
                 }
                 'close' { Close-OwnedWindow $parameters; break }
                 'desktop' { @{ interactive = [OwnedUia.Native]::InteractiveDesktop() }; break }
-                'shutdown' { Clear-OwnedApps; $script:stopping = $true; @{ shutdown = $true }; break }
+                'shutdown' { $script:stopping = $true; @{ shutdown = $true }; break }
                 default { Deny 'Unknown method.' }
             }
             $reply = @{ id = $id; result = $result }
@@ -1351,12 +1377,8 @@ namespace OwnedUia {
         } catch { }
     }
 } finally {
-    # EOF, shutdown, lifetime death, provider failure, or broken stdout all converge.
-    if ($null -ne (Get-Command Clear-OwnedApps -CommandType Function -ErrorAction SilentlyContinue)) {
-        try { Clear-OwnedApps } catch { }
-    } else {
-        foreach ($identity in @($script:processes.Values)) { Stop-ExactProcess $identity }
-    }
+    # Retirement/timeout is NOT session end. Retained watchdog handles preserve apps.
+    foreach ($job in @($script:jobs.Values)) { if ($null -ne $job) { try { $job.Dispose() } catch { } } }
     # Do not dispose a StreamReader concurrently with a pending ReadLineAsync;
     # process exit closes the input handle and outstanding background read.
     try { $writer.Dispose() } catch { }

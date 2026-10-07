@@ -1,8 +1,9 @@
 # Windows PowerShell 5.1 WinForms fixture. This process owns every control/window;
-# no child processes, compiled code, file access, or save/confirmation dialogs.
+# no child processes, compiled code or file access; optional test-owned modal dialog.
 param(
     [string] $Title = 'Amira UIA test window',
     [switch] $IgnoreClose,
+    [switch] $ModalOnClick,
     [int] $Left = [int]::MinValue,
     [int] $Top = [int]::MinValue
 )
@@ -73,6 +74,14 @@ $status.SetBounds(172, 250, 364, 28)
 $button.Add_Click({
     $status.Text = 'Button clicked'
     $status.AccessibleName = 'Button clicked'
+    if ($ModalOnClick) {
+        $dialog = New-Object System.Windows.Forms.Form
+        $dialog.Text = $Title + '-modal'
+        $dialog.AccessibleName = $dialog.Text
+        $dialog.ClientSize = [System.Drawing.Size]::new(240, 120)
+        try { $null = $dialog.ShowDialog($form) }
+        finally { $dialog.Dispose() }
+    }
 })
 
 $checkbox = New-Object System.Windows.Forms.CheckBox

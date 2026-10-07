@@ -1,4 +1,7 @@
+import { randomBytes } from "node:crypto"
+import { readFile } from "node:fs/promises"
 import type { ExtensionAPI, PipeEvent, PipeProcess } from "@amira/api"
+import { readLaunchJournal } from "./journal.ts"
 import type { UiaSettings } from "./settings.ts"
 import { overlayReply, STOP_MESSAGE, StopState } from "./stop.ts"
 
@@ -57,10 +60,14 @@ export class UiaClient {
   private overlayPid?: number
   private arming?: { id: number; resolve(): void; reject(error: Error): void }
   private actionActive = false
+  private explicitStop = false
   private helperIdentity?: { event: "owner"; pid: number; started: string }
   private overlayExited: Promise<void> = Promise.resolve()
   private queue: Promise<unknown> = Promise.resolve()
   private stopping = false
+  private readonly journalKey = randomBytes(32)
+  private readonly jobRequests = new Map<string, { pipe: PipeProcess; generation: number }>()
+  private stopCleanup?: { promise: Promise<void>; resolve(): void }
   private statePath: string
   private watchdog?: PipeProcess
   private lifetimeStarted?: string
@@ -81,8 +88,10 @@ export class UiaClient {
   /** Serialize even direct callers: snapshots, focus and cleanup must not race. */
   call(method: string, params: Record<string, unknown> = {}, signal?: AbortSignal): Promise<unknown> {
     const epoch = this.sessionEpoch
+    const queuedWhileStopped = this.emergency.stopped && !["windows", "tree"].includes(method)
     const run = this.queue.then(async () => {
       if (signal?.aborted) throw new Error("UIA request cancelled")
+      if (queuedWhileStopped) throw new Error(STOP_MESSAGE)
       if (epoch !== this.sessionEpoch)
         throw new Error(
           this.emergency.stopped ? STOP_MESSAGE : "UIA session ended before the request started",
@@ -217,6 +226,7 @@ export class UiaClient {
     if (this.pipe) return
     const previousGeneration = this.generation
     await this.retired
+    await this.stopCleanup?.promise
     if (this.stopping || previousGeneration !== this.generation)
       throw new Error("UIA session ended during startup")
     // Background jobs have an unload lifetime; pipes require this sentinel/watchdog bridge.
@@ -292,6 +302,7 @@ export class UiaClient {
         },
       },
     )
+    this.pipe.write(`${JSON.stringify({ event: "journal-key", key: this.journalKey.toString("base64") })}\n`)
     if (this.settings.overlay) await this.tryOverlay(job.pid, this.lifetimeStarted)
     if (this.stopping || generation !== this.generation) throw new Error("UIA session ended during startup")
   }
@@ -299,14 +310,21 @@ export class UiaClient {
   /** Stop is out-of-band: retire even a helper blocked inside a synchronous UIA provider. */
   emergencyStop(): void {
     const changed = this.emergency.stop()
-    if (!changed && !this.pipe && !this.overlay) return
+    // A helper-exit notification may beat the physical stop on the other pipe.
+    if (!changed && !this.pipe && !this.overlay && this.explicitStop) return
+    this.explicitStop = true
     this.sessionEpoch++
+    if (this.watchdog && !this.stopCleanup) {
+      this.stopCleanup = Promise.withResolvers<void>()
+      this.watchdog.write(`${JSON.stringify({ event: "stop" })}\n`)
+    }
     this.breakPipe(STOP_MESSAGE)
     if (changed) this.onStopped()
   }
 
   resume(): void {
     this.emergency.resume()
+    this.explicitStop = false
   }
 
   /** Cancelling a read retires its provider without changing the action stop latch. */
@@ -345,6 +363,7 @@ export class UiaClient {
     const ready = Promise.withResolvers<void>()
     const exited = Promise.withResolvers<void>()
     this.overlayExited = exited.promise
+    let hasExited = false
     let buffer = ""
     const timer = setTimeout(
       () => ready.reject(new Error("UIA stop monitor failed to start")),
@@ -376,6 +395,7 @@ export class UiaClient {
           cwd: this.host.cwd,
           onEvent: (event) => {
             if (event.type === "exit") {
+              hasExited = true
               exited.resolve()
               ready.reject(new Error("UIA stop monitor exited"))
               if (this.overlay === overlay)
@@ -385,7 +405,11 @@ export class UiaClient {
               this.host.reportError(
                 "computer-use-uia: input cleanup incomplete; release held keys/buttons manually",
               )
-            if (event.type !== "stdout" || this.overlay !== overlay) return
+            if (event.type !== "stdout" || hasExited || this.stopping) return
+            const current = this.overlay === overlay
+            // While retiring, accept only its physical stop. Replacement startup
+            // waits for this monitor's exit, so it cannot stop a later generation.
+            if (!current && (this.overlay || this.pipe)) return
             buffer += event.data
             if (buffer.length > 20_000) {
               const message = "UIA stop monitor response exceeded the limit"
@@ -401,6 +425,10 @@ export class UiaClient {
               if (!line) continue
               try {
                 const reply = overlayReply(line)
+                if (!current) {
+                  if (reply.event === "stop") this.emergencyStop()
+                  continue
+                }
                 if (reply.event === "ready") {
                   this.overlayClass = reply.class
                   this.overlayPid = reply.pid
@@ -462,9 +490,51 @@ export class UiaClient {
         cwd: this.host.cwd,
         onEvent: (event) => {
           if (event.type === "stdout") {
-            output = (output + event.data).slice(-1000)
-            if (output.includes("UIA watchdog ready")) ready.resolve()
+            output += event.data
+            let newline = output.indexOf("\n")
+            while (newline >= 0) {
+              const line = output.slice(0, newline).trim()
+              output = output.slice(newline + 1)
+              newline = output.indexOf("\n")
+              if (line === "UIA watchdog ready") ready.resolve()
+              else {
+                try {
+                  const reply = JSON.parse(line) as {
+                    event?: string
+                    job?: string
+                    handle?: number
+                    incomplete?: boolean
+                  }
+                  if (reply.event === "job-created" && typeof reply.job === "string") {
+                    const origin = this.jobRequests.get(reply.job)
+                    this.jobRequests.delete(reply.job)
+                    if (
+                      origin &&
+                      origin.pipe === this.pipe &&
+                      origin.generation === this.generation &&
+                      Number.isSafeInteger(reply.handle) &&
+                      reply.handle! > 0
+                    )
+                      origin.pipe.write(
+                        `${JSON.stringify({ method: "job_ack", job: reply.job, handle: reply.handle })}\n`,
+                      )
+                  }
+                  if (reply.event === "stopped") {
+                    if (reply.incomplete)
+                      this.host.reportError(
+                        "computer-use-uia: headless cleanup incomplete; launch journal retained",
+                      )
+                    this.stopCleanup?.resolve()
+                    this.stopCleanup = undefined
+                  }
+                } catch {
+                  this.host.reportError("computer-use-uia: invalid watchdog response")
+                }
+              }
+            }
           }
+          if (event.type === "stderr" && event.data.includes("untrusted launch journal"))
+            this.host.reportError("computer-use-uia: untrusted launch journal; cleanup refused")
           if (event.type === "stderr" && event.data.includes("UIA cleanup incomplete"))
             this.host.reportError(
               "computer-use-uia: cleanup incomplete; launch identities retained for retry",
@@ -474,6 +544,8 @@ export class UiaClient {
             ready.reject(new Error("UIA watchdog exited"))
             if (this.watchdog === watchdog) {
               this.watchdog = undefined
+              this.stopCleanup?.resolve()
+              this.stopCleanup = undefined
               if (!this.stopping) this.breakPipe("UIA watchdog exited; desktop control stopped")
             }
           }
@@ -481,6 +553,7 @@ export class UiaClient {
       },
     )
     this.watchdog = watchdog
+    watchdog.write(`${JSON.stringify({ event: "journal-key", key: this.journalKey.toString("base64") })}\n`)
     try {
       await ready.promise
     } catch (error) {
@@ -500,7 +573,11 @@ export class UiaClient {
     if (event.type === "exit") {
       // A stop-monitor kill and a helper exit may arrive on different pipes in either order.
       // Unexpected helper death must latch too, never let that race reopen desktop control.
-      this.emergencyStop()
+      // Crash/restart latches actions, but must not invoke the explicit stop kill rule.
+      const changed = this.emergency.stop()
+      this.sessionEpoch++
+      this.breakPipe(STOP_MESSAGE)
+      if (changed) this.onStopped()
       return
     }
     if (event.type !== "stdout") return
@@ -523,6 +600,41 @@ export class UiaClient {
           event?: string
           pid?: number
           started?: string
+          job?: string
+        }
+        if (response.event === "create-job" && typeof response.job === "string") {
+          const pipe = this.pipe
+          const watchdog = this.watchdog
+          const generation = this.generation
+          const job = response.job
+          const identity = this.helperIdentity
+          // Defense in depth: only this client's authenticated journal may authorize retention.
+          void readFile(this.statePath, "utf8")
+            .then((serialized) => {
+              const state = readLaunchJournal(serialized, this.journalKey)
+              if (
+                !identity ||
+                state.Helper.Pid !== identity.pid ||
+                state.Helper.Started !== identity.started ||
+                !/^amira-uia-job-[0-9a-f-]{36}$/.test(job)
+              )
+                throw new Error("Unverified launch job request; launch refused")
+              if (
+                generation === this.generation &&
+                this.pipe === pipe &&
+                this.watchdog === watchdog &&
+                pipe
+              ) {
+                this.jobRequests.set(job, { pipe, generation })
+                watchdog?.write(`${JSON.stringify({ event: "create-job", job })}\n`)
+              }
+            })
+            .catch((error: unknown) => {
+              this.host.reportError(
+                `computer-use-uia: ${error instanceof Error ? error.message : String(error)}`,
+              )
+            })
+          continue
         }
         if (response.event === "helper") {
           if (
@@ -535,6 +647,9 @@ export class UiaClient {
             return
           }
           this.helperIdentity = { event: "owner", pid: response.pid, started: response.started }
+          this.watchdog?.write(
+            `${JSON.stringify({ event: "writer", pid: response.pid, started: response.started })}\n`,
+          )
           this.overlay?.write(`${JSON.stringify(this.helperIdentity)}\n`)
           continue
         }
@@ -605,7 +720,10 @@ export class UiaClient {
     try {
       return await new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
-          if (action) this.emergency.stop()
+          if (action) {
+            this.emergency.stop()
+            this.sessionEpoch++
+          }
           this.breakPipe("UIA helper timed out")
         }, this.timeoutMs)
         this.pending.set(id, { resolve, reject, timer })
@@ -639,6 +757,7 @@ export class UiaClient {
     this.overlay = undefined
     overlay?.close(5000)
     this.helperIdentity = undefined
+    this.jobRequests.clear()
     this.generation++
     this.windows.clear()
     this.protectedWindows.clear()
@@ -650,7 +769,7 @@ export class UiaClient {
     pipe?.close(graceMs)
   }
 
-  /** EOF triggers helper finally cleanup. The sentinel covers host-driven unload too. */
+  /** Only watchdog EOF/sentinel death ends the session and cleans launch jobs. */
   async stop(): Promise<void> {
     if (this.stopping) return this.stopWait
     this.stopping = true
@@ -663,6 +782,7 @@ export class UiaClient {
     this.overlay = undefined
     overlay?.close(5000)
     this.helperIdentity = undefined
+    this.jobRequests.clear()
     this.generation++
     this.sessionEpoch++
     this.windows.clear()

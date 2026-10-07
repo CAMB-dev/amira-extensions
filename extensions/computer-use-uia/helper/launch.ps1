@@ -1,9 +1,11 @@
-# Atomic launch guard: even a forced helper exit between creation and journal publication
-# cannot orphan a child. Only the exact CreateProcess handle enters this private job;
-# descendants silently break away, so handoff targets never gain kill eligibility.
+# Session-owned unnamed jobs: the watchdog creates/retains the kernel object BEFORE
+# creation. Only a duplicated handle enters the verified helper; no public job name
+# or journal-supplied handle can be rebound to an unrelated process tree.
 Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -50,25 +52,112 @@ namespace OwnedUia {
         static extern bool GetProcessTimes(IntPtr process, out long created, out long exited, out long kernel, out long user);
         [DllImport("kernel32.dll", SetLastError = true)] static extern uint ResumeThread(IntPtr thread);
         [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool DuplicateHandle(IntPtr sourceProcess, IntPtr source, IntPtr targetProcess,
+            out IntPtr target, uint access, bool inherit, uint options);
+        [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr data, uint size, out uint returned);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool member);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool TerminateJobObject(IntPtr job, uint code);
+        delegate bool EnumWindowsProc(IntPtr window, IntPtr data);
+        [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc callback, IntPtr data);
+        [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
         IntPtr job, process, thread;
+        public string Name { get; private set; }
+        public long HelperHandle { get; private set; }
+        public static LaunchGuard CreateFor(string id, int helperPid, long helperStarted) {
+            var guard = new LaunchGuard();
+            try {
+                guard.Name = id; // Opaque protocol ID only; the kernel job is UNNAMED.
+                guard.job = CreateJobObject(IntPtr.Zero, null);
+                if (guard.job == IntPtr.Zero) throw new Win32Exception();
+                guard.Limits();
+                using (var helper = Process.GetProcessById(helperPid)) {
+                    IntPtr target = helper.Handle;
+                    if (helper.HasExited || helper.StartTime.ToUniversalTime().Ticks != helperStarted)
+                        throw new InvalidOperationException("Helper identity changed.");
+                    IntPtr duplicate;
+                    // ASSIGN | QUERY | TERMINATE, not SET_ATTRIBUTES. Never inherit the handle.
+                    if (!DuplicateHandle(GetCurrentProcess(), guard.job, target, out duplicate,
+                        0x0001u | 0x0004u | 0x0008u, false, 0)) throw new Win32Exception();
+                    guard.HelperHandle = duplicate.ToInt64();
+                }
+                return guard;
+            } catch { guard.Dispose(); throw; }
+        }
+        public static LaunchGuard FromHandle(string id, long handle) {
+            return new LaunchGuard { Name = id, job = new IntPtr(handle) };
+        }
+        public void Terminate() {
+            if (!TerminateJobObject(job, 1)) throw new Win32Exception();
+        }
+        // Capture each member's creation time through the SAME cached handle used to kill.
+        // Membership is rechecked after opening the PID (which may have been recycled).
+        public void StopHeadless() {
+            bool failed = false;
+            foreach (int pid in Members()) {
+                try {
+                    using (var member = Process.GetProcessById(pid)) {
+                        IntPtr handle = member.Handle;
+                        long started = member.StartTime.ToUniversalTime().Ticks;
+                        bool belongs;
+                        if (!IsProcessInJob(handle, job, out belongs)) { failed = true; continue; }
+                        if (!belongs || member.HasExited) continue;
+                        bool visible = false;
+                        if (!EnumWindows(delegate(IntPtr window, IntPtr data) {
+                            uint owner; GetWindowThreadProcessId(window, out owner);
+                            if (owner == pid && IsWindowVisible(window)) visible = true;
+                            return true;
+                        }, IntPtr.Zero)) throw new Win32Exception();
+                        if (!visible && !member.HasExited && member.StartTime.ToUniversalTime().Ticks == started) {
+                            member.Kill();
+                            if (!member.WaitForExit(1000)) throw new Win32Exception();
+                        }
+                    }
+                } catch (ArgumentException) { } // Exited before opening; never guess ownership.
+                catch (InvalidOperationException) { } // Exited between opening and inspecting.
+                catch (Win32Exception) { failed = true; } // Continue; report genuine access/kill failures.
+            }
+            if (failed) throw new InvalidOperationException("Headless member cleanup incomplete.");
+        }
+        public int[] Members() {
+            int size = 1024;
+            while (true) {
+                IntPtr data = Marshal.AllocHGlobal(size);
+                try {
+                    uint returned;
+                    if (!QueryInformationJobObject(job, 3, data, (uint)size, out returned)) {
+                        if (Marshal.GetLastWin32Error() == 234 && size < 16777216) { size *= 2; continue; }
+                        throw new Win32Exception();
+                    }
+                    int count = Marshal.ReadInt32(data, 4);
+                    var members = new List<int>();
+                    for (int i = 0; i < count; i++) {
+                        long pid = Marshal.ReadIntPtr(data, 8 + i * IntPtr.Size).ToInt64();
+                        if (pid > 0 && pid <= int.MaxValue) members.Add((int)pid);
+                    }
+                    return members.ToArray();
+                } finally { Marshal.FreeHGlobal(data); }
+            }
+        }
         public int Id { get; private set; }
         public long Started { get; private set; }
-        void Limits(bool guarded) {
+        void Limits() {
             var limits = new EXTENDED_LIMIT();
-            // KILL_ON_JOB_CLOSE only before durable identity publication. SILENT_BREAKAWAY_OK
-            // prevents killing descendants, including apps which hand off to another process.
-            limits.Basic.Flags = 0x1000u | (guarded ? 0x2000u : 0u);
+            // No breakaway and NO implicit kill on handle close. The watchdog owns
+            // the job before creation; only MAC-verified explicit cleanup may terminate it.
+            limits.Basic.Flags = 0u;
             if (!SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf(typeof(EXTENDED_LIMIT))))
                 throw new Win32Exception();
         }
-        public static LaunchGuard Start(string path, string arguments, string cwd) {
-            var guard = new LaunchGuard();
+        public static LaunchGuard Start(string path, string arguments, string cwd, LaunchGuard guard) {
             IntPtr attributes = IntPtr.Zero, value = IntPtr.Zero;
             bool initialized = false;
             try {
-                guard.job = CreateJobObject(IntPtr.Zero, null);
-                if (guard.job == IntPtr.Zero) throw new Win32Exception();
-                guard.Limits(true);
                 IntPtr size = IntPtr.Zero;
                 InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
                 attributes = Marshal.AllocHGlobal(size);
@@ -92,7 +181,11 @@ namespace OwnedUia {
                 if (!GetProcessTimes(guard.process, out created, out exited, out kernel, out user)) throw new Win32Exception();
                 guard.Started = DateTime.FromFileTimeUtc(created).Ticks;
                 return guard;
-            } catch { guard.Dispose(); throw; }
+            } catch {
+                // Atomic assignment means a failed/suspended creation cannot escape
+                // the already-retained session job. Do not kill on provider retirement.
+                guard.Dispose(); throw;
+            }
             finally {
                 if (initialized) DeleteProcThreadAttributeList(attributes);
                 if (attributes != IntPtr.Zero) Marshal.FreeHGlobal(attributes);
@@ -100,9 +193,8 @@ namespace OwnedUia {
             }
         }
         public void Commit() {
-            // The caller MUST persist Id+Started before letting the child execute.
+            // The caller MUST persist the job and await watchdog retention before execution.
             if (ResumeThread(thread) == uint.MaxValue) throw new Win32Exception();
-            Limits(false);
         }
         public void Dispose() {
             if (job != IntPtr.Zero) { CloseHandle(job); job = IntPtr.Zero; }

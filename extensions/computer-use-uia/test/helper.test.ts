@@ -110,7 +110,7 @@ describe("D112 any-window source contracts (not runtime/provider verification)",
     const launch = helperFunction("Start-OwnedApp")
     ordered(
       launch,
-      "[OwnedUia.LaunchGuard]::Start($path, $argumentLine, $cwd)",
+      "[OwnedUia.LaunchGuard]::Start($path, $argumentLine, $cwd, $launcher)",
       "$started = $launcher.Started",
       "$script:processes[$launcherIdentity.Key] = $launcherIdentity",
       "Save-OwnedState",
@@ -139,31 +139,23 @@ describe("D112 any-window source contracts (not runtime/provider verification)",
     expect(close).not.toContain("Stop-ExactProcess")
     expect(close).not.toContain(".Kill()")
     const request = helperFunction("Request-WindowClose")
-    expect(request).toContain("$pattern.Close()")
+    expect(request).toContain("Invoke-BoundedPattern $window $window.Root $pattern 'close'")
     expect(request).toContain("PostMessage($window.Handle, 0x0010")
     expect(request).not.toContain(".Kill()")
-    const cleanup = helperFunction("Clear-OwnedApps")
-    ordered(cleanup, "$script:processes.Values", "Test-Identity $identity", "Stop-ExactProcess $identity")
-    expect(cleanup).not.toContain("Request-WindowClose")
-    expect(cleanup).not.toContain("$script:windows.Values")
-    expect(cleanup).toContain("Test-IdentityGone $script:processes[$key]")
-    const kill = helperFunction("Stop-ExactProcess")
-    ordered(
-      kill,
-      "GetProcessById($identity.Pid)",
-      "$null = $process.Handle",
-      "$process.StartTime.ToUniversalTime().Ticks -eq $identity.Started",
-      "$process.Kill()",
-    )
+    expect(source).not.toContain("Clear-OwnedApps")
+    expect(source).not.toContain("Stop-ExactProcess $previous")
+    expect(lifetime).toContain("$job.StopHeadless()")
+    expect(lifetime).toContain("$job.Terminate()")
     expect(source + lifetime + overlay).not.toMatch(/taskkill|Stop-Process\s+-Name|Kill\([^)]*ProcessName/i)
-    expect(lifetime).toContain("Get-ExactProcess $identity")
     expect(lifetime).toContain("$state.Processes")
   })
 
-  test("journal schema validates identities and retains failed cleanup", () => {
-    expect(helperFunction("Save-OwnedState")).toContain("OwnershipVersion = 2")
-    expect(helperFunction("Test-OwnedState")).toContain("$version -ne 2")
-    expect(helperFunction("Clear-StaleJournals")).toContain("if ($gone) { [IO.File]::Delete($file) }")
+  test("journal restart reads only authenticated same-client records, never cleans apps", () => {
+    expect(helperFunction("Save-OwnedState")).toContain("OwnershipVersion = 3")
+    expect(helperFunction("Save-OwnedState")).toContain("Write-OwnedJournal $StatePath")
+    expect(source).toContain("$previous = Read-OwnedJournal $StatePath")
+    expect(source).not.toContain("Clear-StaleJournals")
+    expect(source).not.toContain("[IO.Directory]::GetFiles")
     expect(lifetime).toContain("launch journal retained")
     expect(helperFunction("Get-Identity")).not.toContain("MainModule")
   })
@@ -200,7 +192,7 @@ describe("D112 any-window source contracts (not runtime/provider verification)",
       click,
       "Show-Action $window $element 'click'",
       "InvokePattern",
-      "$pattern.Invoke()",
+      "Invoke-BoundedPattern $window $element $pattern 'invoke'",
       "SetCursorPos",
       "GetCursorPos([ref]$actualPoint)",
       "Assert-ClickPoint $window $actualPoint",
@@ -236,7 +228,7 @@ describe("D112 any-window source contracts (not runtime/provider verification)",
       loop,
       "Get-PendingRead",
       "Receive-PendingLine",
-      "'overlay_ack') { continue }",
+      "@('overlay_ack', 'job_ack')) { continue }",
       "$id = Get-Argument",
     )
     expect(source).toContain("SetThreadDpiAwarenessContext([IntPtr]::new(-4))")
@@ -337,35 +329,35 @@ describe("overlay source contracts (not rendering/hotkey verification)", () => {
   })
 })
 
-test("forced launch interruption is kernel-guarded before durable identity publication", () => {
+test("launch job is guarded without breakaway and retained before execution", () => {
   ordered(
     guard,
-    "guard.Limits(true)",
     "new IntPtr(0x2000D)",
     "if (!CreateProcess(",
     "GetProcessTimes(guard.process",
     "guard.Started =",
   )
   expect(guard).toContain("0x08080004") // suspended + atomic job-list assignment + no console
-  expect(guard).toContain("limits.Basic.Flags = 0x1000u | (guarded ? 0x2000u : 0u)")
+  expect(guard).toContain("limits.Basic.Flags = 0u")
+  expect(guard).not.toContain("0x1000u")
+  expect(guard).not.toContain("Limits(false)")
   expect(guard).not.toContain("AssignProcessToJobObject(")
-  expect(guard).not.toContain("GetProcessById")
   expect(guard).not.toContain("ProcessName")
   ordered(
-    source,
-    "Stop-ExactProcess $previous.Helper",
-    "Test-IdentityGone $previous.Helper",
-    "$previous = [IO.File]::ReadAllText($StatePath)",
-    "foreach ($identity in $previous.Processes)",
+    helperFunction("Start-OwnedApp"),
+    "event = 'create-job'",
+    "::FromHandle",
     "Save-OwnedState",
+    "::Start",
+    "Save-OwnedState",
+    "$launcher.Commit()",
   )
-  ordered(helperFunction("Start-OwnedApp"), "Save-OwnedState", "$launcher.Commit()")
   ordered(
     lifetime,
-    "$helperProcess.Kill()",
-    "$helperProcess.WaitForExit(1000)",
-    "$state = [IO.File]::ReadAllText($StatePath)",
-    "foreach ($identity in $state.Processes)",
+    "$helper.Kill()",
+    "$helper.WaitForExit(1000)",
+    "Stop-CurrentWriter\n",
+    "$state = Read-OwnedJournal $StatePath",
   )
 })
 
@@ -405,7 +397,7 @@ test("desktop test module has no import-time probes; fixture is isolated", () =>
   expect(desktop).toContain("filter: title")
   const capture = readFileSync(new URL("./capture.ts", import.meta.url), "utf8")
   expect(capture).toContain('[...argv, "-TestMode"]')
-  expect(source).toContain("if (-not $TestMode) { Clear-StaleJournals }")
+  expect(source).not.toContain("Clear-StaleJournals")
   expect(desktop).not.toContain("console.log")
   const fixture = readFileSync(new URL("../helper/test-window.ps1", import.meta.url), "utf8")
   expect(fixture).toContain("$password.UseSystemPasswordChar = $true")

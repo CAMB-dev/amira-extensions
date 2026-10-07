@@ -3,7 +3,6 @@ export const STOP_MESSAGE = "the user stopped desktop control"
 /** The rendering process observes keys; this latch is independent of rendering and helpers. */
 export class StopState {
   stopped = false
-  private escapeAt?: number
 
   stop(): boolean {
     const changed = !this.stopped
@@ -11,24 +10,8 @@ export class StopState {
     return changed
   }
 
-  /** Fake-friendly physical key-down seam; injected Esc never participates. */
-  escape(now: number, flags = 0, active = true): boolean {
-    if (!active) {
-      this.escapeAt = undefined
-      return false
-    }
-    if ((flags & 0x12) !== 0) return false // LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED
-    if (this.escapeAt !== undefined && now - this.escapeAt <= 500) {
-      this.escapeAt = undefined
-      return this.stop()
-    }
-    this.escapeAt = now
-    return false
-  }
-
   resume(): void {
     this.stopped = false
-    this.escapeAt = undefined
   }
 
   assertAction(): void {

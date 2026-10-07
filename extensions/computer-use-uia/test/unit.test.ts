@@ -1,7 +1,10 @@
 import { expect, test } from "bun:test"
+import { createHmac, randomBytes } from "node:crypto"
+import { readFileSync, unlinkSync, writeFileSync } from "node:fs"
 import type { ExtensionAPI, OpenPipeOptions, SettingsLayer, ToolContext, ToolDefinition } from "@amira/api"
 import { formatTree, UiaClient, validateKeys } from "../src/client.ts"
 import { setup } from "../src/extension.ts"
+import { readLaunchJournal } from "../src/journal.ts"
 import { readSettings } from "../src/settings.ts"
 import { overlayReply, StopState } from "../src/stop.ts"
 
@@ -9,9 +12,19 @@ const WINDOW = "123"
 const settings = readSettings({ enabled: true })
 
 function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
-  const pipes: { options: OpenPipeOptions; closed: number[] }[] = []
+  const pipes: {
+    options: OpenPipeOptions
+    closed: number[]
+    argv: string[]
+    writes: Record<string, unknown>[]
+  }[] = []
   const overlays: { options: OpenPipeOptions; closed: number[]; writes: Record<string, unknown>[] }[] = []
-  const watchdogs: { options: OpenPipeOptions; closed: number[] }[] = []
+  const watchdogs: {
+    options: OpenPipeOptions
+    closed: number[]
+    argv: string[]
+    writes: Record<string, unknown>[]
+  }[] = []
   const requests: { id: number; method: string; params: Record<string, unknown> }[] = []
   const acks: unknown[] = []
   const stopped: string[] = []
@@ -64,12 +77,17 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
       },
     },
     openPipe(argv: string[], options: OpenPipeOptions) {
-      const pipe = { options, closed: [] as number[] }
+      const pipe = { options, closed: [] as number[], argv, writes: [] as Record<string, unknown>[] }
       if (argv.some((arg) => arg.endsWith("lifetime.ps1"))) {
         watchdogs.push(pipe)
         ready("watchdog", () => options.onEvent({ type: "stdout", data: "UIA watchdog ready\n" }))
         return {
-          write() {},
+          write(line: string) {
+            const message = JSON.parse(line)
+            pipe.writes.push(message)
+            if (message.event === "stop")
+              queueMicrotask(() => options.onEvent({ type: "stdout", data: '{"event":"stopped"}\n' }))
+          },
           close(ms: number) {
             pipe.closed.push(ms)
             queueMicrotask(() => options.onEvent({ type: "exit", code: 0 }))
@@ -122,6 +140,8 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
       return {
         write(data: string) {
           const request = JSON.parse(data)
+          pipe.writes.push(request)
+          if (request.event === "journal-key" || request.method === "job_ack") return
           if (request.method === "overlay_ack") {
             acks.push(request)
             return
@@ -426,32 +446,14 @@ test("key closing/desktop-switching variants are refused before helper input", (
     expect(() => validateKeys(keys)).toThrow()
 })
 
-test("fake stop state: double Escape within 500ms, hotkey latch, explicit resume", () => {
+test("stop latch is idempotent and only explicit resume re-enables actions", () => {
   const stop = new StopState()
-  expect(stop.escape(0)).toBe(false)
-  expect(stop.escape(501)).toBe(false)
-  expect(stop.escape(1001)).toBe(true)
+  expect(stop.stop()).toBe(true)
   expect(() => stop.assertAction()).toThrow("the user stopped desktop control")
   expect(stop.stop()).toBe(false)
   stop.resume()
   expect(stop.stopped).toBe(false)
-  expect(stop.escape(1200)).toBe(false)
-  expect(stop.stop()).toBe(true)
-})
-
-test("physical-only Escape fake rejects injected input and presses outside the control window", () => {
-  const stop = new StopState()
-  expect(stop.escape(0, 0, false)).toBe(false)
-  expect(stop.escape(100, 0, false)).toBe(false)
-  expect(stop.escape(200, 0x10)).toBe(false)
-  expect(stop.escape(300, 0x2)).toBe(false)
-  expect(stop.escape(400)).toBe(false)
-  expect(stop.escape(500, 0x10)).toBe(false)
-  expect(stop.escape(600)).toBe(true)
-  stop.resume()
-  expect(stop.escape(700)).toBe(false)
-  expect(stop.escape(800, 0, false)).toBe(false)
-  expect(stop.escape(900)).toBe(false)
+  expect(() => stop.assertAction()).not.toThrow()
 })
 
 test("overlay protocol fake: ready/glide forwarding and actions wait for armed hooks", async () => {
@@ -839,6 +841,150 @@ test("ui_windows caps fake output and truncates titles with a cut note", async (
   expect(result.windows.every((window) => window.title.length <= 120)).toBe(true)
   expect(result.cut).toBe(true)
   expect(result.note).toContain("cut")
+  await c.stop()
+})
+
+test("actions queued while stopped stay refused after resume", async () => {
+  const h = fake()
+  const c = new UiaClient(h.api, settings)
+  await c.call("windows")
+  c.emergencyStop()
+  h.response(false)
+  const active = c.call("windows")
+  await Bun.sleep(0)
+  const queued = c.call("focus", { window: WINDOW })
+  c.resume()
+  const id = h.requests.at(-1)!.id
+  h.pipes
+    .at(-1)!
+    .options.onEvent({ type: "stdout", data: `${JSON.stringify({ id, result: { windows: [] } })}\n` })
+  await active
+  await expect(queued).rejects.toThrow("the user stopped desktop control")
+  expect(h.requests.filter((request) => request.method === "focus")).toHaveLength(0)
+  await c.stop()
+})
+
+test("timeout and helper restart preserve the session owner; only explicit stop requests headless cleanup", async () => {
+  const h = fake()
+  const c = new UiaClient(h.api, settings, 50)
+  await c.call("launch", { command: "fake.exe" })
+  const watchdog = h.watchdogs[0]!
+  h.response(false)
+  await expect(c.call("focus", { window: WINDOW })).rejects.toThrow("timed out")
+  expect(watchdog.closed).toEqual([])
+  expect(watchdog.writes.some((message) => message.event === "stop")).toBe(false)
+  h.response(true)
+  await c.call("windows")
+  expect(h.watchdogs).toHaveLength(1)
+  const firstKey = h.pipes[0]!.writes[0]!
+  expect(h.pipes[1]!.writes[0]).toEqual(firstKey)
+  expect(watchdog.writes[0]).toEqual(firstKey)
+  expect(Buffer.from(firstKey.key as string, "base64")).toHaveLength(32)
+  expect(h.started.flat()).not.toContain(firstKey.key as string)
+  expect(watchdog.argv).not.toContain(firstKey.key as string)
+  c.emergencyStop()
+  await Bun.sleep(0)
+  expect(watchdog.writes.filter((message) => message.event === "stop")).toHaveLength(1)
+  await c.stop()
+  expect(watchdog.closed).toEqual([5000])
+})
+
+test("the real retention gate refuses forged/edited/other-client journals and accepts only same-client jobs", async () => {
+  const h = fake()
+  const c = new UiaClient(h.api, settings)
+  await c.call("windows")
+  const helper = h.pipes[0]!
+  const watchdog = h.watchdogs[0]!
+  const path = helper.argv[helper.argv.indexOf("-StatePath") + 1]!
+  const key = Buffer.from(helper.writes[0]!.key as string, "base64")
+  const ownJob = `amira-uia-job-${crypto.randomUUID()}`
+  const identity = { Pid: 17, Started: "1000" }
+  const content = JSON.stringify({
+    OwnershipVersion: 3,
+    Helper: { Pid: 70, Started: "1000" },
+    Processes: [identity],
+    Jobs: [ownJob],
+  })
+  const sign = (body: string, secret = key) =>
+    JSON.stringify({ Content: body, Mac: createHmac("sha256", secret).update(body).digest("base64") })
+  const killed: (typeof identity)[] = []
+  const fakeCleanup = (serialized: string) => {
+    try {
+      killed.push(...readLaunchJournal(serialized, key).Processes)
+    } catch {
+      /* Refuse all identities. */
+    }
+  }
+  try {
+    for (const serialized of [
+      JSON.stringify({ OwnershipVersion: 2, Helper: identity, Processes: [identity] }),
+      sign(content, randomBytes(32)),
+      sign(content).replace('\\"Pid\\":17', '\\"Pid\\":18'),
+    ]) {
+      writeFileSync(path, serialized)
+      fakeCleanup(serialized)
+      helper.options.onEvent({
+        type: "stdout",
+        data: `${JSON.stringify({ event: "create-job", job: ownJob })}\n`,
+      })
+      await Bun.sleep(20)
+      expect(killed).toEqual([])
+      expect(watchdog.writes.filter((message) => message.event === "create-job")).toHaveLength(0)
+      expect(readFileSync(path, "utf8")).toBe(serialized) // Untrusted journals are retained.
+    }
+    const replayed = JSON.stringify({ ...JSON.parse(content), Helper: { Pid: 71, Started: "999" } })
+    writeFileSync(path, sign(replayed))
+    helper.options.onEvent({
+      type: "stdout",
+      data: `${JSON.stringify({ event: "create-job", job: ownJob })}\n`,
+    })
+    await Bun.sleep(20)
+    expect(watchdog.writes.filter((message) => message.event === "create-job")).toHaveLength(0)
+    expect(h.notices.some((notice) => notice.includes("Unverified launch job request"))).toBe(true)
+    writeFileSync(path, sign(content))
+    fakeCleanup(sign(content))
+    expect(killed).toEqual([identity])
+    helper.options.onEvent({
+      type: "stdout",
+      data: `${JSON.stringify({ event: "create-job", job: ownJob })}\n`,
+    })
+    await Bun.sleep(20)
+    expect(watchdog.writes).toContainEqual({ event: "create-job", job: ownJob })
+    watchdog.options.onEvent({
+      type: "stdout",
+      data: `${JSON.stringify({ event: "job-created", job: ownJob, handle: 99 })}\n`,
+    })
+    expect(helper.writes).toContainEqual({ method: "job_ack", job: ownJob, handle: 99 })
+    expect(h.notices.filter((notice) => notice.includes("untrusted launch journal"))).toHaveLength(3)
+  } finally {
+    unlinkSync(path)
+    await c.stop()
+  }
+})
+
+test("late job creation replies cannot authorize a replacement helper", async () => {
+  const h = fake()
+  const c = new UiaClient(h.api, settings)
+  await c.call("windows")
+  const old = h.pipes[0]!
+  old.options.onEvent({ type: "exit", code: 1 })
+  await c.call("windows")
+  h.watchdogs[0]!.options.onEvent({
+    type: "stdout",
+    data: '{"event":"job-created","job":"old","handle":99}\n',
+  })
+  expect(h.pipes[1]!.writes.some((message) => message.method === "job_ack")).toBe(false)
+  await c.stop()
+})
+
+test("a physical stop arriving after helper exit still invokes headless cleanup", async () => {
+  const h = fake()
+  const c = new UiaClient(h.api, settings)
+  await c.call("windows")
+  h.pipes[0]!.options.onEvent({ type: "exit", code: 1 })
+  expect(h.watchdogs[0]!.writes.some((message) => message.event === "stop")).toBe(false)
+  h.overlays[0]!.options.onEvent({ type: "stdout", data: '{"event":"stop"}\n' })
+  expect(h.watchdogs[0]!.writes).toContainEqual({ event: "stop" })
   await c.stop()
 })
 

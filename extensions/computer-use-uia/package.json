@@ -7,7 +7,7 @@
   "scripts": {
     "link-amira": "bun scripts/link-amira.ts",
     "typecheck": "bunx tsc --noEmit",
-    "test": "bun test ./test/unit.test.ts ./test/helper.test.ts"
+    "test": "bun test ./test/unit.test.ts ./test/helper.test.ts ./test/safety.test.ts"
   },
   "amira": {
     "engines": {

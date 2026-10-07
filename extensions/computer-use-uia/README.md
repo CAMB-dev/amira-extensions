@@ -64,6 +64,11 @@ Project, project-local and flag layers cannot enable desktop access or change th
 Hosts without settings provenance remain disabled. Non-Windows hosts register no tools.
 An old `apps` entry is ignored; it no longer restricts launches or window access.
 
+On layouts with **AltGr**, the default **Ctrl+Alt+Q** can also match **AltGr+Q**
+(for example, `@` on a German keyboard). To avoid stopping while typing it, set
+`stopHotkey` in your user settings to another chord, such as `"ctrl+shift+f12"`.
+The default remains unchanged.
+
 ## Stop and resume
 
 With the overlay enabled, press **Ctrl+Alt+Q** (or your configured chord), or press
@@ -104,9 +109,11 @@ physically held user keys. The hidden release-only monitor can retain hooks for 
 seconds during idle/interruption cleanup to retry
 transient failures. If releases still fail (for example across a secure-desktop transition), Amira
 reports incomplete input cleanup; release any held keys/buttons manually before resuming.
-Inspect the target app before resuming. Launched apps are cleaned up by the independent exact-identity watchdog; this can lose
-unsaved changes. Apps that were already open, including handoff targets, are never terminated by
-cleanup just because the extension read or acted on them.
+Inspect the target app before resuming. Emergency stop terminates launched job members with
+**no visible top-level window**, including headless descendants that could keep acting. Windowed
+apps remain open until you close them or end the session. Session cleanup terminates the entire
+launched tree and can lose unsaved changes. Apps that were already open, including unrelated
+handoff targets, are never terminated just because the extension read or acted on them.
 
 ## Virtual pointer
 
@@ -146,7 +153,8 @@ window whose process executable name matches the command (for handoff apps such 
 Notepad). A 500 ms stable, single match returns the native handle and `windowPid`; handoff
 matches are explicitly marked. Multiple matches, existing-window reuse, inaccessible identity
 or no match return the launch PID and an instruction to use `ui_windows`. Executable-name
-correlation is **not proof of launch ownership**. Handoff windows never enter the kill journal.
+correlation is **not proof of launch ownership**. Discovery never grants kill eligibility;
+actual descendants remain owned through their launch job, not executable-name matching.
 
 Use filtered `ui_windows` to select the intended target, including existing apps and separate
 child dialogs. Refresh `ui_tree` after UI changes. Handles may be recycled by Windows; old refs
@@ -159,7 +167,8 @@ UTF-16 code units. A single synchronous provider call can still exceed the trave
 `ui_close` only requests WindowPattern.Close/WM_CLOSE and reports **closed or still open** after
 its brief observation wait; a save prompt may remain. It **never force-kills**, even for an app
 launched by this extension. Exact PID/creation-time kills of still-running launched processes are
-reserved for **session cleanup**. There are no image-name kills.
+reserved for **session cleanup** and the headless-member emergency-stop rule above.
+There are no image-name kills.
 
 `ui_close`, `ui_focus`, `ui_click`, `ui_type` and `ui_key` refuse desktop/taskbar shell classes
 (`Progman`, `WorkerW`, `Shell_TrayWnd`, `Shell_SecondaryTrayWnd`), the overlay's own native window,
@@ -171,20 +180,38 @@ ownership varies between console hosts.
 
 The helper and overlay start lazily through `api.openPipe`. A headless extension-owned lifetime
 sentinel bridges host unload, and a separate headless watchdog can clean up while UIA is blocked.
-Only exact launch PID/start-time records and the helper identity are atomically journaled in
-`%TEMP%/amira-uia-<UUID>.json` (`OwnershipVersion=2`), with no titles, screen text or action history.
-Reading, focusing, clicking, or executable-matching a window never adds a launch record.
-Launch uses an atomically assigned private Windows job and creates the process suspended. The
-exact created process handle is guarded against helper death until its PID/creation time is
-journaled, before execution starts. Descendants break away and never gain kill eligibility.
-Forced watchdog cleanup stops the journal writer before rereading the authoritative launch list.
+Exact launch PID/start-time records, the helper identity and opaque job IDs are atomically
+journaled in `%TEMP%/amira-uia-<UUID>.json` (`OwnershipVersion=3`), with no titles, screen text
+or action history. Every write carries an HMAC-SHA256 over the exact serialized content. A random
+32-byte per-client key stays in memory and reaches the helper/watchdog only over stdin, never
+argv, environment or files. Readers verify the MAC before trusting any identity; an invalid
+journal is retained with **“untrusted launch journal; cleanup refused”**. No other clients'
+journals are scanned. Reading, focusing, clicking, or executable-matching a window never adds
+a launch record.
 
-EOF, session end, host exit and unload close/terminate recorded launches only. Existing windows
-are not closed during teardown. The overlay watches the exact helper and sentinel identities
-and also exits on pipe EOF. Restart/stale cleanup validates the current journal schema, skips
-live/inaccessible helpers and retains unconfirmed cleanup records. Invalid/older journals are
-not consumed. Failed kills retain their records for retry. A machine crash, missing identity,
-or simultaneous termination of helper/watchdog can leave a launched program running.
+The watchdog creates an **unnamed, non-breakaway Windows job** before launch and transfers a
+handle only to the verified helper PID/start-time identity. The helper atomically assigns that
+job during suspended process creation; no public job names or journal-supplied handles are
+opened. Closing job handles does not implicitly kill apps: termination requires authenticated,
+explicit cleanup. Failure to retain/assign the job (including unsupported nested jobs) refuses the launch instead of running it
+untracked. All descendants stay in that job, even if the launcher exits. Emergency stop enumerates
+members, checks exact PID/creation time and membership through the same process handle, and
+terminates only members without a visible top-level window. Session end terminates the whole job.
+
+Helper EOF, request timeout and helper restart **do not clean up launched apps**. The watchdog
+holds jobs across helper replacement; restarted helpers read only their own client's authenticated
+journal and invalidate old window refs. Only session end, host exit/unload, or watchdog EOF end
+the session and clean up jobs. The watchdog pins the current helper identity over its private
+client pipe, independently of the replayable journal. Cleanup retires that exact helper before
+verifying the final snapshot and matching its writer identity. An edited, replayed or missing
+journal refuses app cleanup and reports it incomplete; existing journals are retained. Existing windows are not closed during teardown.
+The overlay watches the exact helper and sentinel identities and exits on pipe EOF.
+
+Invoke/Toggle/SelectionItem/ExpandCollapse/SetValue (and WindowPattern.Close) run on background
+threads with a **five-second wait**. If a click/type provider remains busy, the helper returns
+**“action sent; the target is busy or opened a modal dialog — use ui_windows”** and remains
+available to locate the dialog. This does not cancel or roll back the issued action. A bounded
+number of busy pattern calls is allowed; additional calls are refused until one finishes.
 
 ## Limitations
 
@@ -210,7 +237,7 @@ Safe fake-only checks (no desktop/helper/hotkey processes):
 ```sh
 bunx tsc --noEmit
 bunx biome check src test scripts package.json tsconfig.json biome.json
-bun test ./test/unit.test.ts ./test/helper.test.ts
+bun test ./test/unit.test.ts ./test/helper.test.ts ./test/safety.test.ts
 ```
 
 `unit.test.ts` uses fake host/jobs/pipes for settings, tool traits, arbitrary handles/launches,
@@ -224,17 +251,19 @@ machine, set `AMIRA_UIA_DESKTOP_TESTS=1` and run `bun test ./test/desktop.test.t
 `scripts/smoke.ts` wrapper). Tests use only their uniquely titled bundled test window and their
 own overlay/helper processes, filter `ui_windows` before acting, and never log other windows'
 titles. Their overlay runs with **`-TestMode`**, which does not register hotkeys or detect physical
-Escape stops; stop is simulated over its private pipe. The test helper also skips stale-journal sweeps
-so it cannot reap a previous real session's launched apps. Every launched process is cleaned up in
+Escape stops; stop is simulated over its private pipe. Neither test nor real helpers scan other
+clients' journals. Every launched process is cleaned up in
 `finally`, through exact identities, never by image name. Coverage includes a test-started fixture
 not launched through the extension (it must remain ineligible for termination), real-cursor
 preservation for pattern actions, glide ID/timing checks and idle hiding. For the mixed-DPI test,
 configure a negative-coordinate secondary monitor at a different scale and set
 `AMIRA_UIA_TEST_LEFT` / `AMIRA_UIA_TEST_TOP` to a location fully inside that monitor. This test
-also checks monitor/fixture cleanup after unexpected helper death. No test registers a stop
+also checks that helper death removes the monitor but preserves the fixture across restart. No test registers a stop
 hotkey; input-release hooks observe the test helper's tagged input only during actions and the
 post-action window. Desktop coverage also checks idle hook removal, explicit overlay opt-out,
 polite close of an IgnoreClose fixture, delayed acknowledgements, protected test-owned targets,
-and title truncation.
+title truncation, modal dialogs, windowed-app survival on stop, and headless descendant cleanup.
+Simultaneous loss of helper and watchdog can leave a launched tree running; the journal is retained
+rather than reopening an unverified kernel object.
 Do not use blanket `bun test` as a
 substitute for the explicit fake-only paths on a live desktop.
