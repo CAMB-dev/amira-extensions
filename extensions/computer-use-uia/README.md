@@ -1,192 +1,340 @@
-# computer-use-uia (experimental)
+# computer-use-uia
 
-> **Experimental (0.0.x).** Unstable, Windows only, off by default. Interfaces, settings and safety
-> limits may change without notice. Read the limitations before enabling it.
+> **Experimental 0.0.2 — Windows only, off by default.** This extension can read and control
+> **any window**, including apps you already have open. It is not an application sandbox.
+> Interfaces and safety limits may change. Do not enable it unless you accept the risks below.
 
-Windows desktop control through the built-in .NET UI Automation client. **Off by default**,
-Windows only, tree only: no screenshots, OCR, browser driver, native npm modules or shipped
-compiled binaries. Requires Amira API **0.1.27** and Windows PowerShell 5.1. The helper uses
-UIAutomationClient, UIAutomationTypes and the built-in UIAutomationClientsideProviders for
-Win32 controls. Its small in-memory P/Invoke shim is not a shipped binary.
+Uses Windows PowerShell 5.1 and the built-in .NET UI Automation client (UIA2), with no
+screenshots, OCR, native npm modules or shipped compiled binaries. P/Invoke and the WinForms
+pointer use small in-memory C# shims. Requires **Amira ^0.1.28**.
 
-## Enable
+**D112 supersedes D109:** there is no launch allowlist or launched-window-only read/action rule.
+The old `apps` setting is removed. Reading or controlling a window does **not** make its process
+eligible for termination.
 
-Install with `amira ext install computer-use-uia`, then opt in in **`~/.amira/settings.json`**
-(the user's settings, not a repository's `.amira/settings.json` or `settings.local.json`):
+## Risks and permissions
+
+- Window titles, UIA names, text and values from **any app** may be read and sent to your model
+  provider. This can include private documents, messages and account details. Password controls
+  report `password=true` and do not query ValuePattern/TextPattern values. Edit/Document controls
+  with an unknown password flag report `password=unknown` and also hide their values; other
+  sensitive fields are not automatically redacted. A provider that mislabels secrets can still expose them.
+- In **auto mode**, desktop actions can run **without asking**, including launching arbitrary
+  programs, entering text, clicking controls and closing windows. Amira's normal permission
+  policy applies; there is no extension-specific approval path. Only `ui_windows` and `ui_tree`
+  declare `readOnly`; all other tools are actions.
+- Actions can modify files, send messages, make purchases or trigger other application-specific
+  effects. Closing a window or cleanup of a launched app can discard unsaved work.
+- Screen content is **untrusted data**, not instructions. Both read-tool descriptions and their
+  results explicitly mark it as such. Do not ask the agent to follow instructions it finds in an app.
+- Keyboard/mouse fallback uses Windows global input. Do not compete for focus or the mouse.
+  Target-window focus and cursor hit-test checks reduce risk, but cannot eliminate the race
+  between checking and delivering input. Already-delivered input/pattern actions cannot be undone.
+
+All tools are serialized and main-session-only. UIA patterns are preferred and **do not move the
+real mouse**. Mouse fallback checks the target's foreground status and clickable point, then
+rechecks the actual cursor position and hit test immediately before mouse-down. Keyboard fallback
+checks the focused native control belongs to the target window. Element refs are window-local,
+validated against the target window, and replaced by each new tree.
+
+## Enable and settings
+
+Install with `amira ext install computer-use-uia`, then opt in in **`~/.amira/settings.json`**:
 
 ```json
 {
   "extensions": {
     "computer-use-uia": {
-      "enabled": true
+      "enabled": true,
+      "overlay": true,
+      "stopHotkey": "ctrl+alt+q"
     }
   }
 }
 ```
 
-`enabled` defaults to `false`, even after installation. Omitting `apps` permits only `testWindow`,
-the bundled `helper/test-window.ps1` WinForms window owned by its launched `powershell.exe` PID.
-Its script path is resolved from the installed extension, not the working directory, and it
-runs with `powershell.exe -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File <script path>` (hidden console, so the only visible window is the form). The fixture
-has named multiline/single-line text fields, a button/status label, a checkbox and an item list.
-You can add classic Win32 apps with entries such as `"editor": { "command": "C:\\Tools\\editor.exe" }`
-(using JSON-escaped backslashes in settings); each app must keep its window in the launched process.
-A custom `apps` allowlist **replaces** the defaults. `{}` permits no launches.
-Both `enabled` and `apps` come only from the explicit **user** layer exposed by
-`api.settings.layers("extensions")`;
-project, project-local and flag layers are ignored, even when they override user values.
-Without settings provenance the extension stays disabled. Configure executable paths and
-optional argument arrays (`"args": ["--force-renderer-accessibility"]`) yourself; the model
-can only select an allowed **name**, not supply a command or launch arguments.
-Non-Windows hosts register no tools and print at most one short notice.
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Register desktop tools on Windows |
+| `overlay` | `true` | Run the virtual pointer, action banner and emergency-stop monitor; `false` disables all three |
+| `stopHotkey` | `ctrl+alt+q` | Emergency stop; ctrl/alt/shift modifiers plus a letter, digit or F1–F12 |
 
-**D109 — user decision, 2026-10-05:** packaged Notepad/Calculator, packaged/UWP apps, and
-apps that hand off to an existing process are unsupported. This includes most browsers and
-VS Code when already running. Adding them to the allowlist does not make them supported.
+Settings come **only from the explicit user layer** of `api.settings.layers("extensions")`.
+Project, project-local and flag layers cannot enable desktop access or change the stop monitor.
+Hosts without settings provenance remain disabled. Non-Windows hosts register no tools.
+An old `apps` entry is ignored; it no longer restricts launches or window access.
 
-## Safety boundary
+On layouts with **AltGr**, the default **Ctrl+Alt+Q** can also match **AltGr+Q**
+(for example, `@` on a German keyboard). To avoid stopping while typing it, set
+`stopHotkey` in your user settings to another chord, such as `"ctrl+shift+f12"`.
+The default remains unchanged.
 
-**Only windows belonging to processes this extension launched may be read or controlled.**
-Neither tools nor tests discover/read the user's existing app trees or window titles. Both
-TypeScript and PowerShell reject unowned handles; PowerShell also checks the current window
-PID, process creation time (PID reuse), top-level status, and the ancestry/PID of each UIA
-node/ref before reading or acting. Element refs are local to the latest tree of that window.
-All tools are serialized and main-session-only, avoiding competing sub-agent keyboard focus.
+## Stop and resume
 
-During launch discovery, the helper enumerates top-level window handles/PIDs to find its
-own new visible top-level HWND. Ownership requires the **exact PID returned by the launch
-and its process start time**; no other process is adopted. Foreign new-window metadata can
-cause a generic launch refusal, but is not evidence of launch provenance. The helper does not
-read foreign window names/content, return or log their metadata, or adopt or kill their processes.
-A concurrent unrelated new window can conservatively refuse the launch; no attempt is made
-to attribute that foreign window to the app. Failed-launch cleanup terminates only the exact
-launched PID/start-time identity; failed kills remain journaled for retry. If the launch identity
-cannot be captured, cleanup does not guess or kill; the launched app may remain running.
+With the overlay enabled, press **Ctrl+Alt+Q** (or your configured chord), or press
+**Esc twice within 500 ms** while an action is running or within **three seconds after it ends**.
+Outside that control window these keys do not stop desktop control. Escape detection uses physical
+key-down edges from the low-level keyboard hook and ignores both injected-input flags; a model-sent
+`ui_key escape` cannot trigger the stop. Input is not swallowed and the monitor does not take focus.
 
-`ui_tree` declares `traits: { readOnly: true }`. Launch, click, type, key and close do not:
-Amira's normal permission policy asks in default mode and runs in auto mode. There is no
-custom approval bypass. A UIA read-only tree can still expose sensitive data you enter into
-these launched apps. Do not put secrets there unless you want the model to read them.
+Keyboard/mouse low-level hooks are installed **during actions and the three-second post-action
+window**, then removed when idle. Anti-cheat software may notice these global hooks; do not enable
+this extension while gaming or using software that prohibits input hooks. The chord uses
+`RegisterHotKey`, not a hook, and remains registered while the overlay process is alive.
 
-Pattern operations are preferred. Keyboard/mouse fallback requires the owned window to be
-in the foreground; an obscured clickable point is refused. `alt+f4` (including modified/case
-variants) is refused: use `ui_close`. Windows-key and desktop-switching chords are unsupported.
-The click fallback re-reads the actual cursor immediately before mouse-down, refuses a moved
-pointer, and hit-tests that actual position. Do not compete with the agent for focus or the
-pointer: Windows global input is not atomic or isolated. A **residual microsecond race for
-keys** remains between the final focus check and SendInput delivery; the pointer/foreground
-can likewise change after the final mouse check. Applications can themselves open external
-apps/windows; those are **not** adopted or read.
+If registration fails, the error is **“Stop hotkey ctrl+alt+q is unavailable — set stopHotkey or
+disable the overlay”** (with your configured chord). Other startup failures report their real error.
+These failures are **not user stops** and do not latch. `ui_windows` and `ui_tree` still work without
+an overlay; actions require a working stop monitor and retry startup on the next action.
+
+Set **`overlay: false` explicitly** to disable the pointer, banner, hotkey, Escape stop and low-level
+hooks together. Actions then run **without an overlay-based emergency stop or independent input
+release monitor**. Normal tool cancellation still works, but already-delivered input cannot be undone.
+Set `enabled: false` to disable all desktop tools.
+
+Stopping immediately terminates the **exact helper PID/creation-time identity**, including when a
+synchronous UIA provider blocks. The model receives **“the user stopped desktop control”**. Further
+actions are refused until you run **`/uia resume`**. Cancelling an in-flight action (including an
+action timeout) also latches the stop; cancelling `ui_windows` or `ui_tree` does **not**. Cancelling
+a queued read neither runs that read nor interrupts another request. New or queued messages do
+not resume control. Read tools remain available while stopped; they may start a fresh helper/monitor,
+but do not clear the action latch.
+A system-prompt notice also tells the model that control is stopped. Use `/uia resume` only when
+you want actions to be allowed again.
+
+Stop is not rollback: an action already issued may have completed, and typing may be partial.
+Clicks/chords use a single native input batch; with the overlay enabled, an independent input-hook
+ledger releases only observed extension-injected downs after interruption, without releasing
+physically held user keys. The hidden release-only monitor can retain hooks for up to four additional
+seconds during idle/interruption cleanup to retry
+transient failures. If releases still fail (for example across a secure-desktop transition), Amira
+reports incomplete input cleanup; release any held keys/buttons manually before resuming.
+Inspect the target app before resuming. Emergency stop kills the exact helper and only launched
+job members with **no windowed protector of their own and no live, older windowed ancestor within
+that job**, following PID/creation-time ancestry up to the launch root. Job membership proves
+ownership; an exited ancestor, a broken chain, an ancestor outside the job, or a reused PID that
+is not strictly older grants no protection. Ancestor access/API failures are not proof of a broken
+chain: that candidate is skipped and cleanup is reported incomplete; other candidates are still checked.
+A .NET process-already-exited exception is treated as an exit, not an access failure. Ancestors are
+opened with limited query access plus `SYNCHRONIZE`, never all-access rights. A zero-time wait
+checks exit independently of the process's exit code. If synchronize access is denied, the watchdog
+retries with query-only access: a reused PID or an ancestor outside the job still grants no protection,
+and an exit code other than `259` proves exit. For an older same-job ancestor, query-only code `259`
+cannot distinguish running from exited; that candidate is conservatively preserved, without claiming
+a verified live ancestor chain or reporting a false cleanup failure. Genuine query/wait API failures
+still report incomplete cleanup.
+“Windowed” means a visible top-level window with non-zero bounds intersecting the virtual screen.
+A **minimized window protects** if it is not a tool window and its saved normal placement is non-empty,
+even when that placement is off the virtual screen (for example, after unplugging a monitor). Only
+restored windows require an on-screen intersection; minimized placement needs no coordinate conversion.
+Apps that minimize to the tray hide their window and are **not protected** by that hidden window or tray icon. DWM shell-only cloaking (including windows on another
+virtual desktop) is allowed;
+app/inherited cloaking, including combinations with shell cloaking, is not. Layered windows whose
+reported global alpha is zero are excluded even when minimized. This is a **heuristic**, not proof
+that you can see or use the app:
+per-pixel transparency, occlusion and unusual window styles may still fool it.
+Launch roots younger than **three seconds** (and their members) are skipped and reported as
+**“still starting (3 s grace)”**; stop does not schedule a later kill. **“Launch root registration
+pending”** is reported separately and means the job's members were preserved; failed/pre-commit
+or completed rootless launches are drained and discarded.
+This preserves windowed apps and their
+Chromium/Electron/WebView2 GPU, renderer and utility children. Windowed apps remain open until
+you close them or end the session. Session cleanup terminates the entire launched tree and can
+lose unsaved changes. Apps that were already open, including unrelated handoff targets, are
+never terminated just because the extension read or acted on them.
+
+## Virtual pointer
+
+Before each action the helper sends a physical-pixel UIA clickable point, or bounds center, to a
+**separate PowerShell WinForms process** and awaits a glide acknowledgement for up to **five seconds**.
+If the overlay is slow, the helper logs the timeout and skips that action's animation wait; it does
+not stop control or kill apps. The pending pipe read is retained to consume a late acknowledgement.
+The purple
+Amira pointer has a small label, a 320 ms ease-out glide, click ripple, typing indicator and key
+chord badge. During actions a thin primary-screen banner reads:
+
+> Amira is controlling the desktop — Ctrl+Alt+Q to stop
+
+The chord in the banner follows your setting. The overlay covers the full virtual desktop,
+including negative monitor coordinates, using per-monitor DPI awareness. Its transparent,
+layered, topmost, toolwindow and no-activate styles keep it click-through, out of Alt+Tab and
+away from keyboard focus. It hides after three idle seconds, and exits with the helper/session.
+Setting `overlay: false` prevents the overlay/stop-monitor process from starting. This is a **virtual** pointer: pattern
+operations never reposition your real cursor.
 
 ## Tools
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
-| `ui_launch` | `app` | Owned `window` handle string, `pid`, `title` |
-| `ui_tree` | `window`, optional `depth` (default 8, 0–30), `maxNodes` (default 300, 1–1000) | One line per `eN` ref: control type, name, automation id, cheap value/toggle state, enabled/offscreen flags; cut note and traversal ms/nodes/characters |
-| `ui_click` | `window`, `ref` | Invoke/Toggle/SelectionItem/ExpandCollapse pattern, else guarded clickable-point SendInput; reports path |
-| `ui_type` | `window`, optional `ref`, `text` | ValuePattern.SetValue when available; otherwise focused Unicode input; reports path |
-| `ui_key` | `window`, `keys` | Small single-chord syntax such as `ctrl+s`, `enter`, `shift+tab`; refuses focus failure |
-| `ui_close` | `window` | WindowPattern.Close, then exact owned PID termination after a short timeout |
+| `ui_windows` | optional `filter` | Up to 200 visible top-level `windows`: native handle (`window`), title (120 characters), process name, PID, class, physical bounds, minimized/foreground state. Case-insensitive substring across these identifiers; a `cut` flag/note reports truncated output. |
+| `ui_tree` | `window`, optional `depth` (8, 0–30), `maxNodes` (300, 1–1000) | Any target window's UIA tree, unique snapshot refs, names, flags, bounded values/text, password flags, and timing/size footer |
+| `ui_launch` | `command`, optional string-array `args`, `cwd` | New PID plus an unambiguous new window, or a PID and instruction to use `ui_windows` |
+| `ui_click` | `window`, `ref` | Invoke/Toggle/SelectionItem/ExpandCollapse pattern, otherwise guarded clickable-point input; reports path |
+| `ui_type` | `window`, `text`, optional `ref` | ValuePattern.SetValue or guarded focused Unicode input; reports path |
+| `ui_key` | `window`, `keys` | Single chord such as `ctrl+s`, `enter`, `shift+tab`; refuses desktop-switching chords and `alt+f4` |
+| `ui_focus` | `window` | Restore a minimized window and bring it to the foreground; refuses focus failure |
+| `ui_close` | `window` | WindowPattern.Close or asynchronous WM_CLOSE; reports whether the window closed |
 
-A new `ui_tree` replaces that window's ref map; element numbers are never reused in a helper.
-Window tokens include a helper-generation ID and native HWND, so restart cannot alias an old
-window token to a new window. Refresh after UI changes. Text/value fields
-are escaped onto one line and bounded; trees also have a defensive 200,000-character ceiling
-on the TypeScript side. Timing covers the helper traversal/rendering, not PowerShell startup
-or IPC. The appended character count is the rendered node text, excluding the timing/cut note.
-`ui_type` allows at most 20,000 UTF-16 code units per call. Document/Edit controls exposing
-TextPattern instead of ValuePattern include a bounded `text` field (512 characters); writable
-ValuePattern controls show `readonly=false`. For TextPattern-only editors, typing uses
-Unicode SendInput and read-back uses TextPattern; this is **not** reported as
-ValuePattern.SetValue. Unknown enabled/offscreen flags are shown as `?`.
-Unreadable provider nodes are marked `unreadable`, receive no actionable helper ref, and do
-not abort their siblings; an ownership/lifetime Deny still aborts the whole snapshot. Each
-node's ancestry is verified once per tree, not again for each property. A cooperative **20 s**
-traversal budget is checked between provider reads, leaving headroom below the TypeScript
-60 s request timeout. A single synchronous provider call can still block beyond that budget;
-it cannot be interrupted in-process, and the watchdog remains the last-resort cleanup path.
+`ui_launch` accepts program names/paths and arguments, not an allowlisted name. It launches
+without a shell/console. Discovery looks for a new visible window in the launched PID, or a new
+window whose process executable name matches the command (for handoff apps such as packaged
+Notepad). A 500 ms stable, single match returns the native handle and `windowPid`; handoff
+matches are explicitly marked. Multiple matches, existing-window reuse, inaccessible identity
+or no match return the launch PID and an instruction to use `ui_windows`. Executable-name
+correlation is **not proof of launch ownership**. Discovery never grants kill eligibility;
+actual descendants remain owned through their launch job, not executable-name matching.
 
-The helper starts lazily with `api.openPipe` and speaks one request/response JSON object per
-line. It is restarted after death; old handles and refs are invalid and must be relaunched.
-EOF/session end/host exit closes owned windows and then their remaining owned processes,
-with creation-time checks and **no image-name kills**. Unsaved work in these apps can be lost.
-Since API 0.1.27 has no unload hook and does not dispose `openPipe` on unload, a small
-extension-owned background job acts as a lifetime sentinel. Amira kills that job on unload;
-the helper watches its exact process identity while waiting for input, then cleans up and
-exits. An independent headless watchdog, also started through `api.openPipe`, reads a private
-per-client journal containing **only launch PID/creation-time identities**. It reaps those
-identities after helper death. On unload/session end it gives
-the helper three seconds to close gracefully, then terminates remaining recorded processes
-and the helper even if a UIA provider is stuck. The sentinel's original creation time travels
-with its PID to prevent PID-reuse mistakes. This lifecycle bridge adds two headless PowerShell
-processes while in use; neither enumerates or reads desktop windows. A restarted helper first
-cleans the previous current-schema journal and never adopts old window handles. Temporary journals are removed by
-the watchdog on session end/unload. If termination cannot be confirmed, it reports incomplete
-cleanup and retains the journal instead of silently forgetting the owned process identities.
-Journals retain the `amira-uia-<UUID>.json` prefix (and atomic-write `.tmp` files), but require
-`OwnershipVersion=2`. Old heuristic journals are ignored by stale cleanup, helper restart and
-the watchdog; their recorded processes are not treated as owned. On startup the helper scans
-`%TEMP%` for current-schema journals. It skips live/inaccessible helpers, validates all recorded
-PID/start-time identities, kills only those exact recorded processes if necessary, and removes
-a stale journal only after confirming every recorded process is gone. Invalid/unreadable
-journals and failed kills are retained; journals belonging to active helpers are left alone.
+Use filtered `ui_windows` to select the intended target, including existing apps and separate
+child dialogs. Refresh `ui_tree` after UI changes. Handles may be recycled by Windows; old refs
+are invalid after helper death, closing or a new snapshot. Trees are bounded by node/depth
+limits, a cooperative 20 s traversal budget and a 200,000-character TypeScript ceiling.
+Unreadable nodes receive no actionable ref and do not prevent reading siblings. Text fields
+are escaped onto one line and limited to 512 characters. `ui_type` accepts at most 20,000
+UTF-16 code units. A single synchronous provider call can still exceed the traversal budget.
+
+`ui_close` only requests WindowPattern.Close/WM_CLOSE and reports **closed or still open** after
+its brief observation wait; a save prompt may remain. It **never force-kills**, even for an app
+launched by this extension. Exact PID/creation-time kills of still-running launched processes are
+reserved for **session cleanup** and the headless-member emergency-stop rule above.
+There are no image-name kills.
+
+`ui_close`, `ui_focus`, `ui_click`, `ui_type` and `ui_key` refuse desktop/taskbar shell classes
+(`Progman`, `WorkerW`, `Shell_TrayWnd`, `Shell_SecondaryTrayWnd`), the overlay's own native window,
+and identifiable Amira console/terminal windows (Amira PID/ancestor identities and console HWND).
+Reads can still list and inspect them. Terminal-host identification is best effort; native window
+ownership varies between console hosts.
+
+## Lifecycle
+
+The helper and overlay start lazily through `api.openPipe`. A headless extension-owned lifetime
+sentinel bridges host unload, and a separate headless watchdog can clean up while UIA is blocked.
+Exact launch PID/start-time records, the helper identity and opaque job IDs are atomically
+journaled in `%TEMP%/amira-uia-<UUID>.json` (`OwnershipVersion=3`), with no titles, screen text
+or action history. Every write carries an HMAC-SHA256 over the exact serialized content, including
+a per-session nonce and the state path. A new random 32-byte key and nonce are generated with
+each client session's state path; helper replacements reuse that session's credentials. Replacing
+a lost watchdog starts a fresh state path/key/nonce generation, never adopting its lost jobs. The key
+stays in memory and reaches the helper/watchdog only over stdin, never argv, environment or
+files. Readers verify the MAC, nonce and path before trusting any identity. Untrusted records
+are ignored with **“untrusted launch journal; cleanup refused”** and grant no cleanup authority;
+they cannot block later launches. No other clients' journals are scanned. Reading, focusing,
+clicking, or executable-matching a window never adds a launch record.
+
+The watchdog creates an **unnamed, non-breakaway Windows job** before launch and transfers a
+assignment-only job handle and a limited parent-process handle only to the verified helper PID/start-time identity.
+The helper closes both duplicated handles when a requested transfer acknowledgement arrives late
+or is rejected. Acknowledgements for job IDs this helper never requested are ignored without closing
+any echoed handle numbers.
+The helper validates the parent's PID/creation time and assigns **both the job and the watchdog
+as OS parent atomically** during suspended creation. Launched apps are children of the session
+watchdog, not the transient helper, so even a host-level helper tree kill cannot reach them.
+No public job names or journal-supplied handles are opened. Closing job handles does not implicitly kill apps: termination requires explicit cleanup
+by the watchdog holding those exact handles. After the helper journals the suspended root, the
+watchdog verifies its exact identity and primary-thread ownership, then registers and resumes it
+before acknowledging the launch. Helper death cannot leave a registered root indefinitely suspended;
+a lost acknowledgement does not authorize killing a launch the watchdog already committed.
+Failure to retain/assign the job (including unsupported
+nested jobs) refuses the launch instead of running it untracked. Tracked processes are the launched
+process and **directly created process-tree descendants that remain in its job**, even if the
+launcher exits. This does **not** track processes created by external brokers: WMI
+`Win32_Process.Create`, `schtasks`/scheduled tasks, DCOM or explorer-mediated ShellExecute,
+COM/ShellExecute to an existing instance, or services. Discovery never turns these into owned
+processes. Emergency stop checks exact UTC FILETIME creation identities, job membership,
+visible-window ancestors and the three-second root-start grace described above. Session end
+terminates the whole job, polls for exit for two seconds, and retries once if incomplete.
+
+Helper EOF, request timeout and helper restart **do not clean up launched apps**. Helpers are
+retired through PID/creation-time-checked, non-tree termination; their pipe is closed only after
+confirmed exit. If the watchdog dies, a headless exact-helper reaper is used, never a tree kill.
+Retirement failure or a ten-second retirement timeout refuses replacement and reports the error
+instead of hanging requests; session teardown still drains the watchdog and its retained jobs.
+After that exact old helper's native exit is confirmed, `/uia resume` followed by a tool request
+(or the next read/start) can retry the retirement gate. Until exit is confirmed, replacement stays
+refused; resume alone does not permit overlapping helpers.
+The watchdog holds jobs across helper replacement; restarted helpers read only their own client's authenticated
+journal and invalidate old window refs. Session end, host exit/unload, watchdog EOF,
+**`/jobs stop` on the computer-use-uia lifetime job**, and **extension reload** end the launched
+apps, including windowed apps with unsaved changes. **Extension reload does not call the client's
+`stop()` method**: cleanup relies on the extension-owned sentinel dying and the watchdog's
+**three-second grace** before terminating its retained jobs. Stopping the lifetime sentinel signals the
+watchdog to terminate its retained jobs; a watchdog tree kill at session end also reaches the
+launched trees by design. The watchdog pins the current helper identity over its private
+client pipe, once per helper generation, checks the spawned child's PID and native creation time,
+and acknowledges that identity before the helper's first journal write. Cleanup retires that exact
+helper before verifying the final snapshot. Missing, stale or untrusted journals **never prevent
+cleanup of jobs the watchdog itself retained**; journal-supplied identities grant no kill authority.
+A complete session cleanup removes the journal and `.tmp`; unverifiable/incomplete cleanup retains
+the journal and reports the failure. Existing windows are not closed during teardown.
+Rotated journals are deleted after the old generation's cleanup finishes or its watchdog is
+confirmed gone, when lost unnamed job handles make further cleanup impossible; they are kept
+only while they can provide evidence for active cleanup. A missing journal before the first write,
+or a retired writer's snapshot before replacement writes, is not reported as incomplete when
+all retained jobs were drained. On a non-force emergency stop, windowed members deliberately
+preserved during a journal gap do not count as incomplete cleanup.
+The overlay watches the exact helper and sentinel identities and exits on pipe EOF.
+**Hard-killing only the watchdog process does not clean up launched apps.** Job handles have no
+kill-on-close behavior, and the journal cannot recover lost kernel job handles. Killing the
+**watchdog's entire process tree**, in contrast, also kills its launched apps.
+
+Invoke/Toggle/SelectionItem/ExpandCollapse/SetValue, WindowPattern.Close and element SetFocus run
+on background threads with a **five-second wait**. If a click/type provider remains busy, the
+helper returns **“action timed out; it may still be running or the target may be busy — use
+ui_windows”** and remains available to locate the dialog. Timeout cancels an action still in
+preflight, so it cannot dispatch later; it cannot cancel or roll back a UIA call already entered.
+A focus timeout refuses subsequent input. A bounded number of busy pattern calls is allowed;
+additional calls are refused until one finishes.
 
 ## Limitations
 
-- Apps are launched with `CreateNoWindow` and no shell, so console apps do not get a console
-  window. This matters when Windows Terminal is the default terminal: its window would belong
-  to another process and be refused as a hand-off. Console apps are generally not useful here.
-- Popups that are separate top-level windows (for example a ComboBox dropdown list) are
-  **not visible** in `ui_tree` and cannot be driven, even in the same process: nodes outside
-  the owned top-level window are skipped before their content is read.
-- Requires an active connected session and an interactive, unlocked Windows input desktop.
-  Session 0, disconnected RDP sessions, headless and locked desktops are not supported. Elevated apps and secure desktops are not supported; run at matching
-  integrity levels and do not use this to operate permission prompts.
-- Child dialogs such as **Save As cannot be driven**: their separate top-level HWND is not
-  the exact window returned by `ui_launch`, even if the PID is the same. Input is refused
-  while that dialog has focus. **`ui_close` still works** and can terminate the recorded app
-  process, including its dialog; unsaved work may be discarded.
-- Electron apps generally need `--force-renderer-accessibility`. Custom-drawn controls may
-  expose little or no UIA tree; stale providers and expensive UIA calls can fail or time out.
-- This uses the managed .NET `System.Windows.Automation` client (commonly called **UIA2**),
-  not COM UIA3. Some providers behave differently or lack ValuePattern;
-  there is no UIA3/FlaUI dependency and no screenshot fallback. Typing then uses guarded
-  Unicode keyboard input, not a pretend ValuePattern success.
-- Packaged/UWP apps and process hand-offs are unsupported (D109). Multi-window,
-  multi-process, single-instance reuse, and arbitrary application activation chains are not
-  generally supported. Closing kills only recorded process identities, never by executable
-  name. A machine crash or forced termination of both helper and watchdog may leave an app
-  alive; a foreign process is never adopted or killed speculatively.
-- Allowlisted apps can access files/network and respond to keys in application-specific ways.
-  The window guard is not an application sandbox. UIA calls are synchronous; cancellation
-  before a tool starts is honored, but an already-issued pattern action cannot be rolled back.
+- Requires Windows 10 version 1607 or later, and an active, connected, unlocked interactive desktop. Secure desktops,
+  Session 0 and disconnected RDP sessions are unsupported.
+- **Elevated windows are inaccessible from a non-elevated helper.** Do not use this to operate
+  UAC/security prompts. UIA/input may fail across integrity levels.
+- Electron apps often need **`--force-renderer-accessibility`** in their launch arguments.
+- Games, canvas apps and custom-drawn controls often expose sparse or empty UIA trees. There
+  is no screenshot/OCR fallback. Providers can be stale, expensive or hang.
+- UIA2 behavior varies by provider. Some editors expose TextPattern rather than writable
+  ValuePattern; these use guarded Unicode input, not a pretend SetValue success.
+- A UIA tree can expose cross-process children/popups. Reads may include these, but an action
+  ref must still belong to the selected target top-level HWND. Use `ui_windows` to select a
+  separate popup/dialog instead of assuming it is part of the old target.
+- Global hotkey availability, DPI mapping, overlay hit-testing, focus/pointer races and abrupt
+  provider interruption require real Windows validation; source contracts cannot prove them.
 
-## Tests and measurements
+## Verification and desktop test safety
+
+Safe fake-only checks (no desktop/helper/hotkey processes):
 
 ```sh
-bun scripts/link-amira.ts D:/dev/Amira
 bunx tsc --noEmit
 bunx biome check src test scripts package.json tsconfig.json biome.json
-bun test test
-bun scripts/smoke.ts   # explicit launch/tree/type/read-back/close run, owned apps only
+bun test ./test/unit.test.ts ./test/helper.test.ts ./test/safety.test.ts
 ```
 
-Tests are updated for D109 to target the deterministic bundled WinForms `testWindow`, not
-Notepad or Calculator. Unit tests use a fake JSON-line helper to cover launch refusals,
-ownership/allowlist/ref guards, permissions, cutting, lazy restart, timeout and session
-cleanup, user-only settings provenance, and the entry-point export snapshot.
-The desktop tests probe the input desktop **without enumerating windows** and automatically
-skip desktop work on other platforms or when no interactive desktop is available. With an
-interactive desktop, they launch only the bundled window for tree/type/read-back/key/close,
-extension-host unload and helper-crash cleanup checks. Desktop-free helper **source contract
-tests** cover exact launched-PID ownership, foreign-window refusal, failure cleanup,
-`OwnershipVersion=2` journal safeguards, cursor checks and tree budgets/provider errors;
-they are not runtime PowerShell/provider tests. The explicit smoke script also targets the
-bundled window. Never test against a window you did not launch.
+`unit.test.ts` uses fake host/jobs/pipes for settings, tool traits, arbitrary handles/launches,
+window-local refs, emergency-stop latching/explicit resume, startup-stop races, timeout aborts,
+untrusted-result framing, model-facing stop notices and overlay protocol/lifecycle. `helper.test.ts`
+reads source files only: these contracts are **not PowerShell runtime or provider tests**.
 
-Provider initialization is called through a typed, non-inlined frame: the managed UIA
-[default proxy loader](https://source.dot.net/UIAutomationClient/MS/Internal/Automation/ProxyManager.cs.html)
-walks `ReflectedType` on its calling stack, which PowerShell's dynamic methods do not have.
-Loading the built-in proxies this way restores Win32 document/control types without
-registering custom providers or querying any desktop windows.
+Desktop tests are **explicitly opt-in**. Do not run them while anyone is using the machine.
+Importing/skipping `desktop.test.ts` starts no probes or processes. On a dedicated idle Windows
+machine, set `AMIRA_UIA_DESKTOP_TESTS=1` and run `bun test ./test/desktop.test.ts` (or the explicit
+`scripts/smoke.ts` wrapper). Tests use only their uniquely titled bundled test window and their
+own overlay/helper processes, filter `ui_windows` before acting, and never log other windows'
+titles. Their overlay runs with **`-TestMode`**, which does not register hotkeys or detect physical
+Escape stops; stop is simulated over its private pipe. Neither test nor real helpers scan other
+clients' journals. Every launched process is cleaned up in
+`finally`, through exact identities, never by image name. Coverage includes a test-started fixture
+not launched through the extension (it must remain ineligible for termination), real-cursor
+preservation for pattern actions, glide ID/timing checks and idle hiding. For the mixed-DPI test,
+configure a negative-coordinate secondary monitor at a different scale and set
+`AMIRA_UIA_TEST_LEFT` / `AMIRA_UIA_TEST_TOP` to a location fully inside that monitor. This test
+also checks that helper death removes the monitor but preserves the fixture across restart. No test registers a stop
+hotkey; input-release hooks observe the test helper's tagged input only during actions and the
+post-action window. Desktop coverage also checks idle hook removal, explicit overlay opt-out,
+polite close of an IgnoreClose fixture, delayed acknowledgements, protected test-owned targets,
+title truncation, modal dialogs, windowed-app survival on stop, and headless descendant cleanup.
+Simultaneous loss of helper and watchdog can leave a launched tree running; no replacement
+reopens an unverified kernel object, and rotation removes the unrecoverable old journal.
+Do not use blanket `bun test` as a
+substitute for the explicit fake-only paths on a live desktop.

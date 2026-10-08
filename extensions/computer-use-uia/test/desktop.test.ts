@@ -1,85 +1,70 @@
 import { expect, test } from "bun:test"
-import type { ExtensionAPI } from "@amira/api"
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import type { ExtensionAPI, PipeProcess } from "@amira/api"
 import { EventBus, ExtensionHost, InterceptorRegistry, ToolRegistry } from "@amira/core"
-import type { LaunchResult, TreeResult, UiaClient } from "../src/client.ts"
+import type { LaunchResult, TreeResult, UiaClient, WindowResult } from "../src/client.ts"
 import { setup } from "../src/extension.ts"
-import { readSettings } from "../src/settings.ts"
 import { captureHelper } from "./capture.ts"
 
-const helper = `${import.meta.dir}/../helper/uia.ps1`
+// Explicit opt-in only. Importing/skipping this file NEVER starts a process or registers hotkeys.
+// Do not run on a machine someone is using. All reads/actions below target our unique fixture.
+const enabled = process.platform === "win32" && process.env.AMIRA_UIA_DESKTOP_TESTS === "1"
 
-// Probe the input desktop, not its windows. Session 0 and locked/noninteractive desktops skip.
-const interactive =
-  process.platform === "win32" &&
-  (await (async () => {
-    const process = Bun.spawn(
-      [
-        "powershell.exe",
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        helper,
-        "-AppsJson",
-        "{}",
-      ],
-      { stdin: "pipe", stdout: "pipe", stderr: "pipe" },
-    )
-    process.stdin.write(`${JSON.stringify({ id: 1, method: "desktop", params: {} })}\n`)
-    process.stdin.end()
-    const timer = setTimeout(() => process.kill(), 30_000)
-    try {
-      const [output, errors] = await Promise.all([
-        new Response(process.stdout).text(),
-        new Response(process.stderr).text(),
-      ])
-      const code = await process.exited
-      if (code !== 0) throw new Error(`UIA desktop probe failed (${code}): ${errors}`)
-      const response = JSON.parse(output.trim())
-      if (response.error) throw new Error(response.error)
-      return response.result.interactive === true
-    } finally {
-      clearTimeout(timer)
-    }
-  })())
+/**
+ * Writes a throwaway script for `powershell -File`. Security software (seen with Huorong HIPS)
+ * silently holds `powershell -WindowStyle Hidden -Command/-EncodedCommand` at startup, so
+ * fixtures never pass inline commands.
+ */
+function scriptFile(body: string): string {
+  const path = join(tmpdir(), `amira-uia-test-script-${crypto.randomUUID()}.ps1`)
+  writeFileSync(path, body)
+  return path
+}
 
-function host() {
-  const bus = new EventBus()
-  const instance = new ExtensionHost({
-    bus,
+/**
+ * The error a call rejects with. Not `expect(promise).rejects`: while Bun waits on it, helper
+ * replies (delivered from the pipe worker) stall until the call times out.
+ */
+async function rejection(call: Promise<unknown>): Promise<string> {
+  return call.then(
+    () => "resolved",
+    (error: unknown) => (error instanceof Error ? error.message : String(error)),
+  )
+}
+
+function host(overlay = true) {
+  const settings = { enabled: true, overlay }
+  return new ExtensionHost({
+    bus: new EventBus(),
     tools: new ToolRegistry(),
     interceptors: new InterceptorRegistry(),
-    settings: { extensions: { "computer-use-uia": { enabled: true } } },
+    settings: { extensions: { "computer-use-uia": settings } },
     settingsLayers: {
-      extensions: [
-        { scope: "user", file: "test:user-settings", value: { "computer-use-uia": { enabled: true } } },
-      ],
+      extensions: [{ scope: "user", file: "test:user", value: { "computer-use-uia": settings } }],
     },
     cwd: process.cwd(),
   })
-  return { instance, bus }
 }
 
-function controlLine(tree: TreeResult, type: string, name: string): string {
-  const matches = tree.text.split("\n").filter((line) => line.includes(` ${type} name="${name}" `))
-  if (matches.length !== 1) throw new Error(`Expected one ${type} named "${name}":\n${tree.text}`)
-  return matches[0]!
-}
-
-function controlRef(tree: TreeResult, type: string, name: string): string {
-  const line = controlLine(tree, type, name)
-  const ref = /^\s*(e\d+)\s/.exec(line)?.[1]
-  if (!ref) throw new Error(`No ref for ${type} named "${name}":\n${tree.text}`)
-  return ref
+function ref(tree: TreeResult, name: string): string {
+  const lines = tree.text
+    .split("\n")
+    .filter(
+      (line) =>
+        line.includes(` name="${name}" `) && / (?:Edit|Document|Button|CheckBox|ComboBox) name=/.test(line),
+    )
+  const found = lines.length === 1 && /^\s*(e\d+)\s/.exec(lines[0]!)?.[1]
+  if (!found) throw new Error(`Expected one fixture control named ${name}`)
+  return found
 }
 
 async function until(done: () => boolean, timeoutMs = 15_000) {
   const deadline = Date.now() + timeoutMs
   while (!done()) {
-    if (Date.now() > deadline) throw new Error("Timed out awaiting owned process cleanup")
-    await Bun.sleep(100)
+    if (Date.now() > deadline) throw new Error("Timed out awaiting test-owned process cleanup")
+    await Bun.sleep(50)
   }
 }
 
@@ -92,187 +77,765 @@ function alive(pid: number): boolean {
   }
 }
 
-test.skipIf(!interactive)(
-  "real helper: owned testWindow named edits, button, checkbox, guards and close",
+async function fixture(c: UiaClient, track: (pid: number) => void, position: string[] = []) {
+  const title = `Amira-UIA-test-${crypto.randomUUID()}`
+  const launched = (await c.call("launch", {
+    command: "powershell.exe",
+    args: [
+      "-NoProfile",
+      "-STA",
+      "-WindowStyle",
+      "Hidden",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      `${import.meta.dir}/../helper/test-window.ps1`,
+      "-Title",
+      title,
+      ...position,
+    ],
+  })) as LaunchResult
+  track(launched.pid) // Retain cleanup identity even if discovery/assertions below fail.
+  // Filter BEFORE returning/acting. Never print or inspect the list of unrelated window titles.
+  const result = (await c.call("windows", { filter: title })) as { windows: WindowResult[] }
+  const own = result.windows.filter((window) => window.pid === launched.pid && window.title === title)
+  if (own.length !== 1) throw new Error("Expected one newly launched fixture window")
+  return { window: own[0]!.window, pid: launched.pid, title }
+}
+
+async function minimizedState(c: UiaClient, app: Awaited<ReturnType<typeof fixture>>, minimized: boolean) {
+  const deadline = Date.now() + 15_000
+  while (Date.now() < deadline) {
+    const result = (await c.call("windows", { filter: app.title })) as { windows: WindowResult[] }
+    if (result.windows.find((window) => window.pid === app.pid)?.minimized === minimized) return
+    await Bun.sleep(50)
+  }
+  throw new Error("Fixture did not reach expected minimized/restored state")
+}
+
+test.skipIf(!enabled)(
+  "fixture list/filter/tree/type/click/key/focus/close; overlay never gets foreground",
   async () => {
-    const { instance } = host()
+    const instance = host()
     let client: UiaClient | undefined
     let captured: ReturnType<typeof captureHelper> | undefined
     await instance.load((api) => {
       captured = captureHelper(api)
       client = setup(captured.api)
     }, "test:uia")
-    expect(client).toBeDefined()
     const c = client!
-    const launched: LaunchResult[] = []
+    let app: Awaited<ReturnType<typeof fixture>> | undefined
+    let launchedPid = 0
     try {
-      await expect(c.call("tree", { window: "1" })).rejects.toThrow("not obtained")
-      const testWindow = (await c.call("launch", { app: "testWindow" })) as LaunchResult
-      launched.push(testWindow)
-      let tree = (await c.call("tree", { window: testWindow.window })) as TreeResult
-      // Win32 proxies expose the ComboLBox popup as a child, but its native root
-      // is outside the form: keep the ComboBox, never publish the popup or its items.
-      expect(controlRef(tree, "ComboBox", "Choose an item")).toMatch(/^e\d+$/)
-      expect(tree.text).not.toMatch(/\b(?:List|ListItem) name=/)
-      expect(tree.cut).toBe(true)
-      console.log(
-        `UIA manual measurement: testWindow ${tree.nodes} nodes, ${tree.chars} chars, ${tree.ms} ms`,
-      )
-      for (const [name, message] of [
-        ["Multiline text", "Amira UIA owned-window test — héllo 你好\nSecond line"],
-        ["Single-line text", "Single-line Unicode — héllo 你好"],
-      ] as const) {
-        const type = tree.text.includes(` Document name="${name}" `) ? "Document" : "Edit"
-        const oldRef = controlRef(tree, type, name)
-        const editor = controlLine(tree, type, name)
-        const expectedPath = editor.includes('value="') ? "ValuePattern.SetValue" : "SendInput"
-        const typed = await c.call("type", { window: testWindow.window, ref: oldRef, text: message })
-        expect(typed).toMatchObject({ path: expectedPath })
-        tree = (await c.call("tree", { window: testWindow.window })) as TreeResult
-        expect(controlLine(tree, type, name).replaceAll("\\r\\n", "\\n")).toContain(
-          message.replaceAll("\n", "\\n"),
-        )
-        expect(controlRef(tree, type, name)).not.toBe(oldRef)
-        const stale = await captured!.raw("click", { window: testWindow.window, ref: oldRef })
-        expect(stale.error).toContain("Unknown element")
-      }
-      expect(controlLine(tree, "Text", "Button not clicked")).toContain("enabled=true")
-      const button = await c.call("click", {
-        window: testWindow.window,
-        ref: controlRef(tree, "Button", "Change label"),
+      app = await fixture(c, (pid) => {
+        launchedPid = pid
       })
-      expect(button).toMatchObject({ path: "InvokePattern" })
-      tree = (await c.call("tree", { window: testWindow.window })) as TreeResult
-      expect(controlLine(tree, "Text", "Button clicked")).toContain("enabled=true")
-      const checkbox = controlLine(tree, "CheckBox", "Enable option")
-      expect(checkbox).toContain("toggle=Off")
-      const toggled = await c.call("click", {
-        window: testWindow.window,
-        ref: controlRef(tree, "CheckBox", "Enable option"),
-      })
-      expect(toggled).toMatchObject({ path: "TogglePattern" })
-      tree = (await c.call("tree", { window: testWindow.window })) as TreeResult
-      expect(controlLine(tree, "CheckBox", "Enable option")).toContain("toggle=On")
-      for (const keys of ["ALT+F4", "shift+alt+f4", "alt+tab", "ctrl+escape"]) {
-        const refused = await captured!.raw("key", { window: testWindow.window, keys })
-        expect(refused.error).toContain("not permitted")
-      }
-      const key = await c.call("key", { window: testWindow.window, keys: "ctrl+a" })
-      expect(key).toMatchObject({ path: "SendInput" })
-      for (const app of launched) {
-        await c.call("close", { window: app.window })
-        await until(() => !alive(app.pid))
-      }
-      console.log("UIA close: owned testWindow PID exited")
-    } finally {
+      await c.call("focus", { window: app.window })
+      let tree = (await c.call("tree", { window: app.window })) as TreeResult
+      const password = tree.text.split("\n").find((line) => line.includes('name="Password"'))!
+      expect(password).toMatch(/password=(?:true|unknown)/)
+      expect(password).not.toMatch(/ value=| text=/)
+      expect(tree.text).not.toContain("fixture-secret-never-returned")
+      const edit = ref(tree, "Single-line text")
+      const cursorBefore = await captured!.inspectOverlay()
+      const typed = await c.call("type", { window: app.window, ref: edit, text: "héllo 你好" })
+      expect(typed).toMatchObject({ path: "ValuePattern.SetValue" })
+      tree = (await c.call("tree", { window: app.window })) as TreeResult
+      const singleline = tree.text
+        .split("\n")
+        .find((line) => line.includes('name="Single-line text"') && / Edit /.test(line))!
+      expect(singleline).toContain('value="héllo 你好"')
+      expect(singleline).not.toContain("password=")
+      const multiline = ref(tree, "Multiline text")
+      await c.call("type", { window: app.window, ref: multiline, text: "first line\nsecond line" })
+      tree = (await c.call("tree", { window: app.window })) as TreeResult
+      const document = tree.text
+        .split("\n")
+        .find((line) => line.includes('name="Multiline text"') && / (?:Edit|Document) /.test(line))!
+      expect(document).toMatch(/(?:value|text)="first line\\(?:r\\)?nsecond line"/)
+      expect(document).not.toContain("password=")
+      const stale = await captured!.raw("click", { window: app.window, ref: edit })
+      expect(stale.error).toContain("Unknown element")
+      const clicked = await c.call("click", { window: app.window, ref: ref(tree, "Change label") })
+      expect(clicked).toMatchObject({ path: "InvokePattern" })
+      const overlay = await captured!.inspectOverlay()
+      expect(overlay.foreground).toBe(false)
+      expect(overlay.hooks).toBe(true)
+      expect(overlay.gliding).toBe(false)
+      expect(overlay.kind).toBe("click")
+      expect(overlay.ripple).toBe(true)
+      expect([overlay.cursorX, overlay.cursorY]).toEqual([cursorBefore.cursorX, cursorBefore.cursorY])
+      const action = captured!.actions.find((action) => action.id === overlay.actionId)!
+      const glide = captured!.glides.find((glide) => glide.id === action.id)!
+      expect(action.kind).toBe("click")
+      expect(glide.at - action.at).toBeGreaterThanOrEqual(250)
+      expect(glide.at - action.at).toBeLessThan(5000)
+      expect([overlay.x, overlay.y]).toEqual([overlay.targetX, overlay.targetY])
+      expect(overlay.hitRoot).toBe(app.window)
+      const requiredStyles = 0x20 | 0x80000 | 0x8 | 0x80 | 0x08000000
+      expect((overlay.styles as number) & requiredStyles).toBe(requiredStyles)
+      expect(captured!.overlayEvents).toContain("glided")
+      const filtered = (await c.call("windows", { filter: app.title })) as { windows: WindowResult[] }
+      expect(
+        filtered.windows.filter((window) => window.pid === app!.pid).every((window) => window.foreground),
+      ).toBe(true)
+      tree = (await c.call("tree", { window: app.window })) as TreeResult
+      expect(tree.text).toContain('name="Button clicked"')
+      await c.call("click", { window: app.window, ref: ref(tree, "Enable option") })
+      await c.call("key", { window: app.window, keys: "escape" })
+      await c.call("key", { window: app.window, keys: "escape" })
+      expect(c.emergency.stopped).toBe(false) // Injected model keys are never a user stop.
+      await c.call("key", { window: app.window, keys: "tab" })
+      const chord = await captured!.inspectOverlay()
+      expect(chord.kind).toBe("key")
+      await c.call("key", { window: app.window, keys: "ctrl+m" })
+      await minimizedState(c, app, true)
+      await c.call("focus", { window: app.window })
+      await minimizedState(c, app, false)
+      const closed = await c.call("close", { window: app.window })
+      expect(closed).toMatchObject({ closed: true, terminated: false })
+      await until(() => !alive(app!.pid))
+      const monitorPid = captured!.overlayPid()
+      await Bun.sleep(3300)
+      const idle = await captured!.inspectOverlay()
+      expect(idle.visible).toBe(false)
+      expect(idle.hooks).toBe(false)
       await c.stop()
-      instance.unload("test:uia")
+      await until(() => !alive(monitorPid))
+    } finally {
+      try {
+        await c.stop()
+      } finally {
+        // Exact journal also covers fixture discovery failures.
+        instance.unload("test:uia")
+        if (launchedPid) await until(() => !alive(launchedPid))
+      }
     }
   },
   180_000,
 )
 
-test.skipIf(!interactive)(
-  "real host unload stops sentinel; helper closes only its launched testWindow",
+test.skipIf(!enabled)(
+  "unlaunched-to-extension fixture is actionable but never kill-eligible",
   async () => {
-    const { instance } = host()
-    let client: UiaClient | undefined
+    const instance = host()
     let api: ExtensionAPI | undefined
-    await instance.load((value) => {
-      api = value
-      client = setup(value)
-    }, "test:uia-unload")
-    let launched: LaunchResult | undefined
+    let client: UiaClient | undefined
+    let fixturePipe: PipeProcess | undefined
+    let pid = 0
+    let exited = false
+    const title = `Amira-UIA-test-${crypto.randomUUID()}`
+    await instance.load((hostApi) => {
+      api = captureHelper(hostApi).api
+      client = setup(api)
+    }, "test:uia-foreign")
     try {
-      launched = (await client!.call("launch", { app: "testWindow" })) as LaunchResult
-      const jobs = api!.backgroundJobs.running()
-      expect(jobs).toHaveLength(1)
-      expect(instance.unload("test:uia-unload")).toBe(true)
-      await until(() => !alive(launched!.pid))
-      await until(() => jobs.every((job) => !job.pid || !alive(job.pid)))
+      // The TEST launches this fixture directly; ui_launch never owns/journals it.
+      fixturePipe = api!.openPipe(
+        [
+          "powershell.exe",
+          "-NoProfile",
+          "-STA",
+          "-WindowStyle",
+          "Hidden",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          `${import.meta.dir}/../helper/test-window.ps1`,
+          "-Title",
+          title,
+          "-IgnoreClose",
+        ],
+        {
+          cwd: process.cwd(),
+          onEvent(event) {
+            if (event.type === "spawned") pid = event.pid
+            if (event.type === "exit") exited = true
+          },
+        },
+      )
+      await until(() => pid > 0)
+      let window: string | undefined
+      const deadline = Date.now() + 20_000
+      while (!window && Date.now() < deadline) {
+        const result = (await client!.call("windows", { filter: title })) as { windows: WindowResult[] }
+        window = result.windows.find((entry) => entry.pid === pid && entry.title === title)?.window
+        if (!window) await Bun.sleep(100)
+      }
+      if (!window) throw new Error("Test-started external fixture window unavailable")
+      const tree = (await client!.call("tree", { window })) as TreeResult
+      await client!.call("type", { window, ref: ref(tree, "Single-line text"), text: "external fixture" })
+      await client!.call("click", { window, ref: ref(tree, "Change label") })
+      await client!.call("key", { window, keys: "tab" })
+      await client!.call("focus", { window })
+      expect(await client!.call("close", { window })).toMatchObject({ closed: false, terminated: false })
+      await client!.stop()
+      expect(alive(pid)).toBe(true) // IgnoreClose: neither close nor session cleanup may kill it.
     } finally {
-      await client?.stop()
-      instance.unload("test:uia-unload")
+      try {
+        await client?.stop()
+      } finally {
+        fixturePipe?.close(0) // Host-owned handle of THIS test's process, not an image name.
+        instance.unload("test:uia-foreign")
+        if (fixturePipe) await until(() => exited)
+      }
     }
   },
-  120_000,
+  180_000,
 )
 
-test.skipIf(!interactive)(
-  "watchdog reaps owned app after helper death and restart invalidates handles",
+test.skipIf(!enabled)(
+  "launched IgnoreClose fixture survives ui_close; exact cleanup kills it with overlay off",
   async () => {
-    const { instance } = host()
+    const instance = host(false)
     let client: UiaClient | undefined
     let captured: ReturnType<typeof captureHelper> | undefined
+    let launchedPid = 0
     await instance.load((api) => {
       captured = captureHelper(api)
       client = setup(captured.api)
-    }, "test:uia-crash")
+    }, "test:uia-polite-close")
     try {
-      const original = (await client!.call("launch", { app: "testWindow" })) as LaunchResult
-      const helperPid = captured!.pid()
-      expect(helperPid).toBeGreaterThan(0)
-      // Only the helper this test started, never an image-name or desktop-process search.
-      process.kill(helperPid)
-      await until(() => captured!.pid() === 0 && !alive(original.pid))
-      await expect(client!.call("tree", { window: original.window })).rejects.toThrow("not obtained")
-      const replacement = (await client!.call("launch", { app: "testWindow" })) as LaunchResult
-      expect(replacement.window).not.toBe(original.window)
-      await client!.call("close", { window: replacement.window })
-      await until(() => !alive(replacement.pid))
+      const app = await fixture(
+        client!,
+        (pid) => {
+          launchedPid = pid
+        },
+        ["-IgnoreClose"],
+      )
+      const tree = (await client!.call("tree", { window: app.window })) as TreeResult
+      await client!.call("type", { window: app.window, ref: ref(tree, "Single-line text"), text: "retained" })
+      await client!.call("click", { window: app.window, ref: ref(tree, "Change label") })
+      await client!.call("key", { window: app.window, keys: "tab" })
+      await client!.call("focus", { window: app.window })
+      expect(await client!.call("close", { window: app.window })).toMatchObject({
+        closed: false,
+        terminated: false,
+      })
+      expect(alive(app.pid)).toBe(true)
+      expect(captured!.overlayPid()).toBe(0) // Explicit opt-out: no pointer, hooks or stop monitor.
+      expect(captured!.actions).toHaveLength(0) // No animation events/ack waits when rendering is off.
+      expect(client!.emergency.stopped).toBe(false)
+      expect(((await client!.call("tree", { window: app.window })) as TreeResult).text).toContain(
+        'value="retained"',
+      )
+      await client!.stop()
+      await until(() => !alive(app.pid))
     } finally {
-      await client?.stop()
-      instance.unload("test:uia-crash")
+      try {
+        await client?.stop()
+      } finally {
+        instance.unload("test:uia-polite-close")
+        if (launchedPid) await until(() => !alive(launchedPid))
+      }
     }
   },
   180_000,
 )
 
-// A fabricated HWND is refused in the helper too, before any AutomationElement lookup.
-test.skipIf(process.platform !== "win32")(
-  "helper independently refuses unknown apps/windows without desktop access",
+test.skipIf(!enabled)(
+  "overlay acknowledgement timeout keeps helper alive and consumes a late acknowledgement",
   async () => {
-    const child = Bun.spawn(
-      [
-        "powershell.exe",
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        helper,
-        "-AppsJson",
-        JSON.stringify(readSettings(undefined).apps),
-      ],
-      { stdin: "pipe", stdout: "pipe", stderr: "pipe" },
-    )
-    const requests = [
-      { method: "launch", params: { app: "unknown" } },
-      ...["tree", "click", "type", "key", "close"].map((method) => ({
-        method,
-        params: { window: "1", ref: "e1", text: "x", keys: "alt+f4" },
-      })),
-    ]
-    for (const [i, request] of requests.entries())
-      child.stdin.write(`${JSON.stringify({ id: i + 1, ...request })}\n`)
-    child.stdin.end()
-    const timer = setTimeout(() => child.kill(), 30_000)
+    const instance = host()
+    let client: UiaClient | undefined
+    let captured: ReturnType<typeof captureHelper> | undefined
+    let launchedPid = 0
+    let delayNextAck = false
+    let lateAck: ReturnType<typeof setTimeout> | undefined
+    await instance.load((api) => {
+      captured = captureHelper({
+        ...api,
+        openPipe(argv, options) {
+          const pipe = api.openPipe(argv, options)
+          if (!argv.some((arg) => arg.endsWith("uia.ps1"))) return pipe
+          return {
+            ...pipe,
+            write(line) {
+              if (delayNextAck && line.includes('"method":"overlay_ack"')) {
+                delayNextAck = false
+                lateAck = setTimeout(() => {
+                  pipe.write(line)
+                }, 5500)
+                return
+              }
+              return pipe.write(line)
+            },
+          }
+        },
+      })
+      client = setup(captured.api)
+    }, "test:uia-late-ack")
     try {
-      const output = await new Response(child.stdout).text()
-      const errors = await new Response(child.stderr).text()
-      expect(await child.exited, errors).toBe(0)
-      const responses = output
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line))
-      expect(responses).toHaveLength(requests.length)
-      expect(responses[0].error).toContain("testWindow")
-      for (const response of responses.slice(1))
-        expect(response.error).toMatch(/Refused|not owned|not obtained/i)
+      const app = await fixture(client!, (pid) => {
+        launchedPid = pid
+      })
+      const tree = (await client!.call("tree", { window: app.window })) as TreeResult
+      const helperPid = captured!.pid()
+      delayNextAck = true
+      const began = Date.now()
+      expect(
+        await client!.call("type", {
+          window: app.window,
+          ref: ref(tree, "Single-line text"),
+          text: "after timeout",
+        }),
+      ).toMatchObject({ path: "ValuePattern.SetValue" })
+      expect(Date.now() - began).toBeGreaterThanOrEqual(4900)
+      expect(alive(helperPid)).toBe(true)
+      expect(client!.emergency.stopped).toBe(false)
+      expect(((await client!.call("tree", { window: app.window })) as TreeResult).text).toContain(
+        'value="after timeout"',
+      )
+      await Bun.sleep(1000) // Let the pending shared read receive the late ack.
+      await client!.call("key", { window: app.window, keys: "tab" })
+      expect(client!.emergency.stopped).toBe(false)
     } finally {
-      clearTimeout(timer)
+      if (lateAck) clearTimeout(lateAck)
+      try {
+        await client?.stop()
+      } finally {
+        instance.unload("test:uia-late-ack")
+        if (launchedPid) await until(() => !alive(launchedPid))
+      }
     }
   },
-  60_000,
+  180_000,
+)
+
+test.skipIf(!enabled)(
+  "test-owned AmiraPid target is readable but focus/close/click/type/key are refused",
+  async () => {
+    const instance = host(false)
+    let api: ExtensionAPI | undefined
+    let client: UiaClient | undefined
+    let fixturePipe: PipeProcess | undefined
+    let pid = 0
+    let exited = false
+    const title = `Amira-UIA-test-${crypto.randomUUID()}`
+    await instance.load((hostApi) => {
+      api = hostApi
+    }, "test:uia-protected")
+    try {
+      // Substitute only this test's isolated fixture for AmiraPid: never target the actual terminal.
+      fixturePipe = api!.openPipe(
+        [
+          "powershell.exe",
+          "-NoProfile",
+          "-STA",
+          "-WindowStyle",
+          "Hidden",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          `${import.meta.dir}/../helper/test-window.ps1`,
+          "-Title",
+          title,
+        ],
+        {
+          cwd: process.cwd(),
+          onEvent(event) {
+            if (event.type === "spawned") pid = event.pid
+            if (event.type === "exit") exited = true
+          },
+        },
+      )
+      await until(() => pid > 0)
+      const captured = captureHelper({
+        ...api!,
+        openPipe(argv, options) {
+          if (!argv.some((arg) => arg.endsWith("uia.ps1"))) return api!.openPipe(argv, options)
+          const args = [...argv]
+          const index = args.indexOf("-AmiraPid")
+          if (index >= 0) args[index + 1] = String(pid)
+          else args.push("-AmiraPid", String(pid))
+          return api!.openPipe(args, options)
+        },
+      })
+      client = setup(captured.api)!
+      let window: string | undefined
+      const deadline = Date.now() + 20_000
+      while (!window && Date.now() < deadline) {
+        const result = (await client.call("windows", { filter: title })) as { windows: WindowResult[] }
+        window = result.windows.find((entry) => entry.pid === pid && entry.title === title)?.window
+        if (!window) await Bun.sleep(100)
+      }
+      if (!window) throw new Error("Protected test-owned fixture unavailable")
+      const tree = (await client.call("tree", { window })) as TreeResult
+      expect(tree.text).toContain('name="Single-line text"')
+      for (const [method, params] of [
+        ["focus", {}],
+        ["close", {}],
+        ["click", { ref: ref(tree, "Change label") }],
+        ["type", { ref: ref(tree, "Single-line text"), text: "must not be entered" }],
+        ["key", { keys: "tab" }],
+      ] as const) {
+        expect(await rejection(client.call(method, { window, ...params }))).toContain("Amira terminal")
+      }
+      expect(alive(pid)).toBe(true)
+      expect(client.emergency.stopped).toBe(false)
+      expect(((await client.call("tree", { window })) as TreeResult).text).not.toContain(
+        "must not be entered",
+      )
+      await client.stop()
+      expect(alive(pid)).toBe(true)
+    } finally {
+      try {
+        await client?.stop()
+      } finally {
+        fixturePipe?.close(0)
+        instance.unload("test:uia-protected")
+        if (fixturePipe) await until(() => exited)
+      }
+    }
+  },
+  180_000,
+)
+
+test.skipIf(!enabled)(
+  "long fixture titles are capped at 120 characters with a cut note",
+  async () => {
+    const instance = host(false)
+    let client: UiaClient | undefined
+    let launchedPid = 0
+    await instance.load((api) => {
+      client = setup(captureHelper(api).api)
+    }, "test:uia-title-cap")
+    const prefix = `Amira-UIA-test-${crypto.randomUUID()}`
+    const title = prefix + "x".repeat(180)
+    try {
+      const launch = (await client!.call("launch", {
+        command: "powershell.exe",
+        args: [
+          "-NoProfile",
+          "-STA",
+          "-WindowStyle",
+          "Hidden",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          `${import.meta.dir}/../helper/test-window.ps1`,
+          "-Title",
+          title,
+        ],
+      })) as LaunchResult
+      launchedPid = launch.pid
+      const result = (await client!.call("windows", { filter: prefix })) as {
+        windows: WindowResult[]
+        cut: boolean
+        note?: string
+      }
+      const own = result.windows.filter((window) => window.pid === launchedPid)
+      expect(own).toHaveLength(1)
+      expect(own[0]!.title).toBe(`${title.slice(0, 117)}...`)
+      expect(result.windows.length).toBeLessThanOrEqual(200)
+      expect(result.cut).toBe(true)
+      expect(result.note).toContain("120 characters")
+    } finally {
+      try {
+        await client?.stop()
+      } finally {
+        instance.unload("test:uia-title-cap")
+        if (launchedPid) await until(() => !alive(launchedPid))
+      }
+    }
+  },
+  180_000,
+)
+
+// Dedicated mixed-DPI desktop: set coordinates on a negative-coordinate secondary monitor.
+// Never infer a location from unrelated windows, and do not run this on an occupied desktop.
+const negativePosition = process.env.AMIRA_UIA_TEST_LEFT && process.env.AMIRA_UIA_TEST_TOP
+
+test.skipIf(!enabled || !negativePosition)(
+  "physical pointer point on a mixed-DPI negative monitor",
+  async () => {
+    const instance = host()
+    let client: UiaClient | undefined
+    let captured: ReturnType<typeof captureHelper> | undefined
+    let launchedPid = 0
+    await instance.load((api) => {
+      captured = captureHelper(api)
+      client = setup(captured.api)
+    }, "test:uia-dpi")
+    try {
+      const app = await fixture(
+        client!,
+        (pid) => {
+          launchedPid = pid
+        },
+        ["-Left", process.env.AMIRA_UIA_TEST_LEFT!, "-Top", process.env.AMIRA_UIA_TEST_TOP!],
+      )
+      await client!.call("focus", { window: app.window })
+      const tree = (await client!.call("tree", { window: app.window })) as TreeResult
+      await client!.call("click", { window: app.window, ref: ref(tree, "Change label") })
+      const pointer = await captured!.inspectOverlay()
+      expect((pointer.x as number) < 0 || (pointer.y as number) < 0).toBe(true)
+      expect([pointer.x, pointer.y]).toEqual([pointer.targetX, pointer.targetY])
+      expect(pointer.hitRoot).toBe(app.window)
+      expect(pointer.foreground).toBe(false)
+      const monitorPid = captured!.overlayPid()
+      captured!.crashHelper()
+      await until(() => client!.emergency.stopped && !alive(monitorPid))
+      expect(alive(launchedPid)).toBe(true) // Helper crash is not session cleanup.
+      client!.resume()
+      await client!.call("tree", { window: app.window })
+      expect(alive(launchedPid)).toBe(true)
+    } finally {
+      try {
+        await client?.stop()
+      } finally {
+        instance.unload("test:uia-dpi")
+        if (launchedPid) await until(() => !alive(launchedPid))
+      }
+    }
+  },
+  180_000,
+)
+
+// overlay=false has no monitor; its explicit opt-out is covered by polite-close above.
+for (const overlay of [true]) {
+  test.skipIf(!enabled)(
+    `simulated stop with rendering ${overlay}; no test hotkeys, helper and overlay exit`,
+    async () => {
+      const instance = host(overlay)
+      let client: UiaClient | undefined
+      let captured: ReturnType<typeof captureHelper> | undefined
+      await instance.load((api) => {
+        captured = captureHelper(api)
+        client = setup(captured.api)
+      }, `test:uia-stop-${overlay}`)
+      let app: Awaited<ReturnType<typeof fixture>> | undefined
+      let launchedPid = 0
+      try {
+        app = await fixture(client!, (pid) => {
+          launchedPid = pid
+        })
+        await client!.call("tree", { window: app.window })
+        const helperPid = captured!.pid()
+        const overlayPid = captured!.overlayPid()
+        captured!.simulateStop()
+        await until(() => client!.emergency.stopped)
+        expect(await rejection(client!.call("focus", { window: app.window }))).toContain(
+          "the user stopped desktop control",
+        )
+        await until(() => !alive(helperPid) && !alive(overlayPid))
+        expect(alive(app!.pid)).toBe(true) // Visible apps survive emergency stop.
+        client!.resume()
+        await client!.call("tree", { window: app!.window })
+        expect(alive(app!.pid)).toBe(true)
+      } finally {
+        try {
+          await client?.stop()
+        } finally {
+          instance.unload(`test:uia-stop-${overlay}`)
+          if (launchedPid) await until(() => !alive(launchedPid))
+        }
+      }
+    },
+    120_000,
+  )
+}
+
+test.skipIf(!enabled)(
+  "modal Invoke returns within a bounded wait and the same helper can find/close the dialog",
+  async () => {
+    const instance = host(false)
+    let client: UiaClient | undefined
+    let captured: ReturnType<typeof captureHelper> | undefined
+    let launchedPid = 0
+    await instance.load((api) => {
+      captured = captureHelper(api)
+      client = setup(captured.api)
+    }, "test:uia-modal")
+    try {
+      const app = await fixture(
+        client!,
+        (pid) => {
+          launchedPid = pid
+        },
+        ["-ModalOnClick"],
+      )
+      const tree = (await client!.call("tree", { window: app.window })) as TreeResult
+      const helperPid = captured!.pid()
+      const began = Date.now()
+      const clicked = (await client!.call("click", {
+        window: app.window,
+        ref: ref(tree, "Change label"),
+      })) as { instruction?: string }
+      if (clicked.instruction) expect(clicked.instruction).toContain("action timed out")
+      expect(Date.now() - began).toBeLessThan(15_000)
+      const windows = (await client!.call("windows", { filter: `${app.title}-modal` })) as {
+        windows: WindowResult[]
+      }
+      expect(captured!.pid()).toBe(helperPid)
+      const modal = windows.windows.find(
+        (window) => window.pid === app.pid && window.title === `${app.title}-modal`,
+      )
+      expect(modal).toBeDefined()
+      await client!.call("close", { window: modal!.window })
+      expect(alive(app.pid)).toBe(true)
+    } finally {
+      await client?.stop()
+      instance.unload("test:uia-modal")
+      if (launchedPid) await until(() => !alive(launchedPid))
+    }
+  },
+  180_000,
+)
+
+test.skipIf(!enabled)(
+  "stop preserves a windowed launch's headless child; session end removes the tree and journal",
+  async () => {
+    const instance = host(false)
+    let client: UiaClient | undefined
+    let statePath = ""
+    const pidPath = join(tmpdir(), `amira-uia-test-window-child-${crypto.randomUUID()}.txt`)
+    const title = `Amira-UIA-test-${crypto.randomUUID()}`
+    let rootPid = 0
+    let childPid = 0
+    await instance.load((api) => {
+      client = setup({
+        ...api,
+        openPipe(argv, options) {
+          if (argv.some((arg) => arg.endsWith("uia.ps1"))) statePath = argv[argv.indexOf("-StatePath") + 1]!
+          return api.openPipe(argv, options)
+        },
+      })
+    }, "test:uia-window-child")
+    try {
+      const child = scriptFile(
+        `[IO.File]::WriteAllText('${pidPath.replaceAll("'", "''")}', [string]$PID); Start-Sleep -Seconds 600`,
+      )
+      const fixturePath = `${import.meta.dir}/../helper/test-window.ps1`.replaceAll("'", "''")
+      const script = scriptFile(
+        `Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File "${child}"'; & '${fixturePath}' -Title '${title}'`,
+      )
+      const launched = (await client!.call("launch", {
+        command: "powershell.exe",
+        args: ["-NoProfile", "-STA", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-File", script],
+      })) as LaunchResult
+      rootPid = launched.pid
+      await until(() => existsSync(pidPath))
+      childPid = Number(readFileSync(pidPath, "utf8"))
+      expect(childPid).toBeGreaterThan(0)
+      // Past the launch grace: survival must be due to the visible-window ancestor.
+      await Bun.sleep(3100)
+      client!.emergencyStop()
+      await client!.call("windows", { filter: title }) // Wait for stop cleanup acknowledgement.
+      expect(alive(rootPid)).toBe(true)
+      expect(alive(childPid)).toBe(true)
+      await client!.stop()
+      await until(() => !alive(rootPid) && !alive(childPid))
+      await until(() => !existsSync(statePath) && !existsSync(`${statePath}.tmp`))
+    } finally {
+      await client?.stop()
+      instance.unload("test:uia-window-child")
+      if (childPid) await until(() => !alive(childPid))
+      if (rootPid) await until(() => !alive(rootPid))
+      if (existsSync(pidPath)) unlinkSync(pidPath)
+    }
+  },
+  180_000,
+)
+
+test.skipIf(!enabled)(
+  "emergency stop preserves a minimized fixture with unsaved text beyond launch grace",
+  async () => {
+    const instance = host(false)
+    let client: UiaClient | undefined
+    let launchedPid = 0
+    await instance.load((api) => {
+      client = setup(api)
+    }, "test:uia-minimized-stop")
+    try {
+      const app = await fixture(client!, (pid) => {
+        launchedPid = pid
+      })
+      const tree = (await client!.call("tree", { window: app.window })) as TreeResult
+      await client!.call("type", {
+        window: app.window,
+        ref: ref(tree, "Single-line text"),
+        text: "unsaved fixture text",
+      })
+      await client!.call("key", { window: app.window, keys: "ctrl+m" })
+      await minimizedState(client!, app, true)
+      await Bun.sleep(3100) // Survival must come from window protection, not launch grace.
+      client!.emergencyStop()
+      await minimizedState(client!, app, true) // Also waits for watchdog stop cleanup.
+      expect(alive(app.pid)).toBe(true)
+      client!.resume()
+      await client!.call("focus", { window: app.window })
+      await minimizedState(client!, app, false)
+      const restored = (await client!.call("tree", { window: app.window })) as TreeResult
+      expect(restored.text).toContain('value="unsaved fixture text"')
+      await client!.stop()
+      await until(() => !alive(app.pid))
+    } finally {
+      await client?.stop()
+      instance.unload("test:uia-minimized-stop")
+      if (launchedPid) await until(() => !alive(launchedPid))
+    }
+  },
+  180_000,
+)
+
+test.skipIf(!enabled)(
+  "exited cmd start launcher cannot protect its headless descendant on stop or session cleanup",
+  async () => {
+    const instance = host(false)
+    let client: UiaClient | undefined
+    let captured: ReturnType<typeof captureHelper> | undefined
+    const pidPath = join(tmpdir(), `amira-uia-test-child-${crypto.randomUUID()}.txt`)
+    let childPid = 0
+    await instance.load((api) => {
+      captured = captureHelper(api)
+      client = setup(captured.api)
+    }, "test:uia-descendant")
+    try {
+      const script = scriptFile(
+        `[IO.File]::WriteAllText('${pidPath.replaceAll("'", "''")}', [string]$PID); Start-Sleep -Seconds 600`,
+      )
+      const launch = () =>
+        client!.call("launch", {
+          command: "cmd.exe",
+          args: [
+            "/c",
+            "start",
+            "",
+            "/b",
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            script,
+          ],
+        }) as Promise<LaunchResult>
+      const launcher = await launch()
+      await until(() => !alive(launcher.pid)) // A dead PPID is not a windowed protector.
+      await until(() => existsSync(pidPath))
+      childPid = Number(readFileSync(pidPath, "utf8"))
+      expect(childPid).toBeGreaterThan(0)
+      captured!.crashHelper()
+      await until(() => client!.emergency.stopped)
+      client!.resume()
+      await client!.call("windows", { filter: "Amira-UIA-no-such-fixture" })
+      expect(alive(childPid)).toBe(true)
+      client!.emergencyStop()
+      await until(() => !alive(childPid))
+      unlinkSync(pidPath)
+      client!.resume()
+      await launch()
+      await until(() => existsSync(pidPath))
+      childPid = Number(readFileSync(pidPath, "utf8"))
+      await client!.stop()
+      await until(() => !alive(childPid))
+    } finally {
+      await client?.stop()
+      instance.unload("test:uia-descendant")
+      if (childPid) await until(() => !alive(childPid))
+      if (existsSync(pidPath)) unlinkSync(pidPath)
+    }
+  },
+  180_000,
 )
