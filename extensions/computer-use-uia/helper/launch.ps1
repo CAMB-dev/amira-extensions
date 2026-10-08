@@ -413,7 +413,7 @@ namespace OwnedUia {
                 PROCESS_INFORMATION child;
                 // CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW.
                 if (!CreateProcess(path, new StringBuilder("\"" + path + "\" " + arguments), IntPtr.Zero,
-                    IntPtr.Zero, false, 0x08080004, IntPtr.Zero, cwd, ref startup, out child)) throw new Win32Exception();
+                    IntPtr.Zero, false, 0x08080004, IntPtr.Zero, string.IsNullOrEmpty(cwd) ? null : cwd, ref startup, out child)) throw new Win32Exception();
                 guard.process = child.Process; guard.thread = child.Thread; guard.Id = checked((int)child.Pid);
                 guard.ThreadId = child.Tid;
                 guard.Started = CreationTime(guard.process);

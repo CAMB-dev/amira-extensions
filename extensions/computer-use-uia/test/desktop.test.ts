@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { existsSync, readFileSync, unlinkSync } from "node:fs"
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { ExtensionAPI, PipeProcess } from "@amira/api"
@@ -11,6 +11,28 @@ import { captureHelper } from "./capture.ts"
 // Explicit opt-in only. Importing/skipping this file NEVER starts a process or registers hotkeys.
 // Do not run on a machine someone is using. All reads/actions below target our unique fixture.
 const enabled = process.platform === "win32" && process.env.AMIRA_UIA_DESKTOP_TESTS === "1"
+
+/**
+ * Writes a throwaway script for `powershell -File`. Security software (seen with Huorong HIPS)
+ * silently holds `powershell -WindowStyle Hidden -Command/-EncodedCommand` at startup, so
+ * fixtures never pass inline commands.
+ */
+function scriptFile(body: string): string {
+  const path = join(tmpdir(), `amira-uia-test-script-${crypto.randomUUID()}.ps1`)
+  writeFileSync(path, body)
+  return path
+}
+
+/**
+ * The error a call rejects with. Not `expect(promise).rejects`: while Bun waits on it, helper
+ * replies (delivered from the pipe worker) stall until the call times out.
+ */
+async function rejection(call: Promise<unknown>): Promise<string> {
+  return call.then(
+    () => "resolved",
+    (error: unknown) => (error instanceof Error ? error.message : String(error)),
+  )
+}
 
 function host(overlay = true) {
   const settings = { enabled: true, overlay }
@@ -447,7 +469,7 @@ test.skipIf(!enabled)(
         ["type", { ref: ref(tree, "Single-line text"), text: "must not be entered" }],
         ["key", { keys: "tab" }],
       ] as const) {
-        await expect(client.call(method, { window, ...params })).rejects.toThrow("Amira terminal")
+        expect(await rejection(client.call(method, { window, ...params }))).toContain("Amira terminal")
       }
       expect(alive(pid)).toBe(true)
       expect(client.emergency.stopped).toBe(false)
@@ -593,7 +615,7 @@ for (const overlay of [true]) {
         const overlayPid = captured!.overlayPid()
         captured!.simulateStop()
         await until(() => client!.emergency.stopped)
-        await expect(client!.call("focus", { window: app.window })).rejects.toThrow(
+        expect(await rejection(client!.call("focus", { window: app.window }))).toContain(
           "the user stopped desktop control",
         )
         await until(() => !alive(helperPid) && !alive(overlayPid))
@@ -681,13 +703,16 @@ test.skipIf(!enabled)(
       })
     }, "test:uia-window-child")
     try {
-      const child = `[IO.File]::WriteAllText('${pidPath.replaceAll("'", "''")}', [string]$PID); Start-Sleep -Seconds 600`
-      const encoded = Buffer.from(child, "utf16le").toString("base64")
+      const child = scriptFile(
+        `[IO.File]::WriteAllText('${pidPath.replaceAll("'", "''")}', [string]$PID); Start-Sleep -Seconds 600`,
+      )
       const fixturePath = `${import.meta.dir}/../helper/test-window.ps1`.replaceAll("'", "''")
-      const script = `Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile -EncodedCommand ${encoded}'; & '${fixturePath}' -Title '${title}'`
+      const script = scriptFile(
+        `Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File "${child}"'; & '${fixturePath}' -Title '${title}'`,
+      )
       const launched = (await client!.call("launch", {
         command: "powershell.exe",
-        args: ["-NoProfile", "-STA", "-WindowStyle", "Hidden", "-Command", script],
+        args: ["-NoProfile", "-STA", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-File", script],
       })) as LaunchResult
       rootPid = launched.pid
       await until(() => existsSync(pidPath))
@@ -767,11 +792,24 @@ test.skipIf(!enabled)(
       client = setup(captured.api)
     }, "test:uia-descendant")
     try {
-      const script = `[IO.File]::WriteAllText('${pidPath.replaceAll("'", "''")}', [string]$PID); Start-Sleep -Seconds 600`
+      const script = scriptFile(
+        `[IO.File]::WriteAllText('${pidPath.replaceAll("'", "''")}', [string]$PID); Start-Sleep -Seconds 600`,
+      )
       const launch = () =>
         client!.call("launch", {
           command: "cmd.exe",
-          args: ["/c", "start", "", "/b", "powershell.exe", "-NoProfile", "-Command", script],
+          args: [
+            "/c",
+            "start",
+            "",
+            "/b",
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            script,
+          ],
         }) as Promise<LaunchResult>
       const launcher = await launch()
       await until(() => !alive(launcher.pid)) // A dead PPID is not a windowed protector.

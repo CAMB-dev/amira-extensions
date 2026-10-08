@@ -118,5 +118,8 @@ $form.Controls.AddRange([System.Windows.Forms.Control[]]@(
     $multilineLabel, $multiline, $singlelineLabel, $singleline,
     $button, $status, $checkbox, $listLabel, $list, $password
 ))
+# A parent that starts us hidden (STARTF_USESHOWWINDOW + SW_HIDE, e.g. Bun's windowsHide)
+# turns the first show into a hide; showing again makes the fixture window really visible.
+$form.Add_Shown({ $form.Visible = $false; $form.Visible = $true })
 try { [System.Windows.Forms.Application]::Run($form) }
 finally { $form.Dispose() }

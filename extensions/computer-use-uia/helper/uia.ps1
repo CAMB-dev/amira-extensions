@@ -177,7 +177,7 @@ try {
     Add-Type -AssemblyName UIAutomationClient | Out-Null
     Add-Type -AssemblyName UIAutomationTypes | Out-Null
     Add-Type -AssemblyName UIAutomationClientsideProviders | Out-Null
-    Add-Type -ReferencedAssemblies @('System.dll', [System.Windows.Automation.AutomationElement].Assembly.Location) -TypeDefinition @'
+    Add-Type -ReferencedAssemblies @('System.dll', [System.Windows.Automation.AutomationElement].Assembly.Location, [System.Windows.Automation.AutomationProperty].Assembly.Location) -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
@@ -829,7 +829,9 @@ namespace OwnedUia {
 
     function Quote-ProcessArgument([string] $argument) {
         # Start-Process joins ArgumentList with spaces in Windows PowerShell 5.1.
-        # Quote every argv entry, doubling backslashes before quotes/the final quote.
+        # Quote only entries that need it (cmd.exe does not recognize a quoted "/c"),
+        # doubling backslashes before quotes/the final quote.
+        if ($argument.Length -gt 0 -and $argument -notmatch '[\s"]') { return $argument }
         $escaped = [regex]::Replace($argument, '(\\*)"', '$1$1\"')
         $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
         return '"' + $escaped + '"'
