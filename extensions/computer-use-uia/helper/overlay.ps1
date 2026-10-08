@@ -80,10 +80,17 @@ namespace AmiraPointer {
         protected override CreateParams CreateParams {
             get { var p = base.CreateParams; p.ExStyle |= Styles; return p; }
         }
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetProcessTimes(IntPtr process, out long created, out long exited, out long kernel, out long user);
+        static long CreationTime(IntPtr handle) {
+            long created, exited, kernel, user;
+            if (!GetProcessTimes(handle, out created, out exited, out kernel, out user)) throw new Win32Exception();
+            return created; // Raw UTC FILETIME; do not round-trip through local time.
+        }
         static bool ExactAlive(int pid, string started) {
             try { using (var p = Process.GetProcessById(pid)) {
                 var handle = p.Handle;
-                return !p.HasExited && p.StartTime.ToUniversalTime().Ticks.ToString() == started;
+                return !p.HasExited && CreationTime(handle).ToString() == started;
             }} catch { return false; }
         }
         void Reply(object value) { Console.WriteLine(json.Serialize(value)); Console.Out.Flush(); }
@@ -180,7 +187,7 @@ namespace AmiraPointer {
             if (ownerPid <= 0) return;
             try { using (var p = Process.GetProcessById(ownerPid)) {
                 var handle = p.Handle;
-                if (!p.HasExited && p.StartTime.ToUniversalTime().Ticks.ToString() == ownerStarted) p.Kill();
+                if (!p.HasExited && CreationTime(handle).ToString() == ownerStarted) p.Kill();
             }} catch { }
         }
         void StopControl() {

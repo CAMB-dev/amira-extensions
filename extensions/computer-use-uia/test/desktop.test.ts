@@ -636,7 +636,11 @@ test.skipIf(!enabled)(
       const tree = (await client!.call("tree", { window: app.window })) as TreeResult
       const helperPid = captured!.pid()
       const began = Date.now()
-      await client!.call("click", { window: app.window, ref: ref(tree, "Change label") })
+      const clicked = (await client!.call("click", {
+        window: app.window,
+        ref: ref(tree, "Change label"),
+      })) as { instruction?: string }
+      if (clicked.instruction) expect(clicked.instruction).toContain("action timed out")
       expect(Date.now() - began).toBeLessThan(15_000)
       const windows = (await client!.call("windows", { filter: `${app.title}-modal` })) as {
         windows: WindowResult[]
@@ -652,6 +656,58 @@ test.skipIf(!enabled)(
       await client?.stop()
       instance.unload("test:uia-modal")
       if (launchedPid) await until(() => !alive(launchedPid))
+    }
+  },
+  180_000,
+)
+
+test.skipIf(!enabled)(
+  "stop preserves a windowed launch's headless child; session end removes the tree and journal",
+  async () => {
+    const instance = host(false)
+    let client: UiaClient | undefined
+    let statePath = ""
+    const pidPath = join(tmpdir(), `amira-uia-test-window-child-${crypto.randomUUID()}.txt`)
+    const title = `Amira-UIA-test-${crypto.randomUUID()}`
+    let rootPid = 0
+    let childPid = 0
+    await instance.load((api) => {
+      client = setup({
+        ...api,
+        openPipe(argv, options) {
+          if (argv.some((arg) => arg.endsWith("uia.ps1"))) statePath = argv[argv.indexOf("-StatePath") + 1]!
+          return api.openPipe(argv, options)
+        },
+      })
+    }, "test:uia-window-child")
+    try {
+      const child = `[IO.File]::WriteAllText('${pidPath.replaceAll("'", "''")}', [string]$PID); Start-Sleep -Seconds 600`
+      const encoded = Buffer.from(child, "utf16le").toString("base64")
+      const fixturePath = `${import.meta.dir}/../helper/test-window.ps1`.replaceAll("'", "''")
+      const script = `Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile -EncodedCommand ${encoded}'; & '${fixturePath}' -Title '${title}'`
+      const launched = (await client!.call("launch", {
+        command: "powershell.exe",
+        args: ["-NoProfile", "-STA", "-WindowStyle", "Hidden", "-Command", script],
+      })) as LaunchResult
+      rootPid = launched.pid
+      await until(() => existsSync(pidPath))
+      childPid = Number(readFileSync(pidPath, "utf8"))
+      expect(childPid).toBeGreaterThan(0)
+      // Past the launch grace: survival must be due to the visible-window ancestor.
+      await Bun.sleep(3100)
+      client!.emergencyStop()
+      await client!.call("windows", { filter: title }) // Wait for stop cleanup acknowledgement.
+      expect(alive(rootPid)).toBe(true)
+      expect(alive(childPid)).toBe(true)
+      await client!.stop()
+      await until(() => !alive(rootPid) && !alive(childPid))
+      await until(() => !existsSync(statePath) && !existsSync(`${statePath}.tmp`))
+    } finally {
+      await client?.stop()
+      instance.unload("test:uia-window-child")
+      if (childPid) await until(() => !alive(childPid))
+      if (rootPid) await until(() => !alive(rootPid))
+      if (existsSync(pidPath)) unlinkSync(pidPath)
     }
   },
   180_000,
@@ -674,7 +730,7 @@ test.skipIf(!enabled)(
       const launch = () =>
         client!.call("launch", {
           command: "cmd.exe",
-          args: ["/c", "start", "", "/b", "powershell.exe", "-NoProfile", "-Command", script],
+          args: ["/c", "start", "", "/wait", "/b", "powershell.exe", "-NoProfile", "-Command", script],
         })
       await launch()
       await until(() => existsSync(pidPath))

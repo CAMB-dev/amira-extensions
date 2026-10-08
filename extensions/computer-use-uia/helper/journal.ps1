@@ -3,7 +3,9 @@ function Read-JournalKey($reader) {
     try {
         $bootstrap = $reader.ReadLine() | ConvertFrom-Json
         $key = [Convert]::FromBase64String($bootstrap.key)
-        if ($bootstrap.event -cne 'journal-key' -or $key.Length -ne 32) { throw 'Invalid key' }
+        if ($bootstrap.event -cne 'journal-key' -or $key.Length -ne 32 -or
+            $bootstrap.nonce -isnot [string] -or $bootstrap.nonce -cnotmatch '^[0-9a-f-]{36}$') { throw 'Invalid key' }
+        $script:journalNonce = $bootstrap.nonce
         return ,$key
     } catch { throw 'untrusted launch journal; cleanup refused' }
 }
@@ -26,6 +28,7 @@ function Read-OwnedJournal([string] $path) {
         for ($i = 0; $i -lt 32; $i++) { $difference = $difference -bor ($actual[$i] -bxor $expected[$i]) }
         if ($difference -ne 0) { throw 'Invalid MAC' }
         $state = $envelope.Content | ConvertFrom-Json
+        if ($state.Nonce -cne $script:journalNonce -or $state.StatePath -cne $path) { throw 'Session mismatch' }
         if ($state.OwnershipVersion -isnot [int] -or $state.OwnershipVersion -ne 3 -or $null -eq $state.Helper -or
             $state.Processes -isnot [System.Array] -or $state.Jobs -isnot [System.Array]) { throw 'Invalid schema' }
         foreach ($identity in (@($state.Helper) + @($state.Processes))) {
@@ -42,6 +45,8 @@ function Read-OwnedJournal([string] $path) {
 }
 
 function Write-OwnedJournal([string] $path, $state) {
+    $state.Nonce = $script:journalNonce
+    $state.StatePath = $path
     $content = $state | ConvertTo-Json -Depth 5 -Compress
     $envelope = @{ Content = $content; Mac = [Convert]::ToBase64String((Get-JournalMac $content)) } | ConvertTo-Json -Compress
     [IO.File]::WriteAllText($path + '.tmp', $envelope, $utf8)

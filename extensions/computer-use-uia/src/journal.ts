@@ -7,16 +7,31 @@ interface Identity {
 
 interface LaunchJournal {
   OwnershipVersion: 3
+  Nonce: string
+  StatePath: string
   Helper: Identity
   Processes: Identity[]
   Jobs: string[]
 }
 
 /** Same exact UTF-8 Content bytes as the PowerShell codec; never reserialize before verifying. */
-export function readLaunchJournal(serialized: string, key: Uint8Array): LaunchJournal {
+export function readLaunchJournal(
+  serialized: string,
+  key: Uint8Array,
+  nonce: string,
+  statePath: string,
+): LaunchJournal {
   try {
     const envelope = JSON.parse(serialized)
-    if (key.length !== 32 || typeof envelope.Content !== "string" || typeof envelope.Mac !== "string")
+    if (
+      key.length !== 32 ||
+      typeof nonce !== "string" ||
+      !/^[0-9a-f-]{36}$/.test(nonce) ||
+      typeof statePath !== "string" ||
+      !statePath ||
+      typeof envelope.Content !== "string" ||
+      typeof envelope.Mac !== "string"
+    )
       throw new Error()
     const expected = createHmac("sha256", key).update(envelope.Content, "utf8").digest()
     const actual = Buffer.from(envelope.Mac, "base64")
@@ -24,6 +39,8 @@ export function readLaunchJournal(serialized: string, key: Uint8Array): LaunchJo
     const state = JSON.parse(envelope.Content) as LaunchJournal
     if (
       state.OwnershipVersion !== 3 ||
+      state.Nonce !== nonce ||
+      state.StatePath !== statePath ||
       !Array.isArray(state.Processes) ||
       !Array.isArray(state.Jobs) ||
       ![state.Helper, ...state.Processes].every(

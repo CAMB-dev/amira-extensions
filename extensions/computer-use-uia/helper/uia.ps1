@@ -72,7 +72,7 @@ function Get-Identity([int] $processId) {
         $process = [System.Diagnostics.Process]::GetProcessById($processId)
         # Open/cache the handle before reading StartTime. Do not trust a PID alone.
         $null = $process.Handle
-        $started = $process.StartTime.ToUniversalTime().Ticks
+        $started = [OwnedUia.LaunchGuard]::CreationTime($process.Handle)
         if ($process.HasExited) { return $null }
         return [pscustomobject]@{
             Pid = $processId
@@ -94,7 +94,7 @@ function Test-IdentityGone($identity) {
     try {
         $process = [Diagnostics.Process]::GetProcessById([int]$identity.Pid)
         $null = $process.Handle
-        return ($process.HasExited -or $process.StartTime.ToUniversalTime().Ticks -ne [long]$identity.Started)
+        return ($process.HasExited -or [OwnedUia.LaunchGuard]::CreationTime($process.Handle) -ne [long]$identity.Started)
     } catch [ArgumentException] { return $true }
     catch { return $false } # Inaccessible is not proof that an owned process exited.
     finally { if ($null -ne $process) { $process.Dispose() } }
@@ -105,22 +105,6 @@ function Assert-Lifetime {
         $script:stopping = $true
         Deny 'Lifetime process exited.'
     }
-}
-
-function Stop-ExactProcess($identity) {
-    $process = $null
-    try {
-        $process = [System.Diagnostics.Process]::GetProcessById($identity.Pid)
-        # Kill through this same cached handle, not a fresh lookup or image name.
-        $null = $process.Handle
-        if (-not $process.HasExited -and
-            $process.StartTime.ToUniversalTime().Ticks -eq $identity.Started) {
-            $process.Kill()
-            $null = $process.WaitForExit(1000)
-        }
-    } catch {
-        # Cleanup is best effort (the process may already have exited).
-    } finally { if ($null -ne $process) { $process.Dispose() } }
 }
 
 # The watchdog, not a transient helper, owns session cleanup. Restart only reloads
@@ -151,9 +135,27 @@ try {
             Deny 'Lifetime process is unavailable or its identity changed.'
         }
     }
+    # Complete the PID-bound writer handoff before ANY journal write. Startup may
+    # die during Add-Type/provider/DPI initialization without stranding owned jobs.
+    $writer.WriteLine((@{ event = 'helper'; pid = $script:self.Pid; started = $script:self.Started.ToString() } | ConvertTo-Json -Compress))
+    $handoff = $false
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    while ($clock.ElapsedMilliseconds -lt 5000) {
+        $pending = Get-PendingRead
+        if (-not $pending.Wait(25)) { continue }
+        $line = Receive-PendingLine
+        if ($null -eq $line) { Deny 'Session input closed during writer handoff.' }
+        $message = $line | ConvertFrom-Json
+        if ((Get-Argument $message 'method') -ceq 'writer_ack') { $handoff = $true; break }
+        $script:queuedLines.Enqueue($line)
+    }
+    if (-not $handoff) { Deny 'Writer handoff timed out; journal unchanged.' }
+    $previous = $null
     if (-not [string]::IsNullOrEmpty($StatePath) -and [IO.File]::Exists($StatePath)) {
         try { $previous = Read-OwnedJournal $StatePath }
-        catch { Deny 'untrusted launch journal; cleanup refused' }
+        catch { [Console]::Error.WriteLine('untrusted launch journal; cleanup refused; records ignored') }
+    }
+    if ($null -ne $previous) {
         # The client awaits the old helper's exit before starting a replacement.
         if (-not (Test-IdentityGone $previous.Helper)) { Deny 'Previous helper is still active; journal retained.' }
         foreach ($identity in $previous.Processes) {
@@ -181,6 +183,7 @@ using System.Runtime.InteropServices;
 namespace OwnedUia {
     public sealed class PatternCall {
         static int active;
+        int dispatchState; // 0 pending, 1 dispatched, 2 cancelled; timeout and dispatch have one winner.
         public bool Completed { get; private set; }
         public bool Failed { get; private set; }
         public static PatternCall Run(object pattern, string action, string text,
@@ -190,49 +193,60 @@ namespace OwnedUia {
                 System.Threading.Interlocked.Decrement(ref active);
                 throw new InvalidOperationException("UIA_SAFE: Too many busy pattern calls; close the target dialog first.");
             }
-            var result = new PatternCall();
-            var worker = new System.Threading.Thread(delegate() {
-                try {
-                    // Repeat the existing identity/root/ancestry checks on the worker;
-                    // never act on a recycled HWND or a ref moved to a foreign window.
-                    using (var target = System.Diagnostics.Process.GetProcessById(pid)) {
-                        var handle = target.Handle;
-                        if (target.HasExited || target.StartTime.ToUniversalTime().Ticks != started ||
-                            !Native.IsWindow(window) || Native.WindowPid(window) != pid ||
-                            !System.Windows.Automation.Automation.Compare(root,
-                                System.Windows.Automation.AutomationElement.FromHandle(window))) throw new InvalidOperationException();
-                        var cursor = element;
-                        bool verified = false;
-                        for (int i = 0; cursor != null && i < 128; i++) {
-                            if (System.Windows.Automation.Automation.Compare(cursor, root)) { verified = true; break; }
-                            object value = cursor.GetCurrentPropertyValue(
-                                System.Windows.Automation.AutomationElement.NativeWindowHandleProperty, true);
-                            if (value is int && (int)value != 0 &&
-                                Native.GetAncestor(new IntPtr((int)value), 2) != window) throw new InvalidOperationException();
-                            cursor = System.Windows.Automation.TreeWalker.RawViewWalker.GetParent(cursor);
+            bool workerStarted = false;
+            try {
+                var result = new PatternCall();
+                var worker = new System.Threading.Thread(delegate() {
+                    try {
+                        // Repeat the existing identity/root/ancestry checks on the worker;
+                        // never act on a recycled HWND or a ref moved to a foreign window.
+                        using (var target = System.Diagnostics.Process.GetProcessById(pid)) {
+                            var handle = target.Handle;
+                            if (target.HasExited || Native.CreationTime(handle) != started ||
+                                !Native.IsWindow(window) || Native.WindowPid(window) != pid ||
+                                !System.Windows.Automation.Automation.Compare(root,
+                                    System.Windows.Automation.AutomationElement.FromHandle(window))) throw new InvalidOperationException();
+                            var cursor = element;
+                            bool verified = false;
+                            for (int i = 0; cursor != null && i < 128; i++) {
+                                if (System.Windows.Automation.Automation.Compare(cursor, root)) { verified = true; break; }
+                                object value = cursor.GetCurrentPropertyValue(
+                                    System.Windows.Automation.AutomationElement.NativeWindowHandleProperty, true);
+                                if (value is int && (int)value != 0 &&
+                                    Native.GetAncestor(new IntPtr((int)value), 2) != window) throw new InvalidOperationException();
+                                cursor = System.Windows.Automation.TreeWalker.RawViewWalker.GetParent(cursor);
+                            }
+                            if (!verified || target.HasExited || Native.CreationTime(handle) != started ||
+                                Native.WindowPid(window) != pid || !System.Windows.Automation.Automation.Compare(root,
+                                    System.Windows.Automation.AutomationElement.FromHandle(window))) throw new InvalidOperationException();
+                            // A timed-out preflight must not dispatch a delayed action.
+                            if (System.Threading.Interlocked.CompareExchange(ref result.dispatchState, 1, 0) != 0) return;
+                            switch (action) {
+                                case "invoke": ((System.Windows.Automation.InvokePattern)pattern).Invoke(); break;
+                                case "toggle": ((System.Windows.Automation.TogglePattern)pattern).Toggle(); break;
+                                case "select": ((System.Windows.Automation.SelectionItemPattern)pattern).Select(); break;
+                                case "expand": ((System.Windows.Automation.ExpandCollapsePattern)pattern).Expand(); break;
+                                case "collapse": ((System.Windows.Automation.ExpandCollapsePattern)pattern).Collapse(); break;
+                                case "value": ((System.Windows.Automation.ValuePattern)pattern).SetValue(text); break;
+                                case "close": ((System.Windows.Automation.WindowPattern)pattern).Close(); break;
+                                case "focus": element.SetFocus(); break;
+                                default: throw new InvalidOperationException();
+                            }
                         }
-                        if (!verified || target.HasExited || target.StartTime.ToUniversalTime().Ticks != started ||
-                            Native.WindowPid(window) != pid || !System.Windows.Automation.Automation.Compare(root,
-                                System.Windows.Automation.AutomationElement.FromHandle(window))) throw new InvalidOperationException();
-                        switch (action) {
-                            case "invoke": ((System.Windows.Automation.InvokePattern)pattern).Invoke(); break;
-                            case "toggle": ((System.Windows.Automation.TogglePattern)pattern).Toggle(); break;
-                            case "select": ((System.Windows.Automation.SelectionItemPattern)pattern).Select(); break;
-                            case "expand": ((System.Windows.Automation.ExpandCollapsePattern)pattern).Expand(); break;
-                            case "collapse": ((System.Windows.Automation.ExpandCollapsePattern)pattern).Collapse(); break;
-                            case "value": ((System.Windows.Automation.ValuePattern)pattern).SetValue(text); break;
-                            case "close": ((System.Windows.Automation.WindowPattern)pattern).Close(); break;
-                            default: throw new InvalidOperationException();
-                        }
-                    }
-                } catch { result.Failed = true; }
-                finally { System.Threading.Interlocked.Decrement(ref active); }
-            });
-            worker.IsBackground = true;
-            worker.SetApartmentState(System.Threading.ApartmentState.MTA);
-            worker.Start();
-            result.Completed = worker.Join(5000);
-            return result;
+                    } catch { result.Failed = true; }
+                    finally { System.Threading.Interlocked.Decrement(ref active); }
+                });
+                worker.IsBackground = true;
+                worker.SetApartmentState(System.Threading.ApartmentState.MTA);
+                worker.Start();
+                workerStarted = true;
+                result.Completed = worker.Join(5000);
+                if (!result.Completed) System.Threading.Interlocked.CompareExchange(ref result.dispatchState, 2, 0);
+                return result;
+            } finally {
+                // After Start succeeds, only the actual worker exit releases its slot.
+                if (!workerStarted) System.Threading.Interlocked.Decrement(ref active);
+            }
         }
     }
     public static class Native {
@@ -292,6 +306,13 @@ namespace OwnedUia {
         public static extern IntPtr GetForegroundWindow();
         [DllImport("kernel32.dll")]
         public static extern IntPtr GetConsoleWindow();
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetProcessTimes(IntPtr process, out long created, out long exited, out long kernel, out long user);
+        public static long CreationTime(IntPtr handle) {
+            long created, exited, kernel, user;
+            if (!GetProcessTimes(handle, out created, out exited, out kernel, out user)) throw new System.ComponentModel.Win32Exception();
+            return created; // Raw UTC FILETIME, matching the launcher and lifetime identities.
+        }
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
@@ -496,7 +517,6 @@ namespace OwnedUia {
     if ([OwnedUia.Native]::SetThreadDpiAwarenessContext([IntPtr]::new(-4)) -eq [IntPtr]::Zero) {
         Deny 'Per-monitor DPI awareness is unavailable.'
     }
-    $writer.WriteLine((@{ event = 'helper'; pid = $script:self.Pid; started = $script:self.Started.ToString() } | ConvertTo-Json -Compress))
     $script:actionId = 0
     if ($AmiraPid -lt 0) { Deny 'Invalid Amira process.' }
     if ($AmiraPid -gt 0) {
@@ -788,7 +808,7 @@ namespace OwnedUia {
     function Focus-Element($window, $element, [bool] $requireExact) {
         Focus-Window $window
         Assert-Element $window $element
-        $element.SetFocus()
+        $null = Invoke-BoundedPattern $window $element $null 'focus' 'AutomationElement.SetFocus'
         Assert-NativeFocus $window
         if ($requireExact -and
             (Read-Property $window $element ([System.Windows.Automation.AutomationElement]::HasKeyboardFocusProperty)) -ne $true) {
@@ -847,7 +867,7 @@ namespace OwnedUia {
         foreach ($native in [OwnedUia.Native]::Windows()) {
             $beforeHandles[$native.Handle.ToInt64().ToString()] = $true
         }
-        $began = [DateTime]::UtcNow.Ticks
+        $began = [DateTime]::UtcNow.ToFileTimeUtc()
         $argumentLine = ($arguments | ForEach-Object { Quote-ProcessArgument $_ }) -join ' '
         Show-Action $null $null 'launch' 'Launch'
         # Request an unnamed job BEFORE process creation. The watchdog authenticates
@@ -867,7 +887,13 @@ namespace OwnedUia {
                 (Get-Argument $ack 'job') -ceq $jobId) {
                 $handle = Get-Argument $ack 'handle'
                 if ($handle -isnot [long] -and $handle -isnot [int]) { Deny 'Invalid launch job handle.' }
-                $launcher = [OwnedUia.LaunchGuard]::FromHandle($jobId, [long]$handle)
+                $parentHandle = Get-Argument $ack 'parentHandle'
+                $parentPid = Get-Argument $ack 'parentPid'
+                $parentStarted = Get-Argument $ack 'parentStarted'
+                if (($parentHandle -isnot [long] -and $parentHandle -isnot [int]) -or $parentHandle -le 0 -or
+                    $parentPid -isnot [int] -or $parentPid -le 0 -or $parentStarted -isnot [string] -or
+                    $parentStarted -cnotmatch '^[1-9][0-9]*$') { Deny 'Invalid launch parent identity.' }
+                $launcher = [OwnedUia.LaunchGuard]::FromHandle($jobId, [long]$handle, [long]$parentHandle, $parentPid, [long]$parentStarted)
                 break
             }
             if ((Get-Argument $ack 'method') -cne 'job_ack') { $script:queuedLines.Enqueue($line) }
@@ -888,6 +914,22 @@ namespace OwnedUia {
             }
             $script:processes[$launcherIdentity.Key] = $launcherIdentity
             Save-OwnedState
+            $writer.WriteLine((@{ event = 'launch-root'; job = $jobId; pid = $launcher.Id; started = $started.ToString() } | ConvertTo-Json -Compress))
+            $registered = $false
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            while ($clock.ElapsedMilliseconds -lt 5000) {
+                Assert-Lifetime
+                $pending = Get-PendingRead
+                if (-not $pending.Wait(25)) { continue }
+                $line = Receive-PendingLine
+                if ($null -eq $line) { Deny 'Session input closed during launch root registration.' }
+                $ack = $line | ConvertFrom-Json
+                if ((Get-Argument $ack 'method') -ceq 'root_ack' -and (Get-Argument $ack 'job') -ceq $jobId) {
+                    $registered = $true; break
+                }
+                $script:queuedLines.Enqueue($line)
+            }
+            if (-not $registered) { Deny 'Launch root registration timed out; process remains suspended.' }
             Assert-Lifetime
             $launcher.Commit() # Already session-owned, atomically assigned, and journaled.
 
@@ -1078,7 +1120,8 @@ namespace OwnedUia {
         if ($call.Completed -and $call.Failed) { Deny 'Pattern action failed or target could not be verified.' }
         $result = @{ path = $path }
         if (-not $call.Completed) {
-            $result.instruction = 'action sent; the target is busy or opened a modal dialog ¡ª use ui_windows'
+            if ($action -eq 'focus') { Deny 'Element focus timed out; input was not sent.' }
+            $result.instruction = 'action timed out; it may still be running or the target may be busy - use ui_windows'
         }
         return $result
     }
@@ -1264,7 +1307,14 @@ namespace OwnedUia {
                 $null = Invoke-BoundedPattern $window $window.Root $pattern 'close' 'WindowPattern.Close'
                 return 'WindowPattern.Close'
             }
-        } catch { }
+        } catch {
+            $exception = $_.Exception
+            while ($exception -is [System.Management.Automation.MethodInvocationException] -and
+                $null -ne $exception.InnerException) {
+                $exception = $exception.InnerException
+            }
+            if ($exception.Message.StartsWith('UIA_SAFE: ', [StringComparison]::Ordinal)) { throw }
+        }
         # A provider call may have blocked before throwing; revalidate before native fallback.
         Assert-ActionWindow $window
         # Asynchronous WM_CLOSE, never WM_QUIT or an image-name/process sweep.
@@ -1304,7 +1354,7 @@ namespace OwnedUia {
                     $script:stopping = $true
                     break
                 }
-                Start-Sleep -Milliseconds 100
+                Start-Sleep -Milliseconds 250
             }
             if ($script:stopping) { break }
             Assert-Lifetime
@@ -1317,7 +1367,7 @@ namespace OwnedUia {
             $request = $line | ConvertFrom-Json
             if ($null -eq $request -or $request -isnot [pscustomobject]) { Deny 'Request must be a JSON object.' }
             # Late animation acknowledgements are protocol events, not RPC requests.
-            if ((Get-Argument $request 'method') -cin @('overlay_ack', 'job_ack')) { continue }
+            if ((Get-Argument $request 'method') -cin @('overlay_ack', 'job_ack', 'root_ack', 'writer_ack')) { continue }
             $id = Get-Argument $request 'id'
             if ($null -eq $request.PSObject.Properties['id'] -or
                 ($id -isnot [string] -and $id -isnot [int] -and $id -isnot [long])) {
@@ -1355,8 +1405,13 @@ namespace OwnedUia {
             $reply = @{ id = $id; result = $result }
         } catch {
             $message = 'Operation failed or target could not be verified.'
-            if ($_.Exception.Message.StartsWith('UIA_SAFE: ', [StringComparison]::Ordinal)) {
-                $message = $_.Exception.Message.Substring(10)
+            $exception = $_.Exception
+            while ($exception -is [System.Management.Automation.MethodInvocationException] -and
+                $null -ne $exception.InnerException) {
+                $exception = $exception.InnerException
+            }
+            if ($exception.Message.StartsWith('UIA_SAFE: ', [StringComparison]::Ordinal)) {
+                $message = $exception.Message.Substring(10)
             }
             $reply = @{ id = $id; error = $message }
         }

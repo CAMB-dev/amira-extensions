@@ -1,9 +1,15 @@
 import { expect, test } from "bun:test"
-import { readFileSync } from "node:fs"
+import { readdirSync, readFileSync } from "node:fs"
 
 // Source contracts only; never execute PowerShell or touch the desktop.
 const helper = readFileSync(new URL("../helper/uia.ps1", import.meta.url), "utf8")
 const launch = readFileSync(new URL("../helper/launch.ps1", import.meta.url), "utf8")
+
+test("every PowerShell helper is pure ASCII, including model-visible strings", () => {
+  const directory = new URL("../helper/", import.meta.url)
+  for (const name of readdirSync(directory).filter((name) => name.endsWith(".ps1")))
+    expect(readFileSync(new URL(name, directory)).some((byte) => byte > 127), name).toBe(false)
+})
 
 test("no startup sweep can consume another client's journal", () => {
   expect(helper).not.toContain("Clear-StaleJournals")
@@ -33,17 +39,18 @@ test("every journal reader verifies exact content before parsing identities and 
 })
 
 test("headless stop checks exact handle identity and job membership, not image names", () => {
-  const stop = launch.slice(
-    launch.indexOf("public void StopHeadless()"),
-    launch.indexOf("public int[] Members()"),
-  )
+  const stop = launch.slice(launch.indexOf("bool Visible(int pid)"), launch.indexOf("public int[] Members()"))
   for (const fragment of [
     "member.Handle",
-    "member.StartTime.ToUniversalTime().Ticks",
+    "CreationTime(handle)",
     "IsProcessInJob(handle, job",
     "EnumWindows",
     "IsWindowVisible",
-    "if (!visible",
+    "HeadlessAncestors(pid, started",
+    "parentStarted > started",
+    "parentStarted != rootStarted",
+    "rootStarted < 30000000L",
+    "still starting",
     "member.Kill()",
   ])
     expect(stop).toContain(fragment)
@@ -56,8 +63,8 @@ test("modal patterns run on a bounded background thread and retain target checks
     "worker.Join(5000)",
     "RawViewWalker.GetParent",
     "Native.GetAncestor",
-    "target.StartTime.ToUniversalTime().Ticks != started",
-    "action sent; the target is busy or opened a modal dialog",
+    "Native.CreationTime(handle) != started",
+    "action timed out; it may still be running or the target may be busy",
   ])
     expect(helper).toContain(fragment)
   for (const action of ["invoke", "toggle", "select", "expand", "collapse", "value"])
@@ -74,11 +81,35 @@ test("refusing edited journals cannot implicitly kill apps; job objects cannot b
   expect(launch).not.toContain("OpenJobObject")
   expect(launch).toContain("CreateJobObject(IntPtr.Zero, null)")
   expect(launch).toContain("DuplicateHandle(GetCurrentProcess(), guard.job, target")
-  expect(launch).toContain("helper.StartTime.ToUniversalTime().Ticks != helperStarted")
+  expect(launch).toContain("CreationTime(target) != helperStarted")
   expect(watchdog).toContain("::CreateFor(")
   expect(watchdog).not.toContain("::Open(")
   expect(helper).not.toContain("::Open(")
-  expect(helper).toContain("@('overlay_ack', 'job_ack')")
+  expect(helper).toContain("@('overlay_ack', 'job_ack', 'root_ack', 'writer_ack')")
+})
+
+test("session nonce and exact path are authenticated and untrusted job names are never adopted", () => {
+  expect(journal).toContain("$state.Nonce = $script:journalNonce")
+  expect(journal).toContain("$state.StatePath = $path")
+  expect(journal).toContain("$state.Nonce -cne $script:journalNonce -or $state.StatePath -cne $path")
+  expect(helper).toContain("if ($null -ne $previous)")
+  const create = watchdog.slice(
+    watchdog.indexOf("elseif ($message.event -ceq 'create-job')"),
+    watchdog.indexOf("elseif ($message.event -ceq 'stop')"),
+  )
+  expect(create).not.toContain("Read-OwnedJournal")
+  expect(create).toContain("if (-not $writerAccepted)")
+  expect(create).toContain("::CreateFor($message.job, [int]$script:writerIdentity.Pid")
+})
+
+test("all process identities use raw native UTC FILETIME, never ambiguous local StartTime", () => {
+  const overlay = readFileSync(new URL("../helper/overlay.ps1", import.meta.url), "utf8")
+  expect(helper + watchdog + launch + overlay).not.toContain(".StartTime.ToUniversalTime()")
+  expect(launch).toContain("guard.Started = CreationTime(guard.process)")
+  for (const source of [helper, launch, overlay]) {
+    expect(source).toContain("GetProcessTimes(")
+    expect(source).toContain("return created;")
+  }
 })
 
 test("PowerShell and TypeScript accept the same opaque job IDs", () => {
@@ -92,10 +123,14 @@ test("PowerShell and TypeScript accept the same opaque job IDs", () => {
 test("cleanup pins the actual writer independently of replayable signed journal content", () => {
   expect(watchdog).toContain("$message.event -ceq 'writer'")
   expect(watchdog).toContain("$script:writerIdentity = $identity")
-  expect(watchdog).toContain("$helper = Get-ExactProcess $script:writerIdentity")
+  expect(watchdog).toContain("Stop-HelperIdentity $script:writerIdentity")
+  expect(watchdog).toContain("$helper = Get-ExactProcess $identity")
   expect(watchdog).not.toContain("$helper = Get-ExactProcess $state.Helper")
   expect(watchdog).toContain("Stop-CurrentWriter")
-  expect(watchdog).toContain("Assert-CurrentWriter $state")
-  expect(watchdog).toContain("elseif ($jobs.Count -gt 0)")
-  expect(watchdog).toContain("cleanup refused (journal missing)")
+  expect(watchdog).toContain("Assert-CurrentWriter $snapshot")
+  expect(watchdog).toContain("try { Stop-RetainedJobs $force $state }")
+  expect(watchdog).not.toContain("elseif ($jobs.Count -gt 0)")
+  expect(watchdog).toContain("$writerAccepted -or [int]$message.pid -ne $expectedHelperPid")
+  expect(watchdog).toContain("[int]$message.generation -ne $helperGeneration")
+  expect(watchdog).toContain("$verified = Get-ExactProcess $identity")
 })

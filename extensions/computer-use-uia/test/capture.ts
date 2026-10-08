@@ -5,6 +5,7 @@ export function captureHelper(api: ExtensionAPI) {
   let pipe: PipeProcess | undefined
   let overlay: PipeProcess | undefined
   let pid = 0
+  let started = ""
   let overlayPid = 0
   let nextId = -1
   const pending = new Map<number, (value: { error?: string; result?: unknown }) => void>()
@@ -29,6 +30,7 @@ export function captureHelper(api: ExtensionAPI) {
           if (event.type === "exit") {
             if (isHelper) {
               pid = 0
+              started = ""
               for (const resolve of pending.values()) resolve({ error: "helper exited" })
               pending.clear()
             } else {
@@ -51,9 +53,13 @@ export function captureHelper(api: ExtensionAPI) {
             const response = JSON.parse(line) as {
               id: number
               event?: string
+              pid?: number
+              started?: string
               error?: string
               result?: unknown
             }
+            if (isHelper && response.event === "helper" && response.pid === pid && response.started)
+              started = response.started
             if (isOverlay && response.event === "inspection") {
               inspections.shift()?.(response as unknown as Record<string, unknown>)
               continue
@@ -84,8 +90,31 @@ export function captureHelper(api: ExtensionAPI) {
     actions,
     glides,
     crashHelper() {
-      if (!pipe) throw new Error("No test helper pipe")
-      pipe.close(0) // Exact test-started helper handle, never name/PID guessing.
+      if (!pid || !started) throw new Error("No exact test helper identity")
+      // Pipe close tree-kills on Windows. Crash only the exact helper, not its apps.
+      api.openPipe(
+        [
+          "powershell.exe",
+          "-NoLogo",
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          `${import.meta.dir}/../helper/lifetime.ps1`,
+          "-RetirePid",
+          String(pid),
+          "-RetireStarted",
+          started,
+        ],
+        {
+          cwd: api.cwd,
+          onEvent(event) {
+            if (event.type === "exit" && event.code !== 0)
+              api.reportError("Exact test helper retirement failed")
+          },
+        },
+      )
     },
     simulateStop() {
       if (!overlay) throw new Error("No test overlay pipe")

@@ -56,6 +56,8 @@ namespace OwnedUia {
         static extern bool DuplicateHandle(IntPtr sourceProcess, IntPtr source, IntPtr targetProcess,
             out IntPtr target, uint access, bool inherit, uint options);
         [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+        [DllImport("kernel32.dll", SetLastError = true)] static extern uint GetProcessId(IntPtr process);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetExitCodeProcess(IntPtr process, out uint code);
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr data, uint size, out uint returned);
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -66,9 +68,52 @@ namespace OwnedUia {
         [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc callback, IntPtr data);
         [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
         [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
-        IntPtr job, process, thread;
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        static extern bool Process32First(IntPtr snapshot, ref PROCESSENTRY32 entry);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        static extern bool Process32Next(IntPtr snapshot, ref PROCESSENTRY32 entry);
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct PROCESSENTRY32 {
+            public uint Size, Usage, Pid; public UIntPtr Heap;
+            public uint Module, Threads, ParentPid; public int Priority; public uint Flags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string Exe;
+        }
+        public static long CreationTime(IntPtr handle) {
+            long created, exited, kernel, user;
+            if (!GetProcessTimes(handle, out created, out exited, out kernel, out user)) throw new Win32Exception();
+            return created; // UTC FILETIME, never local StartTime -> UTC (ambiguous across DST).
+        }
+        IntPtr job, process, thread, parent;
+        int rootPid;
+        long rootStarted;
+        public void SetRoot(int pid, long started) {
+            if (rootPid != 0) throw new InvalidOperationException("Launch root already registered.");
+            using (var root = Process.GetProcessById(pid)) {
+                bool belongs;
+                if (root.HasExited || CreationTime(root.Handle) != started ||
+                    !IsProcessInJob(root.Handle, job, out belongs) || !belongs)
+                    throw new InvalidOperationException("Launch root identity changed.");
+            }
+            rootPid = pid; rootStarted = started;
+        }
         public string Name { get; private set; }
         public long HelperHandle { get; private set; }
+        public long ParentHandle { get; private set; }
+        public int ParentPid { get; private set; }
+        public long ParentStarted { get; private set; }
+        void CheckParent() {
+            uint code;
+            if (parent == IntPtr.Zero || GetProcessId(parent) != ParentPid ||
+                CreationTime(parent) != ParentStarted || !GetExitCodeProcess(parent, out code) || code != 259u)
+                throw new InvalidOperationException("Launch parent identity changed or exited.");
+        }
+        static void CloseRemote(IntPtr target, IntPtr handle) {
+            IntPtr local;
+            // DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS: roll back only our own duplicate.
+            if (DuplicateHandle(target, handle, GetCurrentProcess(), out local, 0, false, 3)) CloseHandle(local);
+        }
         public static LaunchGuard CreateFor(string id, int helperPid, long helperStarted) {
             var guard = new LaunchGuard();
             try {
@@ -78,49 +123,135 @@ namespace OwnedUia {
                 guard.Limits();
                 using (var helper = Process.GetProcessById(helperPid)) {
                     IntPtr target = helper.Handle;
-                    if (helper.HasExited || helper.StartTime.ToUniversalTime().Ticks != helperStarted)
+                    if (helper.HasExited || CreationTime(target) != helperStarted)
                         throw new InvalidOperationException("Helper identity changed.");
                     IntPtr duplicate;
                     // ASSIGN | QUERY | TERMINATE, not SET_ATTRIBUTES. Never inherit the handle.
                     if (!DuplicateHandle(GetCurrentProcess(), guard.job, target, out duplicate,
                         0x0001u | 0x0004u | 0x0008u, false, 0)) throw new Win32Exception();
                     guard.HelperHandle = duplicate.ToInt64();
+                    try {
+                        using (var owner = Process.GetCurrentProcess()) {
+                            guard.ParentPid = owner.Id;
+                            guard.ParentStarted = CreationTime(owner.Handle);
+                            IntPtr parentDuplicate;
+                            // PROCESS_CREATE_PROCESS | PROCESS_QUERY_LIMITED_INFORMATION only.
+                            if (!DuplicateHandle(GetCurrentProcess(), owner.Handle, target, out parentDuplicate,
+                                0x1080u, false, 0)) throw new Win32Exception();
+                            guard.ParentHandle = parentDuplicate.ToInt64();
+                        }
+                    } catch {
+                        CloseRemote(target, duplicate);
+                        throw;
+                    }
                 }
                 return guard;
             } catch { guard.Dispose(); throw; }
         }
-        public static LaunchGuard FromHandle(string id, long handle) {
-            return new LaunchGuard { Name = id, job = new IntPtr(handle) };
+        public static LaunchGuard FromHandle(string id, long handle, long parentHandle, int parentPid, long parentStarted) {
+            var guard = new LaunchGuard { Name = id, job = new IntPtr(handle), parent = new IntPtr(parentHandle),
+                ParentPid = parentPid, ParentStarted = parentStarted };
+            try { guard.CheckParent(); return guard; }
+            catch { guard.Dispose(); throw; }
         }
         public void Terminate() {
             if (!TerminateJobObject(job, 1)) throw new Win32Exception();
         }
-        // Capture each member's creation time through the SAME cached handle used to kill.
-        // Membership is rechecked after opening the PID (which may have been recycled).
+        bool Visible(int pid) {
+            bool visible = false;
+            if (!EnumWindows(delegate(IntPtr window, IntPtr data) {
+                uint owner; GetWindowThreadProcessId(window, out owner);
+                if (owner == pid && IsWindowVisible(window)) visible = true;
+                return true;
+            }, IntPtr.Zero)) throw new Win32Exception();
+            return visible;
+        }
+        Dictionary<int, int> Parents() {
+            var parents = new Dictionary<int, int>();
+            IntPtr snapshot = CreateToolhelp32Snapshot(2, 0);
+            if (snapshot == new IntPtr(-1)) throw new Win32Exception();
+            try {
+                var entry = new PROCESSENTRY32(); entry.Size = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
+                if (!Process32First(snapshot, ref entry)) throw new Win32Exception();
+                do { parents[(int)entry.Pid] = (int)entry.ParentPid; }
+                while (Process32Next(snapshot, ref entry));
+            } finally { CloseHandle(snapshot); }
+            return parents;
+        }
+        // A missing/recycled/inaccessible ancestor is not proof of a headless tree.
+        sealed class HeadlessMember { public int Pid, Depth; public long Started; }
+        bool HeadlessAncestors(int pid, long started, Dictionary<int, int> parents, out int depth) {
+            depth = 0;
+            var seen = new HashSet<int>();
+            while (seen.Add(pid)) {
+                if (Visible(pid)) return false;
+                if (pid == rootPid) return started == rootStarted;
+                int parentPid;
+                if (!parents.TryGetValue(pid, out parentPid) || parentPid <= 0) return false;
+                try {
+                    using (var parent = Process.GetProcessById(parentPid)) {
+                        IntPtr handle = parent.Handle;
+                        long parentStarted = CreationTime(handle);
+                        bool belongs;
+                        if (parent.HasExited || parentStarted > started ||
+                            !IsProcessInJob(handle, job, out belongs) || !belongs) return false;
+                        if (parentPid == rootPid && parentStarted != rootStarted) return false;
+                        pid = parentPid; started = parentStarted; depth++;
+                    }
+                } catch (ArgumentException) {
+                    // PID alone cannot prove the creation time of an exited ancestor.
+                    return false;
+                }
+            }
+            return false;
+        }
+        // Capture identity through the SAME cached handle used to kill, recheck job
+        // membership and each live ancestor, and stop at the exact registered launch root.
         public void StopHeadless() {
+            if (rootPid == 0 || DateTime.UtcNow.ToFileTimeUtc() - rootStarted < 30000000L) {
+                Console.Error.WriteLine("Launch job still starting; emergency stop preserved its members.");
+                return;
+            }
             bool failed = false;
+            var parents = Parents();
+            var eligible = new List<HeadlessMember>();
+            // Snapshot eligibility before any kills: never erase a parent needed by a child.
             foreach (int pid in Members()) {
                 try {
                     using (var member = Process.GetProcessById(pid)) {
                         IntPtr handle = member.Handle;
-                        long started = member.StartTime.ToUniversalTime().Ticks;
+                        long started = CreationTime(handle);
                         bool belongs;
                         if (!IsProcessInJob(handle, job, out belongs)) { failed = true; continue; }
-                        if (!belongs || member.HasExited) continue;
-                        bool visible = false;
-                        if (!EnumWindows(delegate(IntPtr window, IntPtr data) {
-                            uint owner; GetWindowThreadProcessId(window, out owner);
-                            if (owner == pid && IsWindowVisible(window)) visible = true;
-                            return true;
-                        }, IntPtr.Zero)) throw new Win32Exception();
-                        if (!visible && !member.HasExited && member.StartTime.ToUniversalTime().Ticks == started) {
+                        int depth;
+                        if (belongs && !member.HasExited && HeadlessAncestors(pid, started, parents, out depth))
+                            eligible.Add(new HeadlessMember { Pid = pid, Started = started, Depth = depth });
+                    }
+                } catch (ArgumentException) { }
+                catch (InvalidOperationException) { }
+                catch (Win32Exception) { failed = true; }
+            }
+            // Children first; an exited root/ancestor is conservatively preserved on later stops.
+            eligible.Sort(delegate(HeadlessMember a, HeadlessMember b) { return b.Depth.CompareTo(a.Depth); });
+            foreach (var candidate in eligible) {
+                int pid = candidate.Pid;
+                try {
+                    using (var member = Process.GetProcessById(pid)) {
+                        IntPtr handle = member.Handle;
+                        long started = CreationTime(handle);
+                        bool belongs;
+                        if (!IsProcessInJob(handle, job, out belongs)) { failed = true; continue; }
+                        int depth;
+                        if (!belongs || member.HasExited || started != candidate.Started ||
+                            !HeadlessAncestors(pid, started, Parents(), out depth)) continue;
+                        if (!member.HasExited && CreationTime(handle) == started) {
                             member.Kill();
                             if (!member.WaitForExit(1000)) throw new Win32Exception();
                         }
                     }
-                } catch (ArgumentException) { } // Exited before opening; never guess ownership.
-                catch (InvalidOperationException) { } // Exited between opening and inspecting.
-                catch (Win32Exception) { failed = true; } // Continue; report genuine access/kill failures.
+                } catch (ArgumentException) { }
+                catch (InvalidOperationException) { }
+                catch (Win32Exception) { failed = true; }
             }
             if (failed) throw new InvalidOperationException("Headless member cleanup incomplete.");
         }
@@ -149,19 +280,20 @@ namespace OwnedUia {
         void Limits() {
             var limits = new EXTENDED_LIMIT();
             // No breakaway and NO implicit kill on handle close. The watchdog owns
-            // the job before creation; only MAC-verified explicit cleanup may terminate it.
+            // the job before creation; its retained handle authorizes explicit cleanup.
             limits.Basic.Flags = 0u;
             if (!SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf(typeof(EXTENDED_LIMIT))))
                 throw new Win32Exception();
         }
         public static LaunchGuard Start(string path, string arguments, string cwd, LaunchGuard guard) {
-            IntPtr attributes = IntPtr.Zero, value = IntPtr.Zero;
+            IntPtr attributes = IntPtr.Zero, value = IntPtr.Zero, parentValue = IntPtr.Zero;
             bool initialized = false;
             try {
                 IntPtr size = IntPtr.Zero;
-                InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
+                guard.CheckParent();
+                InitializeProcThreadAttributeList(IntPtr.Zero, 2, 0, ref size);
                 attributes = Marshal.AllocHGlobal(size);
-                if (!InitializeProcThreadAttributeList(attributes, 1, 0, ref size)) throw new Win32Exception();
+                if (!InitializeProcThreadAttributeList(attributes, 2, 0, ref size)) throw new Win32Exception();
                 initialized = true;
                 value = Marshal.AllocHGlobal(IntPtr.Size);
                 Marshal.WriteIntPtr(value, guard.job);
@@ -169,6 +301,13 @@ namespace OwnedUia {
                 // there is no CreateProcess -> AssignProcessToJobObject interruption window.
                 if (!UpdateProcThreadAttribute(attributes, 0, new IntPtr(0x2000D), value,
                     new IntPtr(IntPtr.Size), IntPtr.Zero, IntPtr.Zero)) throw new Win32Exception();
+                parentValue = Marshal.AllocHGlobal(IntPtr.Size);
+                Marshal.WriteIntPtr(parentValue, guard.parent);
+                // PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: the session owner, NOT the helper,
+                // is the OS parent. Helper/overlay tree retirement cannot reach launched apps.
+                if (!UpdateProcThreadAttribute(attributes, 0, new IntPtr(0x20000), parentValue,
+                    new IntPtr(IntPtr.Size), IntPtr.Zero, IntPtr.Zero)) throw new Win32Exception();
+                guard.CheckParent();
                 var startup = new STARTUPINFOEX();
                 startup.Startup.Size = Marshal.SizeOf(typeof(STARTUPINFOEX));
                 startup.Attributes = attributes;
@@ -177,9 +316,7 @@ namespace OwnedUia {
                 if (!CreateProcess(path, new StringBuilder("\"" + path + "\" " + arguments), IntPtr.Zero,
                     IntPtr.Zero, false, 0x08080004, IntPtr.Zero, cwd, ref startup, out child)) throw new Win32Exception();
                 guard.process = child.Process; guard.thread = child.Thread; guard.Id = checked((int)child.Pid);
-                long created, exited, kernel, user;
-                if (!GetProcessTimes(guard.process, out created, out exited, out kernel, out user)) throw new Win32Exception();
-                guard.Started = DateTime.FromFileTimeUtc(created).Ticks;
+                guard.Started = CreationTime(guard.process);
                 return guard;
             } catch {
                 // Atomic assignment means a failed/suspended creation cannot escape
@@ -190,6 +327,7 @@ namespace OwnedUia {
                 if (initialized) DeleteProcThreadAttributeList(attributes);
                 if (attributes != IntPtr.Zero) Marshal.FreeHGlobal(attributes);
                 if (value != IntPtr.Zero) Marshal.FreeHGlobal(value);
+                if (parentValue != IntPtr.Zero) Marshal.FreeHGlobal(parentValue);
             }
         }
         public void Commit() {
@@ -200,6 +338,7 @@ namespace OwnedUia {
             if (job != IntPtr.Zero) { CloseHandle(job); job = IntPtr.Zero; }
             if (thread != IntPtr.Zero) { CloseHandle(thread); thread = IntPtr.Zero; }
             if (process != IntPtr.Zero) { CloseHandle(process); process = IntPtr.Zero; }
+            if (parent != IntPtr.Zero) { CloseHandle(parent); parent = IntPtr.Zero; }
         }
     }
 }

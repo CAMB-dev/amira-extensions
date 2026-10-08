@@ -228,7 +228,7 @@ describe("D112 any-window source contracts (not runtime/provider verification)",
       loop,
       "Get-PendingRead",
       "Receive-PendingLine",
-      "@('overlay_ack', 'job_ack')) { continue }",
+      "@('overlay_ack', 'job_ack', 'root_ack', 'writer_ack')) { continue }",
       "$id = Get-Argument",
     )
     expect(source).toContain("SetThreadDpiAwarenessContext([IntPtr]::new(-4))")
@@ -280,7 +280,7 @@ describe("overlay source contracts (not rendering/hotkey verification)", () => {
     expect(overlay).toContain("now - escapeAt <= 500")
     expect(overlay).toContain('ev == "simulate-stop" && testMode')
     expect(overlay).toContain("AbortOwner();")
-    expect(overlay).toContain("p.StartTime.ToUniversalTime().Ticks.ToString() == ownerStarted")
+    expect(overlay).toContain("CreationTime(handle).ToString() == ownerStarted")
     expect(overlay).toContain('Reply(new { @event = "stop" })')
     expect(overlay).toContain("UnregisterHotKey(Handle, 1)")
     expect(overlay).toContain("ExactAlive(lifetimePid, lifetimeStarted)")
@@ -330,13 +330,7 @@ describe("overlay source contracts (not rendering/hotkey verification)", () => {
 })
 
 test("launch job is guarded without breakaway and retained before execution", () => {
-  ordered(
-    guard,
-    "new IntPtr(0x2000D)",
-    "if (!CreateProcess(",
-    "GetProcessTimes(guard.process",
-    "guard.Started =",
-  )
+  ordered(guard, "new IntPtr(0x2000D)", "if (!CreateProcess(", "guard.Started = CreationTime(guard.process)")
   expect(guard).toContain("0x08080004") // suspended + atomic job-list assignment + no console
   expect(guard).toContain("limits.Basic.Flags = 0u")
   expect(guard).not.toContain("0x1000u")
@@ -352,13 +346,68 @@ test("launch job is guarded without breakaway and retained before execution", ()
     "Save-OwnedState",
     "$launcher.Commit()",
   )
+  ordered(lifetime, "$helper.Kill()", "$helper.WaitForExit(1000)")
   ordered(
     lifetime,
-    "$helper.Kill()",
-    "$helper.WaitForExit(1000)",
-    "Stop-CurrentWriter\n",
-    "$state = Read-OwnedJournal $StatePath",
+    "try { Stop-CurrentWriter }",
+    "$snapshot = Read-OwnedJournal $StatePath",
+    "try { Stop-RetainedJobs $force $state }",
   )
+})
+
+test("launch parent and job membership are assigned together before suspended creation", () => {
+  ordered(guard, "new IntPtr(0x2000D)", "new IntPtr(0x20000)", "if (!CreateProcess(")
+  expect(guard).toContain("InitializeProcThreadAttributeList(IntPtr.Zero, 2")
+  expect(guard).toContain("GetProcessId(parent) != ParentPid")
+  expect(guard).toContain("CreationTime(parent) != ParentStarted")
+  expect(guard).toContain("guard.ParentPid = owner.Id")
+  ordered(guard, "Process.GetCurrentProcess()", "owner.Handle, target, out parentDuplicate", "guard.ParentHandle = parentDuplicate.ToInt64()")
+  expect(guard).toContain("parent = new IntPtr(parentHandle)")
+  ordered(guard, "Marshal.WriteIntPtr(parentValue, guard.parent)", "new IntPtr(0x20000), parentValue", "if (!CreateProcess(")
+})
+
+test("lifetime polling uses a cached sentinel handle and the helper polls no faster than 250 ms", () => {
+  const loop = lifetime.slice(lifetime.indexOf("try {\n    while ($true)"))
+  expect(loop).toContain("$sentinelProcess.WaitForExit(0)")
+  expect(loop).not.toContain("Get-ExactProcess $lifetime")
+  const helperLoop = source.slice(source.indexOf("while (-not $script:stopping)"))
+  expect(helperLoop).toContain("Start-Sleep -Milliseconds 250")
+  expect(helperLoop).not.toContain("Start-Sleep -Milliseconds 100")
+})
+
+test("writer handoff precedes the first journal write, even before provider initialization", () => {
+  ordered(
+    source,
+    "event = 'helper'",
+    "'writer_ack'",
+    "    Save-OwnedState\n",
+    "Add-Type -AssemblyName UIAutomationClient",
+  )
+})
+
+test("session cleanup always visits retained jobs and waits before retrying termination", () => {
+  expect(lifetime).toContain("function Stop-RetainedJobs")
+  expect(lifetime).toContain("$clock.ElapsedMilliseconds -lt 2000")
+  expect(lifetime).toContain("$attempt -lt 2")
+  expect(lifetime).toContain("Stop-RetainedJobs")
+  expect(lifetime).not.toContain("elseif ($jobs.Count -gt 0)")
+})
+
+test("concurrent helper exit is confirmed in the catch and retirement failure is acknowledged", () => {
+  const retirement = lifetime.slice(lifetime.indexOf("function Stop-HelperIdentity"), lifetime.indexOf("# Headless fallback"))
+  ordered(retirement, "$helper.Kill()", "} catch {", "Test-IdentityGone $identity", "} finally")
+  expect(lifetime).toContain("event = 'retired'")
+  expect(lifetime).toContain("failed = $failed")
+  expect(lifetime).toContain("Launch journal missing; cleanup incomplete.")
+  expect(lifetime).toContain("try { Stop-RetainedJobs $force $state }")
+})
+
+test("pattern timeout cancels preflight and startup failure releases the busy slot", () => {
+  ordered(source, "CompareExchange(ref result.dispatchState, 1, 0)", "switch (action)")
+  expect(source).toContain("CompareExchange(ref result.dispatchState, 2, 0)")
+  expect(source).toContain("if (!workerStarted)")
+  expect(helperFunction("Focus-Element")).toContain("Invoke-BoundedPattern")
+  expect(source).toContain(".InnerException")
 })
 
 test("input batches and independent release ledger survive helper termination", () => {

@@ -109,11 +109,15 @@ physically held user keys. The hidden release-only monitor can retain hooks for 
 seconds during idle/interruption cleanup to retry
 transient failures. If releases still fail (for example across a secure-desktop transition), Amira
 reports incomplete input cleanup; release any held keys/buttons manually before resuming.
-Inspect the target app before resuming. Emergency stop terminates launched job members with
-**no visible top-level window**, including headless descendants that could keep acting. Windowed
-apps remain open until you close them or end the session. Session cleanup terminates the entire
-launched tree and can lose unsaved changes. Apps that were already open, including unrelated
-handoff targets, are never terminated just because the extension read or acted on them.
+Inspect the target app before resuming. Emergency stop kills the exact helper and only launched
+job members with **no visible top-level window and no visible-window ancestor within that job**,
+following PID/creation-time ancestry up to the launch root. Unverifiable ancestry is preserved.
+Launch roots younger than **three seconds** (and their members) are skipped and reported as
+**“still starting”**; stop does not schedule a later kill. This preserves windowed apps and their
+Chromium/Electron/WebView2 GPU, renderer and utility children. Windowed apps remain open until
+you close them or end the session. Session cleanup terminates the entire launched tree and can
+lose unsaved changes. Apps that were already open, including unrelated handoff targets, are
+never terminated just because the extension read or acted on them.
 
 ## Virtual pointer
 
@@ -182,36 +186,61 @@ The helper and overlay start lazily through `api.openPipe`. A headless extension
 sentinel bridges host unload, and a separate headless watchdog can clean up while UIA is blocked.
 Exact launch PID/start-time records, the helper identity and opaque job IDs are atomically
 journaled in `%TEMP%/amira-uia-<UUID>.json` (`OwnershipVersion=3`), with no titles, screen text
-or action history. Every write carries an HMAC-SHA256 over the exact serialized content. A random
-32-byte per-client key stays in memory and reaches the helper/watchdog only over stdin, never
-argv, environment or files. Readers verify the MAC before trusting any identity; an invalid
-journal is retained with **“untrusted launch journal; cleanup refused”**. No other clients'
-journals are scanned. Reading, focusing, clicking, or executable-matching a window never adds
-a launch record.
+or action history. Every write carries an HMAC-SHA256 over the exact serialized content, including
+a per-session nonce and the state path. A new random 32-byte key and nonce are generated with
+each client session's state path; helper replacements reuse that session's credentials. Replacing
+a lost watchdog starts a fresh state path/key/nonce generation, never adopting its lost jobs. The key
+stays in memory and reaches the helper/watchdog only over stdin, never argv, environment or
+files. Readers verify the MAC, nonce and path before trusting any identity. Untrusted records
+are ignored with **“untrusted launch journal; cleanup refused”** and grant no cleanup authority;
+they cannot block later launches. No other clients' journals are scanned. Reading, focusing,
+clicking, or executable-matching a window never adds a launch record.
 
 The watchdog creates an **unnamed, non-breakaway Windows job** before launch and transfers a
-handle only to the verified helper PID/start-time identity. The helper atomically assigns that
-job during suspended process creation; no public job names or journal-supplied handles are
-opened. Closing job handles does not implicitly kill apps: termination requires authenticated,
-explicit cleanup. Failure to retain/assign the job (including unsupported nested jobs) refuses the launch instead of running it
-untracked. All descendants stay in that job, even if the launcher exits. Emergency stop enumerates
-members, checks exact PID/creation time and membership through the same process handle, and
-terminates only members without a visible top-level window. Session end terminates the whole job.
+job handle and a limited parent-process handle only to the verified helper PID/start-time identity.
+The helper validates the parent's PID/creation time and assigns **both the job and the watchdog
+as OS parent atomically** during suspended creation. Launched apps are children of the session
+watchdog, not the transient helper, so even a host-level helper tree kill cannot reach them.
+No public job names or journal-supplied handles are opened. Closing job handles does not implicitly kill apps: termination requires explicit cleanup
+by the watchdog holding those exact handles. Failure to retain/assign the job (including unsupported
+nested jobs) refuses the launch instead of running it untracked. Tracked processes are the launched
+process and **directly created process-tree descendants that remain in its job**, even if the
+launcher exits. This does **not** track processes created by external brokers: WMI
+`Win32_Process.Create`, `schtasks`/scheduled tasks, DCOM or explorer-mediated ShellExecute,
+COM/ShellExecute to an existing instance, or services. Discovery never turns these into owned
+processes. Emergency stop checks exact UTC FILETIME creation identities, job membership,
+visible-window ancestors and the three-second root-start grace described above. Session end
+terminates the whole job, polls for exit for two seconds, and retries once if incomplete.
 
-Helper EOF, request timeout and helper restart **do not clean up launched apps**. The watchdog
-holds jobs across helper replacement; restarted helpers read only their own client's authenticated
-journal and invalidate old window refs. Only session end, host exit/unload, or watchdog EOF end
-the session and clean up jobs. The watchdog pins the current helper identity over its private
-client pipe, independently of the replayable journal. Cleanup retires that exact helper before
-verifying the final snapshot and matching its writer identity. An edited, replayed or missing
-journal refuses app cleanup and reports it incomplete; existing journals are retained. Existing windows are not closed during teardown.
+Helper EOF, request timeout and helper restart **do not clean up launched apps**. Helpers are
+retired through PID/creation-time-checked, non-tree termination; their pipe is closed only after
+confirmed exit. If the watchdog dies, a headless exact-helper reaper is used, never a tree kill.
+Retirement failure or a ten-second retirement timeout refuses replacement and reports the error
+instead of hanging requests; session teardown still drains the watchdog and its retained jobs.
+The watchdog holds jobs across helper replacement; restarted helpers read only their own client's authenticated
+journal and invalidate old window refs. Session end, host exit/unload, watchdog EOF,
+**`/jobs stop` on the computer-use-uia lifetime job**, and **extension reload** end the launched
+apps, including windowed apps with unsaved changes. Stopping the lifetime sentinel signals the
+watchdog to terminate its retained jobs; a watchdog tree kill at session end also reaches the
+launched trees by design. The watchdog pins the current helper identity over its private
+client pipe, once per helper generation, checks the spawned child's PID and native creation time,
+and acknowledges that identity before the helper's first journal write. Cleanup retires that exact
+helper before verifying the final snapshot. Missing, stale or untrusted journals **never prevent
+cleanup of jobs the watchdog itself retained**; journal-supplied identities grant no kill authority.
+A complete session cleanup removes the journal and `.tmp`; unverifiable/incomplete cleanup retains
+the journal and reports the failure. Existing windows are not closed during teardown.
 The overlay watches the exact helper and sentinel identities and exits on pipe EOF.
+**Hard-killing only the watchdog process does not clean up launched apps.** Job handles have no
+kill-on-close behavior, and the journal cannot recover lost kernel job handles. Killing the
+**watchdog's entire process tree**, in contrast, also kills its launched apps.
 
-Invoke/Toggle/SelectionItem/ExpandCollapse/SetValue (and WindowPattern.Close) run on background
-threads with a **five-second wait**. If a click/type provider remains busy, the helper returns
-**“action sent; the target is busy or opened a modal dialog — use ui_windows”** and remains
-available to locate the dialog. This does not cancel or roll back the issued action. A bounded
-number of busy pattern calls is allowed; additional calls are refused until one finishes.
+Invoke/Toggle/SelectionItem/ExpandCollapse/SetValue, WindowPattern.Close and element SetFocus run
+on background threads with a **five-second wait**. If a click/type provider remains busy, the
+helper returns **“action timed out; it may still be running or the target may be busy — use
+ui_windows”** and remains available to locate the dialog. Timeout cancels an action still in
+preflight, so it cannot dispatch later; it cannot cancel or roll back a UIA call already entered.
+A focus timeout refuses subsequent input. A bounded number of busy pattern calls is allowed;
+additional calls are refused until one finishes.
 
 ## Limitations
 
