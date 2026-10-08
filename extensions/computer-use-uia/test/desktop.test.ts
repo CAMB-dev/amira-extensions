@@ -714,7 +714,7 @@ test.skipIf(!enabled)(
 )
 
 test.skipIf(!enabled)(
-  "cmd start headless descendant survives helper restart, dies on stop; session cleanup kills the whole tree",
+  "exited cmd start launcher cannot protect its headless descendant on stop or session cleanup",
   async () => {
     const instance = host(false)
     let client: UiaClient | undefined
@@ -730,9 +730,10 @@ test.skipIf(!enabled)(
       const launch = () =>
         client!.call("launch", {
           command: "cmd.exe",
-          args: ["/c", "start", "", "/wait", "/b", "powershell.exe", "-NoProfile", "-Command", script],
-        })
-      await launch()
+          args: ["/c", "start", "", "/b", "powershell.exe", "-NoProfile", "-Command", script],
+        }) as Promise<LaunchResult>
+      const launcher = await launch()
+      await until(() => !alive(launcher.pid)) // A dead PPID is not a windowed protector.
       await until(() => existsSync(pidPath))
       childPid = Number(readFileSync(pidPath, "utf8"))
       expect(childPid).toBeGreaterThan(0)

@@ -51,6 +51,8 @@ namespace OwnedUia {
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool GetProcessTimes(IntPtr process, out long created, out long exited, out long kernel, out long user);
         [DllImport("kernel32.dll", SetLastError = true)] static extern uint ResumeThread(IntPtr thread);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenThread(uint access, bool inherit, uint tid);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern uint GetProcessIdOfThread(IntPtr thread);
         [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool DuplicateHandle(IntPtr sourceProcess, IntPtr source, IntPtr targetProcess,
@@ -67,6 +69,12 @@ namespace OwnedUia {
         delegate bool EnumWindowsProc(IntPtr window, IntPtr data);
         [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc callback, IntPtr data);
         [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
+        [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
+        [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr window, out RECT rect);
+        [DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] static extern int GetWindowLong(IntPtr window, int index);
+        [DllImport("user32.dll")] static extern bool GetLayeredWindowAttributes(IntPtr window, out uint key, out byte alpha, out uint flags);
+        [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr window, int attribute, out uint value, int size);
         [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
@@ -88,13 +96,22 @@ namespace OwnedUia {
         IntPtr job, process, thread, parent;
         int rootPid;
         long rootStarted;
-        public void SetRoot(int pid, long started) {
+        public void SetRoot(int pid, long started, uint tid) {
             if (rootPid != 0) throw new InvalidOperationException("Launch root already registered.");
             using (var root = Process.GetProcessById(pid)) {
                 bool belongs;
                 if (root.HasExited || CreationTime(root.Handle) != started ||
                     !IsProcessInJob(root.Handle, job, out belongs) || !belongs)
                     throw new InvalidOperationException("Launch root identity changed.");
+                // The watchdog commits while holding the verified root identity. There
+                // is no registered-but-suspended gap if the helper dies before the ack.
+                IntPtr primary = OpenThread(0x0802u, false, tid); // QUERY_LIMITED_INFORMATION | SUSPEND_RESUME
+                if (primary == IntPtr.Zero) throw new Win32Exception();
+                try {
+                    if (GetProcessIdOfThread(primary) != pid || root.HasExited || CreationTime(root.Handle) != started)
+                        throw new InvalidOperationException("Launch thread identity changed.");
+                    if (ResumeThread(primary) == uint.MaxValue) throw new Win32Exception();
+                } finally { CloseHandle(primary); }
             }
             rootPid = pid; rootStarted = started;
         }
@@ -126,9 +143,9 @@ namespace OwnedUia {
                     if (helper.HasExited || CreationTime(target) != helperStarted)
                         throw new InvalidOperationException("Helper identity changed.");
                     IntPtr duplicate;
-                    // ASSIGN | QUERY | TERMINATE, not SET_ATTRIBUTES. Never inherit the handle.
+                    // ASSIGN only; cleanup/query authority stays with the watchdog. Never inherit.
                     if (!DuplicateHandle(GetCurrentProcess(), guard.job, target, out duplicate,
-                        0x0001u | 0x0004u | 0x0008u, false, 0)) throw new Win32Exception();
+                        0x0001u, false, 0)) throw new Win32Exception();
                     guard.HelperHandle = duplicate.ToInt64();
                     try {
                         using (var owner = Process.GetCurrentProcess()) {
@@ -157,11 +174,31 @@ namespace OwnedUia {
         public void Terminate() {
             if (!TerminateJobObject(job, 1)) throw new Win32Exception();
         }
+        public bool HasRoot { get { return rootPid != 0; } }
+        public static void CloseTransferredHandle(long handle) {
+            if (handle > 0) CloseHandle(new IntPtr(handle));
+        }
+        bool ProtectorWindow(IntPtr window) {
+            uint cloaked;
+            RECT rect;
+            if (!IsWindowVisible(window) || DwmGetWindowAttribute(window, 14, out cloaked, 4) != 0 || cloaked != 0 ||
+                !GetWindowRect(window, out rect) || rect.Right <= rect.Left || rect.Bottom <= rect.Top) return false;
+            long left = GetSystemMetrics(76), top = GetSystemMetrics(77);
+            long right = left + GetSystemMetrics(78), bottom = top + GetSystemMetrics(79);
+            if (rect.Right <= left || rect.Left >= right || rect.Bottom <= top || rect.Top >= bottom) return false;
+            if ((GetWindowLong(window, -20) & 0x80000) != 0) {
+                uint key, flags; byte alpha;
+                // Per-pixel layered windows may not expose a global alpha. This is a heuristic.
+                if (GetLayeredWindowAttributes(window, out key, out alpha, out flags) && (flags & 2) != 0 && alpha == 0)
+                    return false;
+            }
+            return true;
+        }
         bool Visible(int pid) {
             bool visible = false;
             if (!EnumWindows(delegate(IntPtr window, IntPtr data) {
                 uint owner; GetWindowThreadProcessId(window, out owner);
-                if (owner == pid && IsWindowVisible(window)) visible = true;
+                if (owner == pid && ProtectorWindow(window)) visible = true;
                 return true;
             }, IntPtr.Zero)) throw new Win32Exception();
             return visible;
@@ -178,38 +215,43 @@ namespace OwnedUia {
             } finally { CloseHandle(snapshot); }
             return parents;
         }
-        // A missing/recycled/inaccessible ancestor is not proof of a headless tree.
+        // Job membership already proves ownership. Ancestry only finds a live,
+        // strictly older, same-job windowed protector; a broken chain grants none.
         sealed class HeadlessMember { public int Pid, Depth; public long Started; }
         bool HeadlessAncestors(int pid, long started, Dictionary<int, int> parents, out int depth) {
             depth = 0;
             var seen = new HashSet<int>();
+            if (Visible(pid)) return false;
             while (seen.Add(pid)) {
-                if (Visible(pid)) return false;
-                if (pid == rootPid) return started == rootStarted;
+                if (pid == rootPid && started == rootStarted) return true;
                 int parentPid;
-                if (!parents.TryGetValue(pid, out parentPid) || parentPid <= 0) return false;
+                if (!parents.TryGetValue(pid, out parentPid) || parentPid <= 0) return true;
                 try {
                     using (var parent = Process.GetProcessById(parentPid)) {
                         IntPtr handle = parent.Handle;
                         long parentStarted = CreationTime(handle);
                         bool belongs;
-                        if (parent.HasExited || parentStarted > started ||
-                            !IsProcessInJob(handle, job, out belongs) || !belongs) return false;
-                        if (parentPid == rootPid && parentStarted != rootStarted) return false;
+                        if (parent.HasExited || parentStarted >= started ||
+                            !IsProcessInJob(handle, job, out belongs) || !belongs) return true;
+                        if (parentPid == rootPid && parentStarted != rootStarted) return true;
+                        if (Visible(parentPid) && !parent.HasExited && CreationTime(handle) == parentStarted) return false;
                         pid = parentPid; started = parentStarted; depth++;
                     }
-                } catch (ArgumentException) {
-                    // PID alone cannot prove the creation time of an exited ancestor.
-                    return false;
-                }
+                } catch (ArgumentException) { return true; }
+                catch (InvalidOperationException) { return true; }
+                catch (Win32Exception) { return true; }
             }
-            return false;
+            return true;
         }
         // Capture identity through the SAME cached handle used to kill, recheck job
         // membership and each live ancestor, and stop at the exact registered launch root.
         public void StopHeadless() {
-            if (rootPid == 0 || DateTime.UtcNow.ToFileTimeUtc() - rootStarted < 30000000L) {
-                Console.Error.WriteLine("Launch job still starting; emergency stop preserved its members.");
+            if (rootPid == 0) {
+                Console.Error.WriteLine("Launch root registration pending; emergency stop preserved its members.");
+                return;
+            }
+            if (DateTime.UtcNow.ToFileTimeUtc() - rootStarted < 30000000L) {
+                Console.Error.WriteLine("Launch job still starting (3 s grace); emergency stop preserved its members.");
                 return;
             }
             bool failed = false;
@@ -231,7 +273,7 @@ namespace OwnedUia {
                 catch (InvalidOperationException) { }
                 catch (Win32Exception) { failed = true; }
             }
-            // Children first; an exited root/ancestor is conservatively preserved on later stops.
+            // Children first; exited ancestors never exempt surviving owned descendants.
             eligible.Sort(delegate(HeadlessMember a, HeadlessMember b) { return b.Depth.CompareTo(a.Depth); });
             foreach (var candidate in eligible) {
                 int pid = candidate.Pid;
@@ -276,6 +318,7 @@ namespace OwnedUia {
             }
         }
         public int Id { get; private set; }
+        public uint ThreadId { get; private set; }
         public long Started { get; private set; }
         void Limits() {
             var limits = new EXTENDED_LIMIT();
@@ -316,6 +359,7 @@ namespace OwnedUia {
                 if (!CreateProcess(path, new StringBuilder("\"" + path + "\" " + arguments), IntPtr.Zero,
                     IntPtr.Zero, false, 0x08080004, IntPtr.Zero, cwd, ref startup, out child)) throw new Win32Exception();
                 guard.process = child.Process; guard.thread = child.Thread; guard.Id = checked((int)child.Pid);
+                guard.ThreadId = child.Tid;
                 guard.Started = CreationTime(guard.process);
                 return guard;
             } catch {
@@ -329,10 +373,6 @@ namespace OwnedUia {
                 if (value != IntPtr.Zero) Marshal.FreeHGlobal(value);
                 if (parentValue != IntPtr.Zero) Marshal.FreeHGlobal(parentValue);
             }
-        }
-        public void Commit() {
-            // The caller MUST persist the job and await watchdog retention before execution.
-            if (ResumeThread(thread) == uint.MaxValue) throw new Win32Exception();
         }
         public void Dispose() {
             if (job != IntPtr.Zero) { CloseHandle(job); job = IntPtr.Zero; }

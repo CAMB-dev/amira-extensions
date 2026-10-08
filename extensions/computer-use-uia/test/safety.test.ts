@@ -42,7 +42,10 @@ test("every journal reader verifies exact content before parsing identities and 
 })
 
 test("headless stop checks exact handle identity and job membership, not image names", () => {
-  const stop = launch.slice(launch.indexOf("bool Visible(int pid)"), launch.indexOf("public int[] Members()"))
+  const stop = launch.slice(
+    launch.indexOf("bool ProtectorWindow(IntPtr window)"),
+    launch.indexOf("public int[] Members()"),
+  )
   for (const fragment of [
     "member.Handle",
     "CreationTime(handle)",
@@ -50,7 +53,13 @@ test("headless stop checks exact handle identity and job membership, not image n
     "EnumWindows",
     "IsWindowVisible",
     "HeadlessAncestors(pid, started",
-    "parentStarted > started",
+    "parentStarted >= started",
+    "DwmGetWindowAttribute(window, 14",
+    "cloaked != 0",
+    "rect.Right <= rect.Left",
+    "GetSystemMetrics(76)",
+    "GetLayeredWindowAttributes(window",
+    "alpha == 0",
     "parentStarted != rootStarted",
     "rootStarted < 30000000L",
     "still starting",
@@ -58,6 +67,17 @@ test("headless stop checks exact handle identity and job membership, not image n
   ])
     expect(stop).toContain(fragment)
   expect(helper + watchdog + launch).not.toMatch(/taskkill|Stop-Process\s+-Name/)
+})
+
+test("broken ancestor chains cannot protect an owned member; protectors are strictly older", () => {
+  const ancestors = launch.slice(
+    launch.indexOf("bool HeadlessAncestors"),
+    launch.indexOf("public void StopHeadless"),
+  )
+  expect(ancestors).toContain("parentStarted >= started")
+  expect(ancestors).toContain("if (pid == rootPid && started == rootStarted) return true;")
+  expect(ancestors).toContain("if (!parents.TryGetValue(pid, out parentPid) || parentPid <= 0) return true;")
+  expect(ancestors).not.toContain("return false;\n                }")
 })
 
 test("modal patterns run on a bounded background thread and retain target checks", () => {
@@ -88,7 +108,8 @@ test("refusing edited journals cannot implicitly kill apps; job objects cannot b
   expect(watchdog).toContain("::CreateFor(")
   expect(watchdog).not.toContain("::Open(")
   expect(helper).not.toContain("::Open(")
-  expect(helper).toContain("@('overlay_ack', 'job_ack', 'root_ack', 'writer_ack')")
+  expect(helper).toContain("'job_ack') { Close-JobAck $request; continue }")
+  expect(helper).toContain("@('overlay_ack', 'root_ack', 'writer_ack')")
 })
 
 test("session nonce and exact path are authenticated and untrusted job names are never adopted", () => {

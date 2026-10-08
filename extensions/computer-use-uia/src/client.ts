@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto"
+import { rmSync } from "node:fs"
 import type { ExtensionAPI, PipeEvent, PipeProcess } from "@amira/api"
 import type { UiaSettings } from "./settings.ts"
 import { overlayReply, STOP_MESSAGE, StopState } from "./stop.ts"
@@ -80,6 +81,7 @@ export class UiaClient {
   private pipeExited: Promise<void> = Promise.resolve()
   private watchdogExited: Promise<void> = Promise.resolve()
   private retired: Promise<void> = Promise.resolve()
+  private retirementRecovery?: () => Promise<void>
   private stopWait: Promise<void> = Promise.resolve()
 
   constructor(
@@ -229,6 +231,15 @@ export class UiaClient {
   }
 
   private rotateJournal(): void {
+    // Called only after the previous watchdog exited: its journal can no longer
+    // assist active cleanup, and lost unnamed kernel jobs cannot be recovered.
+    for (const path of [this.statePath, `${this.statePath}.tmp`]) {
+      try {
+        rmSync(path, { force: true })
+      } catch {
+        this.host.reportError("computer-use-uia: could not remove retired launch journal")
+      }
+    }
     this.statePath = `${process.env.TEMP ?? process.env.TMP ?? this.host.cwd}/amira-uia-${crypto.randomUUID()}.json`
     this.journalKey = randomBytes(32)
     this.journalNonce = crypto.randomUUID()
@@ -237,7 +248,14 @@ export class UiaClient {
   private async start(): Promise<void> {
     if (this.pipe) return
     const previousGeneration = this.generation
-    await this.retired
+    try {
+      await this.retired
+    } catch (error) {
+      if (!this.retirementRecovery) throw error
+      await this.retirementRecovery()
+      this.retirementRecovery = undefined
+      this.retired = Promise.resolve()
+    }
     if (this.stopCleanup) {
       let timer: ReturnType<typeof setTimeout> | undefined
       try {
@@ -302,9 +320,12 @@ export class UiaClient {
       throw new Error("UIA session ended during startup")
     if (!job?.pid || !this.lifetimeStarted) throw new Error("UIA lifetime process has no identity")
     if (!this.watchdog) {
-      // Lost kernel jobs cannot be adopted by a replacement owner. Keep the old
-      // journal as evidence, but give the new owner fresh credentials and records.
-      if (this.watchdogStarted) this.rotateJournal()
+      // Lost kernel jobs cannot be adopted. Retain evidence only while the old
+      // owner can still clean up; after its confirmed exit, rotate and delete it.
+      if (this.watchdogStarted) {
+        await this.watchdogExited
+        this.rotateJournal()
+      }
       await this.startWatchdog(job.pid, this.lifetimeStarted)
       this.watchdogStarted = true
     }
@@ -338,7 +359,11 @@ export class UiaClient {
       {
         cwd: this.host.cwd,
         onEvent: (event) => {
-          if (event.type === "exit") exited.resolve()
+          if (event.type === "exit") {
+            exited.resolve()
+            for (const [job, origin] of this.jobRequests)
+              if (origin.generation === generation) this.jobRequests.delete(job)
+          }
           if (generation === this.generation) this.event(event)
         },
       },
@@ -589,6 +614,10 @@ export class UiaClient {
                       origin.pipe.write(
                         `${JSON.stringify({ method: "job_ack", job: reply.job, handle: reply.handle, parentHandle: reply.parentHandle, parentPid: reply.parentPid, parentStarted: reply.parentStarted })}\n`,
                       )
+                    else if (origin)
+                      origin.pipe.write(
+                        `${JSON.stringify({ method: "job_ack", job: reply.job, handle: reply.handle, parentHandle: reply.parentHandle, parentPid: reply.parentPid, parentStarted: reply.parentStarted, rejected: true })}\n`,
+                      )
                   }
                   if (reply.event === "root-registered" && typeof reply.job === "string") {
                     const origin = this.jobRequests.get(reply.job)
@@ -709,6 +738,14 @@ export class UiaClient {
           pid?: number
           started?: string
           job?: string
+          failed?: boolean
+          threadId?: number
+        }
+        if (response.event === "launch-finished" && typeof response.job === "string") {
+          this.watchdog?.write(
+            `${JSON.stringify({ event: "launch-finished", job: response.job, failed: response.failed, generation: this.generation })}\n`,
+          )
+          continue
         }
         if (response.event === "create-job" && typeof response.job === "string") {
           const pipe = this.pipe
@@ -740,7 +777,7 @@ export class UiaClient {
         ) {
           this.jobRequests.set(response.job, { pipe: this.pipe, generation: this.generation })
           this.watchdog?.write(
-            `${JSON.stringify({ event: "launch-root", job: response.job, pid: response.pid, started: response.started, generation: this.generation })}\n`,
+            `${JSON.stringify({ event: "launch-root", job: response.job, pid: response.pid, started: response.started, threadId: response.threadId, generation: this.generation })}\n`,
           )
           continue
         }
@@ -945,7 +982,7 @@ export class UiaClient {
   private breakPipe(message: string, graceMs = 0) {
     const pipe = this.pipe
     const overlay = this.overlay
-    const retirement = this.retireHelper(pipe, graceMs)
+    const retirement = pipe ? this.retireHelper(pipe, graceMs) : this.retired
     // Failed in-flight requests must not continue acting after their error is returned.
     // Keep the independent input-release monitor alive long enough to process abort/EOF.
     overlay?.write(`${JSON.stringify({ event: "abort" })}\n`)
@@ -955,14 +992,33 @@ export class UiaClient {
     this.helperIdentity = undefined
     this.helperPid = undefined
     this.writerConfirmed = false
-    this.jobRequests.clear()
+    // Keep pending transfers until their original helper exits so a late reply
+    // can be explicitly rejected there, never delivered to a replacement helper.
     this.generation++
     this.windows.clear()
     this.protectedWindows.clear()
     this.arming?.reject(new Error(message))
     this.failPending(new Error(message))
     // Never overlap helpers writing the same launch journal during a restart.
-    this.retired = Promise.all([retirement, this.pipeExited, this.overlayExited]).then(() => {})
+    const exited = this.pipeExited
+    const overlayExited = this.overlayExited
+    if (pipe) {
+      let confirmedGone = false
+      void exited.then(() => {
+        confirmedGone = true
+      })
+      this.retirementRecovery = async () => {
+        if (!confirmedGone)
+          throw new Error(
+            "UIA helper retirement failed; restart refused: old helper exit is unconfirmed; retry /uia resume after it exits",
+          )
+        // A native exit notification is identity-bound to this exact pipe generation.
+        // Only then is a host pipe close safe (it must never tree-kill a live helper).
+        pipe.close(graceMs)
+        await overlayExited
+      }
+    }
+    this.retired = Promise.all([retirement, exited, overlayExited]).then(() => {})
     // Retain the rejection to fail closed at start()/stop(), without an unhandled void-stop rejection.
     void this.retired.catch(() => {})
   }
@@ -971,31 +1027,17 @@ export class UiaClient {
   async stop(): Promise<void> {
     if (this.stopping) return this.stopWait
     this.stopping = true
-    const pipe = this.pipe
     const watchdog = this.watchdog
-    const overlay = this.overlay
-    const retirement = this.retireHelper(pipe)
-    overlay?.write(`${JSON.stringify({ event: "abort" })}\n`)
-    this.pipe = undefined
+    // Teardown uses the same identity-bound retirement/recovery gate as interruption.
+    // Even a failed stop must not permit a replacement while the old helper is alive.
+    this.breakPipe("UIA session ended")
     this.watchdog = undefined
-    this.overlay = undefined
-    overlay?.close(5000)
-    this.helperIdentity = undefined
-    this.helperPid = undefined
-    this.writerConfirmed = false
-    this.jobRequests.clear()
-    this.generation++
     this.sessionEpoch++
-    this.windows.clear()
-    this.protectedWindows.clear()
-    this.arming?.reject(new Error("UIA session ended"))
-    this.failPending(new Error("UIA session ended"))
     // Watchdog EOF grace (3 s), helper retirement (1 s), then two 2 s job drains.
     watchdog?.close(15_000)
     // Retirement is bounded and proves helper exit on success. Do not separately
     // await an immortal pipe after a retirement failure, but still drain the owner.
     this.stopWait = Promise.allSettled([
-      retirement,
       this.retired,
       this.watchdogExited,
       this.overlayExited,

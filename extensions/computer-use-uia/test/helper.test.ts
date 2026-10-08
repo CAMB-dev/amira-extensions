@@ -114,7 +114,7 @@ describe("D112 any-window source contracts (not runtime/provider verification)",
       "$started = $launcher.Started",
       "$script:processes[$launcherIdentity.Key] = $launcherIdentity",
       "Save-OwnedState",
-      "$launcher.Commit()",
+      "$committed = $true",
       "while ($clock.ElapsedMilliseconds -lt 10000)",
     )
     expect(launch.match(/\$script:processes\[[^\n]+\] = /g)).toHaveLength(1)
@@ -228,7 +228,8 @@ describe("D112 any-window source contracts (not runtime/provider verification)",
       loop,
       "Get-PendingRead",
       "Receive-PendingLine",
-      "@('overlay_ack', 'job_ack', 'root_ack', 'writer_ack')) { continue }",
+      "'job_ack') { Close-JobAck $request; continue }",
+      "@('overlay_ack', 'root_ack', 'writer_ack')) { continue }",
       "$id = Get-Argument",
     )
     expect(source).toContain("SetThreadDpiAwarenessContext([IntPtr]::new(-4))")
@@ -344,7 +345,7 @@ test("launch job is guarded without breakaway and retained before execution", ()
     "Save-OwnedState",
     "::Start",
     "Save-OwnedState",
-    "$launcher.Commit()",
+    "$committed = $true",
   )
   ordered(lifetime, "$helper.Kill()", "$helper.WaitForExit(1000)")
   ordered(
@@ -411,8 +412,75 @@ test("concurrent helper exit is confirmed in the catch and retirement failure is
   ordered(retirement, "$helper.Kill()", "} catch {", "Test-IdentityGone $identity", "} finally")
   expect(lifetime).toContain("event = 'retired'")
   expect(lifetime).toContain("failed = $failed")
-  expect(lifetime).toContain("Launch journal missing; cleanup incomplete.")
+  expect(lifetime).not.toContain("Launch journal missing; cleanup incomplete.")
+  expect(lifetime).toContain("if ($journalGap)")
+  expect(lifetime).toContain("if ($job.Members().Length -gt 0) { $cleanupIncomplete = $true }")
   expect(lifetime).toContain("try { Stop-RetainedJobs $force $state }")
+})
+
+test("failed/rootless jobs are drained before disposal and only real launch grace says still starting", () => {
+  ordered(
+    lifetime,
+    "function Remove-LaunchJob",
+    "$job.Terminate()",
+    "$job.Members().Length -gt 0",
+    "$job.Dispose()",
+    "$jobs.Remove($name)",
+  )
+  expect(lifetime).toContain("$message.event -ceq 'launch-finished'")
+  expect(lifetime).toContain("-not $jobs[$message.job].HasRoot")
+  const rootless = lifetime.slice(
+    lifetime.indexOf("function Remove-RootlessJobs"),
+    lifetime.indexOf("function Stop-CurrentWriter"),
+  )
+  ordered(
+    rootless,
+    "foreach",
+    "try { Remove-LaunchJob $name }",
+    "catch { $failed = $true",
+    "if ($failed) { throw",
+  )
+  const register = guard.slice(guard.indexOf("public void SetRoot"), guard.indexOf("public string Name"))
+  ordered(
+    register,
+    "CreationTime(root.Handle) != started",
+    "IsProcessInJob(root.Handle, job",
+    "OpenThread(0x0802u",
+    "GetProcessIdOfThread(primary) != pid",
+    "ResumeThread(primary)",
+    "rootPid = pid; rootStarted = started;",
+  )
+  expect(guard).not.toContain("public void Commit()")
+  expect(lifetime).toContain("Remove-RootlessJobs")
+  expect(helperFunction("Start-OwnedApp")).toContain("failed = (-not $committed)")
+  expect(guard).toContain("Launch root registration pending;")
+  expect(guard).toContain("still starting (3 s grace)")
+})
+
+test("transferred handles have least privilege and late/rejected acks close both exactly once", () => {
+  expect(guard).toContain("0x0001u, false, 0)")
+  expect(guard).not.toContain("0x0008u")
+  const close = helperFunction("Close-JobAck")
+  expect(close).toContain("@('handle', 'parentHandle')")
+  expect(close).toContain("receivedJobAcks.ContainsKey($job)")
+  expect(close).toContain("::CloseTransferredHandle([long]$handle)")
+  const launch = helperFunction("Start-OwnedApp")
+  expect(launch).toContain("Get-Argument $ack 'rejected'")
+  expect(launch).toContain("finally { if (-not $transferred) { Close-JobAck $ack } }")
+  ordered(launch, "[long]::TryParse", "$transferred = $true", "::FromHandle")
+  expect(source).toContain("'job_ack') { Close-JobAck $request; continue }")
+})
+
+test("launch parent identity failure is not misreported as unsupported nested jobs", () => {
+  const launch = helperFunction("Start-OwnedApp")
+  ordered(
+    launch,
+    "::Start",
+    "$exception.InnerException",
+    "Launch parent identity changed or exited.",
+    "Launch refused: launch parent identity changed or exited.",
+    "nested jobs may be unsupported",
+  )
 })
 
 test("pattern timeout cancels preflight and startup failure releases the busy slot", () => {

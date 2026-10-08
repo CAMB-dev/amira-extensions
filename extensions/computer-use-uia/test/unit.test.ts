@@ -4,9 +4,9 @@ import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
 import type { ExtensionAPI, OpenPipeOptions, SettingsLayer, ToolContext, ToolDefinition } from "@amira/api"
 import { formatTree, UiaClient, validateKeys } from "../src/client.ts"
 import { setup } from "../src/extension.ts"
-import { readLaunchJournal } from "../src/journal.ts"
 import { readSettings } from "../src/settings.ts"
 import { overlayReply, StopState } from "../src/stop.ts"
+import { readLaunchJournal } from "./journal.ts"
 
 const WINDOW = "123"
 const settings = readSettings({ enabled: true })
@@ -15,6 +15,12 @@ interface FakeNative {
   pid: number
   exited: boolean
   parent?: FakeNative
+  started?: number
+  windowed?: boolean
+  cloaked?: boolean
+  offscreen?: boolean
+  zeroSize?: boolean
+  alpha?: number
 }
 
 interface FakeApp extends FakeNative {
@@ -33,6 +39,8 @@ interface FakePipe extends FakeNative {
   writes: Record<string, unknown>[]
   close(ms: number): void
   jobs: Map<string, FakeNative[]>
+  roots: Set<string>
+  closedTransfers: number[]
 }
 
 function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
@@ -56,18 +64,65 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
     /Marshal\.WriteIntPtr\(parentValue,\s*guard\.parent\)/.test(launchSource) &&
     /new IntPtr\(0x20000\),\s*parentValue/.test(launchSource)
   let holdJobCreation = false
+  let failLaunchBeforeRoot = false
+  let holdRootAck = false
+  let holdRootRequest = false
+  const failedDrains = new Set<string>()
   function descendantOf(native: FakeNative, parent: FakeNative): boolean {
     for (let ancestor = native.parent; ancestor; ancestor = ancestor.parent)
       if (ancestor === parent) return true
     return false
   }
+  const lifetimeSource = readFileSync(new URL("../helper/lifetime.ps1", import.meta.url), "utf8")
+  const helperSource = readFileSync(new URL("../helper/uia.ps1", import.meta.url), "utf8")
   function stopOwnedJobs(watchdog: FakePipe, force: boolean) {
-    // Retained fake job membership is independent of disk. Journal identities grant no authority.
-    for (const members of watchdog.jobs.values()) {
-      const app = apps.find((candidate) => members.includes(candidate))
-      if (force || (app && !app.windowed && app.ancestryTrusted))
-        for (const member of members) member.exited = true
+    // Source-driven native model, not Windows execution. Source contracts separately
+    // pin exact handles and the branches modeled here; journals grant no authority.
+    if (!force) for (const job of watchdog.jobs.keys()) if (!watchdog.roots.has(job)) dropJob(watchdog, job)
+    for (const [job, members] of watchdog.jobs) {
+      if (!force && !watchdog.roots.has(job)) continue
+      const eligible = members.filter((member) => {
+        if (force) return true
+        const seen = new Set<FakeNative>()
+        let current: FakeNative | undefined = member
+        while (current && !seen.has(current)) {
+          seen.add(current)
+          if (
+            !current.exited &&
+            current.windowed &&
+            !current.cloaked &&
+            !current.offscreen &&
+            !current.zeroSize &&
+            current.alpha !== 0
+          )
+            return false
+          const parent: FakeNative | undefined = current.parent
+          if (
+            !parent ||
+            parent.exited ||
+            !members.includes(parent) ||
+            (parent.started ?? 0) >= (current.started ?? 0)
+          )
+            return launchSource.includes("parentStarted >= started")
+          current = parent
+        }
+        return true
+      })
+      for (const member of eligible) member.exited = true
     }
+  }
+  function dropJob(watchdog: FakePipe, job: string) {
+    if (!lifetimeSource.includes("function Remove-LaunchJob") || failedDrains.has(job)) return
+    for (const member of watchdog.jobs.get(job) ?? []) member.exited = true
+    watchdog.jobs.delete(job)
+    watchdog.roots.delete(job)
+  }
+  function commitApp(app: FakeApp, watchdog: FakePipe) {
+    app.committed = true
+    const child: FakeNative = { pid: 170 + apps.length, parent: app, exited: false, started: 4000 }
+    app.descendants.push(child)
+    natives.push(child)
+    watchdog.jobs.get(app.job)!.push(child)
   }
   const reapers: { argv: string[] }[] = []
   const retirements: (() => void)[] = []
@@ -142,6 +197,8 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
         pid: 70,
         exited: false,
         jobs: new Map(),
+        roots: new Set(),
+        closedTransfers: [],
         close(ms: number) {
           pipe.closed.push(ms)
           // PipeProcess.close() kills descendants only while its native root is still alive.
@@ -189,7 +246,10 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
               writerGeneration === message.generation
             ) {
               const target = writer
-              const retire = () => target.options.onEvent({ type: "exit", code: 0 })
+              const retire = () => {
+                target.options.onEvent({ type: "exit", code: 0 })
+                for (const job of pipe.jobs.keys()) if (!pipe.roots.has(job)) dropJob(pipe, job)
+              }
               if (failRetirement)
                 queueMicrotask(() =>
                   pipe.options.onEvent({
@@ -225,18 +285,25 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
                   }),
                 )
             }
+            if (message.event === "launch-finished" && !pipe.roots.has(message.job))
+              dropJob(pipe, message.job)
             if (
               message.event === "launch-root" &&
               writerAccepted &&
               writerGeneration === message.generation &&
               pipe.jobs.has(message.job)
-            )
-              queueMicrotask(() =>
-                pipe.options.onEvent({
-                  type: "stdout",
-                  data: `${JSON.stringify({ event: "root-registered", job: message.job })}\n`,
-                }),
-              )
+            ) {
+              pipe.roots.add(message.job)
+              const app = apps.find((candidate) => candidate.job === message.job)
+              if (app && launchSource.includes("ResumeThread(primary)")) commitApp(app, pipe)
+              if (!holdRootAck)
+                queueMicrotask(() =>
+                  pipe.options.onEvent({
+                    type: "stdout",
+                    data: `${JSON.stringify({ event: "root-registered", job: message.job })}\n`,
+                  }),
+                )
+            }
             if (message.event === "stop" && !holdStopCleanup)
               queueMicrotask(() => {
                 stopOwnedJobs(pipe, false)
@@ -325,12 +392,44 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
             return
           }
           if (request.method === "job_ack") {
-            // Manual create-job protocol probes need not have a pending launch.
-            if (!launch || launch.job !== request.job || launch.app) return
+            // Model late/rejected transfer disposal only when the real helper has that path.
+            if (request.rejected || !launch || launch.job !== request.job || launch.app) {
+              if (helperSource.includes("function Close-JobAck"))
+                for (const handle of [request.handle, request.parentHandle])
+                  if (Number.isSafeInteger(handle) && handle > 0) pipe.closedTransfers.push(handle)
+              if (launch && launch.job === request.job && request.rejected) {
+                pipe.options.onEvent({
+                  type: "stdout",
+                  data: `${JSON.stringify({ event: "launch-finished", job: launch.job, failed: true })}\n`,
+                })
+                pipe.options.onEvent({
+                  type: "stdout",
+                  data: `${JSON.stringify({ id: launch.id, error: "Launch transfer rejected" })}\n`,
+                })
+                launch = undefined
+              }
+              return
+            }
             const watchdog = watchdogs.findLast(
               (candidate) => !candidate.exited && candidate.jobs.has(request.job),
             )
             if (!watchdog || request.handle !== 99) return
+            if (failLaunchBeforeRoot) {
+              const failed = launch
+              pipe.closedTransfers.push(request.handle, request.parentHandle)
+              queueMicrotask(() => {
+                pipe.options.onEvent({
+                  type: "stdout",
+                  data: `${JSON.stringify({ event: "launch-finished", job: failed.job, failed: true })}\n`,
+                })
+                pipe.options.onEvent({
+                  type: "stdout",
+                  data: `${JSON.stringify({ id: failed.id, error: "Launch failed before root registration" })}\n`,
+                })
+              })
+              launch = undefined
+              return
+            }
             const validParent =
               request.parentHandle === 100 &&
               request.parentPid === watchdog.pid &&
@@ -345,6 +444,7 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
               windowed: launch.windowed,
               committed: false,
               ancestryTrusted: true,
+              started: 3000,
               descendants: [] as FakeNative[],
             }
             launch.app = app
@@ -352,10 +452,10 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
             natives.push(app)
             watchdog.jobs.get(app.job)!.push(app)
             queueMicrotask(() => {
-              if (!pipe.exited)
+              if (!pipe.exited && !holdRootRequest)
                 pipe.options.onEvent({
                   type: "stdout",
-                  data: `${JSON.stringify({ event: "launch-root", job: app.job, pid: app.pid, started: "3000" })}\n`,
+                  data: `${JSON.stringify({ event: "launch-root", job: app.job, pid: app.pid, started: "3000", threadId: 301 })}\n`,
                 })
             })
             return
@@ -363,14 +463,11 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
           if (request.method === "root_ack") {
             if (!launch || launch.job !== request.job || !launch.app || launch.app.exited) return
             const app = launch.app
-            app.committed = true
-            const child: FakeNative = { pid: 170 + apps.length, parent: app, exited: false }
-            app.descendants.push(child)
-            natives.push(child)
-            watchdogs
-              .find((watchdog) => watchdog.jobs.has(app.job))!
-              .jobs.get(app.job)!
-              .push(child)
+            if (!app.committed) commitApp(app, watchdogs.find((watchdog) => watchdog.jobs.has(app.job))!)
+            pipe.options.onEvent({
+              type: "stdout",
+              data: `${JSON.stringify({ event: "launch-finished", job: app.job, failed: false })}\n`,
+            })
             publish(launch.id, {
               pid: app.pid,
               ...(app.windowed ? { window: WINDOW, title: "fixture" } : { instruction: "use ui_windows" }),
@@ -444,14 +541,26 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
     holdJobCreation() {
       holdJobCreation = true
     },
-    holdRetirement() {
-      holdRetirement = true
+    failLaunchBeforeRoot() {
+      failLaunchBeforeRoot = true
     },
-    failRetirement() {
-      failRetirement = true
+    holdRootAck() {
+      holdRootAck = true
     },
-    failReaper() {
-      failReaper = true
+    holdRootRequest() {
+      holdRootRequest = true
+    },
+    failDrain(job: string) {
+      failedDrains.add(job)
+    },
+    holdRetirement(value = true) {
+      holdRetirement = value
+    },
+    failRetirement(value = true) {
+      failRetirement = value
+    },
+    failReaper(value = true) {
+      failReaper = value
     },
     releaseRetirement() {
       for (const retire of retirements.splice(0)) retire()
@@ -1238,6 +1347,172 @@ test("MAC replay is refused for adoption but untrusted journals cannot block fre
   }
 })
 
+for (const ancestor of [
+  "exited launcher",
+  "live windowed launcher",
+  "reused younger PID",
+  "same-time PID",
+  "outside job",
+] as const) {
+  test(`headless stop: ${ancestor} ${ancestor === "live windowed launcher" ? "protects" : "does not protect"} owned children`, async () => {
+    const h = fake({ enabled: true, overlay: false })
+    const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+    await c.call("launch", { command: "launcher.exe" })
+    const app = h.apps[0]!
+    const child = app.descendants[0]!
+    if (ancestor === "exited launcher") app.exited = true
+    if (ancestor === "reused younger PID") app.started = 5000
+    if (ancestor === "same-time PID") app.started = child.started!
+    if (ancestor === "outside job") h.watchdogs[0]!.jobs.get(app.job)!.splice(0, 1)
+    c.emergencyStop()
+    await c.call("windows")
+    expect(child.exited).toBe(ancestor !== "live windowed launcher")
+    await c.stop()
+  })
+}
+
+for (const invisible of ["cloaked", "offscreen", "zeroSize", "alpha"] as const) {
+  test(`a ${invisible} window does not protect a fake launched subtree`, async () => {
+    const h = fake({ enabled: true, overlay: false })
+    const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+    await c.call("launch", { command: "invisible.exe" })
+    const app = h.apps[0]!
+    if (invisible === "alpha") app.alpha = 0
+    else app[invisible] = true
+    c.emergencyStop()
+    await c.call("windows")
+    expect(app.exited).toBe(true)
+    expect(app.descendants[0]!.exited).toBe(true)
+    await c.stop()
+  })
+}
+
+test("a candidate reusing the dead root PID still searches its live windowed parent", async () => {
+  const h = fake({ enabled: true, overlay: false })
+  const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+  await c.call("launch", { command: "root.exe" })
+  const root = h.apps[0]!
+  root.exited = true
+  const parent = root.descendants[0]!
+  parent.windowed = true
+  const worker: FakeNative = { pid: root.pid, parent, started: 5000, exited: false }
+  h.watchdogs[0]!.jobs.get(root.job)!.push(worker)
+  c.emergencyStop()
+  await c.call("windows")
+  expect(worker.exited).toBe(false)
+  expect(parent.exited).toBe(false)
+  await c.stop()
+})
+
+test("the watchdog commits a registered root before ack, so helper retirement cannot leave it suspended", async () => {
+  const h = fake({ enabled: true, overlay: false })
+  h.holdRootAck()
+  const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+  const launch = c.call("launch", { command: "windowed.exe" }).catch((error: Error) => error)
+  await Bun.sleep(0)
+  const app = h.apps[0]!
+  expect(h.watchdogs[0]!.roots.has(app.job)).toBe(true)
+  expect(app.committed).toBe(true)
+  expect(app.descendants).toHaveLength(1)
+  expect(h.pipes[0]!.writes.some((message) => message.method === "root_ack")).toBe(false)
+  c.cancelRead()
+  expect(await launch).toMatchObject({ message: "UIA read cancelled" })
+  await c.call("windows")
+  expect(app.exited).toBe(false)
+  expect(h.watchdogs[0]!.jobs.has(app.job)).toBe(true)
+  await c.stop()
+})
+
+test("one rootless drain failure retains its authority but does not skip other suspended launches", async () => {
+  const h = fake({ enabled: true, overlay: false })
+  h.holdRootRequest()
+  const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+  const launch = c.call("launch", { command: "suspended.exe" }).catch((error: Error) => error)
+  await Bun.sleep(0)
+  const app = h.apps[0]!
+  const helper = h.pipes[0]!
+  const watchdog = h.watchdogs[0]!
+  h.failDrain(app.job)
+  const second = `amira-uia-job-${crypto.randomUUID()}`
+  helper.options.onEvent({
+    type: "stdout",
+    data: `${JSON.stringify({ event: "create-job", job: second })}\n`,
+  })
+  const suspended: FakeNative = { pid: 901, exited: false, started: 3000 }
+  watchdog.jobs.get(second)!.push(suspended)
+  c.cancelRead()
+  await launch
+  await c.call("windows")
+  expect(app.committed).toBe(false)
+  expect(app.exited).toBe(false)
+  expect(watchdog.jobs.has(app.job)).toBe(true)
+  expect(suspended.exited).toBe(true)
+  expect(watchdog.jobs.has(second)).toBe(false)
+  await c.stop()
+})
+
+test("failed pre-root launches drop the retained fake job before later stops", async () => {
+  const h = fake({ enabled: true, overlay: false })
+  h.failLaunchBeforeRoot()
+  const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+  await expect(c.call("launch", { command: "missing.exe" })).rejects.toThrow("before root registration")
+  const watchdog = h.watchdogs[0]!
+  expect(
+    watchdog.writes.some((message) => message.event === "launch-finished" && message.failed === true),
+  ).toBe(true)
+  expect(watchdog.jobs.size).toBe(0)
+  expect(h.pipes[0]!.closedTransfers).toEqual([99, 100])
+  for (let stop = 0; stop < 2; stop++) {
+    c.emergencyStop()
+    await c.call("windows")
+    c.resume()
+    expect(watchdog.jobs.size).toBe(0)
+  }
+  await c.stop()
+})
+
+test("completed rootless jobs drain suspended fake members instead of lingering in launch grace", async () => {
+  const h = fake({ enabled: true, overlay: false })
+  h.holdJobCreation()
+  const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+  await c.call("windows")
+  const helper = h.pipes[0]!
+  const watchdog = h.watchdogs[0]!
+  const job = `amira-uia-job-${crypto.randomUUID()}`
+  helper.options.onEvent({ type: "stdout", data: `${JSON.stringify({ event: "create-job", job })}\n` })
+  const suspended: FakeNative = { pid: 900, exited: false, started: 3000 }
+  watchdog.jobs.get(job)!.push(suspended)
+  helper.options.onEvent({
+    type: "stdout",
+    data: `${JSON.stringify({ event: "launch-finished", job, failed: false })}\n`,
+  })
+  expect(suspended.exited).toBe(true)
+  expect(watchdog.jobs.has(job)).toBe(false)
+  await c.stop()
+})
+
+test("a late job transfer is rejected on its original live helper and closes both duplicates", async () => {
+  const h = fake({ enabled: true, overlay: false })
+  h.holdJobCreation()
+  h.holdRetirement()
+  const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+  await c.call("windows")
+  const helper = h.pipes[0]!
+  const watchdog = h.watchdogs[0]!
+  const job = `amira-uia-job-${crypto.randomUUID()}`
+  helper.options.onEvent({ type: "stdout", data: `${JSON.stringify({ event: "create-job", job })}\n` })
+  c.cancelRead()
+  watchdog.options.onEvent({
+    type: "stdout",
+    data: `${JSON.stringify({ event: "job-created", job, handle: 99, parentHandle: 100, parentPid: watchdog.pid, parentStarted: "2000" })}\n`,
+  })
+  expect(helper.writes.at(-1)).toMatchObject({ method: "job_ack", job, rejected: true })
+  expect(helper.closedTransfers).toEqual([99, 100])
+  expect(helper.exited).toBe(false)
+  h.releaseRetirement()
+  await c.stop()
+})
+
 test("job acknowledgements forward valid parent metadata and reject incomplete or mismatched parents", async () => {
   const h = fake({ enabled: true, overlay: false })
   h.holdJobCreation()
@@ -1270,7 +1545,7 @@ test("job acknowledgements forward valid parent metadata and reject incomplete o
       type: "stdout",
       data: `${JSON.stringify({ event: "job-created", job, ...metadata, ...invalid })}\n`,
     })
-    expect(helper.writes.some((message) => message.method === "job_ack" && message.job === job)).toBe(false)
+    expect(helper.writes).toContainEqual({ method: "job_ack", job, ...metadata, ...invalid, rejected: true })
   }
   const job = `amira-uia-job-${crypto.randomUUID()}`
   helper.options.onEvent({ type: "stdout", data: `${JSON.stringify({ event: "create-job", job })}\n` })
@@ -1328,6 +1603,7 @@ test("a live helper tree-close preserves watchdog-parented windowed apps across 
     job: app.job,
     pid: app.pid,
     started: "3000",
+    threadId: 301,
     generation: 1,
   })
   expect(helper.writes.findIndex((message) => message.method === "root_ack")).toBeGreaterThan(
@@ -1364,6 +1640,9 @@ test("exact watchdog crash rotates path/key/nonce and replacement owns only fres
   const oldPath = oldHelper.argv[oldHelper.argv.indexOf("-StatePath") + 1]!
   const oldSecret = oldHelper.writes[0]!
   expect(oldApp.parent).toBe(oldWatchdog)
+  writeFileSync(oldPath, "old generation evidence")
+  writeFileSync(`${oldPath}.tmp`, "interrupted write")
+  expect(existsSync(oldPath)).toBe(true) // Still evidence while the old watchdog is active.
   oldWatchdog.options.onEvent({ type: "exit", code: 1 }) // Native death, NOT tree close/EOF cleanup.
   await Bun.sleep(0)
   expect(oldWatchdog.exited).toBe(true)
@@ -1376,6 +1655,8 @@ test("exact watchdog crash rotates path/key/nonce and replacement owns only fres
   const watchdog = h.watchdogs[1]!
   const path = helper.argv[helper.argv.indexOf("-StatePath") + 1]!
   expect(path).not.toBe(oldPath)
+  expect(existsSync(oldPath)).toBe(false)
+  expect(existsSync(`${oldPath}.tmp`)).toBe(false)
   expect(helper.writes[0]!.key).not.toBe(oldSecret.key)
   expect(helper.writes[0]!.nonce).not.toBe(oldSecret.nonce)
   expect(watchdog.argv[watchdog.argv.indexOf("-StatePath") + 1]).toBe(path)
@@ -1520,7 +1801,8 @@ for (const failure of ["failed", "timed out", "reaper failed"] as const) {
     }
     const restartError = await c.call("windows").catch((error: Error) => error)
     expect(restartError).toMatchObject({
-      message: `UIA helper retirement ${failure === "timed out" ? "timed out" : "failed"}; restart refused`,
+      message:
+        "UIA helper retirement failed; restart refused: old helper exit is unconfirmed; retry /uia resume after it exits",
     })
     expect(helper.exited).toBe(false)
     expect(helper.closed).toEqual([])
@@ -1531,6 +1813,61 @@ for (const failure of ["failed", "timed out", "reaper failed"] as const) {
     expect(h.notices.some((message) => message.includes("restart refused"))).toBe(true)
   })
 }
+
+for (const failure of ["failed", "timed out", "reaper failed"] as const) {
+  test(`${failure} retirement can recover after exact old-helper exit without overlapping helpers`, async () => {
+    const h = fake({ enabled: true, overlay: false })
+    const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }), 100)
+    await c.call("launch", { command: "windowed.exe" })
+    const helper = h.pipes[0]!
+    if (failure === "reaper failed") {
+      h.failReaper()
+      h.watchdogs[0]!.options.onEvent({ type: "exit", code: 1 })
+      c.resume()
+    } else {
+      if (failure === "failed") h.failRetirement()
+      else h.holdRetirement()
+      c.cancelRead()
+    }
+    await expect(c.call("windows")).rejects.toThrow("old helper exit is unconfirmed")
+    expect(h.pipes).toHaveLength(1)
+    expect(helper.closed).toEqual([])
+    helper.options.onEvent({ type: "exit", code: 0 })
+    await Bun.sleep(0)
+    c.resume()
+    await c.call("windows")
+    expect(h.pipes).toHaveLength(2)
+    expect(helper.closed).toEqual([0])
+    expect(h.apps[0]!.exited).toBe(false)
+    h.failRetirement(false)
+    h.holdRetirement(false)
+    h.failReaper(false)
+    await c.stop()
+  })
+}
+
+test("failed stop teardown refuses restart until exact old-helper exit, then recovers", async () => {
+  const h = fake({ enabled: true, overlay: false })
+  const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }), 100)
+  await c.call("windows")
+  const helper = h.pipes[0]!
+  h.failRetirement()
+  h.failReaper()
+  await expect(c.stop()).rejects.toThrow("retirement failed")
+  expect(helper.exited).toBe(false)
+  expect(helper.closed).toEqual([])
+  await expect(c.call("windows")).rejects.toThrow("old helper exit is unconfirmed")
+  expect(h.pipes).toHaveLength(1)
+  helper.options.onEvent({ type: "exit", code: 0 })
+  await Bun.sleep(0)
+  c.resume()
+  await c.call("windows")
+  expect(h.pipes).toHaveLength(2)
+  expect(helper.closed).toEqual([0])
+  h.failRetirement(false)
+  h.failReaper(false)
+  await c.stop()
+})
 
 test("replacement death before writer announcement leaves the session owner alive for cleanup", async () => {
   const h = fake({ enabled: true, overlay: false })

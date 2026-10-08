@@ -30,6 +30,7 @@ $writer.AutoFlush = $true
 $script:windows = @{}
 $script:processes = @{}
 $script:jobs = @{}
+$script:receivedJobAcks = @{}
 $script:nextElement = 0
 $script:self = $null
 $script:lifetime = $null
@@ -833,6 +834,18 @@ namespace OwnedUia {
         return '"' + $escaped + '"'
     }
 
+    function Close-JobAck($ack) {
+        $job = Get-Argument $ack 'job'
+        if ($job -isnot [string] -or $script:receivedJobAcks.ContainsKey($job)) { return }
+        $script:receivedJobAcks[$job] = $true
+        foreach ($name in @('handle', 'parentHandle')) {
+            $handle = Get-Argument $ack $name
+            if (($handle -is [long] -or $handle -is [int]) -and $handle -gt 0) {
+                [OwnedUia.LaunchGuard]::CloseTransferredHandle([long]$handle)
+            }
+        }
+    }
+
     # launch: arbitrary executable/argv; journal only the exact process actually started.
     function Start-OwnedApp($parameters) {
         if (-not [OwnedUia.Native]::InteractiveDesktop()) { Deny 'No interactive input desktop is available.' }
@@ -873,39 +886,61 @@ namespace OwnedUia {
         # Request an unnamed job BEFORE process creation. The watchdog authenticates
         # this helper identity and owns the object even if publication is interrupted.
         $jobId = 'amira-uia-job-' + [Guid]::NewGuid().ToString()
-        $writer.WriteLine((@{ event = 'create-job'; job = $jobId } | ConvertTo-Json -Compress))
+        $committed = $false
         $launcher = $null
-        $retainClock = [Diagnostics.Stopwatch]::StartNew()
-        while ($retainClock.ElapsedMilliseconds -lt 5000) {
-            Assert-Lifetime
-            $pending = Get-PendingRead
-            if (-not $pending.IsCompleted) { Start-Sleep -Milliseconds 25; continue }
-            $line = Receive-PendingLine
-            if ($null -eq $line) { break }
-            $ack = $line | ConvertFrom-Json
-            if ((Get-Argument $ack 'method') -ceq 'job_ack' -and
-                (Get-Argument $ack 'job') -ceq $jobId) {
-                $handle = Get-Argument $ack 'handle'
-                if ($handle -isnot [long] -and $handle -isnot [int]) { Deny 'Invalid launch job handle.' }
-                $parentHandle = Get-Argument $ack 'parentHandle'
-                $parentPid = Get-Argument $ack 'parentPid'
-                $parentStarted = Get-Argument $ack 'parentStarted'
-                if (($parentHandle -isnot [long] -and $parentHandle -isnot [int]) -or $parentHandle -le 0 -or
-                    $parentPid -isnot [int] -or $parentPid -le 0 -or $parentStarted -isnot [string] -or
-                    $parentStarted -cnotmatch '^[1-9][0-9]*$') { Deny 'Invalid launch parent identity.' }
-                $launcher = [OwnedUia.LaunchGuard]::FromHandle($jobId, [long]$handle, [long]$parentHandle, $parentPid, [long]$parentStarted)
-                break
-            }
-            if ((Get-Argument $ack 'method') -cne 'job_ack') { $script:queuedLines.Enqueue($line) }
-        }
-        if ($null -eq $launcher) { Deny 'Launch refused: watchdog did not retain the launch job.' }
-        $script:jobs[$jobId] = $launcher
-        Save-OwnedState
         $launcherIdentity = $null
         try {
+            $writer.WriteLine((@{ event = 'create-job'; job = $jobId } | ConvertTo-Json -Compress))
+            $retainClock = [Diagnostics.Stopwatch]::StartNew()
+            while ($retainClock.ElapsedMilliseconds -lt 5000) {
+                Assert-Lifetime
+                $pending = Get-PendingRead
+                if (-not $pending.IsCompleted) { Start-Sleep -Milliseconds 25; continue }
+                $line = Receive-PendingLine
+                if ($null -eq $line) { break }
+                $ack = $line | ConvertFrom-Json
+                if ((Get-Argument $ack 'method') -ceq 'job_ack' -and
+                    (Get-Argument $ack 'job') -ceq $jobId) {
+                    if ((Get-Argument $ack 'rejected' $false) -eq $true) {
+                        Close-JobAck $ack
+                        Deny 'Launch refused: watchdog job transfer was rejected.'
+                    }
+                    $transferred = $false
+                    try {
+                        $handle = Get-Argument $ack 'handle'
+                        if (($handle -isnot [long] -and $handle -isnot [int]) -or $handle -le 0) { Deny 'Invalid launch job handle.' }
+                        $parentHandle = Get-Argument $ack 'parentHandle'
+                        $parentPid = Get-Argument $ack 'parentPid'
+                        $parentStarted = Get-Argument $ack 'parentStarted'
+                        if (($parentHandle -isnot [long] -and $parentHandle -isnot [int]) -or $parentHandle -le 0 -or
+                            $parentPid -isnot [int] -or $parentPid -le 0 -or $parentStarted -isnot [string] -or
+                            $parentStarted -cnotmatch '^[1-9][0-9]*$') { Deny 'Invalid launch parent identity.' }
+                        $parentTime = 0L
+                        if (-not [long]::TryParse($parentStarted, [ref]$parentTime)) { Deny 'Invalid launch parent identity.' }
+                        if ($script:receivedJobAcks.ContainsKey($jobId)) { Deny 'Duplicate launch job transfer.' }
+                        # FromHandle owns both handles even if its identity check throws.
+                        $transferred = $true
+                        $script:receivedJobAcks[$jobId] = $true
+                        $launcher = [OwnedUia.LaunchGuard]::FromHandle($jobId, [long]$handle, [long]$parentHandle, $parentPid, $parentTime)
+                    } finally { if (-not $transferred) { Close-JobAck $ack } }
+                    break
+                }
+                if ((Get-Argument $ack 'method') -ceq 'job_ack') { Close-JobAck $ack }
+                else { $script:queuedLines.Enqueue($line) }
+            }
+            if ($null -eq $launcher) { Deny 'Launch refused: watchdog did not retain the launch job.' }
+            $script:jobs[$jobId] = $launcher
+            Save-OwnedState
             Assert-Lifetime
             try { $launcher = [OwnedUia.LaunchGuard]::Start($path, $argumentLine, $cwd, $launcher) }
-            catch { Deny 'Launch refused: could not retain a non-breakaway job (nested jobs may be unsupported).' }
+            catch {
+                $exception = $_.Exception
+                while ($null -ne $exception.InnerException) { $exception = $exception.InnerException }
+                if ($exception.Message -ceq 'Launch parent identity changed or exited.') {
+                    Deny 'Launch refused: launch parent identity changed or exited.'
+                }
+                Deny 'Launch refused: could not retain a non-breakaway job (nested jobs may be unsupported).'
+            }
             $started = $launcher.Started
             if ($started -lt $began) { Deny 'Launch did not return a newly created process.' }
             $launcherIdentity = [pscustomobject]@{
@@ -914,7 +949,7 @@ namespace OwnedUia {
             }
             $script:processes[$launcherIdentity.Key] = $launcherIdentity
             Save-OwnedState
-            $writer.WriteLine((@{ event = 'launch-root'; job = $jobId; pid = $launcher.Id; started = $started.ToString() } | ConvertTo-Json -Compress))
+            $writer.WriteLine((@{ event = 'launch-root'; job = $jobId; pid = $launcher.Id; started = $started.ToString(); threadId = $launcher.ThreadId } | ConvertTo-Json -Compress))
             $registered = $false
             $clock = [Diagnostics.Stopwatch]::StartNew()
             while ($clock.ElapsedMilliseconds -lt 5000) {
@@ -929,9 +964,9 @@ namespace OwnedUia {
                 }
                 $script:queuedLines.Enqueue($line)
             }
-            if (-not $registered) { Deny 'Launch root registration timed out; process remains suspended.' }
+            if (-not $registered) { Deny 'Launch commit acknowledgement timed out; watchdog retains the launch job.' }
+            $committed = $true # The watchdog registered AND resumed the exact primary thread before ack.
             Assert-Lifetime
-            $launcher.Commit() # Already session-owned, atomically assigned, and journaled.
 
             $clock = [Diagnostics.Stopwatch]::StartNew()
             $stableKey = ''
@@ -967,10 +1002,19 @@ namespace OwnedUia {
                 Start-Sleep -Milliseconds 100
             }
             return @{ pid = $launcherIdentity.Pid; instruction = 'No unambiguous new window found; use ui_windows with an executable/title filter.' }
-        } catch {
-            # The watchdog retains even failed/pending jobs. A request failure does
-            # not terminate apps or discard the only record of an interrupted launch.
-            throw
+        } finally {
+            try {
+                if (-not $committed) {
+                    $script:jobs.Remove($jobId)
+                    if ($null -ne $launcherIdentity) { $script:processes.Remove($launcherIdentity.Key) }
+                    if ($null -ne $launcher) { $launcher.Dispose() }
+                    Save-OwnedState
+                }
+            } finally {
+                # A failed pre-commit launch is drained by its retained watchdog job.
+                # Discovery/provider failure after commit must NOT terminate an app.
+                $writer.WriteLine((@{ event = 'launch-finished'; job = $jobId; failed = (-not $committed) } | ConvertTo-Json -Compress))
+            }
         }
     }
 
@@ -1367,7 +1411,8 @@ namespace OwnedUia {
             $request = $line | ConvertFrom-Json
             if ($null -eq $request -or $request -isnot [pscustomobject]) { Deny 'Request must be a JSON object.' }
             # Late animation acknowledgements are protocol events, not RPC requests.
-            if ((Get-Argument $request 'method') -cin @('overlay_ack', 'job_ack', 'root_ack', 'writer_ack')) { continue }
+            if ((Get-Argument $request 'method') -ceq 'job_ack') { Close-JobAck $request; continue }
+            if ((Get-Argument $request 'method') -cin @('overlay_ack', 'root_ack', 'writer_ack')) { continue }
             $id = Get-Argument $request 'id'
             if ($null -eq $request.PSObject.Properties['id'] -or
                 ($id -isnot [string] -and $id -isnot [int] -and $id -isnot [long])) {

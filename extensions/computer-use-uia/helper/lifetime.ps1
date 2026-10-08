@@ -77,6 +77,7 @@ $verified = Get-ExactProcess $lifetime
 if ($null -eq $verified) { exit 1 }
 $sentinelProcess = $verified
 $jobs = @{}
+$completedJobs = @{}
 $cleanupIncomplete = $false
 $endingSince = $null
 $stopRequested = $false
@@ -92,7 +93,9 @@ function Assert-KnownJobs($state) {
     foreach ($name in $state.Jobs) {
         # Never reopen an object by a journal-supplied name/handle. An unavailable
         # owner means incomplete cleanup, not permission to guess a kernel object.
-        if (-not $jobs.ContainsKey($name)) { throw 'Launch job owner unavailable; journal retained.' }
+        if (-not $jobs.ContainsKey($name) -and -not $completedJobs.ContainsKey($name)) {
+            throw 'Launch job owner unavailable; journal retained.'
+        }
     }
 }
 
@@ -104,12 +107,39 @@ function Assert-CurrentWriter($state) {
     }
 }
 
+function Remove-LaunchJob([string] $name) {
+    if (-not $jobs.ContainsKey($name)) { return }
+    $job = $jobs[$name]
+    # Failed/rootless launches can contain suspended processes. Drain before dropping authority.
+    $job.Terminate()
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    while ($job.Members().Length -gt 0) {
+        if ($clock.ElapsedMilliseconds -ge 2000) { throw 'Failed launch job cleanup incomplete.' }
+        Start-Sleep -Milliseconds 25
+    }
+    $job.Dispose()
+    $jobs.Remove($name)
+    $completedJobs[$name] = $true
+}
+
+function Remove-RootlessJobs {
+    $failed = $false
+    foreach ($name in @($jobs.Keys)) {
+        if (-not $jobs[$name].HasRoot) {
+            try { Remove-LaunchJob $name }
+            catch { $failed = $true; [Console]::Error.WriteLine($_.Exception.Message) }
+        }
+    }
+    if ($failed) { throw 'Rootless launch job cleanup incomplete.' }
+}
+
 function Stop-CurrentWriter {
     # This identity came over the private client pipe, never from a journal. Explicit
     # stop/session end may always retire our own helper, even if its journal is missing
     # or corrupted. Retained kernel jobs, not the journal, authorize their own cleanup.
     if ($null -eq $script:writerIdentity) { return }
     Stop-HelperIdentity $script:writerIdentity
+    Remove-RootlessJobs
 }
 
 function Stop-RetainedJobs([bool] $force, $state) {
@@ -177,21 +207,31 @@ try {
                         if ([int]$message.pid -ne $expectedHelperPid -or
                             [int]$message.generation -ne $helperGeneration) { throw 'Invalid helper retirement event.' }
                         $failed = $false
-                        try { Stop-HelperIdentity @{ Pid = [int]$message.pid; Started = [string]$message.started } }
+                        try {
+                            Stop-HelperIdentity @{ Pid = [int]$message.pid; Started = [string]$message.started }
+                            Remove-RootlessJobs
+                        }
                         catch { $failed = $true; [Console]::Error.WriteLine($_.Exception.Message) }
                         [Console]::WriteLine((@{ event = 'retired'; pid = [int]$message.pid; started = [string]$message.started;
                             generation = [int]$message.generation; failed = $failed } | ConvertTo-Json -Compress))
+                    } elseif ($message.event -ceq 'launch-finished') {
+                        if (-not $writerAccepted -or [int]$message.generation -ne $helperGeneration -or
+                            $message.failed -isnot [bool]) { throw 'Invalid launch completion event.' }
+                        if ($jobs.ContainsKey([string]$message.job) -and
+                            -not $jobs[$message.job].HasRoot) {
+                            Remove-LaunchJob $message.job
+                        }
                     } elseif ($message.event -ceq 'launch-root') {
                         if (-not $writerAccepted -or [int]$message.generation -ne $helperGeneration -or
                             -not $jobs.ContainsKey([string]$message.job)) { throw 'Invalid launch root request.' }
-                        $jobs[$message.job].SetRoot([int]$message.pid, [long]$message.started)
+                        $jobs[$message.job].SetRoot([int]$message.pid, [long]$message.started, [uint32]$message.threadId)
                         [Console]::WriteLine((@{ event = 'root-registered'; job = $message.job } | ConvertTo-Json -Compress))
                     } elseif ($message.event -ceq 'create-job') {
                         if (-not $writerAccepted) { throw 'Current helper writer is unavailable; launch refused.' }
                         # Fresh jobs are bound to our accepted private writer, not file
                         # records. Unknown journal job names can never block or authorize creation.
                         if ($message.job -isnot [string] -or $message.job -cnotmatch '^amira-uia-job-[0-9a-f-]{36}$' -or
-                            $jobs.ContainsKey($message.job)) { throw 'Invalid launch job request.' }
+                            ($jobs.ContainsKey($message.job) -or $completedJobs.ContainsKey($message.job))) { throw 'Invalid launch job request.' }
                         $job = [OwnedUia.LaunchGuard]::CreateFor($message.job, [int]$script:writerIdentity.Pid, [long]$script:writerIdentity.Started)
                         $jobs[$message.job] = $job
                         [Console]::WriteLine((@{ event = 'job-created'; job = $message.job; handle = $job.HelperHandle;
@@ -208,24 +248,33 @@ try {
             try { Stop-CurrentWriter }
             catch { $cleanupIncomplete = $true; [Console]::Error.WriteLine($_.Exception.Message) }
             $state = $null
+            $journalGap = $false
             if ([IO.File]::Exists($StatePath)) {
                 try {
                     $snapshot = Read-OwnedJournal $StatePath
-                    Assert-CurrentWriter $snapshot
                     Assert-KnownJobs $snapshot
+                    Assert-CurrentWriter $snapshot
                     $state = $snapshot
                 } catch {
                     # Untrusted/stale records grant no kill authority. Our own retained
                     # job handles ALWAYS remain authoritative, even across a writer gap.
-                    $cleanupIncomplete = $true
-                    [Console]::Error.WriteLine($_.Exception.Message)
+                    if ($_.Exception.Message -like 'Stale launch journal;*') { $journalGap = $true }
+                    else {
+                        $cleanupIncomplete = $true
+                        [Console]::Error.WriteLine($_.Exception.Message)
+                    }
                 }
-            } elseif ($jobs.Count -gt 0 -or $null -ne $script:writerIdentity) {
-                $cleanupIncomplete = $true
-                [Console]::Error.WriteLine('Launch journal missing; cleanup incomplete.')
-            }
+            } else { $journalGap = $true }
             try { Stop-RetainedJobs $force $state }
             catch { $cleanupIncomplete = $true; [Console]::Error.WriteLine($_.Exception.Message) }
+            if ($journalGap) {
+                # Before the first write (or a replacement writer's first write), an
+                # absent/stale snapshot is not incomplete if retained authority drained.
+                foreach ($job in @($jobs.Values)) {
+                    try { if ($job.Members().Length -gt 0) { $cleanupIncomplete = $true } }
+                    catch { $cleanupIncomplete = $true }
+                }
+            }
             if ($stopRequested) {
                 [Console]::WriteLine((@{ event = 'stopped'; incomplete = $cleanupIncomplete } | ConvertTo-Json -Compress))
             }
