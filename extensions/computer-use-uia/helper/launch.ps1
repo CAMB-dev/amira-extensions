@@ -61,6 +61,7 @@ namespace OwnedUia {
         [DllImport("kernel32.dll", SetLastError = true)] static extern uint GetProcessId(IntPtr process);
         [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
         [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetExitCodeProcess(IntPtr process, out uint code);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr data, uint size, out uint returned);
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -77,9 +78,6 @@ namespace OwnedUia {
             public int Length, Flags, Show; public POINT MinPosition, MaxPosition; public RECT NormalPosition;
         }
         [DllImport("user32.dll")] static extern bool GetWindowPlacement(IntPtr window, ref WINDOWPLACEMENT placement);
-        [StructLayout(LayoutKind.Sequential)] struct MONITORINFO { public int Size; public RECT Bounds, Work; public uint Flags; }
-        [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr window, uint flags);
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
         [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr window, out RECT rect);
         [DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
         [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] static extern int GetWindowLong(IntPtr window, int index);
@@ -103,11 +101,19 @@ namespace OwnedUia {
             if (!GetProcessTimes(handle, out created, out exited, out kernel, out user)) throw new Win32Exception();
             return created; // UTC FILETIME, never local StartTime -> UTC (ambiguous across DST).
         }
-        static bool HasExited(IntPtr handle) {
-            long created, exited, kernel, user;
-            if (!GetProcessTimes(handle, out created, out exited, out kernel, out user)) throw new Win32Exception();
-            // The exit FILETIME is zero while running, independent of an exit code of 259.
-            return exited != 0;
+        static bool? HasExited(IntPtr handle, bool synchronize) {
+            if (!synchronize) {
+                uint code;
+                if (!GetExitCodeProcess(handle, out code)) throw new Win32Exception();
+                // Query-only access cannot distinguish STILL_ACTIVE from an exit code of 259.
+                if (code == 259u) return null;
+                return true;
+            }
+            uint status = WaitForSingleObject(handle, 0);
+            if (status == 0) return true; // WAIT_OBJECT_0
+            if (status == 258) return false; // WAIT_TIMEOUT
+            if (status == 0xffffffffu) throw new Win32Exception(); // WAIT_FAILED
+            throw new Win32Exception("Unexpected process wait result.");
         }
         IntPtr job, process, thread, parent;
         int rootPid;
@@ -202,28 +208,22 @@ namespace OwnedUia {
                 (cloaked & ~2u) != 0) return false;
             int styles = GetWindowLong(window, -20);
             RECT rect;
-            long offsetX = 0, offsetY = 0;
-            if (!IsIconic(window)) {
+            bool iconic = IsIconic(window);
+            if (!iconic) {
                 if (!GetWindowRect(window, out rect)) return false;
             } else {
-                // Ignore iconic bounds; require a normal on-screen app window, not a tool/tray stub.
+                // Ignore iconic bounds; a taskbar-restorable app still protects after monitor removal.
                 if ((styles & 0x80) != 0) return false; // WS_EX_TOOLWINDOW
                 var placement = new WINDOWPLACEMENT(); placement.Length = Marshal.SizeOf(typeof(WINDOWPLACEMENT));
                 if (!GetWindowPlacement(window, ref placement)) return false;
                 rect = placement.NormalPosition;
-                // Non-tool normal placement uses workspace coordinates. Convert using
-                // the restore monitor's work-area origin, including top/left taskbars.
-                IntPtr monitor = MonitorFromWindow(window, 2u); // MONITOR_DEFAULTTONEAREST
-                var info = new MONITORINFO(); info.Size = Marshal.SizeOf(typeof(MONITORINFO));
-                if (monitor == IntPtr.Zero || !GetMonitorInfo(monitor, ref info)) return false;
-                offsetX = (long)info.Work.Left - info.Bounds.Left;
-                offsetY = (long)info.Work.Top - info.Bounds.Top;
             }
             if (rect.Right <= rect.Left || rect.Bottom <= rect.Top) return false;
-            long left = GetSystemMetrics(76), top = GetSystemMetrics(77);
-            long right = left + GetSystemMetrics(78), bottom = top + GetSystemMetrics(79);
-            if (rect.Right + offsetX <= left || rect.Left + offsetX >= right ||
-                rect.Bottom + offsetY <= top || rect.Top + offsetY >= bottom) return false;
+            if (!iconic) {
+                long left = GetSystemMetrics(76), top = GetSystemMetrics(77);
+                long right = left + GetSystemMetrics(78), bottom = top + GetSystemMetrics(79);
+                if (rect.Right <= left || rect.Left >= right || rect.Bottom <= top || rect.Top >= bottom) return false;
+            }
             if ((styles & 0x80000) != 0) {
                 uint key, flags; byte alpha;
                 // Per-pixel layered windows may not expose a global alpha. This is a heuristic.
@@ -265,28 +265,37 @@ namespace OwnedUia {
                 if (pid == rootPid && started == rootStarted) return true;
                 int parentPid;
                 if (!parents.TryGetValue(pid, out parentPid) || parentPid <= 0) return true;
-                try {
-                    // PROCESS_QUERY_LIMITED_INFORMATION only, never Process.Handle (ALL_ACCESS).
-                    IntPtr handle = OpenProcess(0x1000u, false, (uint)parentPid);
+                // Limited query + SYNCHRONIZE, never Process.Handle (ALL_ACCESS).
+                bool synchronize = true;
+                IntPtr handle = OpenProcess(0x101000u, false, (uint)parentPid);
+                if (handle == IntPtr.Zero) {
+                    int error = Marshal.GetLastWin32Error();
+                    if (error == 5) { // ERROR_ACCESS_DENIED: retry without SYNCHRONIZE.
+                        synchronize = false;
+                        handle = OpenProcess(0x1000u, false, (uint)parentPid);
+                        error = handle == IntPtr.Zero ? Marshal.GetLastWin32Error() : 0;
+                    }
                     if (handle == IntPtr.Zero) {
-                        int error = Marshal.GetLastWin32Error();
                         if (error == 87) return true; // ERROR_INVALID_PARAMETER: PID gone.
                         throw new Win32Exception(error);
                     }
-                    try {
-                        if (GetProcessId(handle) != (uint)parentPid) throw new Win32Exception();
-                        if (HasExited(handle)) return true;
-                        long parentStarted = CreationTime(handle);
-                        bool belongs;
-                        if (HasExited(handle) || parentStarted >= started) return true;
-                        if (!IsProcessInJob(handle, job, out belongs)) throw new Win32Exception();
-                        if (!belongs) return true;
-                        if (parentPid == rootPid && parentStarted != rootStarted) return true;
-                        if (Visible(parentPid) && !HasExited(handle) && CreationTime(handle) == parentStarted) return false;
-                        pid = parentPid; started = parentStarted; depth++;
-                    } finally { CloseHandle(handle); }
-                } catch (ArgumentException) { return true; }
-                catch (InvalidOperationException) { return true; } // .NET Framework process already exited.
+                }
+                try {
+                    if (GetProcessId(handle) != (uint)parentPid) throw new Win32Exception();
+                    bool? exited = HasExited(handle, synchronize);
+                    if (exited == true) return true;
+                    long parentStarted = CreationTime(handle);
+                    bool belongs;
+                    if (HasExited(handle, synchronize) == true || parentStarted >= started) return true;
+                    if (!IsProcessInJob(handle, job, out belongs)) throw new Win32Exception();
+                    if (!belongs) return true;
+                    if (parentPid == rootPid && parentStarted != rootStarted) return true;
+                    // An ambiguous query-only ancestor is not proof of a traversable live
+                    // chain. Preserve this candidate, without pretending cleanup failed.
+                    if (exited == null) return false;
+                    if (Visible(parentPid) && HasExited(handle, synchronize) == false && CreationTime(handle) == parentStarted) return false;
+                    pid = parentPid; started = parentStarted; depth++;
+                } finally { CloseHandle(handle); }
             }
             return true;
         }

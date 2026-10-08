@@ -116,12 +116,18 @@ ownership; an exited ancestor, a broken chain, an ancestor outside the job, or a
 is not strictly older grants no protection. Ancestor access/API failures are not proof of a broken
 chain: that candidate is skipped and cleanup is reported incomplete; other candidates are still checked.
 A .NET process-already-exited exception is treated as an exit, not an access failure. Ancestors are
-opened with limited query access for exit, creation-time and job-membership checks; they are never
-opened with all-access rights.
+opened with limited query access plus `SYNCHRONIZE`, never all-access rights. A zero-time wait
+checks exit independently of the process's exit code. If synchronize access is denied, the watchdog
+retries with query-only access: a reused PID or an ancestor outside the job still grants no protection,
+and an exit code other than `259` proves exit. For an older same-job ancestor, query-only code `259`
+cannot distinguish running from exited; that candidate is conservatively preserved, without claiming
+a verified live ancestor chain or reporting a false cleanup failure. Genuine query/wait API failures
+still report incomplete cleanup.
 “Windowed” means a visible top-level window with non-zero bounds intersecting the virtual screen.
-A **minimized window protects** if it is not a tool window and its saved normal placement, converted
-from workspace to screen coordinates, is non-empty and intersects the virtual screen. Apps that minimize to the tray hide their window and are **not
-protected** by that hidden window or tray icon. DWM shell-only cloaking (including windows on another
+A **minimized window protects** if it is not a tool window and its saved normal placement is non-empty,
+even when that placement is off the virtual screen (for example, after unplugging a monitor). Only
+restored windows require an on-screen intersection; minimized placement needs no coordinate conversion.
+Apps that minimize to the tray hide their window and are **not protected** by that hidden window or tray icon. DWM shell-only cloaking (including windows on another
 virtual desktop) is allowed;
 app/inherited cloaking, including combinations with shell cloaking, is not. Layered windows whose
 reported global alpha is zero are excluded even when minimized. This is a **heuristic**, not proof

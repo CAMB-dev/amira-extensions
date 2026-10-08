@@ -22,11 +22,11 @@ interface FakeNative {
   lookupError?: "handle" | "creation time" | "job membership" | "window enumeration" | "exited"
   allAccessDenied?: boolean
   exitCode?: number
-  exitedAt?: number
+  waitStatus?: "signaled" | "timeout" | "failed"
+  synchronizeDenied?: boolean
+  queryDenied?: boolean
   normalRect?: { left: number; top: number; right: number; bottom: number }
-  workAreaOffset?: { x: number; y: number }
   toolWindow?: boolean
-  normalOffscreen?: boolean
   normalEmpty?: boolean
   placementFailure?: boolean
   offscreen?: boolean
@@ -104,18 +104,19 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
         while (current && !seen.has(current)) {
           seen.add(current)
           if (
-            current.exitedAt &&
-            (current === member || current.exitCode !== 259 || launchSource.includes("return exited != 0;"))
+            current.waitStatus === "signaled" &&
+            (current === member || launchSource.includes("WaitForSingleObject(handle, 0)"))
           ) {
             current.exited = true
             return current !== member
           }
+          if (current.waitStatus === "failed" && current !== member) {
+            incomplete = true
+            return false
+          }
           if (current.lookupError === "exited") {
-            const caught = launchSource.includes(
-              current === member
-                ? "catch (InvalidOperationException) { }"
-                : "catch (InvalidOperationException) { return true; }",
-            )
+            const caught =
+              current === member && launchSource.includes("catch (InvalidOperationException) { }")
             if (caught) {
               current.exited = true
               return current !== member
@@ -131,26 +132,12 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
           const cloakMask = launchSource.includes("(cloaked & ~2u) != 0") ? ~2 : ~0
           const placementChecked = launchSource.includes("GetWindowPlacement(window, ref placement)")
           const rect = current.normalRect
-          const offset = launchSource.includes("rect.Right + offsetX") ? current.workAreaOffset : undefined
-          const x = offset?.x ?? 0,
-            y = offset?.y ?? 0
-          const normalOnScreen =
-            !rect ||
-            (rect.right > rect.left &&
-              rect.bottom > rect.top &&
-              rect.right + x > 0 &&
-              rect.left + x < 1920 &&
-              rect.bottom + y > 0 &&
-              rect.top + y < 1080)
+          const normalNonEmpty = !rect || (rect.right > rect.left && rect.bottom > rect.top)
           const minimized =
             current.minimized &&
-            launchSource.includes("if (!IsIconic(window))") &&
+            launchSource.includes("IsIconic(window)") &&
             (!placementChecked ||
-              (!current.toolWindow &&
-                !current.normalOffscreen &&
-                !current.normalEmpty &&
-                !current.placementFailure &&
-                normalOnScreen))
+              (!current.toolWindow && !current.normalEmpty && !current.placementFailure && normalNonEmpty))
           if (
             !current.exited &&
             current.windowed &&
@@ -160,6 +147,20 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
           )
             return false
           const parent: FakeNative | undefined = current.parent
+          if (parent?.queryDenied) {
+            incomplete = true
+            return false
+          }
+          if (parent?.synchronizeDenied) {
+            if (!launchSource.includes("if (exited == null) return false;")) {
+              incomplete = true
+              return false
+            }
+            if ((parent.exitCode ?? 259) !== 259) {
+              parent.exited = true
+              return true
+            }
+          }
           if (
             parent?.allAccessDenied &&
             !launchSource.includes("OpenProcess(0x1000u, false, (uint)parentPid)")
@@ -169,16 +170,24 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
           }
           if (
             !parent ||
-            parent.exited ||
+            (parent.exited && !parent.synchronizeDenied) ||
             !members.includes(parent) ||
-            (parent.started ?? 0) >= (current.started ?? 0)
+            ((parent.started ?? 0) >= (current.started ?? 0) &&
+              (!parent.synchronizeDenied ||
+                (launchSource.indexOf("parentStarted >= started") >= 0 &&
+                  launchSource.indexOf("parentStarted >= started") <
+                    launchSource.indexOf("if (exited == null)"))))
           )
             return launchSource.includes("parentStarted >= started")
+          if (parent.synchronizeDenied) return false // Ambiguous query-only ancestry is preserved, not traversed.
           current = parent
         }
         return true
       })
-      for (const member of eligible) member.exited = true
+      for (const member of eligible) {
+        if (!member.exited) member.exitCode = 1 // A fake kill proves exit without overwriting an existing code 259.
+        member.exited = true
+      }
     }
     if (journalGap && !lifetimeSource.includes("if ($force -and $journalGap)"))
       incomplete ||= [...watchdog.jobs.values()].some((members) => members.some((member) => !member.exited))
@@ -1468,42 +1477,42 @@ for (const ancestor of [
 for (const [state, appearance, kept] of [
   ["minimized", { minimized: true, offscreen: true, zeroSize: true }, true],
   ["minimized tool", { minimized: true, toolWindow: true }, false],
-  ["minimized off-screen normal placement", { minimized: true, normalOffscreen: true }, false],
+  [
+    "minimized on an unplugged monitor",
+    { minimized: true, normalRect: { left: 2500, top: 100, right: 2800, bottom: 300 } },
+    true,
+  ],
   ["minimized empty normal placement", { minimized: true, normalEmpty: true }, false],
   ["minimized unreadable placement", { minimized: true, placementFailure: true }, false],
   [
-    "minimized below a top-taskbar screen",
+    "minimized below the current screen",
     {
       minimized: true,
-      normalRect: { left: 100, top: 1050, right: 500, bottom: 1090 },
-      workAreaOffset: { x: 0, y: 40 },
-    },
-    false,
-  ],
-  [
-    "minimized intersecting a top-taskbar screen",
-    {
-      minimized: true,
-      normalRect: { left: 100, top: -70, right: 500, bottom: -30 },
-      workAreaOffset: { x: 0, y: 40 },
+      normalRect: { left: 100, top: 1200, right: 500, bottom: 1240 },
     },
     true,
   ],
   [
-    "minimized beyond a left-taskbar screen",
+    "minimized above the current screen",
     {
       minimized: true,
-      normalRect: { left: 1890, top: 100, right: 1930, bottom: 500 },
-      workAreaOffset: { x: 40, y: 0 },
+      normalRect: { left: 100, top: -70, right: 500, bottom: -30 },
     },
-    false,
+    true,
   ],
   [
-    "minimized intersecting a left-taskbar screen",
+    "minimized beyond the current screen",
+    {
+      minimized: true,
+      normalRect: { left: 2000, top: 100, right: 2040, bottom: 500 },
+    },
+    true,
+  ],
+  [
+    "minimized left of the current screen",
     {
       minimized: true,
       normalRect: { left: -70, top: 100, right: -30, bottom: 500 },
-      workAreaOffset: { x: 40, y: 0 },
     },
     true,
   ],
@@ -1541,8 +1550,11 @@ for (const gone of ["candidate", "ancestor"] as const) {
     const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
     await c.call("launch", { command: "launcher.exe" })
     const app = h.apps[0]!
-    app.lookupError = "exited"
-    if (gone === "ancestor") h.watchdogs[0]!.jobs.get(app.job)!.reverse()
+    if (gone === "candidate") app.lookupError = "exited"
+    else {
+      app.waitStatus = "signaled"
+      h.watchdogs[0]!.jobs.get(app.job)!.reverse()
+    }
     c.emergencyStop()
     await c.call("windows")
     expect(app.exited).toBe(true)
@@ -1559,7 +1571,7 @@ test("an exited ancestor with code 259 cannot bridge a child to a live windowed 
   const root = h.apps[0]!
   const intermediate = root.descendants[0]!
   intermediate.exitCode = 259
-  intermediate.exitedAt = 6000
+  intermediate.waitStatus = "signaled"
   const child: FakeNative = { pid: 902, parent: intermediate, started: 5000, exited: false }
   const members = h.watchdogs[0]!.jobs.get(root.job)!
   members.unshift(child) // Query the dead ancestor before a candidate observation proves its exit.
@@ -1572,7 +1584,89 @@ test("an exited ancestor with code 259 cannot bridge a child to a live windowed 
   await c.stop()
 })
 
-test("limited ancestor queries do not let a reused elevated PID protect an orphan", async () => {
+test("a live ancestor whose wait times out still protects its headless child", async () => {
+  const h = fake({ enabled: true, overlay: false })
+  const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+  await c.call("launch", { command: "windowed.exe" })
+  h.apps[0]!.waitStatus = "timeout"
+  h.apps[0]!.exitCode = 259
+  c.emergencyStop()
+  await c.call("windows")
+  expect(h.apps[0]!.descendants[0]!.exited).toBe(false)
+  expect(h.notices).not.toContain("computer-use-uia: headless cleanup incomplete; launch journal retained")
+  await c.stop()
+})
+
+for (const failure of ["wait", "query-only open"] as const) {
+  test(`an ancestor ${failure} failure skips the candidate and reports incomplete`, async () => {
+    const h = fake({ enabled: true, overlay: false })
+    const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+    await c.call("launch", { command: "windowed.exe" })
+    const root = h.apps[0]!
+    if (failure === "wait") root.waitStatus = "failed"
+    else {
+      root.synchronizeDenied = true
+      root.queryDenied = true
+    }
+    c.emergencyStop()
+    await c.call("windows")
+    expect(root.descendants[0]!.exited).toBe(false)
+    expect(h.notices).toContain("computer-use-uia: headless cleanup incomplete; launch journal retained")
+    await c.stop()
+  })
+}
+
+for (const [exitCode, alreadyExited] of [
+  [0, true],
+  [259, false],
+  [259, true],
+] as const) {
+  test(`SYNCHRONIZE denial with code ${exitCode} and exited=${alreadyExited} uses query-only without false incomplete`, async () => {
+    const h = fake({ enabled: true, overlay: false })
+    h.uncertain()
+    const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+    await c.call("launch", { command: "headless.exe" })
+    const root = h.apps[0]!
+    root.synchronizeDenied = true
+    root.exitCode = exitCode
+    root.exited = alreadyExited
+    h.watchdogs[0]!.jobs.get(root.job)!.reverse() // Query the ancestor before a candidate exit observation.
+    if (exitCode === 0) root.waitStatus = "signaled"
+    c.emergencyStop()
+    await c.call("windows")
+    expect(root.descendants[0]!.exited).toBe(exitCode === 0)
+    expect(h.notices).not.toContain("computer-use-uia: headless cleanup incomplete; launch journal retained")
+    await c.stop()
+  })
+}
+
+test("query-only fallback rejects a younger same-job ancestor before treating code 259 as ambiguous", async () => {
+  const h = fake({ enabled: true, overlay: false })
+  const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+  await c.call("launch", { command: "windowed.exe" })
+  const root = h.apps[0]!
+  const child = root.descendants[0]!
+  const younger: FakeNative = {
+    pid: 903,
+    started: 5000,
+    exited: false,
+    windowed: true,
+    synchronizeDenied: true,
+    exitCode: 259,
+    parent: root,
+  }
+  child.parent = younger
+  h.watchdogs[0]!.jobs.get(root.job)!.push(younger)
+  c.emergencyStop()
+  await c.call("windows")
+  expect(child.exited).toBe(true)
+  expect(root.exited).toBe(false)
+  expect(younger.exited).toBe(false)
+  expect(h.notices).not.toContain("computer-use-uia: headless cleanup incomplete; launch journal retained")
+  await c.stop()
+})
+
+test("query-only fallback does not let a reused elevated PID protect an orphan", async () => {
   const h = fake({ enabled: true, overlay: false })
   const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
   await c.call("launch", { command: "launcher.exe" })
@@ -1584,6 +1678,8 @@ test("limited ancestor queries do not let a reused elevated PID protect an orpha
     exited: false,
     windowed: true,
     allAccessDenied: true,
+    synchronizeDenied: true,
+    exitCode: 259,
   }
   app.descendants[0]!.parent = replacement
   c.emergencyStop()

@@ -56,7 +56,7 @@ test("headless stop checks exact handle identity and job membership, not image n
     "parentStarted >= started",
     "DwmGetWindowAttribute(window, 14",
     "(cloaked & ~2u) != 0",
-    "if (!IsIconic(window))",
+    "bool iconic = IsIconic(window);",
     "rect.Right <= rect.Left",
     "GetSystemMetrics(76)",
     "GetLayeredWindowAttributes(window",
@@ -86,8 +86,8 @@ test("ancestor access/API failures cannot become permission to kill", () => {
     launch.indexOf("bool HeadlessAncestors"),
     launch.indexOf("public void StopHeadless"),
   )
-  expect(ancestors).toContain("catch (ArgumentException) { return true; }")
-  expect(ancestors).toContain("catch (InvalidOperationException) { return true; }")
+  expect(ancestors).not.toContain("catch (ArgumentException)")
+  expect(ancestors).not.toContain("catch (InvalidOperationException)")
   expect(ancestors).not.toContain("catch (Win32Exception) { return true; }")
   expect(ancestors).toContain("if (!IsProcessInJob(handle, job, out belongs)) throw new Win32Exception();")
   expect(ancestors).toContain("OpenProcess(0x1000u, false, (uint)parentPid)")
@@ -95,11 +95,26 @@ test("ancestor access/API failures cannot become permission to kill", () => {
   expect(ancestors).not.toContain("Process.GetProcessById(parentPid)")
   expect(ancestors).toContain("if (error == 87) return true;")
   expect(ancestors).toContain("GetProcessId(handle) != (uint)parentPid")
-  expect(ancestors).toContain("HasExited(handle)")
-  const exited = launch.slice(launch.indexOf("static bool HasExited"), launch.indexOf("IntPtr job, process"))
-  expect(exited).toContain("GetProcessTimes(handle, out created, out exited")
-  expect(exited).toContain("return exited != 0;")
-  expect(exited).not.toContain("GetExitCodeProcess")
+  expect(ancestors).toContain("OpenProcess(0x101000u, false, (uint)parentPid)")
+  expect(ancestors).toContain("if (error == 5)")
+  expect(ancestors.indexOf("if (error == 5)")).toBeLessThan(ancestors.indexOf("OpenProcess(0x1000u"))
+  expect(ancestors).toContain("if (exited == null) return false;")
+  expect(ancestors.indexOf("if (!belongs) return true;")).toBeLessThan(
+    ancestors.indexOf("if (exited == null)"),
+  )
+  expect(ancestors.indexOf("parentStarted >= started")).toBeLessThan(ancestors.indexOf("if (exited == null)"))
+  expect(ancestors.indexOf("parentPid == rootPid && parentStarted != rootStarted")).toBeLessThan(
+    ancestors.indexOf("if (exited == null)"),
+  )
+  expect(ancestors).toContain("HasExited(handle, synchronize)")
+  const exited = launch.slice(launch.indexOf("static bool? HasExited"), launch.indexOf("IntPtr job, process"))
+  expect(exited).toContain("WaitForSingleObject(handle, 0)")
+  expect(exited).toContain("if (status == 0) return true;")
+  expect(exited).toContain("if (status == 258) return false;")
+  expect(exited).not.toContain("GetProcessTimes")
+  expect(exited).toContain("if (!synchronize)")
+  expect(exited).toContain("if (code == 259u) return null;")
+  expect(exited).toContain("if (status == 0xffffffffu) throw new Win32Exception();")
   expect(ancestors).toContain("CreationTime(handle)")
   expect(ancestors).toContain("finally { CloseHandle(handle); }")
   const stop = launch.slice(
@@ -110,17 +125,18 @@ test("ancestor access/API failures cannot become permission to kill", () => {
   expect(stop.match(/catch \(Win32Exception\) \{ failed = true; \}/g)).toHaveLength(2)
 })
 
-test("minimized protectors require a normal on-screen placement and cannot be tool windows", () => {
+test("minimized protectors need non-empty placement, but only restored windows need on-screen bounds", () => {
   const protector = launch.slice(launch.indexOf("bool ProtectorWindow"), launch.indexOf("bool Visible"))
   expect(protector).toContain("GetWindowPlacement(window, ref placement)")
   expect(protector).toContain("rect = placement.NormalPosition;")
   expect(protector).toContain("(styles & 0x80) != 0")
-  expect(protector).toContain("MonitorFromWindow(window, 2u)")
-  expect(protector).toContain("GetMonitorInfo(monitor, ref info)")
-  expect(protector).toContain("offsetX = (long)info.Work.Left - info.Bounds.Left;")
-  expect(protector).toContain("offsetY = (long)info.Work.Top - info.Bounds.Top;")
-  expect(protector).toContain("rect.Right + offsetX <= left")
-  expect(protector).toContain("rect.Bottom + offsetY <= top")
+  expect(protector).not.toContain("MonitorFromWindow")
+  expect(launch).not.toContain("MONITORINFO")
+  expect(launch).not.toContain("GetMonitorInfo")
+  expect(protector).not.toContain("offsetX")
+  expect(protector).toContain("bool iconic = IsIconic(window);")
+  expect(protector.match(/if \(!iconic\)/g)).toHaveLength(2)
+  expect(protector.lastIndexOf("if (!iconic)")).toBeLessThan(protector.indexOf("GetSystemMetrics(76)"))
   expect(protector.indexOf("rect = placement.NormalPosition;")).toBeLessThan(
     protector.indexOf("rect.Right <= rect.Left"),
   )
