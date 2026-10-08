@@ -48,7 +48,9 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
     /UpdateProcThreadAttribute\(attributes,\s*0,\s*new IntPtr\(0x20000\)/.test(launchSource) &&
     /UpdateProcThreadAttribute\(attributes,\s*0,\s*new IntPtr\(0x2000D\)/.test(launchSource) &&
     /InitializeProcThreadAttributeList\(attributes,\s*2,/.test(launchSource) &&
-    /DuplicateHandle\(GetCurrentProcess\(\),\s*owner\.Handle,\s*target,\s*out parentDuplicate/.test(launchSource) &&
+    /DuplicateHandle\(GetCurrentProcess\(\),\s*owner\.Handle,\s*target,\s*out parentDuplicate/.test(
+      launchSource,
+    ) &&
     /guard\.ParentHandle = parentDuplicate\.ToInt64\(\)/.test(launchSource) &&
     /parent = new IntPtr\(parentHandle\)/.test(launchSource) &&
     /Marshal\.WriteIntPtr\(parentValue,\s*guard\.parent\)/.test(launchSource) &&
@@ -145,8 +147,7 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
           // PipeProcess.close() kills descendants only while its native root is still alive.
           if (pipe.exited) return
           if (watchdogs.includes(pipe)) stopOwnedJobs(pipe, true)
-          for (const native of natives)
-            if (descendantOf(native, pipe)) native.exited = true
+          for (const native of natives) if (descendantOf(native, pipe)) native.exited = true
           pipe.exited = true
           queueMicrotask(() => pipe.options.onEvent({ type: "exit", code: 0 }))
         },
@@ -183,16 +184,19 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
             }
             if (
               message.event === "retire" &&
-              writer && writer.pid === message.pid &&
+              writer &&
+              writer.pid === message.pid &&
               writerGeneration === message.generation
             ) {
               const target = writer
               const retire = () => target.options.onEvent({ type: "exit", code: 0 })
               if (failRetirement)
-                queueMicrotask(() => pipe.options.onEvent({
-                  type: "stdout",
-                  data: `${JSON.stringify({ ...message, event: "retired", failed: true })}\n`,
-                }))
+                queueMicrotask(() =>
+                  pipe.options.onEvent({
+                    type: "stdout",
+                    data: `${JSON.stringify({ ...message, event: "retired", failed: true })}\n`,
+                  }),
+                )
               else if (holdRetirement) retirements.push(retire)
               else queueMicrotask(retire)
             }
@@ -304,7 +308,10 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
         const job = launch.job
         queueMicrotask(() => {
           if (!pipe.exited)
-            pipe.options.onEvent({ type: "stdout", data: `${JSON.stringify({ event: "create-job", job })}\n` })
+            pipe.options.onEvent({
+              type: "stdout",
+              data: `${JSON.stringify({ event: "create-job", job })}\n`,
+            })
         })
       }
       return {
@@ -346,7 +353,10 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
             watchdog.jobs.get(app.job)!.push(app)
             queueMicrotask(() => {
               if (!pipe.exited)
-                pipe.options.onEvent({ type: "stdout", data: `${JSON.stringify({ event: "launch-root", job: app.job, pid: app.pid, started: "3000" })}\n` })
+                pipe.options.onEvent({
+                  type: "stdout",
+                  data: `${JSON.stringify({ event: "launch-root", job: app.job, pid: app.pid, started: "3000" })}\n`,
+                })
             })
             return
           }
@@ -357,7 +367,10 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
             const child: FakeNative = { pid: 170 + apps.length, parent: app, exited: false }
             app.descendants.push(child)
             natives.push(child)
-            watchdogs.find((watchdog) => watchdog.jobs.has(app.job))!.jobs.get(app.job)!.push(child)
+            watchdogs
+              .find((watchdog) => watchdog.jobs.has(app.job))!
+              .jobs.get(app.job)!
+              .push(child)
             publish(launch.id, {
               pid: app.pid,
               ...(app.windowed ? { window: WINDOW, title: "fixture" } : { instruction: "use ui_windows" }),
@@ -372,7 +385,12 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
           requests.push(request)
           if (!respond) return
           if (request.method === "launch") {
-            launch = { id: request.id, job: `amira-uia-job-${crypto.randomUUID()}`, windowed: launchWindow, begun: false }
+            launch = {
+              id: request.id,
+              job: `amira-uia-job-${crypto.randomUUID()}`,
+              windowed: launchWindow,
+              begun: false,
+            }
             beginLaunch()
             return
           }
@@ -1205,7 +1223,14 @@ test("MAC replay is refused for adoption but untrusted journals cannot block fre
       type: "stdout",
       data: `${JSON.stringify({ event: "job-created", job: ownJob, handle: 99, parentHandle: 100, parentPid: watchdog.pid, parentStarted: "2000" })}\n`,
     })
-    expect(helper.writes).toContainEqual({ method: "job_ack", job: ownJob, handle: 99, parentHandle: 100, parentPid: watchdog.pid, parentStarted: "2000" })
+    expect(helper.writes).toContainEqual({
+      method: "job_ack",
+      job: ownJob,
+      handle: 99,
+      parentHandle: 100,
+      parentPid: watchdog.pid,
+      parentStarted: "2000",
+    })
     expect(h.notices).toEqual([])
   } finally {
     unlinkSync(path)
@@ -1249,7 +1274,10 @@ test("job acknowledgements forward valid parent metadata and reject incomplete o
   }
   const job = `amira-uia-job-${crypto.randomUUID()}`
   helper.options.onEvent({ type: "stdout", data: `${JSON.stringify({ event: "create-job", job })}\n` })
-  watchdog.options.onEvent({ type: "stdout", data: `${JSON.stringify({ event: "job-created", job, ...metadata })}\n` })
+  watchdog.options.onEvent({
+    type: "stdout",
+    data: `${JSON.stringify({ event: "job-created", job, ...metadata })}\n`,
+  })
   expect(helper.writes).toContainEqual({ method: "job_ack", job, ...metadata })
   expect(h.apps).toEqual([]) // A standalone protocol probe must not fabricate an application.
   await c.stop()
@@ -1286,9 +1314,22 @@ test("a live helper tree-close preserves watchdog-parented windowed apps across 
   expect(app.parentPid).toBe(watchdog.pid)
   expect(app.committed).toBe(true)
   expect(app.descendants).toHaveLength(1)
-  expect(helper.writes).toContainEqual({ method: "job_ack", job: app.job, handle: 99, parentHandle: 100, parentPid: watchdog.pid, parentStarted: "2000" })
+  expect(helper.writes).toContainEqual({
+    method: "job_ack",
+    job: app.job,
+    handle: 99,
+    parentHandle: 100,
+    parentPid: watchdog.pid,
+    parentStarted: "2000",
+  })
   expect(watchdog.writes).toContainEqual({ event: "create-job", job: app.job })
-  expect(watchdog.writes).toContainEqual({ event: "launch-root", job: app.job, pid: app.pid, started: "3000", generation: 1 })
+  expect(watchdog.writes).toContainEqual({
+    event: "launch-root",
+    job: app.job,
+    pid: app.pid,
+    started: "3000",
+    generation: 1,
+  })
   expect(helper.writes.findIndex((message) => message.method === "root_ack")).toBeGreaterThan(
     helper.writes.findIndex((message) => message.method === "job_ack"),
   )
@@ -1384,7 +1425,9 @@ for (const journal of ["missing", "corrupt", "stale"] as const) {
           Processes: [],
           Jobs: [],
         })
-        const mac = createHmac("sha256", Buffer.from(secret.key as string, "base64")).update(content).digest("base64")
+        const mac = createHmac("sha256", Buffer.from(secret.key as string, "base64"))
+          .update(content)
+          .digest("base64")
         writeFileSync(path, JSON.stringify({ Content: content, Mac: mac }))
       }
       expect(watchdog.jobs.size).toBe(2)
@@ -1475,7 +1518,10 @@ for (const failure of ["failed", "timed out", "reaper failed"] as const) {
       await Bun.sleep(0)
       expect(watchdog.exited).toBe(false)
     }
-    await expect(c.call("windows")).rejects.toThrow(`retirement ${failure === "timed out" ? "timed out" : "failed"}`)
+    const restartError = await c.call("windows").catch((error: Error) => error)
+    expect(restartError).toMatchObject({
+      message: `UIA helper retirement ${failure === "timed out" ? "timed out" : "failed"}; restart refused`,
+    })
     expect(helper.exited).toBe(false)
     expect(helper.closed).toEqual([])
     expect(h.pipes).toHaveLength(1)

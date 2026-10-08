@@ -8,7 +8,10 @@ const launch = readFileSync(new URL("../helper/launch.ps1", import.meta.url), "u
 test("every PowerShell helper is pure ASCII, including model-visible strings", () => {
   const directory = new URL("../helper/", import.meta.url)
   for (const name of readdirSync(directory).filter((name) => name.endsWith(".ps1")))
-    expect(readFileSync(new URL(name, directory)).some((byte) => byte > 127), name).toBe(false)
+    expect(
+      readFileSync(new URL(name, directory)).some((byte) => byte > 127),
+      name,
+    ).toBe(false)
 })
 
 test("no startup sweep can consume another client's journal", () => {

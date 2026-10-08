@@ -361,9 +361,19 @@ test("launch parent and job membership are assigned together before suspended cr
   expect(guard).toContain("GetProcessId(parent) != ParentPid")
   expect(guard).toContain("CreationTime(parent) != ParentStarted")
   expect(guard).toContain("guard.ParentPid = owner.Id")
-  ordered(guard, "Process.GetCurrentProcess()", "owner.Handle, target, out parentDuplicate", "guard.ParentHandle = parentDuplicate.ToInt64()")
+  ordered(
+    guard,
+    "Process.GetCurrentProcess()",
+    "owner.Handle, target, out parentDuplicate",
+    "guard.ParentHandle = parentDuplicate.ToInt64()",
+  )
   expect(guard).toContain("parent = new IntPtr(parentHandle)")
-  ordered(guard, "Marshal.WriteIntPtr(parentValue, guard.parent)", "new IntPtr(0x20000), parentValue", "if (!CreateProcess(")
+  ordered(
+    guard,
+    "Marshal.WriteIntPtr(parentValue, guard.parent)",
+    "new IntPtr(0x20000), parentValue",
+    "if (!CreateProcess(",
+  )
 })
 
 test("lifetime polling uses a cached sentinel handle and the helper polls no faster than 250 ms", () => {
@@ -394,7 +404,10 @@ test("session cleanup always visits retained jobs and waits before retrying term
 })
 
 test("concurrent helper exit is confirmed in the catch and retirement failure is acknowledged", () => {
-  const retirement = lifetime.slice(lifetime.indexOf("function Stop-HelperIdentity"), lifetime.indexOf("# Headless fallback"))
+  const retirement = lifetime.slice(
+    lifetime.indexOf("function Stop-HelperIdentity"),
+    lifetime.indexOf("# Headless fallback"),
+  )
   ordered(retirement, "$helper.Kill()", "} catch {", "Test-IdentityGone $identity", "} finally")
   expect(lifetime).toContain("event = 'retired'")
   expect(lifetime).toContain("failed = $failed")

@@ -879,7 +879,12 @@ export class UiaClient {
       const watchdog = this.watchdog
       if (watchdog) {
         const acknowledged = Promise.withResolvers<void>()
-        this.helperRetirements.set(generation, { watchdog, pid: identity.pid, started: identity.started, ...acknowledged })
+        this.helperRetirements.set(generation, {
+          watchdog,
+          pid: identity.pid,
+          started: identity.started,
+          ...acknowledged,
+        })
         watchdog.write(
           `${JSON.stringify({ event: "retire", pid: identity.pid, started: identity.started, generation })}\n`,
         )
@@ -917,8 +922,7 @@ export class UiaClient {
             cwd: this.host.cwd,
             onEvent: (event) => {
               if (event.type === "exit") {
-                if (event.code !== 0)
-                  done.reject(new Error("UIA helper retirement failed; restart refused"))
+                if (event.code !== 0) done.reject(new Error("UIA helper retirement failed; restart refused"))
                 else done.resolve()
               }
             },
