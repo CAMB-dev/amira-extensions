@@ -31,6 +31,7 @@ $script:windows = @{}
 $script:processes = @{}
 $script:jobs = @{}
 $script:receivedJobAcks = @{}
+$script:requestedJobs = [Collections.Hashtable]::new([StringComparer]::Ordinal)
 $script:nextElement = 0
 $script:self = $null
 $script:lifetime = $null
@@ -836,7 +837,8 @@ namespace OwnedUia {
 
     function Close-JobAck($ack) {
         $job = Get-Argument $ack 'job'
-        if ($job -isnot [string] -or $script:receivedJobAcks.ContainsKey($job)) { return }
+        if ($job -isnot [string] -or -not $script:requestedJobs.ContainsKey($job) -or
+            $script:receivedJobAcks.ContainsKey($job)) { return }
         $script:receivedJobAcks[$job] = $true
         foreach ($name in @('handle', 'parentHandle')) {
             $handle = Get-Argument $ack $name
@@ -891,6 +893,7 @@ namespace OwnedUia {
         $launcherIdentity = $null
         try {
             $writer.WriteLine((@{ event = 'create-job'; job = $jobId } | ConvertTo-Json -Compress))
+            $script:requestedJobs[$jobId] = $true
             $retainClock = [Diagnostics.Stopwatch]::StartNew()
             while ($retainClock.ElapsedMilliseconds -lt 5000) {
                 Assert-Lifetime

@@ -334,7 +334,7 @@ test("launch job is guarded without breakaway and retained before execution", ()
   ordered(guard, "new IntPtr(0x2000D)", "if (!CreateProcess(", "guard.Started = CreationTime(guard.process)")
   expect(guard).toContain("0x08080004") // suspended + atomic job-list assignment + no console
   expect(guard).toContain("limits.Basic.Flags = 0u")
-  expect(guard).not.toContain("0x1000u")
+  expect(guard).not.toMatch(/limits\.Basic\.Flags\s*(?:=|\|=)[^\n;]*0x1000u/)
   expect(guard).not.toContain("Limits(false)")
   expect(guard).not.toContain("AssignProcessToJobObject(")
   expect(guard).not.toContain("ProcessName")
@@ -463,6 +463,14 @@ test("transferred handles have least privilege and late/rejected acks close both
   const close = helperFunction("Close-JobAck")
   expect(close).toContain("@('handle', 'parentHandle')")
   expect(close).toContain("receivedJobAcks.ContainsKey($job)")
+  expect(source).toContain("$script:requestedJobs = [Collections.Hashtable]::new([StringComparer]::Ordinal)")
+  ordered(close, "-not $script:requestedJobs.ContainsKey($job)", "::CloseTransferredHandle([long]$handle)")
+  ordered(
+    helperFunction("Start-OwnedApp"),
+    "event = 'create-job'",
+    "$script:requestedJobs[$jobId] = $true",
+    "Get-PendingRead",
+  )
   expect(close).toContain("::CloseTransferredHandle([long]$handle)")
   const launch = helperFunction("Start-OwnedApp")
   expect(launch).toContain("Get-Argument $ack 'rejected'")

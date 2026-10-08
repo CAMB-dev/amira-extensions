@@ -115,8 +115,14 @@ that job**, following PID/creation-time ancestry up to the launch root. Job memb
 ownership; an exited ancestor, a broken chain, an ancestor outside the job, or a reused PID that
 is not strictly older grants no protection. Ancestor access/API failures are not proof of a broken
 chain: that candidate is skipped and cleanup is reported incomplete; other candidates are still checked.
-“Windowed” means a visible top-level window that is **minimized** or has non-zero bounds intersecting
-the virtual screen. DWM shell-only cloaking (including windows on another virtual desktop) is allowed;
+A .NET process-already-exited exception is treated as an exit, not an access failure. Ancestors are
+opened with limited query access for exit, creation-time and job-membership checks; they are never
+opened with all-access rights.
+“Windowed” means a visible top-level window with non-zero bounds intersecting the virtual screen.
+A **minimized window protects** if it is not a tool window and its saved normal placement, converted
+from workspace to screen coordinates, is non-empty and intersects the virtual screen. Apps that minimize to the tray hide their window and are **not
+protected** by that hidden window or tray icon. DWM shell-only cloaking (including windows on another
+virtual desktop) is allowed;
 app/inherited cloaking, including combinations with shell cloaking, is not. Layered windows whose
 reported global alpha is zero are excluded even when minimized. This is a **heuristic**, not proof
 that you can see or use the app:
@@ -210,7 +216,9 @@ clicking, or executable-matching a window never adds a launch record.
 
 The watchdog creates an **unnamed, non-breakaway Windows job** before launch and transfers a
 assignment-only job handle and a limited parent-process handle only to the verified helper PID/start-time identity.
-The helper closes both duplicated handles when a transfer acknowledgement arrives late or is rejected.
+The helper closes both duplicated handles when a requested transfer acknowledgement arrives late
+or is rejected. Acknowledgements for job IDs this helper never requested are ignored without closing
+any echoed handle numbers.
 The helper validates the parent's PID/creation time and assigns **both the job and the watchdog
 as OS parent atomically** during suspended creation. Launched apps are children of the session
 watchdog, not the transient helper, so even a host-level helper tree kill cannot reach them.

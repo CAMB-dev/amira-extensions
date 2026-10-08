@@ -738,6 +738,11 @@ test.skipIf(!enabled)(
       client!.emergencyStop()
       await minimizedState(client!, app, true) // Also waits for watchdog stop cleanup.
       expect(alive(app.pid)).toBe(true)
+      client!.resume()
+      await client!.call("focus", { window: app.window })
+      await minimizedState(client!, app, false)
+      const restored = (await client!.call("tree", { window: app.window })) as TreeResult
+      expect(restored.text).toContain('value="unsaved fixture text"')
       await client!.stop()
       await until(() => !alive(app.pid))
     } finally {

@@ -59,6 +59,7 @@ namespace OwnedUia {
             out IntPtr target, uint access, bool inherit, uint options);
         [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
         [DllImport("kernel32.dll", SetLastError = true)] static extern uint GetProcessId(IntPtr process);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
         [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetExitCodeProcess(IntPtr process, out uint code);
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr data, uint size, out uint returned);
@@ -71,6 +72,14 @@ namespace OwnedUia {
         [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
         [DllImport("user32.dll")] static extern bool IsIconic(IntPtr window);
         [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
+        [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
+        [StructLayout(LayoutKind.Sequential)] struct WINDOWPLACEMENT {
+            public int Length, Flags, Show; public POINT MinPosition, MaxPosition; public RECT NormalPosition;
+        }
+        [DllImport("user32.dll")] static extern bool GetWindowPlacement(IntPtr window, ref WINDOWPLACEMENT placement);
+        [StructLayout(LayoutKind.Sequential)] struct MONITORINFO { public int Size; public RECT Bounds, Work; public uint Flags; }
+        [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr window, uint flags);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
         [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr window, out RECT rect);
         [DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
         [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] static extern int GetWindowLong(IntPtr window, int index);
@@ -93,6 +102,12 @@ namespace OwnedUia {
             long created, exited, kernel, user;
             if (!GetProcessTimes(handle, out created, out exited, out kernel, out user)) throw new Win32Exception();
             return created; // UTC FILETIME, never local StartTime -> UTC (ambiguous across DST).
+        }
+        static bool HasExited(IntPtr handle) {
+            long created, exited, kernel, user;
+            if (!GetProcessTimes(handle, out created, out exited, out kernel, out user)) throw new Win32Exception();
+            // The exit FILETIME is zero while running, independent of an exit code of 259.
+            return exited != 0;
         }
         IntPtr job, process, thread, parent;
         int rootPid;
@@ -185,15 +200,31 @@ namespace OwnedUia {
             // INHERITED (4), and unknown cloak flags cannot protect a subtree.
             if (!IsWindowVisible(window) || DwmGetWindowAttribute(window, 14, out cloaked, 4) != 0 ||
                 (cloaked & ~2u) != 0) return false;
-            // Minimized windows have iconic off-screen bounds, not abandoned UI.
+            int styles = GetWindowLong(window, -20);
+            RECT rect;
+            long offsetX = 0, offsetY = 0;
             if (!IsIconic(window)) {
-                RECT rect;
-                if (!GetWindowRect(window, out rect) || rect.Right <= rect.Left || rect.Bottom <= rect.Top) return false;
-                long left = GetSystemMetrics(76), top = GetSystemMetrics(77);
-                long right = left + GetSystemMetrics(78), bottom = top + GetSystemMetrics(79);
-                if (rect.Right <= left || rect.Left >= right || rect.Bottom <= top || rect.Top >= bottom) return false;
+                if (!GetWindowRect(window, out rect)) return false;
+            } else {
+                // Ignore iconic bounds; require a normal on-screen app window, not a tool/tray stub.
+                if ((styles & 0x80) != 0) return false; // WS_EX_TOOLWINDOW
+                var placement = new WINDOWPLACEMENT(); placement.Length = Marshal.SizeOf(typeof(WINDOWPLACEMENT));
+                if (!GetWindowPlacement(window, ref placement)) return false;
+                rect = placement.NormalPosition;
+                // Non-tool normal placement uses workspace coordinates. Convert using
+                // the restore monitor's work-area origin, including top/left taskbars.
+                IntPtr monitor = MonitorFromWindow(window, 2u); // MONITOR_DEFAULTTONEAREST
+                var info = new MONITORINFO(); info.Size = Marshal.SizeOf(typeof(MONITORINFO));
+                if (monitor == IntPtr.Zero || !GetMonitorInfo(monitor, ref info)) return false;
+                offsetX = (long)info.Work.Left - info.Bounds.Left;
+                offsetY = (long)info.Work.Top - info.Bounds.Top;
             }
-            if ((GetWindowLong(window, -20) & 0x80000) != 0) {
+            if (rect.Right <= rect.Left || rect.Bottom <= rect.Top) return false;
+            long left = GetSystemMetrics(76), top = GetSystemMetrics(77);
+            long right = left + GetSystemMetrics(78), bottom = top + GetSystemMetrics(79);
+            if (rect.Right + offsetX <= left || rect.Left + offsetX >= right ||
+                rect.Bottom + offsetY <= top || rect.Top + offsetY >= bottom) return false;
+            if ((styles & 0x80000) != 0) {
                 uint key, flags; byte alpha;
                 // Per-pixel layered windows may not expose a global alpha. This is a heuristic.
                 if (GetLayeredWindowAttributes(window, out key, out alpha, out flags) && (flags & 2) != 0 && alpha == 0)
@@ -235,19 +266,27 @@ namespace OwnedUia {
                 int parentPid;
                 if (!parents.TryGetValue(pid, out parentPid) || parentPid <= 0) return true;
                 try {
-                    using (var parent = Process.GetProcessById(parentPid)) {
-                        if (parent.HasExited) return true;
-                        IntPtr handle = parent.Handle;
+                    // PROCESS_QUERY_LIMITED_INFORMATION only, never Process.Handle (ALL_ACCESS).
+                    IntPtr handle = OpenProcess(0x1000u, false, (uint)parentPid);
+                    if (handle == IntPtr.Zero) {
+                        int error = Marshal.GetLastWin32Error();
+                        if (error == 87) return true; // ERROR_INVALID_PARAMETER: PID gone.
+                        throw new Win32Exception(error);
+                    }
+                    try {
+                        if (GetProcessId(handle) != (uint)parentPid) throw new Win32Exception();
+                        if (HasExited(handle)) return true;
                         long parentStarted = CreationTime(handle);
                         bool belongs;
-                        if (parent.HasExited || parentStarted >= started) return true;
+                        if (HasExited(handle) || parentStarted >= started) return true;
                         if (!IsProcessInJob(handle, job, out belongs)) throw new Win32Exception();
                         if (!belongs) return true;
                         if (parentPid == rootPid && parentStarted != rootStarted) return true;
-                        if (Visible(parentPid) && !parent.HasExited && CreationTime(handle) == parentStarted) return false;
+                        if (Visible(parentPid) && !HasExited(handle) && CreationTime(handle) == parentStarted) return false;
                         pid = parentPid; started = parentStarted; depth++;
-                    }
-                } catch (ArgumentException) { return true; } // PID gone, not an access/API failure.
+                    } finally { CloseHandle(handle); }
+                } catch (ArgumentException) { return true; }
+                catch (InvalidOperationException) { return true; } // .NET Framework process already exited.
             }
             return true;
         }
@@ -278,7 +317,7 @@ namespace OwnedUia {
                             eligible.Add(new HeadlessMember { Pid = pid, Started = started, Depth = depth });
                     }
                 } catch (ArgumentException) { }
-                catch (InvalidOperationException) { failed = true; }
+                catch (InvalidOperationException) { } // Process already exited; nothing to kill.
                 catch (Win32Exception) { failed = true; }
             }
             // Children first; exited ancestors never exempt surviving owned descendants.
@@ -300,7 +339,7 @@ namespace OwnedUia {
                         }
                     }
                 } catch (ArgumentException) { }
-                catch (InvalidOperationException) { failed = true; }
+                catch (InvalidOperationException) { } // Process already exited; nothing to kill.
                 catch (Win32Exception) { failed = true; }
             }
             if (failed) throw new InvalidOperationException("Headless member cleanup incomplete.");

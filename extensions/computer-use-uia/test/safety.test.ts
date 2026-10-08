@@ -20,7 +20,7 @@ test("no startup sweep can consume another client's journal", () => {
 })
 
 test("committed launches cannot silently break away from their job", () => {
-  expect(launch).not.toContain("0x1000u")
+  expect(launch).not.toMatch(/limits\.Basic\.Flags\s*(?:=|\|=)[^\n;]*0x1000u/)
   expect(launch).not.toContain("Limits(false)")
 })
 
@@ -87,17 +87,43 @@ test("ancestor access/API failures cannot become permission to kill", () => {
     launch.indexOf("public void StopHeadless"),
   )
   expect(ancestors).toContain("catch (ArgumentException) { return true; }")
-  expect(ancestors).not.toContain("catch (InvalidOperationException) { return true; }")
+  expect(ancestors).toContain("catch (InvalidOperationException) { return true; }")
   expect(ancestors).not.toContain("catch (Win32Exception) { return true; }")
   expect(ancestors).toContain("if (!IsProcessInJob(handle, job, out belongs)) throw new Win32Exception();")
-  expect(ancestors.indexOf("if (parent.HasExited) return true;")).toBeLessThan(
-    ancestors.indexOf("parent.Handle"),
-  )
+  expect(ancestors).toContain("OpenProcess(0x1000u, false, (uint)parentPid)")
+  expect(ancestors).not.toContain("parent.Handle")
+  expect(ancestors).not.toContain("Process.GetProcessById(parentPid)")
+  expect(ancestors).toContain("if (error == 87) return true;")
+  expect(ancestors).toContain("GetProcessId(handle) != (uint)parentPid")
+  expect(ancestors).toContain("HasExited(handle)")
+  const exited = launch.slice(launch.indexOf("static bool HasExited"), launch.indexOf("IntPtr job, process"))
+  expect(exited).toContain("GetProcessTimes(handle, out created, out exited")
+  expect(exited).toContain("return exited != 0;")
+  expect(exited).not.toContain("GetExitCodeProcess")
+  expect(ancestors).toContain("CreationTime(handle)")
+  expect(ancestors).toContain("finally { CloseHandle(handle); }")
   const stop = launch.slice(
     launch.indexOf("public void StopHeadless"),
     launch.indexOf("public int[] Members"),
   )
-  expect(stop.match(/catch \(InvalidOperationException\) \{ failed = true; \}/g)).toHaveLength(2)
+  expect(stop.match(/catch \(InvalidOperationException\) \{ \}/g)).toHaveLength(2)
+  expect(stop.match(/catch \(Win32Exception\) \{ failed = true; \}/g)).toHaveLength(2)
+})
+
+test("minimized protectors require a normal on-screen placement and cannot be tool windows", () => {
+  const protector = launch.slice(launch.indexOf("bool ProtectorWindow"), launch.indexOf("bool Visible"))
+  expect(protector).toContain("GetWindowPlacement(window, ref placement)")
+  expect(protector).toContain("rect = placement.NormalPosition;")
+  expect(protector).toContain("(styles & 0x80) != 0")
+  expect(protector).toContain("MonitorFromWindow(window, 2u)")
+  expect(protector).toContain("GetMonitorInfo(monitor, ref info)")
+  expect(protector).toContain("offsetX = (long)info.Work.Left - info.Bounds.Left;")
+  expect(protector).toContain("offsetY = (long)info.Work.Top - info.Bounds.Top;")
+  expect(protector).toContain("rect.Right + offsetX <= left")
+  expect(protector).toContain("rect.Bottom + offsetY <= top")
+  expect(protector.indexOf("rect = placement.NormalPosition;")).toBeLessThan(
+    protector.indexOf("rect.Right <= rect.Left"),
+  )
 })
 
 test("modal patterns run on a bounded background thread and retain target checks", () => {

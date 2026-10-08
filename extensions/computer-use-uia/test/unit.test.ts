@@ -19,7 +19,16 @@ interface FakeNative {
   windowed?: boolean
   cloaked?: number
   minimized?: boolean
-  lookupError?: "handle" | "creation time" | "job membership" | "window enumeration"
+  lookupError?: "handle" | "creation time" | "job membership" | "window enumeration" | "exited"
+  allAccessDenied?: boolean
+  exitCode?: number
+  exitedAt?: number
+  normalRect?: { left: number; top: number; right: number; bottom: number }
+  workAreaOffset?: { x: number; y: number }
+  toolWindow?: boolean
+  normalOffscreen?: boolean
+  normalEmpty?: boolean
+  placementFailure?: boolean
   offscreen?: boolean
   zeroSize?: boolean
   alpha?: number
@@ -43,6 +52,9 @@ interface FakePipe extends FakeNative {
   jobs: Map<string, FakeNative[]>
   roots: Set<string>
   closedTransfers: number[]
+  requestedJobs: Set<string>
+  receivedAcks: Set<string>
+  send?(data: string): void
 }
 
 function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
@@ -91,22 +103,70 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
         let current: FakeNative | undefined = member
         while (current && !seen.has(current)) {
           seen.add(current)
+          if (
+            current.exitedAt &&
+            (current === member || current.exitCode !== 259 || launchSource.includes("return exited != 0;"))
+          ) {
+            current.exited = true
+            return current !== member
+          }
+          if (current.lookupError === "exited") {
+            const caught = launchSource.includes(
+              current === member
+                ? "catch (InvalidOperationException) { }"
+                : "catch (InvalidOperationException) { return true; }",
+            )
+            if (caught) {
+              current.exited = true
+              return current !== member
+            }
+            incomplete = true
+            return false
+          }
           if (current.lookupError) {
             if (launchSource.includes("catch (Win32Exception) { return true; }")) return true
             incomplete = true
             return false
           }
           const cloakMask = launchSource.includes("(cloaked & ~2u) != 0") ? ~2 : ~0
-          const minimized = current.minimized && launchSource.includes("if (!IsIconic(window))")
+          const placementChecked = launchSource.includes("GetWindowPlacement(window, ref placement)")
+          const rect = current.normalRect
+          const offset = launchSource.includes("rect.Right + offsetX") ? current.workAreaOffset : undefined
+          const x = offset?.x ?? 0,
+            y = offset?.y ?? 0
+          const normalOnScreen =
+            !rect ||
+            (rect.right > rect.left &&
+              rect.bottom > rect.top &&
+              rect.right + x > 0 &&
+              rect.left + x < 1920 &&
+              rect.bottom + y > 0 &&
+              rect.top + y < 1080)
+          const minimized =
+            current.minimized &&
+            launchSource.includes("if (!IsIconic(window))") &&
+            (!placementChecked ||
+              (!current.toolWindow &&
+                !current.normalOffscreen &&
+                !current.normalEmpty &&
+                !current.placementFailure &&
+                normalOnScreen))
           if (
             !current.exited &&
             current.windowed &&
             ((current.cloaked ?? 0) & cloakMask) === 0 &&
-            (minimized || (!current.offscreen && !current.zeroSize)) &&
+            (current.minimized ? minimized : !current.offscreen && !current.zeroSize) &&
             current.alpha !== 0
           )
             return false
           const parent: FakeNative | undefined = current.parent
+          if (
+            parent?.allAccessDenied &&
+            !launchSource.includes("OpenProcess(0x1000u, false, (uint)parentPid)")
+          ) {
+            incomplete = true
+            return false
+          }
           if (
             !parent ||
             parent.exited ||
@@ -201,6 +261,10 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
           ...options,
           onEvent(event) {
             if (event.type === "exit") pipe.exited = true // Exact native death never tree-kills.
+            if (event.type === "stdout" && event.data.startsWith('{"event":"create-job"')) {
+              const message = JSON.parse(event.data)
+              pipe.requestedJobs.add(message.job)
+            }
             options.onEvent(event)
           },
         },
@@ -212,6 +276,8 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
         jobs: new Map(),
         roots: new Set(),
         closedTransfers: [],
+        requestedJobs: new Set(),
+        receivedAcks: new Set(),
         close(ms: number) {
           pipe.closed.push(ms)
           // PipeProcess.close() kills descendants only while its native root is still alive.
@@ -397,7 +463,7 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
             })
         })
       }
-      return {
+      const helperPipe = {
         write(data: string) {
           const request = JSON.parse(data)
           pipe.writes.push(request)
@@ -408,6 +474,13 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
             return
           }
           if (request.method === "job_ack") {
+            if (
+              helperSource.includes("-not $script:requestedJobs.ContainsKey($job)") &&
+              !pipe.requestedJobs.has(request.job)
+            )
+              return
+            if (pipe.receivedAcks.has(request.job)) return
+            pipe.receivedAcks.add(request.job)
             // Model late/rejected transfer disposal only when the real helper has that path.
             if (request.rejected || !launch || launch.job !== request.job || launch.app) {
               if (helperSource.includes("function Close-JobAck"))
@@ -519,6 +592,8 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
         },
         close: pipe.close,
       }
+      pipe.send = helperPipe.write
+      return helperPipe
     },
     registerTool(tool: ToolDefinition) {
       tools.set(tool.name, tool)
@@ -1392,6 +1467,46 @@ for (const ancestor of [
 
 for (const [state, appearance, kept] of [
   ["minimized", { minimized: true, offscreen: true, zeroSize: true }, true],
+  ["minimized tool", { minimized: true, toolWindow: true }, false],
+  ["minimized off-screen normal placement", { minimized: true, normalOffscreen: true }, false],
+  ["minimized empty normal placement", { minimized: true, normalEmpty: true }, false],
+  ["minimized unreadable placement", { minimized: true, placementFailure: true }, false],
+  [
+    "minimized below a top-taskbar screen",
+    {
+      minimized: true,
+      normalRect: { left: 100, top: 1050, right: 500, bottom: 1090 },
+      workAreaOffset: { x: 0, y: 40 },
+    },
+    false,
+  ],
+  [
+    "minimized intersecting a top-taskbar screen",
+    {
+      minimized: true,
+      normalRect: { left: 100, top: -70, right: 500, bottom: -30 },
+      workAreaOffset: { x: 0, y: 40 },
+    },
+    true,
+  ],
+  [
+    "minimized beyond a left-taskbar screen",
+    {
+      minimized: true,
+      normalRect: { left: 1890, top: 100, right: 1930, bottom: 500 },
+      workAreaOffset: { x: 40, y: 0 },
+    },
+    false,
+  ],
+  [
+    "minimized intersecting a left-taskbar screen",
+    {
+      minimized: true,
+      normalRect: { left: -70, top: 100, right: -30, bottom: 500 },
+      workAreaOffset: { x: 40, y: 0 },
+    },
+    true,
+  ],
   ["off-screen restored", { offscreen: true }, false],
   ["shell-cloaked", { cloaked: 2 }, true],
   ["minimized shell-cloaked", { minimized: true, cloaked: 2, offscreen: true }, true],
@@ -1419,6 +1534,66 @@ for (const [state, appearance, kept] of [
     await c.stop()
   })
 }
+
+for (const gone of ["candidate", "ancestor"] as const) {
+  test(`a ${gone} exit race is not incomplete, and its headless descendants are stopped`, async () => {
+    const h = fake({ enabled: true, overlay: false })
+    const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+    await c.call("launch", { command: "launcher.exe" })
+    const app = h.apps[0]!
+    app.lookupError = "exited"
+    if (gone === "ancestor") h.watchdogs[0]!.jobs.get(app.job)!.reverse()
+    c.emergencyStop()
+    await c.call("windows")
+    expect(app.exited).toBe(true)
+    expect(app.descendants[0]!.exited).toBe(true)
+    expect(h.notices).not.toContain("computer-use-uia: headless cleanup incomplete; launch journal retained")
+    await c.stop()
+  })
+}
+
+test("an exited ancestor with code 259 cannot bridge a child to a live windowed root", async () => {
+  const h = fake({ enabled: true, overlay: false })
+  const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+  await c.call("launch", { command: "windowed-root.exe" })
+  const root = h.apps[0]!
+  const intermediate = root.descendants[0]!
+  intermediate.exitCode = 259
+  intermediate.exitedAt = 6000
+  const child: FakeNative = { pid: 902, parent: intermediate, started: 5000, exited: false }
+  const members = h.watchdogs[0]!.jobs.get(root.job)!
+  members.unshift(child) // Query the dead ancestor before a candidate observation proves its exit.
+  c.emergencyStop()
+  await c.call("windows")
+  expect(root.exited).toBe(false)
+  expect(child.exited).toBe(true)
+  expect(intermediate.exited).toBe(true)
+  expect(h.notices).not.toContain("computer-use-uia: headless cleanup incomplete; launch journal retained")
+  await c.stop()
+})
+
+test("limited ancestor queries do not let a reused elevated PID protect an orphan", async () => {
+  const h = fake({ enabled: true, overlay: false })
+  const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+  await c.call("launch", { command: "launcher.exe" })
+  const app = h.apps[0]!
+  app.exited = true
+  const replacement: FakeNative = {
+    pid: app.pid,
+    started: 5000,
+    exited: false,
+    windowed: true,
+    allAccessDenied: true,
+  }
+  app.descendants[0]!.parent = replacement
+  c.emergencyStop()
+  await c.call("windows")
+  expect(app.descendants[0]!.exited).toBe(true)
+  expect(replacement.exited).toBe(false)
+  expect(h.notices).not.toContain("computer-use-uia: headless cleanup incomplete; launch journal retained")
+  await c.stop()
+  expect(replacement.exited).toBe(false)
+})
 
 for (const lookupError of ["handle", "creation time", "job membership", "window enumeration"] as const) {
   test(`an ancestor ${lookupError} failure skips its child, reports incomplete, and continues other jobs`, async () => {
@@ -1596,6 +1771,45 @@ test("a late job transfer is rejected on its original live helper and closes bot
   expect(helper.closedTransfers).toEqual([99, 100])
   expect(helper.exited).toBe(false)
   h.releaseRetirement()
+  await c.stop()
+})
+
+test("unrequested job acknowledgements never close handles; requested late acks close only once", async () => {
+  const h = fake({ enabled: true, overlay: false })
+  h.holdJobCreation()
+  const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+  await c.call("windows")
+  const helper = h.pipes[0]!
+  const metadata = { handle: 99, parentHandle: 100, parentPid: h.watchdogs[0]!.pid, parentStarted: "2000" }
+  for (const job of [`amira-uia-job-${crypto.randomUUID()}`, "not-requested"]) {
+    for (const rejected of [false, true])
+      helper.send!(JSON.stringify({ method: "job_ack", job, ...metadata, rejected }))
+    expect(helper.receivedAcks.has(job)).toBe(false)
+  }
+  expect(helper.closedTransfers).toEqual([])
+  const job = `amira-uia-job-${crypto.randomUUID()}`
+  helper.options.onEvent({ type: "stdout", data: `${JSON.stringify({ event: "create-job", job })}\n` })
+  helper.send!(JSON.stringify({ method: "job_ack", job: job.toUpperCase(), ...metadata, rejected: true }))
+  expect(helper.closedTransfers).toEqual([])
+  helper.send!(JSON.stringify({ method: "job_ack", job, ...metadata, rejected: true }))
+  helper.send!(JSON.stringify({ method: "job_ack", job, ...metadata, rejected: true }))
+  expect(helper.closedTransfers).toEqual([99, 100])
+  expect(h.apps).toEqual([])
+  await c.stop()
+})
+
+test("a replacement helper ignores acknowledgements for a previous helper's job IDs", async () => {
+  const h = fake({ enabled: true, overlay: false })
+  const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+  await c.call("launch", { command: "windowed.exe" })
+  const job = h.apps[0]!.job
+  c.cancelRead()
+  await c.call("windows")
+  const helper = h.pipes[1]!
+  helper.send!(JSON.stringify({ method: "job_ack", job, handle: 99, parentHandle: 100, rejected: true }))
+  expect(helper.closedTransfers).toEqual([])
+  expect(helper.receivedAcks.has(job)).toBe(false)
+  expect(h.apps[0]!.exited).toBe(false)
   await c.stop()
 })
 
