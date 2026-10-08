@@ -55,7 +55,8 @@ test("headless stop checks exact handle identity and job membership, not image n
     "HeadlessAncestors(pid, started",
     "parentStarted >= started",
     "DwmGetWindowAttribute(window, 14",
-    "cloaked != 0",
+    "(cloaked & ~2u) != 0",
+    "if (!IsIconic(window))",
     "rect.Right <= rect.Left",
     "GetSystemMetrics(76)",
     "GetLayeredWindowAttributes(window",
@@ -78,6 +79,25 @@ test("broken ancestor chains cannot protect an owned member; protectors are stri
   expect(ancestors).toContain("if (pid == rootPid && started == rootStarted) return true;")
   expect(ancestors).toContain("if (!parents.TryGetValue(pid, out parentPid) || parentPid <= 0) return true;")
   expect(ancestors).not.toContain("return false;\n                }")
+})
+
+test("ancestor access/API failures cannot become permission to kill", () => {
+  const ancestors = launch.slice(
+    launch.indexOf("bool HeadlessAncestors"),
+    launch.indexOf("public void StopHeadless"),
+  )
+  expect(ancestors).toContain("catch (ArgumentException) { return true; }")
+  expect(ancestors).not.toContain("catch (InvalidOperationException) { return true; }")
+  expect(ancestors).not.toContain("catch (Win32Exception) { return true; }")
+  expect(ancestors).toContain("if (!IsProcessInJob(handle, job, out belongs)) throw new Win32Exception();")
+  expect(ancestors.indexOf("if (parent.HasExited) return true;")).toBeLessThan(
+    ancestors.indexOf("parent.Handle"),
+  )
+  const stop = launch.slice(
+    launch.indexOf("public void StopHeadless"),
+    launch.indexOf("public int[] Members"),
+  )
+  expect(stop.match(/catch \(InvalidOperationException\) \{ failed = true; \}/g)).toHaveLength(2)
 })
 
 test("modal patterns run on a bounded background thread and retain target checks", () => {

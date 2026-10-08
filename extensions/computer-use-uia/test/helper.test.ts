@@ -413,7 +413,7 @@ test("concurrent helper exit is confirmed in the catch and retirement failure is
   expect(lifetime).toContain("event = 'retired'")
   expect(lifetime).toContain("failed = $failed")
   expect(lifetime).not.toContain("Launch journal missing; cleanup incomplete.")
-  expect(lifetime).toContain("if ($journalGap)")
+  expect(lifetime).toContain("if ($force -and $journalGap)")
   expect(lifetime).toContain("if ($job.Members().Length -gt 0) { $cleanupIncomplete = $true }")
   expect(lifetime).toContain("try { Stop-RetainedJobs $force $state }")
 })

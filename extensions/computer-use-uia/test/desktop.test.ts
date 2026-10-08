@@ -714,6 +714,42 @@ test.skipIf(!enabled)(
 )
 
 test.skipIf(!enabled)(
+  "emergency stop preserves a minimized fixture with unsaved text beyond launch grace",
+  async () => {
+    const instance = host(false)
+    let client: UiaClient | undefined
+    let launchedPid = 0
+    await instance.load((api) => {
+      client = setup(api)
+    }, "test:uia-minimized-stop")
+    try {
+      const app = await fixture(client!, (pid) => {
+        launchedPid = pid
+      })
+      const tree = (await client!.call("tree", { window: app.window })) as TreeResult
+      await client!.call("type", {
+        window: app.window,
+        ref: ref(tree, "Single-line text"),
+        text: "unsaved fixture text",
+      })
+      await client!.call("key", { window: app.window, keys: "ctrl+m" })
+      await minimizedState(client!, app, true)
+      await Bun.sleep(3100) // Survival must come from window protection, not launch grace.
+      client!.emergencyStop()
+      await minimizedState(client!, app, true) // Also waits for watchdog stop cleanup.
+      expect(alive(app.pid)).toBe(true)
+      await client!.stop()
+      await until(() => !alive(app.pid))
+    } finally {
+      await client?.stop()
+      instance.unload("test:uia-minimized-stop")
+      if (launchedPid) await until(() => !alive(launchedPid))
+    }
+  },
+  180_000,
+)
+
+test.skipIf(!enabled)(
   "exited cmd start launcher cannot protect its headless descendant on stop or session cleanup",
   async () => {
     const instance = host(false)

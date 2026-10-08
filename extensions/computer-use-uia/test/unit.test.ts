@@ -17,7 +17,9 @@ interface FakeNative {
   parent?: FakeNative
   started?: number
   windowed?: boolean
-  cloaked?: boolean
+  cloaked?: number
+  minimized?: boolean
+  lookupError?: "handle" | "creation time" | "job membership" | "window enumeration"
   offscreen?: boolean
   zeroSize?: boolean
   alpha?: number
@@ -68,6 +70,7 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
   let holdRootAck = false
   let holdRootRequest = false
   const failedDrains = new Set<string>()
+  let journalGap = false
   function descendantOf(native: FakeNative, parent: FakeNative): boolean {
     for (let ancestor = native.parent; ancestor; ancestor = ancestor.parent)
       if (ancestor === parent) return true
@@ -79,6 +82,7 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
     // Source-driven native model, not Windows execution. Source contracts separately
     // pin exact handles and the branches modeled here; journals grant no authority.
     if (!force) for (const job of watchdog.jobs.keys()) if (!watchdog.roots.has(job)) dropJob(watchdog, job)
+    let incomplete = false
     for (const [job, members] of watchdog.jobs) {
       if (!force && !watchdog.roots.has(job)) continue
       const eligible = members.filter((member) => {
@@ -87,12 +91,18 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
         let current: FakeNative | undefined = member
         while (current && !seen.has(current)) {
           seen.add(current)
+          if (current.lookupError) {
+            if (launchSource.includes("catch (Win32Exception) { return true; }")) return true
+            incomplete = true
+            return false
+          }
+          const cloakMask = launchSource.includes("(cloaked & ~2u) != 0") ? ~2 : ~0
+          const minimized = current.minimized && launchSource.includes("if (!IsIconic(window))")
           if (
             !current.exited &&
             current.windowed &&
-            !current.cloaked &&
-            !current.offscreen &&
-            !current.zeroSize &&
+            ((current.cloaked ?? 0) & cloakMask) === 0 &&
+            (minimized || (!current.offscreen && !current.zeroSize)) &&
             current.alpha !== 0
           )
             return false
@@ -110,6 +120,9 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
       })
       for (const member of eligible) member.exited = true
     }
+    if (journalGap && !lifetimeSource.includes("if ($force -and $journalGap)"))
+      incomplete ||= [...watchdog.jobs.values()].some((members) => members.some((member) => !member.exited))
+    return incomplete
   }
   function dropJob(watchdog: FakePipe, job: string) {
     if (!lifetimeSource.includes("function Remove-LaunchJob") || failedDrains.has(job)) return
@@ -306,8 +319,11 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
             }
             if (message.event === "stop" && !holdStopCleanup)
               queueMicrotask(() => {
-                stopOwnedJobs(pipe, false)
-                pipe.options.onEvent({ type: "stdout", data: '{"event":"stopped"}\n' })
+                const incomplete = stopOwnedJobs(pipe, false)
+                pipe.options.onEvent({
+                  type: "stdout",
+                  data: `${JSON.stringify({ event: "stopped", incomplete })}\n`,
+                })
               })
           },
           close: pipe.close,
@@ -610,6 +626,9 @@ function fake(value: unknown = { enabled: true }, layers?: SettingsLayer[]) {
     },
     holdStopCleanup() {
       holdStopCleanup = true
+    },
+    journalGap() {
+      journalGap = true
     },
     response(value: boolean) {
       respond = value
@@ -1371,21 +1390,88 @@ for (const ancestor of [
   })
 }
 
-for (const invisible of ["cloaked", "offscreen", "zeroSize", "alpha"] as const) {
-  test(`a ${invisible} window does not protect a fake launched subtree`, async () => {
+for (const [state, appearance, kept] of [
+  ["minimized", { minimized: true, offscreen: true, zeroSize: true }, true],
+  ["off-screen restored", { offscreen: true }, false],
+  ["shell-cloaked", { cloaked: 2 }, true],
+  ["minimized shell-cloaked", { minimized: true, cloaked: 2, offscreen: true }, true],
+  ["app-cloaked", { cloaked: 1 }, false],
+  ["inherited-cloaked", { cloaked: 4 }, false],
+  ["shell-and-app-cloaked", { cloaked: 3 }, false],
+  ["shell-and-inherited-cloaked", { cloaked: 6 }, false],
+  ["unknown-cloaked", { cloaked: 8 }, false],
+  ["hidden minimized", { windowed: false, minimized: true }, false],
+  ["minimized app-cloaked", { minimized: true, cloaked: 1 }, false],
+  ["zero-size", { zeroSize: true }, false],
+  ["zero-alpha restored", { alpha: 0 }, false],
+  ["zero-alpha minimized", { minimized: true, alpha: 0 }, false],
+] as const) {
+  test(`a ${state} window ${kept ? "protects" : "does not protect"} a fake launched subtree`, async () => {
     const h = fake({ enabled: true, overlay: false })
     const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
-    await c.call("launch", { command: "invisible.exe" })
+    await c.call("launch", { command: "fixture.exe" })
     const app = h.apps[0]!
-    if (invisible === "alpha") app.alpha = 0
-    else app[invisible] = true
+    Object.assign(app, appearance)
     c.emergencyStop()
     await c.call("windows")
-    expect(app.exited).toBe(true)
-    expect(app.descendants[0]!.exited).toBe(true)
+    expect(app.exited).toBe(!kept)
+    expect(app.descendants[0]!.exited).toBe(!kept)
     await c.stop()
   })
 }
+
+for (const lookupError of ["handle", "creation time", "job membership", "window enumeration"] as const) {
+  test(`an ancestor ${lookupError} failure skips its child, reports incomplete, and continues other jobs`, async () => {
+    const h = fake({ enabled: true, overlay: false })
+    const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+    await c.call("launch", { command: "protected.exe" })
+    const app = h.apps[0]!
+    app.lookupError = lookupError
+    h.uncertain()
+    await c.call("launch", { command: "headless.exe" })
+    c.emergencyStop()
+    await c.call("windows")
+    expect(app.descendants[0]!.exited).toBe(false)
+    expect(h.apps[1]!.exited).toBe(true)
+    expect(h.notices).toContain("computer-use-uia: headless cleanup incomplete; launch journal retained")
+    await c.stop()
+  })
+}
+
+test("intentionally preserved windowed members during a journal gap do not report incomplete", async () => {
+  const h = fake({ enabled: true, overlay: false })
+  const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+  await c.call("launch", { command: "windowed.exe" })
+  h.journalGap()
+  c.emergencyStop()
+  await c.call("windows")
+  expect(h.apps[0]!.exited).toBe(false)
+  expect(h.apps[0]!.descendants[0]!.exited).toBe(false)
+  expect(h.notices).not.toContain("computer-use-uia: headless cleanup incomplete; launch journal retained")
+  await c.stop()
+  expect(h.apps[0]!.exited).toBe(true)
+  expect(h.apps[0]!.descendants[0]!.exited).toBe(true)
+})
+
+test("pending root registration is surfaced alongside real launch grace", async () => {
+  const h = fake({ enabled: true, overlay: false })
+  const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+  await c.call("windows")
+  for (const message of [
+    "Launch root registration pending; emergency stop preserved its members.",
+    "Launch job still starting (3 s grace); emergency stop preserved its members.",
+  ]) {
+    for (const split of [19, message.indexOf(";") + 1, message.length]) {
+      const before = h.notices.length
+      h.watchdogs[0]!.options.onEvent({ type: "stderr", data: message.slice(0, split) })
+      expect(h.notices).toHaveLength(before) // Never emit a truncated warning before newline.
+      h.watchdogs[0]!.options.onEvent({ type: "stderr", data: `${message.slice(split)}\r\n` })
+      expect(h.notices).toHaveLength(before + 1)
+      expect(h.notices.at(-1)).toBe(`computer-use-uia: ${message}`)
+    }
+  }
+  await c.stop()
+})
 
 test("a candidate reusing the dead root PID still searches its live windowed parent", async () => {
   const h = fake({ enabled: true, overlay: false })

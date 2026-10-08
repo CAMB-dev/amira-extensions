@@ -69,6 +69,7 @@ namespace OwnedUia {
         delegate bool EnumWindowsProc(IntPtr window, IntPtr data);
         [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc callback, IntPtr data);
         [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
+        [DllImport("user32.dll")] static extern bool IsIconic(IntPtr window);
         [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
         [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr window, out RECT rect);
         [DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
@@ -180,12 +181,18 @@ namespace OwnedUia {
         }
         bool ProtectorWindow(IntPtr window) {
             uint cloaked;
-            RECT rect;
-            if (!IsWindowVisible(window) || DwmGetWindowAttribute(window, 14, out cloaked, 4) != 0 || cloaked != 0 ||
-                !GetWindowRect(window, out rect) || rect.Right <= rect.Left || rect.Bottom <= rect.Top) return false;
-            long left = GetSystemMetrics(76), top = GetSystemMetrics(77);
-            long right = left + GetSystemMetrics(78), bottom = top + GetSystemMetrics(79);
-            if (rect.Right <= left || rect.Left >= right || rect.Bottom <= top || rect.Top >= bottom) return false;
+            // SHELL (2) alone includes windows on another virtual desktop; APP (1),
+            // INHERITED (4), and unknown cloak flags cannot protect a subtree.
+            if (!IsWindowVisible(window) || DwmGetWindowAttribute(window, 14, out cloaked, 4) != 0 ||
+                (cloaked & ~2u) != 0) return false;
+            // Minimized windows have iconic off-screen bounds, not abandoned UI.
+            if (!IsIconic(window)) {
+                RECT rect;
+                if (!GetWindowRect(window, out rect) || rect.Right <= rect.Left || rect.Bottom <= rect.Top) return false;
+                long left = GetSystemMetrics(76), top = GetSystemMetrics(77);
+                long right = left + GetSystemMetrics(78), bottom = top + GetSystemMetrics(79);
+                if (rect.Right <= left || rect.Left >= right || rect.Bottom <= top || rect.Top >= bottom) return false;
+            }
             if ((GetWindowLong(window, -20) & 0x80000) != 0) {
                 uint key, flags; byte alpha;
                 // Per-pixel layered windows may not expose a global alpha. This is a heuristic.
@@ -217,6 +224,7 @@ namespace OwnedUia {
         }
         // Job membership already proves ownership. Ancestry only finds a live,
         // strictly older, same-job windowed protector; a broken chain grants none.
+        // Access/API failures are not broken chains: propagate and skip that candidate.
         sealed class HeadlessMember { public int Pid, Depth; public long Started; }
         bool HeadlessAncestors(int pid, long started, Dictionary<int, int> parents, out int depth) {
             depth = 0;
@@ -228,18 +236,18 @@ namespace OwnedUia {
                 if (!parents.TryGetValue(pid, out parentPid) || parentPid <= 0) return true;
                 try {
                     using (var parent = Process.GetProcessById(parentPid)) {
+                        if (parent.HasExited) return true;
                         IntPtr handle = parent.Handle;
                         long parentStarted = CreationTime(handle);
                         bool belongs;
-                        if (parent.HasExited || parentStarted >= started ||
-                            !IsProcessInJob(handle, job, out belongs) || !belongs) return true;
+                        if (parent.HasExited || parentStarted >= started) return true;
+                        if (!IsProcessInJob(handle, job, out belongs)) throw new Win32Exception();
+                        if (!belongs) return true;
                         if (parentPid == rootPid && parentStarted != rootStarted) return true;
                         if (Visible(parentPid) && !parent.HasExited && CreationTime(handle) == parentStarted) return false;
                         pid = parentPid; started = parentStarted; depth++;
                     }
-                } catch (ArgumentException) { return true; }
-                catch (InvalidOperationException) { return true; }
-                catch (Win32Exception) { return true; }
+                } catch (ArgumentException) { return true; } // PID gone, not an access/API failure.
             }
             return true;
         }
@@ -270,7 +278,7 @@ namespace OwnedUia {
                             eligible.Add(new HeadlessMember { Pid = pid, Started = started, Depth = depth });
                     }
                 } catch (ArgumentException) { }
-                catch (InvalidOperationException) { }
+                catch (InvalidOperationException) { failed = true; }
                 catch (Win32Exception) { failed = true; }
             }
             // Children first; exited ancestors never exempt surviving owned descendants.
@@ -292,7 +300,7 @@ namespace OwnedUia {
                         }
                     }
                 } catch (ArgumentException) { }
-                catch (InvalidOperationException) { }
+                catch (InvalidOperationException) { failed = true; }
                 catch (Win32Exception) { failed = true; }
             }
             if (failed) throw new InvalidOperationException("Headless member cleanup incomplete.");

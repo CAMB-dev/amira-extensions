@@ -537,6 +537,15 @@ export class UiaClient {
     this.watchdogExited = exited.promise
     let watchdogPid: number | undefined
     let output = ""
+    let stderr = ""
+    const reportStderr = (line: string) => {
+      if (line.includes("still starting") || line.includes("Launch root registration pending"))
+        this.host.reportError(`computer-use-uia: ${line}`)
+      if (line.includes("untrusted launch journal"))
+        this.host.reportError("computer-use-uia: untrusted launch journal; cleanup refused")
+      if (line.includes("UIA cleanup incomplete"))
+        this.host.reportError("computer-use-uia: cleanup incomplete; launch identities retained for retry")
+    }
     const timer = setTimeout(() => ready.reject(new Error("UIA watchdog failed to start")), this.timeoutMs)
     const watchdog = this.host.openPipe(
       [
@@ -652,15 +661,18 @@ export class UiaClient {
               }
             }
           }
-          if (event.type === "stderr" && event.data.includes("still starting"))
-            this.host.reportError(`computer-use-uia: ${event.data.trim()}`)
-          if (event.type === "stderr" && event.data.includes("untrusted launch journal"))
-            this.host.reportError("computer-use-uia: untrusted launch journal; cleanup refused")
-          if (event.type === "stderr" && event.data.includes("UIA cleanup incomplete"))
-            this.host.reportError(
-              "computer-use-uia: cleanup incomplete; launch identities retained for retry",
-            )
+          if (event.type === "stderr") {
+            stderr += event.data
+            let newline = stderr.indexOf("\n")
+            while (newline >= 0) {
+              reportStderr(stderr.slice(0, newline).trim())
+              stderr = stderr.slice(newline + 1)
+              newline = stderr.indexOf("\n")
+            }
+          }
           if (event.type === "exit") {
+            if (stderr.trim()) reportStderr(stderr.trim())
+            stderr = ""
             exited.resolve()
             ready.reject(new Error("UIA watchdog exited"))
             if (this.watchdog === watchdog) {

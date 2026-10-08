@@ -267,9 +267,9 @@ try {
             } else { $journalGap = $true }
             try { Stop-RetainedJobs $force $state }
             catch { $cleanupIncomplete = $true; [Console]::Error.WriteLine($_.Exception.Message) }
-            if ($journalGap) {
-                # Before the first write (or a replacement writer's first write), an
-                # absent/stale snapshot is not incomplete if retained authority drained.
+            if ($force -and $journalGap) {
+                # Only session-end cleanup must drain every retained member. An emergency
+                # stop intentionally preserves windowed members, even during a journal gap.
                 foreach ($job in @($jobs.Values)) {
                     try { if ($job.Members().Length -gt 0) { $cleanupIncomplete = $true } }
                     catch { $cleanupIncomplete = $true }

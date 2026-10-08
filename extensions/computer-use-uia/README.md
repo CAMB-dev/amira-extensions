@@ -113,13 +113,18 @@ Inspect the target app before resuming. Emergency stop kills the exact helper an
 job members with **no windowed protector of their own and no live, older windowed ancestor within
 that job**, following PID/creation-time ancestry up to the launch root. Job membership proves
 ownership; an exited ancestor, a broken chain, an ancestor outside the job, or a reused PID that
-is not strictly older grants no protection. “Windowed” means a visible, non-DWM-cloaked top-level
-window with non-zero bounds intersecting the virtual screen, excluding layered windows whose
-reported global alpha is zero. This is a **heuristic**, not proof that you can see or use the app:
+is not strictly older grants no protection. Ancestor access/API failures are not proof of a broken
+chain: that candidate is skipped and cleanup is reported incomplete; other candidates are still checked.
+“Windowed” means a visible top-level window that is **minimized** or has non-zero bounds intersecting
+the virtual screen. DWM shell-only cloaking (including windows on another virtual desktop) is allowed;
+app/inherited cloaking, including combinations with shell cloaking, is not. Layered windows whose
+reported global alpha is zero are excluded even when minimized. This is a **heuristic**, not proof
+that you can see or use the app:
 per-pixel transparency, occlusion and unusual window styles may still fool it.
 Launch roots younger than **three seconds** (and their members) are skipped and reported as
-**“still starting (3 s grace)”**; stop does not schedule a later kill. Pending root registration has
-a separate message; failed/pre-commit or completed rootless launches are drained and discarded.
+**“still starting (3 s grace)”**; stop does not schedule a later kill. **“Launch root registration
+pending”** is reported separately and means the job's members were preserved; failed/pre-commit
+or completed rootless launches are drained and discarded.
 This preserves windowed apps and their
 Chromium/Electron/WebView2 GPU, renderer and utility children. Windowed apps remain open until
 you close them or end the session. Session cleanup terminates the entire launched tree and can
@@ -250,7 +255,8 @@ Rotated journals are deleted after the old generation's cleanup finishes or its 
 confirmed gone, when lost unnamed job handles make further cleanup impossible; they are kept
 only while they can provide evidence for active cleanup. A missing journal before the first write,
 or a retired writer's snapshot before replacement writes, is not reported as incomplete when
-all retained jobs were drained.
+all retained jobs were drained. On a non-force emergency stop, windowed members deliberately
+preserved during a journal gap do not count as incomplete cleanup.
 The overlay watches the exact helper and sentinel identities and exits on pipe EOF.
 **Hard-killing only the watchdog process does not clean up launched apps.** Job handles have no
 kill-on-close behavior, and the journal cannot recover lost kernel job handles. Killing the
