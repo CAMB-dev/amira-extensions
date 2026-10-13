@@ -5,6 +5,14 @@ import type { HtmlToPngRequest, MarkdownRenderContext } from "@amira/api"
 export const KATEX_VERSION = "0.16.22"
 export type MathTheme = "light" | "dark" | MarkdownRenderContext["theme"]
 export type RenderHtml = (req: HtmlToPngRequest) => Promise<Uint8Array>
+export interface MathFormula {
+  source: string
+  display: boolean
+}
+type MathSource = string | readonly MathFormula[]
+
+const formulasFor = (source: MathSource): readonly MathFormula[] =>
+  typeof source === "string" ? [{ source, display: true }] : source
 
 let assets: { js: string; css: string } | undefined
 
@@ -26,8 +34,8 @@ export function terminalTheme(colorfgbg = process.env.COLORFGBG): MathTheme {
   return background === "7" || background === "15" ? "light" : "dark"
 }
 
-function jsString(s: string): string {
-  return JSON.stringify(s).replaceAll("<", "\\u003c")
+function jsValue(value: unknown): string {
+  return JSON.stringify(value).replaceAll("<", "\\u003c")
 }
 
 function themeColors(theme: MathTheme): { foreground: string; background: string } {
@@ -39,27 +47,36 @@ function themeColors(theme: MathTheme): { foreground: string; background: string
 }
 
 /** A tight card, scaled to the requested width without clipping long formulae. */
-export function mathPage(source: string, width: number, theme: MathTheme): string {
+export function mathPage(source: MathSource, width: number, theme: MathTheme, size = 16): string {
+  const formulas = formulasFor(source)
   const { js, css } = katexAssets()
   const { foreground, background } = themeColors(theme)
   return `<!doctype html><html><head><meta charset="utf-8"><style>${css}
 html,body{margin:0}
 #math{display:inline-block;padding:4px;box-sizing:border-box}
-#formula{display:inline-block;font-size:24px}
+#formula{display:inline-block;font-size:${size}px}
+.formula+.formula{margin-top:8px}
+.katex{font-size:1em}
 .katex-display{margin:0}
 .katex-display>.katex>.katex-html>.tag{position:static;margin-left:1em}
 </style></head><body><div id="math" role="img"><div id="formula"></div></div>
 <script>${js}</script><script>
 window.amiraRenderDone = (async () => {
-  document.body.style.backgroundColor = ${jsString(background)}
-  document.body.style.color = ${jsString(foreground)}
+  document.body.style.backgroundColor = ${jsValue(background)}
+  document.body.style.color = ${jsValue(foreground)}
   const card = document.getElementById("math")
   const formula = document.getElementById("formula")
-  const source = ${jsString(source)}
+  const samples = ${jsValue(formulas)}
+  const source = samples.map(sample => sample.source).join("\\n")
   card.setAttribute("aria-label", source)
   try {
-    katex.render(source, formula, { displayMode: true, throwOnError: true, trust: false,
-      strict: "warn", maxExpand: 1000, maxSize: 20, output: "html" })
+    for (const sample of samples) {
+      const element = document.createElement("div")
+      element.className = "formula"
+      formula.appendChild(element)
+      katex.render(sample.source, element, { displayMode: sample.display, throwOnError: true, trust: false,
+        strict: "warn", maxExpand: 1000, maxSize: 20, output: "html" })
+    }
   } catch (err) {
     throw new Error("latex could not render math: " + (err && err.message ? err.message : String(err)))
   }
@@ -82,14 +99,26 @@ export function isMathError(message: string): boolean {
 export class MathImages {
   private cache = new Map<string, Promise<Uint8Array>>()
 
-  key(source: string, width: number, theme: MathTheme): string {
+  clear(): void {
+    this.cache.clear()
+  }
+
+  key(source: MathSource, width: number, theme: MathTheme, size = 16): string {
     return createHash("sha256")
-      .update(`${KATEX_VERSION}\0${width}\0${JSON.stringify(themeColors(theme))}\0${source}`)
+      .update(
+        `${KATEX_VERSION}\0${width}\0${size}\0${JSON.stringify(themeColors(theme))}\0${JSON.stringify(formulasFor(source))}`,
+      )
       .digest("hex")
   }
 
-  render(source: string, width: number, theme: MathTheme, renderHtml: RenderHtml): Promise<Uint8Array> {
-    const key = this.key(source, width, theme)
+  render(
+    source: MathSource,
+    width: number,
+    theme: MathTheme,
+    renderHtml: RenderHtml,
+    size = 16,
+  ): Promise<Uint8Array> {
+    const key = this.key(source, width, theme, size)
     const hit = this.cache.get(key)
     if (hit) {
       this.cache.delete(key)
@@ -97,7 +126,7 @@ export class MathImages {
       return hit
     }
     const png = Promise.resolve().then(() =>
-      renderHtml({ html: mathPage(source, width, theme), width, selector: "#math", timeoutMs: 10_000 }),
+      renderHtml({ html: mathPage(source, width, theme, size), width, selector: "#math", timeoutMs: 10_000 }),
     )
     this.cache.set(key, png)
     png.catch((err) => {

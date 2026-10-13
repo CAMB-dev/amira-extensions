@@ -1,16 +1,18 @@
 {
   "name": "latex",
   "license": "Apache-2.0",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "LaTeX inline and display math and fences as Unicode text or offline KaTeX pictures through the browser and images extensions",
   "type": "module",
   "scripts": {
     "link-amira": "bun scripts/link-amira.ts",
+    "typecheck": "bun scripts/check.ts typecheck",
+    "lint": "bun scripts/check.ts lint",
     "test": "bun test"
   },
   "amira": {
     "engines": {
-      "amira": "^0.1.27"
+      "amira": "^0.1.45"
     },
     "extensions": [
       "./src/index.ts"
