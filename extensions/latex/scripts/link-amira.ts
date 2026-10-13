@@ -13,13 +13,16 @@ if (!repo) {
 }
 const dir = path.join(import.meta.dir, "..", "node_modules", "@amira")
 mkdirSync(dir, { recursive: true })
-const target = path.resolve(repo, "packages", "api")
-if (!existsSync(path.join(target, "package.json"))) {
-  console.error(`${target} is not an Amira package; is ${repo} an Amira checkout?`)
-  process.exit(1)
+// Core is linked only for isolated host/settings integration tests, not runtime imports.
+for (const name of ["api", "core", "ai", "ai-shared", "net", "proc", "text-width"]) {
+  const target = path.resolve(repo, "packages", name)
+  if (!existsSync(path.join(target, "package.json"))) {
+    console.error(`${target} is not an Amira package; is ${repo} an Amira checkout?`)
+    process.exit(1)
+  }
+  const link = path.join(dir, name)
+  rmSync(link, { recursive: true, force: true })
+  // A junction on Windows needs no special rights.
+  symlinkSync(target, link, "junction")
+  console.log(`@amira/${name} -> ${target}`)
 }
-const link = path.join(dir, "api")
-rmSync(link, { recursive: true, force: true })
-// A junction on Windows needs no special rights.
-symlinkSync(target, link, "junction")
-console.log(`@amira/api -> ${target}`)

@@ -8,7 +8,8 @@ import type {
   MarkdownRenderContext,
   MarkdownRendererDefinition,
 } from "@amira/api"
-import extension, { latexRenderer, MathImages, mathPage, readSettings, terminalTheme } from "../src/index.ts"
+import extension, { latexFields, latexRenderer, MathImages, mathPage, terminalTheme } from "../src/index.ts"
+import { settingsRegistry } from "./settings-fixture.ts"
 
 const SOURCE = String.raw`x^2 + \alpha \le \infty`
 const TEXT = { lines: [{ text: "x² + α ≤ ∞", kind: "text" as const }] }
@@ -23,6 +24,7 @@ function setup(
     fail?: string
     term?: string
     maxWidth?: number
+    size?: number
   } = {},
 ) {
   const renders: HtmlToPngRequest[] = []
@@ -34,8 +36,16 @@ function setup(
     return png
   }
   let lookups = 0
+  let redraws = 0
+  const registry = settingsRegistry({
+    extensions: { latex: { mode: o.mode, maxWidth: o.maxWidth, size: o.size } },
+  })
   const api = {
-    settings: { extensions: { latex: { mode: o.mode, maxWidth: o.maxWidth } } },
+    settings: {
+      declare: (declaration: Parameters<typeof registry.register>[2]) =>
+        registry.register("latex", "package:latex", declaration).handle,
+    },
+    requestRender: () => redraws++,
     useService: (name: string) => {
       lookups++
       return o.browser && name === "browser.renderHtmlToPng" ? service : undefined
@@ -44,27 +54,53 @@ function setup(
   } as unknown as ExtensionAPI
   const theme = { value: "dark" as "dark" | "light" }
   const renderer = latexRenderer(api, { theme: () => theme.value, term: () => o.term })
-  return { renderer, renders, errors, png, theme, lookups: () => lookups }
+  return { renderer, renders, errors, png, theme, registry, redraws: () => redraws, lookups: () => lookups }
 }
 
-test("settings validate mode and maxWidth", () => {
-  expect(readSettings(undefined)).toEqual({ mode: "auto", maxWidth: 900 })
-  expect(readSettings({ extensions: { latex: { mode: "image", maxWidth: 640 } } } as never)).toEqual({
-    mode: "image",
-    maxWidth: 640,
-  })
-  for (const maxWidth of [null, "640", 0, 15, 4097, Number.NaN, Number.POSITIVE_INFINITY]) {
-    expect(readSettings({ extensions: { latex: { mode: "svg", maxWidth } } } as never)).toEqual({
-      mode: "auto",
-      maxWidth: 900,
+test("declares ordered fields with defaults, choices and integer pixel validation", () => {
+  expect(latexFields.map(({ key, type, default: value }) => ({ key, type, default: value }))).toEqual([
+    { key: "mode", type: "choice", default: "auto" },
+    { key: "maxWidth", type: "number", default: 900 },
+    { key: "size", type: "number", default: 16 },
+  ])
+  expect(latexFields[0].options).toEqual(["auto", "text", "image"])
+  expect(latexFields[1]).toMatchObject({ min: 16, max: 4096, step: 1 })
+  expect(latexFields[2]).toMatchObject({ min: 8, max: 64, step: 1 })
+  expect(latexFields[2].description).toContain("Text mode and inline math ignore")
+  expect(setup().registry.get("latex")!.get()).toEqual({ mode: "auto", maxWidth: 900, size: 16 })
+  for (const mode of ["auto", "text", "image"] as const) {
+    expect(setup({ mode, maxWidth: 640, size: 32 }).registry.get("latex")!.get()).toEqual({
+      mode,
+      maxWidth: 640,
+      size: 32,
     })
+  }
+  for (const maxWidth of [null, "640", 0, 15, 4097, 640.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const registry = settingsRegistry({ extensions: { latex: { mode: "svg", maxWidth } } } as never)
+    registry.register("latex", "package:latex", { fields: latexFields })
+    expect(registry.get("latex")!.get()).toEqual({ mode: "auto", maxWidth: 900, size: 16 })
+  }
+  for (const size of [null, "16", 7, 65, 16.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const registry = settingsRegistry({ extensions: { latex: { size } } } as never)
+    registry.register("latex", "package:latex", { fields: latexFields })
+    expect(registry.get("latex")!.get().size).toBe(16)
+  }
+  for (const [maxWidth, size] of [
+    [16, 8],
+    [4096, 64],
+  ]) {
+    expect(setup({ maxWidth, size }).registry.get("latex")!.get()).toMatchObject({ maxWidth, size })
   }
 })
 
 test("registers math, latex and tex fences plus inline and display math; other nodes are declined", async () => {
   const renderers: MarkdownRendererDefinition[] = []
+  const registry = settingsRegistry()
   await extension({
-    settings: {},
+    settings: {
+      declare: (declaration: Parameters<typeof registry.register>[2]) =>
+        registry.register("latex", "package:latex", declaration).handle,
+    },
     registerMarkdownRenderer: (r: MarkdownRendererDefinition) => renderers.push(r),
   } as unknown as ExtensionAPI)
   expect(renderers.map((r) => [r.id, r.match])).toEqual([
@@ -97,6 +133,92 @@ test("auto and image use the browser; source, width and theme distinguish cached
     await s.renderer.render(node("y^2"), ctx)
     expect(s.renders).toHaveLength(4)
   }
+})
+
+test("preview uses draft mode, width and size without changing saved reads or caches", async () => {
+  const s = setup({ mode: "text", maxWidth: 700, size: 16, browser: true })
+  const page = s.registry.get("latex")!
+  const saved = page.get()
+  const previewCtx = { ...ctx, signal: new AbortController().signal }
+  const result = await page.preview!({ mode: "image", maxWidth: 320, size: 32 }, previewCtx)
+  expect(result).toHaveProperty("image")
+  expect(s.renders).toHaveLength(1)
+  expect(s.renders[0]!.width).toBe(320)
+  expect(s.renders[0]!.html).toContain("font-size:32px")
+  expect(s.renders[0]!.html).toContain('"display":false')
+  expect(s.renders[0]!.html).toContain('"display":true')
+  expect(s.renders[0]!.html).toContain("e^{i")
+  expect(s.renders[0]!.html).toContain("sum_{n=1}")
+  expect(page.get()).toBe(saved)
+  expect(s.redraws()).toBe(0)
+  expect(s.renderer.render(math(), ctx)).toEqual(TEXT)
+  expect(s.renders).toHaveLength(1)
+
+  s.registry.setSettings({ extensions: { latex: { mode: "image", maxWidth: 700, size: 16 } } })
+  await s.renderer.render(math(), ctx)
+  expect(s.renders[1]!.width).toBe(700)
+  expect(s.renders[1]!.html).toContain("font-size:16px")
+  const text = await page.preview!({ mode: "text", maxWidth: 320, size: 64 }, previewCtx)
+  expect(text).toHaveProperty("lines")
+  expect(s.renders).toHaveLength(2)
+  await s.renderer.render(math(), ctx)
+  expect(s.renders).toHaveLength(2)
+})
+
+test("preview falls back to both text samples without graphics or a browser", async () => {
+  for (const options of [{ browser: false }, { browser: true }, { browser: true, term: "dumb" }]) {
+    const s = setup(options)
+    const result = await s.registry.get("latex")!.preview!(
+      { mode: "image", maxWidth: 900, size: 24 },
+      {
+        ...ctx,
+        images: !options.browser || options.term === "dumb",
+        signal: new AbortController().signal,
+      },
+    )
+    expect(result).toHaveProperty("lines")
+    if (!("lines" in result)) throw new Error("Expected preview text")
+    expect(result.lines).toHaveLength(2)
+    expect(result.lines[0]!.text).toContain("e")
+    expect(result.lines[1]!.text).toContain("∑")
+    expect(s.renders).toHaveLength(0)
+  }
+})
+
+test("aborted previews do no work and preview failures do not mute normal error reporting", async () => {
+  const s = setup({ browser: true, fail: "browser unavailable" })
+  const page = s.registry.get("latex")!
+  const controller = new AbortController()
+  controller.abort()
+  await expect(page.preview!(page.get(), { ...ctx, signal: controller.signal })).rejects.toThrow()
+  expect(s.renders).toHaveLength(0)
+  expect(await page.preview!(page.get(), { ...ctx, signal: new AbortController().signal })).toHaveProperty(
+    "lines",
+  )
+  expect(s.errors).toEqual([])
+  expect(await s.renderer.render(math(), ctx)).toEqual(TEXT)
+  expect(s.errors).toHaveLength(1)
+})
+
+test("onChange clears pictures even when changed modes have identical image semantics", async () => {
+  const s = setup({ browser: true })
+  await s.renderer.render(math(), ctx)
+  await s.renderer.render(math(), ctx)
+  expect(s.renders).toHaveLength(1)
+  s.registry.setSettings({ extensions: { latex: { mode: "image" } } })
+  expect(s.redraws()).toBe(1)
+  await s.renderer.render(math(), ctx)
+  expect(s.renders).toHaveLength(2)
+  s.registry.setSettings({ extensions: { latex: { mode: "image" } } })
+  expect(s.redraws()).toBe(1)
+  await s.renderer.render(math(), ctx)
+  expect(s.renders).toHaveLength(2)
+  s.registry.setSettings({ extensions: { latex: { mode: "image", size: 32 } } })
+  await s.renderer.render(math(), ctx)
+  expect(s.renders[2]!.html).toContain("font-size:32px")
+  s.registry.setSettings({ extensions: { latex: { mode: "text" } } })
+  expect(s.renderer.render(math(), ctx)).toEqual(TEXT)
+  expect(s.renders).toHaveLength(3)
 })
 
 test("text mode, print mode (images:false) and TERM=dumb never look up the browser", () => {
@@ -261,15 +383,11 @@ test("the vendored KaTeX renders real math, and rejects invalid input", () => {
   expect(() => sandbox.katex!.renderToString(String.raw`\notACommand`)).toThrow()
 })
 
-test("release metadata requires API 0.1.27 and matches the extension index", async () => {
+test("release metadata requires API 0.1.45 and bumps the minor version", async () => {
   const manifest = await Bun.file(new URL("../package.json", import.meta.url)).json()
-  const index = await Bun.file(new URL("../../../index.json", import.meta.url)).json()
-  expect(manifest.version).toBe("0.2.0")
-  expect(manifest.amira.engines).toEqual({ amira: "^0.1.27" })
-  expect(index.extensions.find((entry: { name: string }) => entry.name === "latex")).toMatchObject({
-    version: manifest.version,
-    engines: manifest.amira.engines,
-  })
+  expect(manifest.version).toBe("0.3.0")
+  expect(manifest.amira.engines).toEqual({ amira: "^0.1.45" })
+  // The repository-wide index is outside this migration's extensions/latex-only scope.
 })
 
 test("public exports", async () => {
@@ -278,10 +396,10 @@ test("public exports", async () => {
       "KATEX_VERSION",
       "MathImages",
       "default",
+      "latexFields",
       "latexRenderer",
       "latexToText",
       "mathPage",
-      "readSettings",
       "terminalTheme",
     ]
   `)

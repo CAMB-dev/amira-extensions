@@ -12,7 +12,7 @@ amira ext install browser
 amira ext install images
 ```
 
-Requires Amira extension API 0.1.27 or later. An open fence or display math block stays
+Requires Amira extension API 0.1.45 or later. An open fence or display math block stays
 source while streaming. After it closes, the renderer replaces it. The inline transcript
 waits up to 12 seconds for a picture; if that deadline expires, core commits the source
 instead. Full-screen replies redraw when a picture arrives.
@@ -77,35 +77,53 @@ browser/KaTeX failures all use the small hand-written converter:
 
 This is a readable approximation, not a TeX engine. Long text wraps to the terminal width.
 Invalid math stays readable as text; a browser failure is reported only once per extension
-load. Picture results (including in-flight requests) are cached by source, width and theme,
-with at most 64 entries. Syntax failures are cached; transient browser failures may retry.
+load. Picture results (including in-flight requests) are cached by source, display mode,
+width, font size and theme, with at most 64 entries. Syntax failures are cached; transient
+browser failures may retry. Saved settings changes clear the picture cache.
 
 ## Settings
 
-In your or the project's `settings.json`:
+Open `/ext config latex` (or choose **Settings** for latex in `/ext`) to adjust settings
+with an inline Euler identity and display sum preview. The preview uses draft values;
+normal replies keep using saved settings. It uses pictures when supported and text
+otherwise, including in text mode. Enter chooses the user or project scope, then Enter
+again saves; Esc discards the draft. Saved changes redraw replies and clear render caches.
+
+| Setting | Type | Default | Range / choices | Description |
+| --- | --- | --- | --- | --- |
+| `mode` | Choice | `auto` | `auto`, `text`, `image` | Auto and image try pictures for blocks when supported, with text fallback. Text never starts the browser. Inline math and print mode always use text. |
+| `maxWidth` | Number | `900` | 16–4096, step 1 | Maximum picture width in CSS pixels, also capped at about ten pixels per terminal column. |
+| `size` | Number | `16` | 8–64, step 1 | Image font size in CSS pixels. Text mode and normal inline math ignore it. |
+
+Existing user and project `settings.json` files still work with the same keys under
+`extensions.latex`. Missing or invalid values use declared defaults. For example:
 
 ```json
 {
   "extensions": {
     "latex": {
       "mode": "auto",
-      "maxWidth": 900
+      "maxWidth": 900,
+      "size": 16
     }
   }
 }
 ```
 
-- `mode`: `"auto"` (default) and `"image"` try pictures for blocks when supported and fall
-  back to text; `"text"` never starts the browser. Inline math and print mode always use text.
-- `maxWidth`: maximum picture width in CSS pixels, 16–4096 (default 900). The renderer also
-  caps this at approximately ten pixels per available terminal column; core performs the
-  final fit using the real cell size. Invalid settings use defaults. Reload after changes.
+Pictures are tightly cropped at the chosen font size. The browser uses one image pixel
+per CSS pixel; core fits the PNG using the real terminal cell size and scales down, never
+up. Large formulas may therefore shrink to fit `maxWidth`, the terminal width, or the
+available image rows. Increasing `size` enlarges formulas that already fit, rather than
+merely increasing screenshot resolution. The preview's inline sample is included in its
+picture to demonstrate both KaTeX styles; inline math in replies still uses Unicode text.
+Reload (`/reload`) after editing settings files externally. Number settings accept whole
+pixels; fractional or out-of-range values use defaults.
 
 Pictures use the render context's theme: supplied foreground/background colours take
 precedence, otherwise `theme.dark` selects light text on a dark card or dark text on a
 light card. Only when the context has no theme does the legacy `COLORFGBG` hint apply
 (background index 7 or 15 means light; otherwise dark). Fence rendering retains this
-compatibility fallback, but loading the extension requires API 0.1.27 for math claims.
+compatibility fallback, but loading the extension requires API 0.1.45 for declared settings.
 
 ## Offline assets
 
@@ -121,12 +139,16 @@ their WOFF2 entry, replacing the file URL with its base64 data URL. KaTeX runs w
 
 ```sh
 bun install
-bun scripts/link-amira.ts D:/dev/Amira
+bun run link-amira D:/dev/Amira
+bun run typecheck
+bun run lint
 bun test
-D:/dev/Amira/node_modules/.bin/tsc --noEmit -p tsconfig.json
-D:/dev/Amira/node_modules/.bin/biome check --config-path=D:/dev/Amira src test scripts package.json tsconfig.json
 ```
 
-Tests cover the converter, claims, settings, text-only contexts, image caching, theme,
-failures, page isolation and the bundled KaTeX. No real browser or image terminal is
-required for the tests. Vendored minified assets are not reformatted or linted.
+Tests cover the converter, claims, declared settings validation, draft preview isolation,
+legacy settings files, saved-change invalidation, font-size crop dimensions, image caching,
+theme, failures, page isolation and the bundled KaTeX. Settings integration tests use a
+temporary home inside this extension; image tests use a fake browser service and deterministic
+layout metrics. No real browser or image terminal is required. Vendored minified assets
+are not reformatted or linted. The link command supplies the API and test-only host packages;
+typecheck and lint use the linked checkout's already-installed TypeScript and Biome.
