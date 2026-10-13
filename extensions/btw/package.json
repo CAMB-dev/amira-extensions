@@ -1,7 +1,7 @@
 {
   "name": "btw",
   "license": "Apache-2.0",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Ask a quick side question while the main agent keeps working, without changing the conversation",
   "type": "module",
   "scripts": {
@@ -12,7 +12,7 @@
   },
   "amira": {
     "engines": {
-      "amira": "^0.1.24"
+      "amira": "^0.1.44"
     },
     "extensions": [
       "./src/index.ts"
