@@ -1,44 +1,77 @@
 # btw
 
-Ask a quick side question in [Amira](https://github.com/CAMB-dev/Amira) while the main
-agent keeps working. The question and answer stay out of the main conversation.
+Ask a side question in [Amira](https://github.com/CAMB-dev/Amira) while the main agent
+keeps working. The side conversation never enters the main model's context.
 
 ```sh
 amira ext install btw
 ```
 
-Requires Amira extension API **0.1.24 or later within 0.1.x**.
+Version **0.2.0** requires Amira extension API **0.1.44 or later within 0.1.x**, a
+terminal UI with dock support, and an agent tree. Print/RPC frontends without docks
+are not supported; no child is started when a dock is unavailable.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `/btw <question>` | Ask using the conversation so far. A new question cancels and replaces an unfinished one. |
-| `/btw clear` | Hide the panel and cancel an unfinished question. Keep completed answers in memory. |
-| `/btw show` | Open the current question and full answer in a scrollable view. |
-| `/btw history` | Open the last five completed Q&As, oldest first. |
+| `/btw <question>` | Fork the main session's current context into a private side agent and open a dock. |
+| `/btw <follow-up>` | While the dock is open, send another question to the same side agent. |
+| `/btw clear` | Close the dock and stop the side agent, like Esc. |
+| `/btw` | Show command help. |
 
-In the terminal UI, a live panel above the input/activity line shows `btw: <question>`,
-then `thinking…`, then the first eight lines of the answer. Long lines are clipped by
-Amira; `/btw show` displays the full text with wrapping and scrolling. Esc or q closes
-the view. The standard panel-folding key (Ctrl+T by default) folds it to its heading;
-there is no per-panel dismiss key, so use `/btw clear`.
+`clear` is reserved when it is the entire argument. To ask about that word, use
+`/btw What does clear mean here?`.
 
-The next side question replaces the panel. Sending a main message hides it, even if the
-side answer arrives later. Completed answers remain available until you leave the session,
-reload the extension or exit; they are never persisted or included as context for later
-side questions. Errors appear in the panel, not the main transcript.
+`/btw show` and `/btw history` were removed: the dock already shows the full live
+exchange, and saved display blocks provide history after closing. `show` and
+`history` are now ordinary question text, not subcommands.
 
-The typed `/btw` line does not appear in the transcript either (Amira 0.1.26 and later; with older Amira the TUI still echoes it, display only).
+## Dock and saved answers
 
-`clear`, `show` and `history` are reserved when used as the entire argument. To ask about
-one of those words, use a question such as `/btw What does clear mean here?`.
+Answers stream as Markdown into a bounded dock directly above the input. The dock
+follows new output, and the main conversation and input remain usable. PgUp/PgDn
+scroll the dock; the mouse wheel scrolls it when the pointer is over it; End resumes
+following (subject to your host keybindings). Typing, arrows, Tab and Enter stay
+with the main input.
 
-## Model and context
+The first **Esc** closes the dock, aborts any unfinished answer, and ends the side
+agent. The next Esc performs the host's usual action, including stopping a running
+main turn. `/btw clear` has the same closing behavior. Starting or steering a main
+turn does not hide the dock.
 
-The extension makes one `api.complete` call per question. It defaults to the current
-session model. To use another model, add this to your Amira settings (replace the example
-with a configured provider/model):
+Closing prints exactly one display-only block headed `btw: <first question>`, with
+all questions, answers, errors and any interrupted-answer status in Markdown
+`details`. The block is collapsed at summary detail; **Ctrl+O** expands it. It is
+persisted with the session and restored on resume, but neither its heading nor its
+details are ever sent to the main model, forks or compaction. The typed command is
+not echoed into the transcript (it still appears in input recall).
+
+Follow-ups keep the side agent's own context. A follow-up sent during an active
+turn is queued by the host and may join that turn before its next model call;
+several queued messages may be combined. Sending is acceptance, not a guarantee
+of delivery. Failures and undelivered follow-ups appear in the dock. If the child
+has ended or the dock is closed, the next question saves the previous exchange
+once and starts a fresh side agent instead of trying to reuse stale state.
+Session exit/switch also stops the child. Saved output remains bound to the session
+where the side question began.
+
+Each extension instance registers a fresh dock identity. After `/reload`, the next
+`/btw <question>` replaces the old dock, saving its pending Q&A once and stopping
+its child. Esc and `/btw clear` then operate on the new dock normally. API 0.1.44
+still has no unload callback, so reload/unload alone cannot trigger immediate
+cleanup; close the dock first when you need that guarantee.
+
+## Model, tools and privacy
+
+The extension spawns an **ephemeral**, automatically persistent child with
+`context: "fork"`. The host forks the main session's context at that moment; this
+extension no longer extracts or truncates a plain-text approximation. Later main
+messages are not copied into the existing side agent. Follow-ups use its private
+conversation instead.
+
+By default the host uses the **current session model**, not the global default.
+To override it, set `extensions.btw.model` to a configured `provider/model`:
 
 ```json
 {
@@ -48,54 +81,48 @@ with a configured provider/model):
 }
 ```
 
-The request includes a brief system instruction, the most recent **60,000 characters**
-of conversation context, and your question. Context includes user/assistant text and
-short tool-call/result summaries (arguments/results limited to 240 characters each).
-Images, reasoning and provider metadata are dropped. Old context is trimmed first,
-including part of the oldest remaining message if necessary. The remaining context stays
-in chronological order. The question and system instruction are outside that budget.
-Choosing another provider sends this context to that provider.
+An empty, whitespace-only or non-string value leaves the session model in use.
+The override is read when a new dock/child starts; it does not change an existing
+side agent. Choosing another provider sends the forked context to that provider.
 
-The side model has **no tools or hosted web search** and cannot change anything.
-`api.complete` does not stream, so the panel shows a waiting message until the answer
-is ready. Usage is host-accounted with the label **`btw`**, appears in `/cost`, and
-counts toward the session's agent-tree budget. Amira writes `side_usage` bookkeeping,
-not conversation messages; this extension never writes session data or sends to the
-main agent. Cancellation aborts the request, but provider charges already incurred
-may not be reflected in local accounting.
+The child inherits the parent's local tool declarations and their order for
+prompt-cache alignment, but `callableTools: ["read", "grep", "glob"]` allows only
+read-only exploration. A short role instruction tells it not to change files or
+the main conversation. It cannot call editing, shell, delegation, or hosted web
+search tools. Hosted search must be removed by the host rather than merely blocked;
+that, role instructions, a different model, interceptors and unfinished parent
+calls can prevent a fully identical cache prefix.
 
-## Running alongside a turn
-
-No busy-command flag is needed. In Amira 0.1.24, TUI slash-command dispatch happens
-before steering/queueing and does not await earlier commands. RPC also dispatches
-`command.run` concurrently. `/btw` stays awaited by the command host so TUI command
-cancellation can reach its AbortSignal; another `/btw` can still replace it immediately.
-
-Print mode awaits the answer and prints it to command output; it has no ongoing input
-loop for mid-turn commands. RPC likewise returns the answer through command output.
-Use RPC `command.run`, not `prompt` (which would send text to the main agent):
-
-```json
-{"id":"side-1","cmd":"command.run","text":"/btw Why use a map here?"}
-```
-
-`show` and `history` print their contents in print/RPC mode. In RPC, another `/btw`
-or `/btw clear` cancels a pending call. Core's RPC `abort` targets the main agent,
-not commands; print/RPC do not currently supply a command-specific cancellation signal.
-Session end and extension unload also abort pending side calls.
+Ephemeral children have no session/artifact files, parent sub-agent history
+entries, public listings or main-bus transcript events. Only the folded
+**display block** is persisted; the side conversation never becomes model history.
+Usage is booked by the host as **side usage**, with the neutral label **`btw`**, and
+counts toward the session/tree budget. Neither the child title nor the group name
+contains the question; the saved display block deliberately includes the Q&A,
+but accounting labels do not. Command-side spawning requires a group: its generic
+`btw` name, counts and usage remain public group metadata, even though the ephemeral
+child and its Q&A are private. API 0.1.44 offers neither direct command-side spawn nor a private-group
+option for commands.
+Concurrency, depth and budget limits still apply. At a concurrency cap of
+at least two the host reserves a slot for ephemeral turns; at one they queue
+normally. The dock shows when a child is waiting.
 
 ## Development
 
 From this folder, with dependencies installed in the local Amira checkout:
 
 ```sh
-bun install
-bun scripts/link-amira.ts D:/dev/Amira
-bun test test
+bun run link-amira D:/dev/Amira
+bun install --ignore-scripts
 bun run typecheck
 bun run lint
+bun test
 ```
 
-Tests use an API-only harness with controlled completions (no network or paid model
-requests). They cover context trimming, request shape, cancellation, panel/view lifecycle,
-session isolation, main-conversation immutability and print/RPC output.
+Tests use strict API-only fakes and controlled child event streams: no network,
+live model requests, real Amira home directory, or GUI windows. They cover spawn
+options and model inheritance, Markdown streaming, same-child follow-ups, dock
+close/clear, one persisted display block, errors, session isolation, and the
+absence of main-history reads or writes. Keyboard priority and resume rendering
+are host contracts; the extension tests exercise lifecycle hooks and print options
+without launching the terminal UI.
