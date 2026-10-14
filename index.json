@@ -49,7 +49,7 @@
     {
       "name": "workflow",
       "description": "Dynamic workflows: TypeScript scripts that orchestrate many sub-agents in the background, with limits, a progress view and resume",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/workflow" },
       "engines": { "amira": "^0.1.48" },
       "tags": ["workflow", "orchestration", "sub-agents", "automation"],
@@ -58,7 +58,7 @@
     {
       "name": "swarm",
       "description": "Swarm mode: long-lived sub-agents that work on one goal together through a shared blackboard and direct messages: /swarm <goal>",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/swarm" },
       "engines": { "amira": "^0.1.48" },
       "tags": ["agents", "swarm", "multi-agent", "orchestration"],

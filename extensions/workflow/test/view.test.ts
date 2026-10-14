@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import type { AgentStatusState, UiContext, UiControl, UiNode, ViewLine } from "@amira/api"
+import type { AgentStatusState, UiContext, UiControl, UiNode, UiState, ViewLine } from "@amira/api"
 import { observeAgentEvent } from "../src/activity.ts"
 import type { JournalEntry, RunRecord } from "../src/journal.ts"
 import { type AgentNode, agentsOf, newFlow, phaseOf } from "../src/progress.ts"
@@ -57,6 +57,8 @@ function fixture() {
   let stopped = 0
   let asked = 0
   let rendered = 0
+  const focused: string[] = []
+  const patches: Partial<UiState>[] = []
   run.stop = () => {
     stopped++
   }
@@ -72,8 +74,12 @@ function fixture() {
     pushPage() {},
     popPage() {},
     print() {},
-    focus() {},
-    setState() {},
+    focus(id) {
+      focused.push(id)
+    },
+    setState(patch) {
+      patches.push(patch)
+    },
     requestRender() {
       rendered++
     },
@@ -87,6 +93,8 @@ function fixture() {
     view,
     control,
     data,
+    focused,
+    patches,
     stopped: () => stopped,
     asked: () => asked,
     rendered: () => rendered,
@@ -191,6 +199,10 @@ test("events and results fold to one semantic row each; Enter expands and folds 
     folded.map(lineText).indexOf("0s: Finished read"),
   )
   f.view.onEvent!({ type: "activate", id: "workflow-agents:wf_test", key: "1" }, f.data, f.control)
+  expect(f.focused).toEqual(["workflow-details:wf_test:1"])
+  expect(f.data.expandedCalls).toBeUndefined()
+  expect(f.patches).toEqual([])
+  f.view.onEvent!({ type: "activate", id: "workflow-details:wf_test:1", key: "1" }, f.data, f.control)
   const expanded = lines(f.view.ui!(f.data, context())).map(lineText)
   expect(expanded).toContain("with arguments")
   expect(expanded.at(-2)).toBe("result second line")
@@ -198,8 +210,70 @@ test("events and results fold to one semantic row each; Enter expands and folds 
   expect(lines(f.view.ui!(f.data, context())).map(lineText).join("\n")).not.toContain("result second line")
   f.view.onEvent!({ type: "select", id: "workflow-agents:wf_test", key: "1" }, f.data, f.control)
   f.view.onEvent!({ type: "activate", id: "workflow-agents:wf_test", key: "1" }, f.data, f.control)
+  expect(f.data.expandedCalls).toEqual([1])
+  f.view.onEvent!({ type: "activate", id: "workflow-details:wf_test:1", key: "1" }, f.data, f.control)
   expect(f.data.expandedCalls).toEqual([])
 })
+
+test("brackets target panes directly; d remains a silent one-release toggle alias", () => {
+  const f = fixture()
+  const list = "workflow-agents:wf_test"
+  const detail = "workflow-details:wf_test:2"
+  expect(f.view.keys!.map((key) => key.key)).toEqual(["[", "]", "d", "?", "x"])
+  expect(f.view.keys!.find((key) => key.key === "d")!.label).toBe("")
+  f.view.onEvent!({ type: "key", key: "]", focused: list }, f.data, f.control)
+  expect(f.focused.at(-1)).toBe("workflow-details:wf_test:1")
+  f.view.onEvent!({ type: "select", id: list, key: "2" }, f.data, f.control)
+  for (const focused of [list, detail]) {
+    f.view.onEvent!({ type: "key", key: "]", focused }, f.data, f.control)
+    f.view.onEvent!({ type: "key", key: "[", focused }, f.data, f.control)
+  }
+  expect(f.focused.slice(-4)).toEqual([detail, list, detail, list])
+  f.view.onEvent!({ type: "key", key: "d", focused: list }, f.data, f.control)
+  f.view.onEvent!({ type: "key", key: "d", focused: detail }, f.data, f.control)
+  expect(f.focused.slice(-2)).toEqual([detail, list])
+  expect(f.data.selectedCall).toBe(2)
+  expect(f.data.expandedCalls).toBeUndefined()
+})
+
+for (const width of [180, 60, 40, 20]) {
+  test(`workflow hints at ${width} columns keep complete shared navigation and applicable actions`, () => {
+    const f = fixture()
+    f.run.status = "running"
+    const opts = context(width)
+    const hints = () => {
+      const root = f.view.ui!(f.data, opts)
+      if (root.type !== "row") throw new Error("Expected inset")
+      const column = root.children[1]!.node
+      if (column.type !== "column") throw new Error("Expected screen")
+      return lines(column.children.at(-1)!.node).map(lineText)
+    }
+    for (const [focused, enter] of [
+      ["workflow-agents:wf_test", "enter details"],
+      ["workflow-details:wf_test:1", "enter expand"],
+    ] as const) {
+      opts.state.focused = focused
+      const rows = hints()
+      for (const hint of ["↑↓ select", "[ ] panes", enter, "? summary", "x stop", "tab input", "esc close"])
+        expect(rows.join(" · ")).toContain(hint)
+      expect(rows.join(" · ")).not.toMatch(/(^| · )d( panes)?( · |$)/)
+      for (const row of rows) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(width - 2)
+      if (width === 180) expect(rows).toHaveLength(1)
+      else expect(rows.length).toBeGreaterThan(1)
+    }
+    f.data.expandedCalls = [1]
+    expect(hints().join(" · ")).toContain("enter fold")
+    for (const status of ["done", "stopped", "error"] as const) {
+      f.run.status = status
+      expect(hints().join(" · ")).not.toContain("x stop")
+    }
+    f.run.status = "running"
+    f.run.readOnly = true
+    expect(hints().join(" · ")).not.toContain("x stop")
+    opts.focused = false
+    expect(hints()).toEqual(["tab view · esc close"])
+  })
+}
 
 for (const [source, expected] of [
   [{ status: "queued" }, "queued"],
@@ -297,9 +371,9 @@ test("only active live runs/agents request one-second elapsed redraws", () => {
 test("archived/finished runs omit action hints and refuse x, but live x still asks and stops", async () => {
   const f = fixture()
   f.run.status = "running"
-  expect(lines(f.view.ui!(f.data, context())).map(lineText).at(-1)).toContain("x stop")
+  expect(lines(f.view.ui!(f.data, context())).map(lineText).join("\n")).toContain("x stop")
   f.run.readOnly = true
-  expect(lines(f.view.ui!(f.data, context())).map(lineText).at(-1)).not.toContain("x stop")
+  expect(lines(f.view.ui!(f.data, context())).map(lineText).join("\n")).not.toContain("x stop")
   expect(f.view.keys!.every((key) => key.label === "")).toBe(true)
   f.view.onEvent!({ type: "key", key: "x" }, f.data, f.control)
   expect(f.asked()).toBe(0)

@@ -62,7 +62,7 @@ clutter. Below 80 columns, the agent list stacks above the selected agent's deta
   > ⠋ working check        │ 0s: Started agent
                            │ 1s: Started read
 
-  d panes · Enter expand · ? summary · x stop · Tab input · Esc close
+  ↑↓ select · [ ] panes · enter details · ? summary · x stop · tab input · esc close
 ```
 
 Counts have protected space on the right, using plain shared labels before their counts:
@@ -77,19 +77,30 @@ still done, and textual progress retains not-merged notes and recovery paths. Un
 cost is labeled unknown in totals and omitted from the selected-agent summary, never
 shown as zero. The elapsed-time clock refreshes only while a live run or agent is active.
 
-Up/Down skips group labels. Enter expands or folds the selected agent's own events and
-result from either pane, with the newest event/result last; folded entries occupy one
-row. `d` switches the active pane; only that pane uses native selectable widgets, so
-inactive content keeps its selection and expansion without a second highlight. Expansion
-is retained when switching agents, panes or terminal widths. Host PgUp/PgDn scrolls long
+Up/Down skips group labels. Since **0.2.1**, both workflow and swarm use the same navigation:
+`[` focuses the list pane; `]` focuses the details pane. Enter in the list focuses the
+selected agent's details without changing expansion. Enter in details expands or folds
+the selected Events / result entry, with the newest event/result last; folded entries
+occupy one row. The old `d` pane toggle remains a silent compatibility alias for one
+release and is not shown in hints. Only the active pane uses native selectable widgets,
+so inactive content keeps its selection and expansion without a second highlight.
+Expansion is retained when switching agents, panes or terminal widths. Host PgUp/PgDn scrolls long
 expanded details. `x` retains the stop confirmation for live runs. Tab, `/`, `i`, Esc and
 input focus remain host-owned; selection dims while the composer owns focus.
 
 The wide layout uses a 22–28-cell agent pane, a native divider and one-cell gap. Both pane
 headers use the same compact style, and the screen has a two-cell left inset. One owned
-hint row replaces the generic host footer; at 60 columns it reads:
-`d · Enter expand · ? · x stop · Tab input · Esc close`. Finished and archived runs
-omit `x stop`.
+hint area replaces the generic host footer. Both views use the same navigation words,
+with `enter details` in the list and `enter expand` or `enter fold` in details. Complete
+hint groups wrap at narrow widths rather than dropping navigation or shortening labels.
+At 60 columns, with the list active, it reads:
+
+```text
+  ↑↓ select · [ ] panes · enter details · ? summary · x stop
+  tab input · esc close
+```
+
+Finished and archived runs omit `x stop`. Host focus toggles remain host-owned.
 
 `/workflow view <id>` can also open a saved run from this session's workflow directory or
 Amira's workflow-runs directory. Archived snapshots are **read-only**: they show the final

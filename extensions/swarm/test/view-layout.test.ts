@@ -288,12 +288,29 @@ function uiControl() {
   return { view, focused, patches }
 }
 
+test("brackets focus each pane directly without changing selection or expansion", () => {
+  for (const definition of [swarmView, readonlySwarmView]) {
+    const data: SwarmViewData = { snapshot: () => snapshot() }
+    const { view, focused, patches } = uiControl()
+    definition.onEvent!({ type: "key", key: "]" }, data, view)
+    expect(focused).toEqual(["details:writer"])
+    definition.onEvent!({ type: "select", id: "members", key: "reviewer" }, data, view)
+    for (const id of ["members", "details:reviewer"]) {
+      definition.onEvent!({ type: "key", key: "]", focused: id }, data, view)
+      definition.onEvent!({ type: "key", key: "[", focused: id }, data, view)
+    }
+    expect(focused.slice(-4)).toEqual(["details:reviewer", "members", "details:reviewer", "members"])
+    expect(patches).toEqual([])
+  }
+})
+
 test("Enter opens selected member details, folds full text and preserves expansion by member", () => {
   const data: SwarmViewData = { snapshot: () => snapshot() }
   const { view, focused, patches } = uiControl()
   swarmView.onEvent!({ type: "select", id: "members", key: "reviewer" }, data, view)
   swarmView.onEvent!({ type: "activate", id: "members", key: "reviewer" }, data, view)
   expect(focused).toEqual(["details:reviewer"])
+  expect(patches).toEqual([])
   swarmView.onEvent!({ type: "activate", id: "details:reviewer", key: "result" }, data, view)
   expect(patches.at(-1)).toEqual({ expanded: { "details:reviewer": ["result"] } })
   swarmView.onEvent!({ type: "activate", id: "details:writer", key: "reply" }, data, view)
@@ -303,6 +320,66 @@ test("Enter opens selected member details, folds full text and preserves expansi
   swarmView.onEvent!({ type: "key", key: "]" }, data, view)
   expect(focused.slice(-2)).toEqual(["members", "details:reviewer"])
 })
+
+for (const width of [180, 60, 40, 20]) {
+  test(`swarm hints at ${width} columns keep complete shared navigation and applicable actions`, () => {
+    const s = snapshot()
+    const data: SwarmViewData = {
+      snapshot: () => s,
+      control: {
+        tell: () => undefined,
+        pause: () => undefined,
+        resume: () => undefined,
+        stopMember: () => undefined,
+        stop: () => {},
+      },
+    }
+    const ctx = context({ width })
+    const hints = (definition = swarmView) => {
+      const root = definition.ui!(data, ctx)
+      if (root.type !== "row") throw new Error("Expected inset")
+      const column = root.children[1]!.node
+      if (column.type !== "column") throw new Error("Expected screen")
+      const footer = column.children.at(-1)!.node
+      if (footer.type !== "text") throw new Error("Expected hints")
+      return footer.lines.map(lineText)
+    }
+    for (const [focused, enter] of [
+      ["members", "enter details"],
+      ["details:writer", "enter expand"],
+    ] as const) {
+      ctx.state.focused = focused
+      const rows = hints()
+      for (const hint of [
+        "↑↓ select",
+        "[ ] panes",
+        enter,
+        "? summary",
+        "m message/all",
+        "p pause/resume",
+        "x stop member",
+        "s stop",
+        "tab input",
+        "esc close",
+      ])
+        expect(rows.join(" · ")).toContain(hint)
+      for (const row of rows) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(width - 2)
+      if (width === 180) expect(rows).toHaveLength(1)
+      else expect(rows.length).toBeGreaterThan(1)
+    }
+    ctx.state.selected["details:writer"] = "result"
+    ctx.state.expanded["details:writer"] = ["result"]
+    expect(hints().join(" · ")).toContain("enter fold")
+    for (const state of ["ending", "ended"] as const) {
+      s.state = state
+      expect(hints().join(" · ")).not.toMatch(/m message|p pause|x stop|s stop/)
+    }
+    s.state = "running"
+    expect(hints(readonlySwarmView).join(" · ")).not.toMatch(/m message|p pause|x stop|s stop/)
+    ctx.focused = false
+    expect(hints()).toEqual(["tab view · esc close"])
+  })
+}
 
 test("read-only view has no action keys or hints and leaves Tab and /i to the host", () => {
   expect(readonlySwarmView.kind).toBe(READONLY_VIEW_KIND)

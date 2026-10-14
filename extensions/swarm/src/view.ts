@@ -184,29 +184,28 @@ function details(s: SwarmSnapshot, m: MemberView): UiTreeItem[] {
 
 function keyHints(data: SwarmViewData, ctx: UiContext, readOnly: boolean): ViewLine[] {
   if (ctx.focused === false)
-    return [{ kind: "segments", parts: [{ kind: "muted", text: "Tab view · Esc close" }] }]
+    return [{ kind: "segments", parts: [{ kind: "muted", text: "tab view · esc close" }] }]
   const s = data.snapshot()
   const live = !readOnly && data.control && s && s.state !== "ended" && s.state !== "ending"
   const detailId = ctx.state.focused ?? ""
   const detailKey = ctx.state.selected[detailId]
   const enter = detailId.startsWith("details:")
     ? detailKey && ctx.state.expanded[detailId]?.includes(detailKey)
-      ? "Enter fold"
-      : "Enter expand"
-    : "Enter details"
-  const full = [
-    "[] panes",
-    enter,
-    "? summary",
-    ...(live ? ["m message/all", "p pause/resume", "x stop member", "s stop"] : []),
-    "Tab input",
-    "Esc close",
-  ]
-  const compact = live
-    ? ["m msg", "p pause/resume", "x member", "s stop", "Tab", "Esc", "?"]
-    : ["[] pane", enter === "Enter details" ? "Enter open" : enter, "? summary", "Tab input", "Esc close"]
-  const groups = Bun.stringWidth(full.join(" · ")) <= ctx.width ? full : compact
-  return [{ kind: "segments", parts: [{ kind: "muted", text: groups.join(" · ") }] }]
+      ? "enter fold"
+      : "enter expand"
+    : "enter details"
+  return wrappedGroups(
+    [
+      "↑↓ select",
+      "[ ] panes",
+      enter,
+      "? summary",
+      ...(live ? ["m message/all", "p pause/resume", "x stop member", "s stop"] : []),
+      "tab input",
+      "esc close",
+    ],
+    ctx.width,
+  )
 }
 
 function wrappedGroups(groups: string[], width: number): ViewLine[] {
@@ -301,7 +300,10 @@ function innerScreen(data: SwarmViewData, s: SwarmSnapshot, ctx: UiContext, read
               { kind: "text", text: s.goal },
               { kind: "segments", parts: summary(s, ctx).slice(1) },
               { kind: "text", text: [...stateCounts(s)].map(([state, n]) => `${state} ${n}`).join(" · ") },
-              { kind: "text", text: "Enter opens or expands details; [ selects members, ] selects details." },
+              {
+                kind: "text",
+                text: "[ focuses the list pane; ] focuses the details pane. Enter in the list focuses details; Enter in details expands or folds the selected entry.",
+              },
               ...(!readOnly && data.control && s.state !== "ended" && s.state !== "ending"
                 ? [
                     {
@@ -318,7 +320,7 @@ function innerScreen(data: SwarmViewData, s: SwarmSnapshot, ctx: UiContext, read
           node: {
             type: "text",
             lines: [
-              { kind: "muted", text: ctx.focused === false ? "Tab view · Esc back" : "Tab input · Esc back" },
+              { kind: "muted", text: ctx.focused === false ? "tab view · esc back" : "tab input · esc back" },
             ],
           },
         },

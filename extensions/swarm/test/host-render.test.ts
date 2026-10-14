@@ -55,9 +55,11 @@ for (const [width, height] of [
     expect(render().join("\n")).toContain("FIRST SECOND")
     expect(render().some((row) => row.includes("SECOND") && !row.includes("FIRST"))).toBe(false)
     viewer.handleInput(kit.key("enter"))
-    render()
+    expect(render().some((row) => row.includes("SECOND") && !row.includes("FIRST"))).toBe(false)
     viewer.handleInput(kit.key("enter"))
     expect(render().some((row) => row.includes("SECOND") && !row.includes("FIRST"))).toBe(true)
+    viewer.handleInput(kit.key("enter"))
+    expect(render().join("\n")).toContain("FIRST SECOND")
     viewer.dispose()
   })
 }
@@ -81,8 +83,8 @@ for (const [width, height] of [
     expect(rows[0]!.startsWith(width >= 82 ? "  Swarm" : "  ")).toBe(true)
     expect(rows[0]).toContain("10s")
     expect(rows.join("\n")).toContain("? summary")
-    expect(rows.join("\n")).toContain("Tab input")
-    expect(rows.join("\n")).toContain("Esc close")
+    expect(rows.join("\n")).toContain("tab input")
+    expect(rows.join("\n")).toContain("esc close")
     expect(rows.join("\n")).not.toContain("scroll")
     viewer.handleInput(kit.key("?"))
     const full = render().join("\n")
@@ -139,20 +141,44 @@ test("narrow live host keeps every action hint visible and badge/name separated"
   const viewer = new tui.ExtensionViewer(swarmView, data, { now: () => 10000 })
   viewer.mount()
   const rows: string[] = viewer.render(60, { theme: kit.monoTheme, color: false, rows: 28 }).map(strip)
-  for (const hint of ["m msg", "p pause/resume", "x member", "s stop", "Tab", "Esc", "?"])
+  for (const hint of [
+    "↑↓ select",
+    "[ ] panes",
+    "enter details",
+    "? summary",
+    "m message/all",
+    "p pause/resume",
+    "x stop member",
+    "s stop",
+    "tab input",
+    "esc close",
+  ])
     expect(rows.join("\n")).toContain(hint)
   expect(rows.join("\n")).toContain("working grid")
   expect(rows.join("\n")).not.toContain("Up/Down")
-  expect(rows.filter((row) => /m msg|Tab/.test(row))).toHaveLength(1)
+  expect(rows.filter((row) => /↑↓ select|m message|x stop|tab input|esc close/.test(row))).toHaveLength(3)
   const wide: string[] = viewer.render(120, { theme: kit.monoTheme, color: false, rows: 32 }).map(strip)
-  expect(wide.filter((row) => /m message|Tab/.test(row))).toHaveLength(1)
+  for (const hint of [
+    "↑↓ select",
+    "[ ] panes",
+    "enter details",
+    "? summary",
+    "m message/all",
+    "p pause/resume",
+    "x stop member",
+    "s stop",
+    "tab input",
+    "esc close",
+  ])
+    expect(wide.join("\n")).toContain(hint)
+  expect(wide.filter((row) => /↑↓ select|tab input|esc close/.test(row))).toHaveLength(2)
   viewer.handleInput(kit.key("m"))
   const prompt: string[] = viewer.render(60, { theme: kit.monoTheme, color: false, rows: 28 }).map(strip)
   expect(prompt.join("\n")).toContain("Message a member")
   viewer.handleInput(kit.key("escape"))
   data.snapshot()!.state = "ending"
   const ending: string[] = viewer.render(60, { theme: kit.monoTheme, color: false, rows: 28 }).map(strip)
-  for (const hint of ["m msg", "p pause/resume", "x member", "s stop"])
+  for (const hint of ["m message/all", "p pause/resume", "x stop member", "s stop"])
     expect(ending.join("\n")).not.toContain(hint)
   viewer.dispose()
 })

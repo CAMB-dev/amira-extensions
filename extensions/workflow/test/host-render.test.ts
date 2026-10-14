@@ -67,7 +67,7 @@ for (const [width, height] of [
   [120, 30],
   [60, 28],
 ] as const) {
-  test(`host ${width}x${height}: arrows skip phase headings and Enter expands the selected result`, () => {
+  test(`host ${width}x${height}: arrows skip headings; list Enter focuses details and detail Enter expands/folds`, () => {
     const run = fixture()
     const data: WorkflowViewData = {}
     const viewer = new tui.ExtensionViewer(
@@ -90,8 +90,15 @@ for (const [width, height] of [
     expect(render().join("\n")).toContain("FIRST SECOND")
     expect(data.selectedCall).toBe(2)
     viewer.handleInput(kit.key("enter"))
+    expect(render().join("\n")).toContain("FIRST SECOND")
+    expect(data.expandedCalls).toBeUndefined()
+    viewer.handleInput(kit.key("enter"))
     expect(render().join("\n")).not.toContain("FIRST SECOND")
     expect(render().join("\n")).toContain("SECOND")
+    viewer.handleInput(kit.key("enter"))
+    expect(render().join("\n")).toContain("FIRST SECOND")
+    viewer.handleInput(kit.key("["))
+    render()
     viewer.handleInput(kit.key("up"))
     render()
     expect(data.selectedCall).toBe(1)
@@ -99,8 +106,13 @@ for (const [width, height] of [
   })
 }
 
-for (const width of [120, 60]) {
-  test(`host ${width}: d then Enter twice expands/folds details and retains expansion across panes`, () => {
+for (const [width, detailsKey, listKey] of [
+  [120, "]", "["],
+  [60, "]", "["],
+  [120, "d", "d"],
+  [60, "d", "d"],
+] as const) {
+  test(`host ${width}: ${detailsKey}/${listKey} and Enter expand/fold details and retain expansion across panes`, () => {
     const run = fixture()
     const data: WorkflowViewData = {}
     const viewer = new tui.ExtensionViewer(
@@ -117,7 +129,7 @@ for (const width of [120, 60]) {
     render()
     viewer.handleInput(kit.key("down"))
     expect(render()).toContain("FIRST SECOND")
-    viewer.handleInput(kit.key("d"))
+    viewer.handleInput(kit.key(detailsKey))
     render()
     viewer.handleInput(kit.key("enter"))
     expect(render()).not.toContain("FIRST SECOND")
@@ -128,7 +140,7 @@ for (const width of [120, 60]) {
     expect(data.expandedCalls).toEqual([])
     viewer.handleInput(kit.key("enter"))
     render()
-    viewer.handleInput(kit.key("d"))
+    viewer.handleInput(kit.key(listKey))
     expect(render()).toContain("SECOND")
     viewer.handleInput(kit.key("up"))
     render()
@@ -141,7 +153,7 @@ for (const width of [120, 60]) {
     render()
     viewer.handleInput(kit.key("down"))
     render()
-    viewer.handleInput(kit.key("d"))
+    viewer.handleInput(kit.key(detailsKey))
     expect(render()).toContain("SECOND")
     expect(render()).not.toContain("FIRST SECOND")
     viewer.dispose()
@@ -200,12 +212,20 @@ test("narrow host keeps stop and navigation hints visible", () => {
   const rows: string[] = viewer
     .render(60, { theme: kit.monoTheme, color: false, rows: 28 })
     .map(kit.stripAnsi)
-  for (const hint of ["Enter expand", "d", "?", "x stop", "Tab input", "Esc close"])
+  for (const hint of [
+    "↑↓ select",
+    "[ ] panes",
+    "enter details",
+    "? summary",
+    "x stop",
+    "tab input",
+    "esc close",
+  ])
     expect(rows.join("\n")).toContain(hint)
   viewer.dispose()
 })
 
-test("60 columns prioritizes label-first counts, one compact hint row, and inspectable full summary", () => {
+test("60 columns prioritizes counts, wrapped navigation hints, and inspectable full summary", () => {
   const run = fixture()
   run.meta.name = "a-very-long-workflow-name-for-layout-regressions"
   run.flow.phases[1]!.items.push(
@@ -224,10 +244,19 @@ test("60 columns prioritizes label-first counts, one compact hint row, and inspe
   const render = () => viewer.render(60, { theme: kit.monoTheme, color: false, rows: 30 }).map(kit.stripAnsi)
   const rows = render()
   expect(rows[0]).toContain("queued 1 · working 1 · done 2")
-  const hints = rows.filter((row: string) => row.includes("Tab input") || row.includes("Esc close"))
-  expect(hints).toHaveLength(1)
-  for (const hint of ["Enter", "d", "?", "x stop", "Tab input", "Esc close"]) expect(hints[0]).toContain(hint)
-  expect(rows.join("\n")).not.toContain("esc close")
+  const hints = rows.filter((row: string) => /↑↓ select|tab input|esc close/.test(row))
+  expect(hints).toHaveLength(2)
+  for (const hint of [
+    "↑↓ select",
+    "[ ] panes",
+    "enter details",
+    "? summary",
+    "x stop",
+    "tab input",
+    "esc close",
+  ])
+    expect(hints.join("\n")).toContain(hint)
+  expect(rows.join("\n")).not.toContain("d panes")
   viewer.handleInput(kit.key("?"))
   expect(render().join("\n")).toContain("a-very-long-workflow-name-for-layout-regressions")
   expect(render().join("\n")).toContain("queued 1 · working 1 · done 2")
@@ -252,7 +281,7 @@ test("only active native pane highlights selection and pointer touches the badge
   expect(kit.stripAnsi(selected)).toMatch(/^ {2}› \S working grid/)
   expect(rows.filter((row) => row.includes("\u001b[7m"))).toHaveLength(1)
   expect(rows.some((row) => kit.stripAnsi(row).includes("│"))).toBe(true)
-  viewer.handleInput(kit.key("d"))
+  viewer.handleInput(kit.key("]"))
   const detailRows = render()
   const listRow = detailRows.find((row) => kit.stripAnsi(row).includes("working grid"))!
   expect(listRow).not.toContain("\u001b[7m")
@@ -287,7 +316,7 @@ test("inactive narrow list keeps the final selected agent visible", () => {
     viewer.handleInput(kit.key("down"))
     render()
   }
-  viewer.handleInput(kit.key("d"))
+  viewer.handleInput(kit.key("]"))
   expect(render()).toContain("> ✓ done    extra 19")
   viewer.dispose()
 })

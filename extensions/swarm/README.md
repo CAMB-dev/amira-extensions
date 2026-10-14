@@ -90,9 +90,10 @@ member workflows, including outstanding confirmations and starts racing with shu
 - `/swarm view` opens a split view: select a member with Up/Down on the left; the right
   shows its role, state, elapsed time, own cost, current tool or last action, result,
   its own board entries and recent events/messages (newest last). At narrow widths the
-  panes stack. Long text stays folded to one line; Enter opens the selected member's
-  details, then Enter expands/collapses a selected detail. `[` returns to members and
-  `]` focuses details. Only the active pane has a selection bar; switching panes keeps
+  panes stack. Long text stays folded to one line. Since **0.2.1**, both swarm and workflow
+  use the same navigation: `[` focuses the list pane; `]` focuses the details pane. Enter
+  in the list focuses the selected member's details; Enter in details expands or folds
+  the selected entry. Only the active pane has a selection bar; switching panes keeps
   the selected member and each member's expanded details. Host focus keys (Tab, `/`, or `i`)
   switch to the input; the selection dims there. `?` opens the full summary (identity, goal,
   state, elapsed time, known cost and counts), and Esc returns from it or closes the root view.
@@ -126,10 +127,10 @@ With at least 80 inner columns (82 including the inset), the view reads like thi
                              │   ▸ 10:24:01 Started read
                              │   ▸ 10:24:05 you → researcher: Check B...
 
-  [] panes · Enter details · ? summary · m message/all · p pause/resume · x stop member · s stop · Tab input · Esc close
+  ↑↓ select · [ ] panes · enter details · ? summary · m message/all · p pause/resume · x stop member · s stop · tab input · esc close
 ```
 
-At 60 columns, panes stack, identity yields to counts/metrics, and hints use one compact row:
+At 60 columns, panes stack, identity yields to counts/metrics, and complete hint groups wrap:
 
 ```text
   ⠋ working · 42s · $0.08                working 1 · idle 1
@@ -142,7 +143,9 @@ At 60 columns, panes stack, identity yields to counts/metrics, and hints use one
 
       ▸ Brief: Compare the two options...
 
-  m msg · p pause/resume · x member · s stop · Tab · Esc · ?
+  ↑↓ select · [ ] panes · enter details · ? summary
+  m message/all · p pause/resume · x stop member · s stop
+  tab input · esc close
 ```
 
 Maintainer conventions shared with the workflow view: use a two-cell outer left spacer
@@ -150,8 +153,11 @@ Maintainer conventions shared with the workflow view: use a two-cell outer left 
 Wide panes use `divider: true`, `gap: 1` and a 22–28-cell member column. Keep counts on the
 header's protected right side; truncate identity before metrics or counts, with `?` for
 full summary access. Own the hints in one area with `hostKeys: "none"`: this intentionally
-removes the generic host footer, not prompts or confirmation questions. Show only applicable
-view actions plus Tab/input and Esc/close. Render the inactive pane as nonfocusable static
+removes the generic host footer, not prompts or confirmation questions. Use the shared hint
+words `↑↓ select · [ ] panes · enter details · ? summary`, followed by applicable actions,
+`tab input` and `esc close`; in details, show `enter expand` or `enter fold` instead. Wrap
+whole groups at narrow widths rather than dropping navigation or shortening labels. Host
+focus toggles remain host-owned. Render the inactive pane as nonfocusable static
 text: native trees highlight selected rows even when unfocused. `UiControl.focus(id)` stores
 focus for the next frame, so choose the active native widget from `ctx.state.focused`
 (default members); keep selection and expansion host-owned. Put the shared badge symbol

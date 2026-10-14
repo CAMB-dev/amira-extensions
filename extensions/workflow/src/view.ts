@@ -358,6 +358,9 @@ export function createWorkflowView(
                 lines: [
                   text(heading.kind === "segments" ? heading.parts.map((part) => part.text).join("") : ""),
                   ...headingLines.slice(1),
+                  text(
+                    "[ focuses the list pane; ] focuses the details pane. Enter in the list focuses details; Enter in details expands or folds the selected entry.",
+                  ),
                 ],
               },
             },
@@ -369,7 +372,7 @@ export function createWorkflowView(
                   segments([
                     {
                       kind: "muted",
-                      text: opts.focused === false ? "Tab view · Esc back" : "Tab input · Esc back",
+                      text: opts.focused === false ? "tab view · esc back" : "tab input · esc back",
                     },
                   ]),
                 ],
@@ -381,20 +384,17 @@ export function createWorkflowView(
       const innerWidth = Math.max(1, opts.width - 2)
       const wide = innerWidth >= 80
       const actions = !run.readOnly && run.status === "running" && run.stop ? ["x stop"] : []
-      const enter = expanded ? "Enter fold" : "Enter expand"
-      const fullHints = ["d panes", enter, "? summary", ...actions, "Tab input", "Esc close"]
-      const compactHints = ["d", enter, "?", ...actions, "Tab input", "Esc close"]
-      const hints = [
-        segments([
-          {
-            kind: "muted",
-            text:
-              opts.focused === false
-                ? "Tab view · Esc close"
-                : (textCells(fullHints.join(" · ")) <= innerWidth ? fullHints : compactHints).join(" · "),
-          },
-        ]),
-      ]
+      const treeId = `workflow-agents:${run.id}`
+      const detailId = `workflow-details:${run.id}:${selected?.call ?? "none"}`
+      const detailsActive = opts.state.focused === detailId
+      const enter = detailsActive ? (expanded ? "enter fold" : "enter expand") : "enter details"
+      const hints =
+        opts.focused === false
+          ? [segments([{ kind: "muted", text: "tab view · esc close" }])]
+          : hintLines(
+              ["↑↓ select", "[ ] panes", enter, "? summary", ...actions, "tab input", "esc close"],
+              innerWidth,
+            )
       const counts = heading.kind === "segments" ? heading.parts[0]!.text.replace(/ · $/, "") : "0 agents"
       const primary =
         heading.kind === "segments" ? protectIdentity(heading.parts.slice(1), counts, innerWidth) : []
@@ -404,9 +404,6 @@ export function createWorkflowView(
       const listHeight = wide
         ? bodyHeight
         : Math.max(2, Math.min(Math.floor(bodyHeight * 0.4), workflowRows(run.flow).length + 2))
-      const treeId = `workflow-agents:${run.id}`
-      const detailId = `workflow-details:${run.id}:${selected?.call ?? "none"}`
-      const detailsActive = opts.state.focused === detailId
       const tree = agentTree(run, opts, selected)
       const list: UiNode = {
         type: "column",
@@ -527,6 +524,9 @@ export function createWorkflowView(
       })
     },
     keys: [
+      { key: "[", label: "" },
+      { key: "]", label: "" },
+      // Compatibility for one release: keep the old toggle silent in hints.
       { key: "d", label: "" },
       { key: "?", label: "" },
       { key: "x", label: "", run: stop },
@@ -561,13 +561,12 @@ export function createWorkflowView(
         const selected = agentsOf(run.flow).find((agent) => String(agent.call) === event.key)
         if (!selected) return
         data.selectedCall = selected.call
-        if (event.type === "activate") {
-          const expanded = data.expandedCalls ?? []
-          data.expandedCalls = expanded.includes(selected.call)
-            ? expanded.filter((call) => call !== selected.call)
-            : [...expanded, selected.call]
-          syncExpansion(run, data, view)
-        }
+        if (event.type === "activate") view.focus(`workflow-details:${run.id}:${selected.call}`)
+      } else if (event.type === "key" && event.key === "[") {
+        view.focus(treeId)
+      } else if (event.type === "key" && event.key === "]") {
+        const selected = selectedAgent(run, data)
+        if (selected) view.focus(`workflow-details:${run.id}:${selected.call}`)
       } else if (event.type === "key" && event.key === "d") {
         const selected = selectedAgent(run, data)
         view.focus(
@@ -576,7 +575,7 @@ export function createWorkflowView(
       } else return
       view.requestRender()
     },
-    // Own one hint row; hiding host chrome does not change host key handling.
+    // Own the wrapped hints; hiding host chrome does not change host key handling.
     hostKeys: "none",
     follow: false,
   }
