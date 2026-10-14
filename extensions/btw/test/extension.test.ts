@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test"
+import { afterEach, expect, spyOn, test } from "bun:test"
 import type {
   AnyEvent,
   ChildSession,
@@ -47,6 +47,9 @@ function stream() {
         },
         return() {
           ended = true
+          queued.length = 0
+          waiter?.resolve({ done: true, value: undefined })
+          waiter = undefined
           return Promise.resolve({ done: true as const, value: undefined })
         },
       }
@@ -54,6 +57,7 @@ function stream() {
   }
   return {
     events,
+    active: () => !!waiter,
     push(event: AnyEvent) {
       if (waiter) {
         waiter.resolve({ done: false, value: event })
@@ -71,6 +75,12 @@ function stream() {
       waiter = undefined
     },
   }
+}
+
+function retryCommand(notice: Parameters<ExtensionAPI["notify"]>): string {
+  const command = notice[2]?.details?.match(/\/btw (retry (?:r\d+|[0-9a-f-]+))/i)?.[1]
+  if (!command) throw new Error("Expected an ask-again action in the recovery notice")
+  return command
 }
 
 async function flush() {
@@ -106,6 +116,13 @@ async function setup(settings: Settings = {}) {
     }) as T
   }
 
+  const records = new Map<string, unknown[]>()
+  const writes: { id: string; key: string; value: unknown }[] = []
+  const recoveryWrites: typeof writes = []
+  const unloadHooks: (() => void)[] = []
+  const hostClosers: (() => void)[] = []
+  const notices: Parameters<ExtensionAPI["notify"]>[] = []
+  let currentSession: SessionControl | undefined
   const commands: CommandDefinition[] = []
   const views: ViewDefinition[] = []
   const listeners = new Map<keyof EventMap, (event: EventEnvelope) => void>()
@@ -124,6 +141,8 @@ async function setup(settings: Settings = {}) {
       value: initialState,
       accepts: true,
       sendError: undefined as unknown,
+      abortRejects: false,
+      abortPending: false,
     }
     const sent: Parameters<ChildSession["send"]>[0][] = []
     const aborts: (string | undefined)[] = []
@@ -141,8 +160,9 @@ async function setup(settings: Settings = {}) {
       abort(reason) {
         aborts.push(reason)
         state.value = "ended"
-        result.resolve(outcome("aborted"))
-        source.end()
+        if (state.abortRejects) result.reject(new DOMException("Cancelled", "AbortError"))
+        else if (!state.abortPending) result.resolve(outcome("aborted"))
+        if (!state.abortPending) source.end()
       },
       send(message) {
         if (state.sendError) throw state.sendError
@@ -175,10 +195,12 @@ async function setup(settings: Settings = {}) {
       state,
       emit,
       source,
+      result,
       async answer(text: string) {
         await emit("message.end", {
           message: { role: "assistant", model: modelRef, content: [{ type: "text", text }] },
         })
+        await emit("turn.end", { reason: "done", steps: 1 })
         state.value = "idle"
         await emit("subagent.state", { childSessionId: id, state: "idle", turns: 1 }, parentSessionId)
       },
@@ -192,7 +214,17 @@ async function setup(settings: Settings = {}) {
   }
 
   const api = strict<ExtensionAPI>("api", {
-    settings: { ...settings, layers: () => [] },
+    settings: strict<ExtensionAPI["settings"]>("settings", {
+      ...settings,
+      extensions: settings.extensions,
+      layers: () => [],
+    }),
+    session: () => currentSession,
+    notify: (...args) => void notices.push(args),
+    onUnload(handler) {
+      unloadHooks.push(handler)
+      return () => {}
+    },
     registerCommand(command) {
       commands.push(command)
       return () => {}
@@ -228,7 +260,7 @@ async function setup(settings: Settings = {}) {
     const controller = new AbortController()
     const printed: Parameters<CommandContext["print"]>[] = []
     const opened: FrontendView[] = []
-    // There is no session.messages/send/data/append API in this strict fake.
+    // There is no main-history messages/send/append API in this strict fake.
     const mainHistory = Object.freeze([
       Object.freeze({ role: "user", content: Object.freeze([{ type: "text", text: "Main question" }]) }),
     ])
@@ -237,6 +269,16 @@ async function setup(settings: Settings = {}) {
     let closes = 0
     const parentModel = { provider: "test", model: "session-model" }
     const session = strict<SessionControl>("session", {
+      data: {
+        read: (key) => structuredClone(records.get(`${id}:${key}`) ?? []),
+        append(key, value) {
+          const write = { id, key, value: structuredClone(value) }
+          writes.push(write)
+          if (key === "btw.pending") recoveryWrites.push(write)
+          const recordKey = `${id}:${key}`
+          records.set(recordKey, [...(records.get(recordKey) ?? []), structuredClone(value)])
+        },
+      },
       info: () => ({
         id,
         cwd: "/work",
@@ -264,11 +306,13 @@ async function setup(settings: Settings = {}) {
               })
             },
     })
+    currentSession = session
     function hostClose() {
       closes++
       if (mounted && "data" in mounted) mountedDefinition?.onClose?.(mounted.data)
       mounted = undefined
     }
+    hostClosers.push(hostClose)
     const control = strict<UiControl>("control", { close: hostClose })
     const ctx = strict<CommandContext>("ctx", {
       session,
@@ -338,6 +382,16 @@ async function setup(settings: Settings = {}) {
     context,
     run,
     emit,
+    writes,
+    recoveryWrites,
+    records,
+    notices,
+    retry: (index: number) => retryCommand(notices[index - 1]!),
+    unload(closeViews = true) {
+      // API 0.1.46 closes owned views synchronously before invoking unload hooks.
+      if (closeViews) for (const close of hostClosers) close()
+      for (const hook of unloadHooks.splice(0)) hook()
+    },
     children,
     groups,
     commands,
@@ -350,7 +404,7 @@ async function setup(settings: Settings = {}) {
       initialState = "queued"
     },
     async reload() {
-      // Registration removal leaves mounted viewers and their callbacks intact.
+      this.unload()
       commands.length = 0
       views.length = 0
       listeners.clear()
@@ -358,6 +412,21 @@ async function setup(settings: Settings = {}) {
     },
   }
 }
+
+test("unload during streaming preserves the unanswered question and partial answer", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.run("Unanswered?", c)
+  await s.children[0]!.emit("message.delta", { kind: "text", text: "Partial" })
+  s.unload()
+  await flush()
+  expect(s.recoveryWrites).toHaveLength(1)
+  expect(s.recoveryWrites[0]?.value).toEqual([
+    { question: "Unanswered?", answer: "Partial", timestamp: expect.any(Number), state: "in-flight" },
+  ])
+  expect(c.printed).toEqual([])
+  expect(s.children[0]!.aborts).toHaveLength(1)
+})
 
 test("the entry point exports only the default extension", async () => {
   expect(Object.keys(await import("../src/index.ts"))).toEqual(["default"])
@@ -383,6 +452,7 @@ test("busy session forks an ephemeral child with inherited declarations and sess
   const before = structuredClone(c.mainHistory)
   await s.children[0]!.answer("Answer")
   c.hostClose()
+  await flush()
   expect(c.mainHistory).toEqual(before)
 })
 
@@ -401,84 +471,774 @@ test("accounting metadata uses neutral labels, never the private question", asyn
   expect(accounting.side_usage.label).toBe("btw")
 })
 
-test("reload replacement preserves the old question block exactly once", async () => {
+test("reload restores partial answers with an ask-again action and consumes storage", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.run("A", c)
+  await s.children[0]!.emit("message.delta", { kind: "text", text: "Partial A" })
+  await s.reload()
+  expect(s.children).toHaveLength(1)
+  expect(s.recoveryWrites.map((write) => write.value)).toEqual([
+    [{ question: "A", answer: "Partial A", timestamp: expect.any(Number), state: "in-flight" }],
+    [],
+  ])
+  expect(s.notices[0]?.[2]?.details).toContain("Partial A")
+  expect(s.notices[0]?.[2]?.details).toContain("Interrupted by reload")
+  expect(s.notices[0]?.[2]?.details).toContain(`/btw ${s.retry(1)}`)
+  expect(c.printed).toEqual([])
+  s.run("", c)
+  expect(c.shown().replies).toEqual(["Partial A"])
+  expect(c.shown().status).toBe("interrupted")
+  s.run(s.retry(1), c)
+  expect(s.children).toHaveLength(2)
+  expect(s.children[1]!.options.prompt).toBe("A")
+  await s.children[1]!.answer("Answer A")
+  c.hostClose()
+  await flush()
+  expect(c.printed).toHaveLength(1)
+  expect(c.printed[0]?.[2]?.details).toContain("Answer A")
+})
+
+test("unload with a queue saves every question and reload automatically re-queues them", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.startQueued()
+  s.run("First", c)
+  s.run("Second", c)
+  s.run("Third", c)
+  await s.reload()
+  expect(s.children[0]!.aborts).toHaveLength(1)
+  expect(s.groups[0]!.ends).toHaveLength(1)
+  expect(s.recoveryWrites[0]?.value).toEqual(
+    ["First", "Second", "Third"].map((question) => ({
+      question,
+      answer: "",
+      timestamp: expect.any(Number),
+      state: "queued",
+    })),
+  )
+  expect(s.children).toHaveLength(2)
+  expect(s.children[1]!.options.prompt).toBe("First")
+  expect(s.children[1]!.sent).toEqual(["Second", "Third"])
+  expect(s.recoveryWrites[1]?.value).toEqual([])
+  expect(c.printed).toEqual([])
+  await s.children[1]!.answer("Restored answer")
+  expect(s.notices[0]?.[2]?.details).toContain("Restored answer")
+  s.run("", c)
+  expect(c.shown().replies).toContain("Restored answer")
+})
+
+test("a streaming question stays interrupted while its queued follow-ups restart", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.run("First", c)
+  await s.children[0]!.emit("message.delta", { kind: "text", text: "Partial" })
+  s.run("Next", c)
+  s.run("Another", c)
+  await s.reload()
+  expect(s.children).toHaveLength(2)
+  expect(s.children[1]!.options.prompt).toBe("Next")
+  expect(s.children[1]!.sent).toEqual(["Another"])
+  expect(s.notices).toHaveLength(1)
+  expect(s.notices[0]?.[2]?.details).toContain("Partial")
+  expect(s.recoveryWrites[0]?.value).toEqual([
+    { question: "First", answer: "Partial", timestamp: expect.any(Number), state: "in-flight" },
+    { question: "Next", answer: "", timestamp: expect.any(Number), state: "queued" },
+    { question: "Another", answer: "", timestamp: expect.any(Number), state: "queued" },
+  ])
+})
+
+test("empty or fully answered sides write no recovery snapshot", async () => {
+  const s = await setup()
+  const c = s.context()
+  await s.reload()
+  expect(s.writes).toEqual([])
+  expect(s.recoveryWrites).toEqual([])
+  s.run("Done?", c)
+  await s.children[0]!.answer("Done")
+  await s.reload()
+  expect(s.writes).toEqual([])
+  expect(s.recoveryWrites).toEqual([])
+  expect(s.children).toHaveLength(1)
+})
+
+test("completed questions are omitted while unanswered follow-ups are preserved", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.run("Answered", c)
+  await s.children[0]!.answer("Done")
+  s.run("Pending", c)
+  s.unload()
+  expect(s.recoveryWrites[0]?.value).toEqual([
+    { question: "Pending", answer: "", timestamp: expect.any(Number), state: "queued" },
+  ])
+})
+
+test("stale and malformed recovery items are dropped, and empty latest records prevent replay", async () => {
+  const s = await setup()
+  const c = s.context()
+  const now = Date.now()
+  s.records.set("session-a:btw.pending", [
+    [
+      { question: "Stale", answer: "Old", timestamp: now - 24 * 60 * 60 * 1000 - 1000, state: "in-flight" },
+      { question: "Fresh", answer: "Partial", timestamp: now, state: "in-flight" },
+      { question: "Bad", answer: 42, timestamp: now, state: "queued" },
+      null,
+    ],
+  ])
+  await s.reload()
+  expect(s.notices).toHaveLength(1)
+  expect(s.notices[0]?.[2]?.details).toContain("Fresh")
+  expect(s.notices[0]?.[2]?.details).not.toContain("Stale")
+  expect(s.recoveryWrites).toEqual([{ id: "session-a", key: "btw.pending", value: [] }])
+  s.run("clear", c)
+  const noticesAfterClear = s.notices.length
+  await s.reload()
+  expect(s.notices).toHaveLength(noticesAfterClear)
+  expect(s.recoveryWrites).toHaveLength(1)
+})
+
+test("the 24-hour cutoff is inclusive and uses the original question timestamp", async () => {
+  const now = 1_800_000_000_000
+  const clock = spyOn(Date, "now").mockReturnValue(now)
+  try {
+    const s = await setup()
+    s.context()
+    const boundary = now - 24 * 60 * 60 * 1000
+    s.records.set("session-a:btw.pending", [
+      [
+        { question: "At cutoff", answer: "Partial", timestamp: boundary, state: "in-flight" },
+        { question: "Expired", answer: "Old", timestamp: boundary - 1, state: "in-flight" },
+      ],
+    ])
+    await s.reload()
+    expect(s.notices).toHaveLength(1)
+    expect(s.notices[0]?.[2]?.details).toContain("At cutoff")
+    clock.mockReturnValue(now + 1)
+    await s.reload()
+    expect(s.notices).toHaveLength(1)
+    expect(s.recoveryWrites.at(-1)?.value).toEqual([])
+  } finally {
+    clock.mockRestore()
+  }
+})
+
+test("a stale-only snapshot is consumed without starting work or showing a notice", async () => {
+  const s = await setup()
+  s.context()
+  s.records.set("session-a:btw.pending", [[{ question: "Stale", answer: "", timestamp: 0, state: "queued" }]])
+  await s.reload()
+  expect(s.children).toEqual([])
+  expect(s.notices).toEqual([])
+  expect(s.recoveryWrites[0]?.value).toEqual([])
+  await s.reload()
+  expect(s.recoveryWrites).toHaveLength(1)
+})
+
+test("explicit close and clear do not become reload recovery candidates", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.run("A", c)
+  s.run("clear", c)
+  await s.reload()
+  expect(s.recoveryWrites).toEqual([])
+  expect(s.children).toHaveLength(1)
+  expect(c.printed).toHaveLength(1)
+  s.run("B", c)
+  c.hostClose()
+  await flush()
+  await s.reload()
+  expect(s.recoveryWrites).toEqual([])
+  expect(s.children).toHaveLength(2)
+  expect(c.printed).toHaveLength(2)
+})
+
+test("restored interruptions survive another reload without automatically asking again", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.run("A", c)
+  await s.children[0]!.emit("message.delta", { kind: "text", text: "Partial" })
+  await s.reload()
+  await s.reload()
+  expect(s.children).toHaveLength(1)
+  const original = s.recoveryWrites[0]!.value
+  if (!Array.isArray(original)) throw new Error("Expected a recovery snapshot")
+  expect(s.recoveryWrites[2]?.value).toEqual([
+    { ...original[0], state: "interrupted", retryId: s.retry(1).slice("retry ".length) },
+  ])
+  expect(s.notices.at(-1)?.[2]?.details).toContain("Partial")
+  expect(retryCommand(s.notices.at(-1)!)).toBe(s.retry(1))
+})
+
+test("recovery is session-scoped and replayed session.start cannot restore twice", async () => {
+  const s = await setup()
+  const a = s.context({ id: "a" })
+  s.run("A", a)
+  const b = s.context({ id: "b" })
+  s.run("B", b)
+  await s.reload()
+  expect(s.recoveryWrites.filter((write) => write.id === "a")[0]?.value).toEqual([
+    { question: "A", answer: "", timestamp: expect.any(Number), state: "in-flight" },
+  ])
+  expect(s.notices).toHaveLength(1)
+  expect(s.notices[0]?.[2]?.details).toContain("B")
+  s.emit("session.start", { reason: "resume", cwd: "/work", model: { provider: "test", model: "m" } }, "b")
+  expect(s.notices).toHaveLength(1)
+  s.context({ id: "a" })
+  s.emit("session.start", { reason: "resume", cwd: "/work", model: { provider: "test", model: "m" } }, "a")
+  expect(s.notices).toHaveLength(2)
+})
+
+test("cancellation releases the event consumer and suppresses late stream/result errors", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.run("A", c)
+  const child = s.children[0]!
+  await child.emit("message.delta", { kind: "text", text: "Partial" })
+  child.source.reject(new DOMException("Cancelled stream", "AbortError"))
+  child.state.abortRejects = true
+  s.unload()
+  const renders = s.renders()
+  await flush()
+  expect(child.aborts).toHaveLength(1)
+  expect(s.groups[0]!.ends).toHaveLength(1)
+  expect(child.source.active()).toBe(false)
+  expect(s.renders()).toBe(renders)
+  expect(c.shown().lines.filter((line) => line.kind === "error")).toEqual([])
+  expect(c.printed).toEqual([])
+  expect(s.notices).toEqual([])
+  expect(s.recoveryWrites[0]?.value).toEqual([
+    { question: "A", answer: "Partial", timestamp: expect.any(Number), state: "in-flight" },
+  ])
+})
+
+test("unload closes subscriptions without waiting for the host's request to settle", async () => {
+  const s = await setup()
+  const c = s.context({ dock: "deferred" })
+  s.run("A", c)
+  const child = s.children[0]!
+  child.state.abortPending = true
+  expect(child.source.active()).toBe(true)
+  s.unload(false)
+  expect(child.source.active()).toBe(false)
+  child.result.reject(new DOMException("Late cancellation", "AbortError"))
+  await flush()
+  expect(child.aborts).toEqual(["btw unloaded"])
+  expect(s.groups[0]!.ends).toEqual(["btw unloaded"])
+  expect(c.printed).toEqual([])
+  expect(c.shown().lines.filter((line) => line.kind === "error")).toEqual([])
+})
+
+test("buffered output after unload cannot change the persisted partial answer", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.run("A", c)
+  const child = s.children[0]!
+  await child.emit("message.delta", { kind: "text", text: "Partial" })
+  child.source.push({
+    type: "message.delta",
+    data: { kind: "text", text: "Too late" },
+    sessionId: child.child.id,
+    seq: 100,
+    ts: 100,
+  })
+  s.unload()
+  await flush()
+  expect(s.recoveryWrites[0]?.value).toEqual([
+    { question: "A", answer: "Partial", timestamp: expect.any(Number), state: "in-flight" },
+  ])
+  expect(c.printed).toEqual([])
+})
+
+test("retry IDs stay stable and blocked docks do not consume interrupted questions", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.records.set("session-a:btw.pending", [
+    [
+      { question: "A", answer: "Partial A", timestamp: Date.now(), state: "in-flight" },
+      { question: "B", answer: "Partial B", timestamp: Date.now(), state: "in-flight" },
+    ],
+  ])
+  await s.reload()
+  const blocked = s.context({ dock: "blocked" })
+  expect(() => s.run(s.retry(1), blocked)).toThrow("dock cannot open")
+  s.run(s.retry(1), c)
+  expect(s.children[0]!.options.prompt).toBe("A")
+  await s.children[0]!.end("error", { error: "Turn failed" })
+  s.run(s.retry(2), c)
+  expect(s.children[1]!.options.prompt).toBe("B")
+  s.run(s.retry(1), c)
+  expect(c.printed.at(-1)?.[0]).toContain("no longer available")
+})
+
+test("short retry IDs are monotonic, case-insensitive, and never accept old bare numbers", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.records.set("session-a:btw.pending", [
+    [
+      { question: "A", answer: "Partial A", timestamp: Date.now(), state: "in-flight" },
+      { question: "B", answer: "Partial B", timestamp: Date.now(), state: "in-flight" },
+    ],
+  ])
+  await s.reload()
+  expect(s.retry(1)).toBe("retry r1")
+  expect(s.retry(2)).toBe("retry r2")
+  expect(s.records.get("session-a:btw.retry.counter")).toEqual([1, 2])
+  s.run("retry 1", c)
+  expect(c.printed.at(-1)?.[0]).toContain("no longer available")
+  expect(s.children).toHaveLength(0)
+  s.run("retry R1", c)
+  expect(s.children[0]!.options.prompt).toBe("A")
+  await s.children[0]!.answer("Completed A")
+  await s.reload()
+  expect(retryCommand(s.notices.at(-1)!)).toBe("retry r2")
+  expect(s.records.get("session-a:btw.retry.counter")).toEqual([1, 2])
+  for (const action of ["retry r1", "retry R1", "retry 2"]) {
+    s.run(action, c)
+    expect(c.printed.at(-1)?.[0]).toContain("no longer available")
+    expect(s.children).toHaveLength(1)
+  }
+  s.run("retry R2", c)
+  expect(s.children[1]!.options.prompt).toBe("B")
+})
+
+test("persisted retry commands never change questions across multiple reloads", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.records.set("session-a:btw.pending", [
+    [
+      { question: "A", answer: "Partial A", timestamp: Date.now(), state: "in-flight" },
+      { question: "B", answer: "Partial B", timestamp: Date.now(), state: "in-flight" },
+    ],
+  ])
+  await s.reload()
+  const askA = s.retry(1)
+  const askB = s.retry(2)
+  expect(askA).not.toBe(askB)
+  s.run(askA, c)
+  await s.children[0]!.answer("Completed A")
+  await s.reload()
+  s.run(askA, c)
+  expect(c.printed.at(-1)?.[0]).toContain("no longer available")
+  expect(s.children).toHaveLength(1)
+  expect(retryCommand(s.notices.at(-1)!)).toBe(askB)
+  await s.reload()
+  expect(retryCommand(s.notices.at(-1)!)).toBe(askB)
+  s.run(askB, c)
+  expect(s.children[1]!.options.prompt).toBe("B")
+  await s.children[1]!.answer("Completed B")
+  await s.reload()
+  s.run(askB, c)
+  expect(c.printed.at(-1)?.[0]).toContain("no longer available")
+  expect(s.children).toHaveLength(2)
+})
+
+test("cleared and stale retry IDs are reserved for the rest of the session", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.records.set("session-a:btw.retry.counter", [5])
+  s.records.set("session-a:btw.pending", [
+    [
+      { question: "Stale", answer: "Old", timestamp: 0, state: "interrupted", retryId: "r5" },
+      { question: "Clear me", answer: "Partial", timestamp: Date.now(), state: "interrupted", retryId: "r2" },
+    ],
+  ])
+  await s.reload()
+  expect(s.notices).toHaveLength(1)
+  expect(s.retry(1)).toBe("retry r2")
+  s.run("clear", c)
+  await s.reload()
+  s.run("New question", c)
+  await s.children[0]!.emit("message.delta", { kind: "text", text: "New partial" })
+  await s.reload()
+  expect(retryCommand(s.notices.at(-1)!)).toBe("retry r6")
+  expect(s.records.get("session-a:btw.retry.counter")).toEqual([5, 6])
+  for (const action of ["retry r2", "retry R5", "retry 6"]) {
+    s.run(action, c)
+    expect(c.printed.at(-1)?.[0]).toContain("no longer available")
+    expect(s.children).toHaveLength(1)
+  }
+  s.run("retry R6", c)
+  expect(s.children[1]!.options.prompt).toBe("New question")
+})
+
+test("historical dropped IDs reserve the counter even without a matching counter record", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.records.set("session-a:btw.retry.counter", [5, 3, "99", null])
+  s.records.set("session-a:btw.pending", [
+    [{ question: "Stale", answer: "Old", timestamp: 0, state: "interrupted", retryId: "r7" }],
+  ])
+  await s.reload()
+  expect(s.notices).toEqual([])
+  s.run("Fresh", c)
+  await s.children[0]!.emit("message.delta", { kind: "text", text: "Partial" })
+  await s.reload()
+  expect(s.retry(1)).toBe("retry r8")
+  expect(s.records.get("session-a:btw.retry.counter")).toEqual([5, 3, "99", null, 8])
+})
+
+test("retry counters are isolated per session", async () => {
+  const s = await setup()
+  const a = s.context({ id: "a" })
+  s.run("A", a)
+  await s.children[0]!.emit("message.delta", { kind: "text", text: "Partial A" })
+  const b = s.context({ id: "b" })
+  s.run("B", b)
+  await s.children[1]!.emit("message.delta", { kind: "text", text: "Partial B" })
+  await s.reload()
+  expect(s.retry(1)).toBe("retry r1")
+  expect(s.records.get("b:btw.retry.counter")).toEqual([1])
+  expect(s.records.get("a:btw.retry.counter")).toBeUndefined()
+  s.context({ id: "a" })
+  s.emit("session.start", { reason: "resume", cwd: "/work", model: { provider: "test", model: "m" } }, "a")
+  expect(s.retry(2)).toBe("retry r1")
+  expect(s.records.get("a:btw.retry.counter")).toEqual([1])
+})
+
+test("UUID recovery records migrate to short IDs without reviving UUID actions", async () => {
+  const s = await setup()
+  const c = s.context()
+  const legacy = "00000000-0000-4000-8000-000000000001"
+  s.records.set("session-a:btw.pending", [
+    [{ question: "A", answer: "Partial A", timestamp: Date.now(), state: "interrupted", retryId: legacy }],
+  ])
+  await s.reload()
+  expect(s.retry(1)).toBe("retry r1")
+  expect(s.notices[0]?.[2]?.details).toContain("Partial A")
+  s.run(`retry ${legacy}`, c)
+  expect(c.printed.at(-1)?.[0]).toContain("no longer available")
+  expect(s.children).toHaveLength(0)
+  s.run("retry r1", c)
+  expect(s.children[0]!.options.prompt).toBe("A")
+})
+
+test("new recoveries cannot reuse consumed or legacy numbered retry commands", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.run("A", c)
+  await s.children[0]!.emit("message.delta", { kind: "text", text: "Partial A" })
+  await s.reload()
+  const askA = s.retry(1)
+  s.run(askA, c)
+  await s.children[1]!.answer("Completed A")
+  s.run("clear", c)
+  await s.reload()
+  s.run("B", c)
+  await s.children[2]!.emit("message.delta", { kind: "text", text: "Partial B" })
+  await s.reload()
+  const askB = retryCommand(s.notices.at(-1)!)
+  expect(askA).toBe("retry r1")
+  expect(askB).toBe("retry r2")
+  expect(s.records.get("session-a:btw.retry.counter")).toEqual([1, 2])
+  for (const action of [askA, "retry 1"]) {
+    s.run(action, c)
+    expect(c.printed.at(-1)?.[0]).toContain("no longer available")
+    expect(s.children).toHaveLength(3)
+  }
+  s.run(askB, c)
+  expect(s.children[3]!.options.prompt).toBe("B")
+})
+
+for (const reopen of [false, true]) {
+  test(`Esc discards recovered work only with a reopened dock (${reopen})`, async () => {
+    const s = await setup()
+    const c = s.context()
+    s.startQueued()
+    s.run("A", c)
+    await s.reload()
+    const recovered = s.children[1]!
+    const writes = s.recoveryWrites.length
+    if (reopen) s.run("", c)
+    c.hostClose()
+    await flush()
+    expect(recovered.aborts).toHaveLength(reopen ? 1 : 0)
+    s.run("clear", c)
+    expect(recovered.aborts).toHaveLength(1)
+    s.unload()
+    expect(s.recoveryWrites).toHaveLength(writes)
+  })
+}
+
+test("turn delivery distinguishes injected questions from undelivered follow-ups", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.run("First", c)
+  const child = s.children[0]!
+  s.run("Injected", c)
+  s.run("Queued", c)
+  await child.emit("turn.steer", {
+    message: { role: "user", content: [{ type: "text", text: "Injected" }] },
+    state: "injected",
+  })
+  await child.emit("message.delta", { kind: "text", text: "Shared partial" })
+  s.unload()
+  expect(s.recoveryWrites[0]?.value).toEqual([
+    { question: "First", answer: "Shared partial", timestamp: expect.any(Number), state: "in-flight" },
+    { question: "Injected", answer: "Shared partial", timestamp: expect.any(Number), state: "in-flight" },
+    { question: "Queued", answer: "", timestamp: expect.any(Number), state: "queued" },
+  ])
+})
+
+test("repeated questions and substrings are not mistaken for delivered follow-ups", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.run("First question", c)
+  const child = s.children[0]!
+  s.run("First question", c)
+  s.run("question", c)
+  await child.emit("turn.start", {
+    prompt: { role: "user", content: [{ type: "text", text: "First question" }] },
+  })
+  await child.emit("message.delta", { kind: "text", text: "Partial" })
+  s.unload()
+  expect(s.recoveryWrites[0]?.value).toEqual([
+    { question: "First question", answer: "Partial", timestamp: expect.any(Number), state: "in-flight" },
+    { question: "First question", answer: "", timestamp: expect.any(Number), state: "queued" },
+    { question: "question", answer: "", timestamp: expect.any(Number), state: "queued" },
+  ])
+})
+
+test("finished turns consume delivered questions but keep the remaining queue", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.startQueued()
+  s.run("A", c)
+  s.run("B", c)
+  s.run("C", c)
+  const child = s.children[0]!
+  await child.emit("turn.start", {
+    prompt: {
+      role: "user",
+      content: [
+        { type: "text", text: "A" },
+        { type: "text", text: "B" },
+      ],
+    },
+  })
+  await child.emit("message.delta", { kind: "text", text: "Answer A/B" })
+  await child.emit("turn.end", { reason: "done", steps: 1 })
+  s.unload()
+  expect(s.recoveryWrites[0]?.value).toEqual([
+    { question: "C", answer: "", timestamp: expect.any(Number), state: "queued" },
+  ])
+})
+
+test("a fully answered dock still saves its display block on unload", async () => {
   const s = await setup()
   const c = s.context()
   s.run("A", c)
   await s.children[0]!.answer("Answer A")
   await s.reload()
-  s.run("B", c)
-  c.hostClose()
-  expect(c.printed.filter(([head]) => head === "btw: A")).toHaveLength(1)
-  expect(c.printed.find(([head]) => head === "btw: A")?.[2]?.details).toContain("Answer A")
-  expect(c.printed.filter(([head]) => head === "btw: B")).toHaveLength(1)
+  expect(s.recoveryWrites).toEqual([])
+  expect(c.printed).toHaveLength(1)
+  expect(c.printed[0]?.[2]?.details).toContain("Answer A")
 })
 
-test("after reload and Esc, the next question always starts a new child", async () => {
+test("review: idle follow-ups awaiting admission stay queued across reload", async () => {
   const s = await setup()
   const c = s.context()
   s.run("A", c)
-  await s.reload()
+  const child = s.children[0]!
+  await child.answer("Answer A")
   s.run("B", c)
-  c.hostClose()
-  s.run("C", c)
-  expect(s.children).toHaveLength(3)
-  expect(s.children[2]!.options.prompt).toBe("C")
-  await s.children[2]!.answer("Answer C")
-  c.hostClose()
-  expect(c.printed.filter(([head]) => head === "btw: C")).toHaveLength(1)
+  child.state.value = "queued"
+  await child.emit(
+    "subagent.state",
+    { childSessionId: child.child.id, state: "queued", turns: 1 },
+    "session-a",
+  )
+  await s.reload()
+  expect(s.recoveryWrites[0]?.value).toEqual([
+    { question: "B", answer: "", timestamp: expect.any(Number), state: "queued" },
+  ])
+  expect(s.children[1]!.options.prompt).toBe("B")
 })
 
-test("a closed side left in a newer instance's map is saved once and replaced", async () => {
+test("review: a replacement cannot attribute its partial output to a failed child's question", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.records.set("session-a:btw.pending", [
+    [
+      { question: "A", answer: "Old A", timestamp: Date.now(), state: "in-flight" },
+      { question: "B", answer: "Old B", timestamp: Date.now(), state: "in-flight" },
+    ],
+  ])
+  await s.reload()
+  s.run(s.retry(1), c)
+  await s.children[0]!.emit("message.delta", { kind: "text", text: "New A" })
+  await s.children[0]!.end("error", { error: "A failed" })
+  s.run(s.retry(2), c)
+  await s.children[1]!.emit("message.delta", { kind: "text", text: "New B" })
+  s.unload()
+  expect(s.recoveryWrites.at(-1)?.value).toEqual([
+    {
+      question: "A",
+      answer: "New A",
+      timestamp: expect.any(Number),
+      state: "interrupted",
+      retryId: expect.any(String),
+    },
+    { question: "B", answer: "New B", timestamp: expect.any(Number), state: "in-flight" },
+  ])
+})
+
+test("review: a late old-child result cannot fail or end its replacement", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.records.set("session-a:btw.pending", [
+    [
+      { question: "A", answer: "Old A", timestamp: Date.now(), state: "in-flight" },
+      { question: "B", answer: "Old B", timestamp: Date.now(), state: "in-flight" },
+    ],
+  ])
+  await s.reload()
+  s.run(s.retry(1), c)
+  const old = s.children[0]!
+  old.state.value = "ended"
+  old.source.push({
+    type: "message.delta",
+    data: { kind: "text", text: "Old output" },
+    sessionId: old.child.id,
+    seq: 100,
+    ts: 100,
+  })
+  old.result.resolve({
+    sessionId: old.child.id,
+    status: "error",
+    text: "",
+    error: "Old failure",
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    steps: 1,
+    durationMs: 1,
+  })
+  // Do not flush the old callback before installing a replacement.
+  s.run(s.retry(2), c)
+  await flush()
+  expect(s.groups[1]!.ends).toEqual([])
+  expect(c.shown().status).toBe("working")
+  expect(c.shown().lines.some((line) => "text" in line && line.text.includes("Old failure"))).toBe(false)
+  expect(old.source.active()).toBe(false)
+  expect(c.shown().replies).not.toContain("Old output")
+})
+
+test("review: completed answers are saved independently of pending recovery", async () => {
   const s = await setup()
   const c = s.context()
   s.run("A", c)
-  const oldDefinition = s.views[0]!
-  await s.reload()
+  await s.children[0]!.answer("Answer A")
   s.run("B", c)
-  const b = c.opened.at(-1)!
-  // Defensively cover an old host callback receiving newer data without owning its map.
-  if ("data" in b) oldDefinition.onClose?.(b.data)
-  s.run("C", c)
-  expect(s.children).toHaveLength(3)
-  expect(s.children[2]!.options.prompt).toBe("C")
-  if ("data" in b) oldDefinition.onClose?.(b.data)
-  s.run("Follow C", c)
-  expect(s.children[2]!.sent).toEqual(["Follow C"])
-  expect(c.printed.filter(([head]) => head === "btw: B")).toHaveLength(1)
+  await s.children[0]!.emit("turn.start", {
+    prompt: { role: "user", content: [{ type: "text", text: "B" }] },
+  })
+  await s.children[0]!.emit("message.delta", { kind: "text", text: "Partial B" })
+  await s.reload()
+  expect(c.printed).toHaveLength(1)
+  expect(c.printed[0]?.[2]?.details).toBe("**Question**\n\nA\n\n**Answer**\n\nAnswer A")
+  expect(s.notices[0]?.[2]?.details).toContain("Partial B")
 })
 
-test("clear removes a closed side even when its callback belonged to an older instance", async () => {
+test("replacement explicitly resends old queued questions and tracks repeated delivery separately", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.records.set("session-a:btw.pending", [
+    [
+      { question: "A", answer: "Old A", timestamp: Date.now(), state: "in-flight" },
+      { question: "B", answer: "Old B", timestamp: Date.now(), state: "in-flight" },
+    ],
+  ])
+  await s.reload()
+  s.run(s.retry(1), c)
+  s.run("B", c)
+  await s.children[0]!.end("error", { error: "A failed before B was delivered" })
+  s.startQueued()
+  s.run(s.retry(2), c)
+  const replacement = s.children[1]!
+  expect(replacement.options.prompt).toBe("B")
+  expect(replacement.sent).toEqual(["B"])
+  const prompt: EventMap["turn.start"]["prompt"] = { role: "user", content: [{ type: "text", text: "B" }] }
+  await replacement.emit("turn.start", { prompt })
+  await replacement.answer("Answer to queued B")
+  await replacement.emit("turn.start", { prompt })
+  await replacement.answer("Answer to retried B")
+  s.unload()
+  expect(s.recoveryWrites.at(-1)?.value).toEqual([
+    {
+      question: "A",
+      answer: "",
+      timestamp: expect.any(Number),
+      state: "interrupted",
+      retryId: expect.any(String),
+    },
+  ])
+  expect(c.printed[0]?.[2]?.details).toContain("Answer to queued B")
+  expect(c.printed[0]?.[2]?.details).toContain("Answer to retried B")
+})
+
+test("an earlier buffered turn.end cannot settle a newly accepted follow-up", async () => {
   const s = await setup()
   const c = s.context()
   s.run("A", c)
-  const oldDefinition = s.views[0]!
-  await s.reload()
+  const child = s.children[0]!
+  await child.emit("message.end", {
+    message: { role: "assistant", model: child.child.model, content: [{ type: "text", text: "Answer A" }] },
+  })
+  child.state.value = "idle"
+  child.source.push({
+    type: "turn.end",
+    data: { reason: "done", steps: 1 },
+    sessionId: child.child.id,
+    seq: 100,
+    ts: 100,
+  })
   s.run("B", c)
-  const b = c.opened.at(-1)!
-  if ("data" in b) oldDefinition.onClose?.(b.data)
-  s.run("clear", c)
-  s.run("C", c)
-  expect(s.children).toHaveLength(3)
-  expect(s.children[2]!.options.prompt).toBe("C")
-  s.run("clear", c)
-  expect(c.printed.filter(([head]) => head === "btw: B")).toHaveLength(1)
-  expect(c.printed.filter(([head]) => head === "btw: C")).toHaveLength(1)
+  await flush()
+  s.unload()
+  expect(s.recoveryWrites[0]?.value).toEqual([
+    { question: "B", answer: "", timestamp: expect.any(Number), state: "queued" },
+  ])
 })
 
-test("after reload, clear resets the dock and a later question starts normally", async () => {
+test("restored queues wait safely for an agent tree and resume when a command can provide one", async () => {
   const s = await setup()
   const c = s.context()
+  s.startQueued()
   s.run("A", c)
+  s.context({ tree: false })
   await s.reload()
+  expect(s.children).toHaveLength(1)
+  expect(s.recoveryWrites.at(-1)?.value).toEqual([])
+  const ready = s.context()
+  s.run("", ready)
+  expect(s.children).toHaveLength(2)
+  expect(s.children[1]!.options.prompt).toBe("A")
+})
+
+test("failed automatic restarts stay visible and retain the queue before new questions", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.startQueued()
+  s.run("A", c)
   s.run("B", c)
-  s.run("clear", c)
-  expect(c.closes()).toBeGreaterThan(0)
+  s.spawnFails(new Error("budget exhausted"))
+  await s.reload()
+  expect(s.notices).toHaveLength(1)
+  expect(s.notices[0]?.[1]).toBe("error")
+  expect(s.notices[0]?.[2]?.details).toContain("budget exhausted")
+  s.spawnFails(undefined)
   s.run("C", c)
-  expect(s.children).toHaveLength(3)
-  s.run("clear", c)
-  expect(c.printed.filter(([head]) => head === "btw: B")).toHaveLength(1)
-  expect(c.printed.filter(([head]) => head === "btw: C")).toHaveLength(1)
+  expect(s.children).toHaveLength(2)
+  expect(s.children[1]!.options.prompt).toBe("A")
+  expect(s.children[1]!.sent).toEqual(["B", "C"])
+  s.unload()
+  expect(s.recoveryWrites.at(-1)?.value).toEqual(
+    ["A", "B", "C"].map((question) => ({
+      question,
+      answer: "",
+      timestamp: expect.any(Number),
+      state: "queued",
+    })),
+  )
 })
 
 test("the configured model override is trimmed and used at spawn", async () => {
@@ -530,6 +1290,7 @@ test("follow-ups reuse the same child, dock and originating printer", async () =
   expect(follow.opened).toEqual([])
   await s.children[0]!.answer("Second answer")
   first.hostClose()
+  await flush()
   expect(first.printed).toHaveLength(1)
   expect(follow.printed).toEqual([])
   expect(first.printed[0]).toEqual([
@@ -579,6 +1340,7 @@ test("host Esc/onClose aborts unfinished work and persists exactly one display-o
     ts: 100,
   })
   c.hostClose()
+  await flush()
   if ("data" in data) s.views[0]!.onClose?.(data.data)
   s.run("clear", c)
   expect(child.aborts).toEqual(["btw dock closed"])
@@ -663,6 +1425,7 @@ test("spawn errors appear in the dock and are persisted only on close", async ()
   })
   expect(c.printed).toEqual([])
   c.hostClose()
+  await flush()
   expect(c.printed).toHaveLength(1)
   expect(c.printed[0]?.[2]?.details).toContain("budget exhausted")
 })
@@ -678,11 +1441,12 @@ test("turn and child errors show in the dock without duplicate errors", async ()
   expect(c.shown().status).toBe("failed")
   expect(c.printed).toEqual([])
   c.hostClose()
+  await flush()
   expect(c.printed).toHaveLength(1)
   expect(c.printed[0]?.[2]?.details).toContain("provider unavailable")
 })
 
-test("an ended child is saved and replaced by a fresh child for the next question", async () => {
+test("an ended child is replaced without discarding its unanswered question", async () => {
   const s = await setup()
   const c = s.context()
   s.run("Question", c)
@@ -691,8 +1455,21 @@ test("an ended child is saved and replaced by a fresh child for the next questio
   expect(s.children).toHaveLength(2)
   expect(s.children[1]!.options.prompt).toBe("Next question")
   expect(s.children[0]!.sent).toEqual([])
-  expect(c.printed).toHaveLength(1)
-  expect(c.printed[0]?.[0]).toBe("btw: Question")
+  expect(c.printed).toEqual([])
+  expect(
+    c.shown().lines.some((line) => "text" in line && line.text.includes("Ask again with /btw retry")),
+  ).toBe(true)
+  s.unload()
+  expect(s.recoveryWrites.at(-1)?.value).toEqual([
+    {
+      question: "Question",
+      answer: "",
+      timestamp: expect.any(Number),
+      state: "interrupted",
+      retryId: expect.any(String),
+    },
+    { question: "Next question", answer: "", timestamp: expect.any(Number), state: "in-flight" },
+  ])
 })
 
 test("send exceptions stay in the dock", async () => {
@@ -814,12 +1591,14 @@ test("session end closes only its side and prints into its originating session e
   s.run("B", b)
   s.emit("session.end", { reason: "switch" }, "a")
   a.hostClose()
+  await flush()
   expect(s.children[0]!.aborts).toHaveLength(1)
   expect(s.children[1]!.aborts).toEqual([])
   expect(a.printed).toHaveLength(1)
   expect(b.printed).toEqual([])
   await s.children[1]!.answer("B answer")
   b.hostClose()
+  await flush()
   expect(b.printed[0]?.[2]?.details).toContain("B answer")
 })
 

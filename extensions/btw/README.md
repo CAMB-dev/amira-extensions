@@ -7,9 +7,10 @@ keeps working. The side conversation never enters the main model's context.
 amira ext install btw
 ```
 
-Version **0.2.0** requires Amira extension API **0.1.44 or later within 0.1.x**, a
+Version **0.3.0** requires Amira extension API **0.1.46 or later within 0.1.x**, a
 terminal UI with dock support, and an agent tree. Print/RPC frontends without docks
-are not supported; no child is started when a dock is unavailable.
+are not supported. New questions start no child when a dock is unavailable;
+reload recovery can restart queued work before the dock reopens (see below).
 
 ## Commands
 
@@ -18,10 +19,14 @@ are not supported; no child is started when a dock is unavailable.
 | `/btw <question>` | Fork the main session's current context into a private side agent and open a dock. |
 | `/btw <follow-up>` | While the dock is open, send another question to the same side agent. |
 | `/btw clear` | Close the dock and stop the side agent, like Esc. |
-| `/btw` | Show command help. |
+| `/btw` | Reopen a restored dock, or show command help. |
+| `/btw retry <id>` | Ask an interrupted question again using its short, stable ID, such as `r1`. |
 
-`clear` is reserved when it is the entire argument. To ask about that word, use
-`/btw What does clear mean here?`.
+`clear` and `retry <id>` are reserved when they are the entire argument. To ask
+about those words, use `/btw What does clear mean here?` or a similar full question.
+Retry IDs are case-insensitive: `/btw retry R1` and `/btw retry r1` do the same thing.
+Keep the `r` prefix: bare numbers remain unavailable because they are ambiguous
+with old numbered actions.
 
 `/btw show` and `/btw history` were removed: the dock already shows the full live
 exchange, and saved display blocks provide history after closing. `show` and
@@ -52,15 +57,55 @@ turn is queued by the host and may join that turn before its next model call;
 several queued messages may be combined. Sending is acceptance, not a guarantee
 of delivery. Failures and undelivered follow-ups appear in the dock. If the child
 has ended or the dock is closed, the next question saves the previous exchange
-once and starts a fresh side agent instead of trying to reuse stale state.
+once and starts a fresh side agent instead of trying to reuse stale state. Restored
+ask-again actions remain available when their child ends; a replacement resends
+any still-queued questions and keeps interrupted answers separate.
 Session exit/switch also stops the child. Saved output remains bound to the session
 where the side question began.
 
-Each extension instance registers a fresh dock identity. After `/reload`, the next
-`/btw <question>` replaces the old dock, saving its pending Q&A once and stopping
-its child. Esc and `/btw clear` then operate on the new dock normally. API 0.1.44
-still has no unload callback, so reload/unload alone cannot trigger immediate
-cleanup; close the dock first when you need that guarantee.
+## Reload recovery
+
+An extension reload (`/ext reload`, a settings change, or a host update) closes the
+dock and cancels its child and event subscription without printing cancellation
+errors. Unanswered questions are saved under the extension's `btw.pending` key in
+**session-scoped `SessionData`**, with their question text, partial answer, original
+ask timestamp, queue/in-flight status, and any retry identifier. There is no
+separate file or direct access to the Amira home directory. With no pending
+questions, no recovery snapshot is written; completed open docks still save their
+usual display block. Completed
+questions are also saved separately when other questions in the dock are still
+pending, so their answers are not lost during recovery.
+
+On the next load in the **same session**:
+
+- In-flight questions appear as display-only Markdown notices marked
+  **Interrupted by reload**, including any partial answer. Each notice gives an
+  action such as `/btw retry r1` to ask that question again. IDs (`r1`, `r2`, …)
+  come from a persisted, per-session monotonic counter and stay bound to the same
+  question across reloads. Consumed, cleared, and dropped IDs are never reassigned
+  within the session; their actions report unavailable. Old bare-number and UUID
+  actions also report unavailable. Questions are not retried automatically, even
+  if no answer text arrived before the reload.
+- Queued questions are automatically sent to a fresh side agent, in order. The
+  host may combine follow-ups, just as during normal operation. The new fork uses
+  the main session's current context and model setting, not the cancelled child's
+  private conversation.
+- Questions older than **24 hours** (measured from when they were asked) and
+  malformed recovery items are dropped.
+- The recovery snapshot is consumed with an empty latest record. The counter's
+  high-water mark is kept alongside it under `btw.retry.counter` in the same
+  session-scoped `SessionData`, so clearing pending work cannot reset the counter.
+  A counter record is written only when a new ID is assigned, before publishing
+  its notice. `SessionData` is append-only: older recovery records remain in the
+  session file but are not replayed.
+
+API 0.1.46 opens docks only from a command context. Recovery therefore shows
+interrupted answers in notices immediately; restarted queued answers also appear
+as saved display blocks until you run `/btw` to reopen their dock. An ask-again
+command also opens the dock. Use `/btw clear` to discard recovered work; Esc does
+the same after reopening the dock. Session exit/switch keeps the existing close
+behavior. Another reload preserves still-interrupted questions with their
+original timestamps.
 
 ## Model, tools and privacy
 
@@ -94,15 +139,15 @@ that, role instructions, a different model, interceptors and unfinished parent
 calls can prevent a fully identical cache prefix.
 
 Ephemeral children have no session/artifact files, parent sub-agent history
-entries, public listings or main-bus transcript events. Only the folded
-**display block** is persisted; the side conversation never becomes model history.
+entries, public listings or main-bus transcript events. Folded **display blocks**
+and pending-question recovery records are persisted; neither becomes model history.
 Usage is booked by the host as **side usage**, with the neutral label **`btw`**, and
 counts toward the session/tree budget. Neither the child title nor the group name
 contains the question; the saved display block deliberately includes the Q&A,
 but accounting labels do not. Command-side spawning requires a group: its generic
 `btw` name, counts and usage remain public group metadata, even though the ephemeral
-child and its Q&A are private. API 0.1.44 offers neither direct command-side spawn nor a private-group
-option for commands.
+child and its Q&A are private. API 0.1.46 offers neither direct command-side spawn
+nor a private-group option for commands.
 Concurrency, depth and budget limits still apply. At a concurrency cap of
 at least two the host reserves a slot for ephemeral turns; at one they queue
 normally. The dock shows when a child is waiting.
@@ -122,7 +167,10 @@ bun test
 Tests use strict API-only fakes and controlled child event streams: no network,
 live model requests, real Amira home directory, or GUI windows. They cover spawn
 options and model inheritance, Markdown streaming, same-child follow-ups, dock
-close/clear, one persisted display block, errors, session isolation, and the
-absence of main-history reads or writes. Keyboard priority and resume rendering
-are host contracts; the extension tests exercise lifecycle hooks and print options
+close/clear, one persisted display block, errors, session isolation, unload during
+streaming and with a queue, automatic reload recovery, ask-again actions, empty and
+stale snapshots, and cancellation without dangling event consumers or error
+output. They also check the absence of main-history reads or writes. Keyboard
+priority and resume rendering are host contracts; the extension tests exercise
+lifecycle hooks and print options
 without launching the terminal UI.
