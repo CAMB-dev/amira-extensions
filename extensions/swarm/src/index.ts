@@ -23,7 +23,15 @@ import {
   type SwarmSnapshot,
   swarmsFromRecords,
 } from "./swarm.ts"
-import { memberLine, type SwarmViewData, swarmView, timelineLine, VIEW_KIND } from "./view.ts"
+import {
+  memberLine,
+  READONLY_VIEW_KIND,
+  readonlySwarmView,
+  type SwarmViewData,
+  swarmView,
+  timelineLine,
+  VIEW_KIND,
+} from "./view.ts"
 import type { WorkflowRunner } from "./workflows.ts"
 
 export { Blackboard } from "./blackboard.ts"
@@ -34,7 +42,7 @@ export {
   type SwarmSettings,
 } from "./limits.ts"
 export * from "./swarm.ts"
-export { swarmView, VIEW_KIND } from "./view.ts"
+export { READONLY_VIEW_KIND, readonlySwarmView, swarmView, VIEW_KIND } from "./view.ts"
 
 export const SWARM_TOOL = "swarm"
 /** The key a swarm's records go under in the session (SessionData). */
@@ -508,7 +516,7 @@ export function createSwarmExtension(): Extension {
               ctx.print(statusText(data.snapshot()!))
               return
             }
-            ctx.openView({ kind: VIEW_KIND, data })
+            ctx.openView({ kind: data.control ? VIEW_KIND : READONLY_VIEW_KIND, data })
             return
           }
           case "stop": {
@@ -566,6 +574,7 @@ export function createSwarmExtension(): Extension {
     })
 
     api.registerView(swarmView)
+    api.registerView(readonlySwarmView)
     api.registerTool(tool)
     api.registerStatusItem({
       id: "swarm",

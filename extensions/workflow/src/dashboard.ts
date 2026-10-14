@@ -3,6 +3,7 @@ import type { ExtensionAPI, TraceSummary, UiNode, ViewLine } from "@amira/api"
 import { type JournalEntry, listRuns, type RunRecord, readJournal } from "./journal.ts"
 import { type AgentNode, type FlowNode, formatTokens, runStateText } from "./progress.ts"
 import type { WorkflowRun } from "./run.ts"
+import { agentStatusState } from "./status.ts"
 
 // Structural mirror of dashboard's experimental source service. No cross-extension imports or
 // AmiraServices augmentation: installing two adapters must not conflict during declaration merging.
@@ -50,11 +51,9 @@ interface Call {
 }
 
 const line = (text: string): ViewLine => ({ kind: "text", text })
-const dashboardStatus = (status: AgentNode["status"]): DashboardAgent["status"] => {
-  if (status === "working") return "running"
-  if (status === "error") return "failed"
-  if (status === "aborted") return "stopped"
-  return status === "cached" ? "done" : status
+const dashboardStatus = (node: AgentNode): DashboardAgent["status"] => {
+  const state = agentStatusState(node)
+  return state === "working" ? "running" : state
 }
 
 /** Cached, coherent reads. Disk loading and rebuilding happen outside dashboard rendering. */
@@ -90,14 +89,23 @@ export function createWorkflowSource(workspace: string) {
             ...(node.childId !== undefined ? { sessionId: node.childId } : {}),
             name: node.label,
             task: node.prompt ?? node.label,
-            status: dashboardStatus(node.status),
+            status: dashboardStatus(node),
             ...(node.startedAt !== undefined ? { startedAt: node.startedAt } : {}),
             ...(node.durationMs !== undefined ? { durationMs: node.durationMs } : {}),
             ...(node.cost !== undefined ? { cost: node.cost } : {}),
-            ...(node.status === "done" || node.status === "cached" ? { progress: 1 } : {}),
+            ...(agentStatusState(node) === "done" ? { progress: 1 } : {}),
             files: [],
             actions: [],
           })
+          const worktreeInfo: ViewLine[] =
+            node.worktreeNote === undefined
+              ? []
+              : [
+                  {
+                    kind: /NOT merged|kept/i.test(node.worktreeNote) ? "warning" : "muted",
+                    text: node.worktreeNote,
+                  },
+                ]
           detail.set(id, {
             summary: [
               line(
@@ -108,7 +116,7 @@ export function createWorkflowSource(workspace: string) {
                 : []),
               line(`Phase: ${name || "Unphased"}${nest ? ` · workflow ${nest}` : ""}`),
               line(
-                `Call ${node.call}: ${runStateText(node.status)}${node.status === "cached" ? " (replayed; no new usage)" : ""}`,
+                `Call ${node.call}: ${agentStatusState(node)}${node.status === "cached" ? " (cached; replayed; no new usage)" : ""}`,
               ),
               line(
                 `Tokens: ${formatTokens(node.tokens)} · cost: ${node.cost === undefined ? "unknown" : `$${node.cost}`}`,
@@ -117,10 +125,12 @@ export function createWorkflowSource(workspace: string) {
               line(`Child session: ${node.childId ?? "none"}`),
               line(node.prompt ?? node.label),
               ...(node.note ? [line(node.note)] : []),
+              ...worktreeInfo,
             ],
             logs: [
               ...(node.text ? [line(node.text)] : []),
               ...(node.note ? [line(node.note)] : []),
+              ...worktreeInfo,
               ...logs.slice(-50),
             ],
           })
@@ -156,7 +166,8 @@ export function createWorkflowSource(workspace: string) {
               childId: entry.sessionId,
               prompt: entry.prompt,
               text: entry.text,
-              note: entry.error,
+              note: entry.note ?? entry.error,
+              worktreeNote: entry.worktreeNote,
             },
           }),
         )

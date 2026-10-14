@@ -957,7 +957,7 @@ test("tool controls are main-only and scoped to this session", async () => {
   expect(t.groups).toHaveLength(1)
 })
 
-test("progress: the group's status line follows the phases and counts, and the view shows the tree", async () => {
+test("progress: the group's status follows phases and counts, and the view lists agents without metrics", async () => {
   const t = setup({ settings: { enabled: "always" } })
   const r = await t.call({ script: SCRIPT })
   const id = /run (wf_\w+)/.exec(t.text(r))![1]!
@@ -969,13 +969,10 @@ test("progress: the group's status line follows the phases and counts, and the v
   const lines = t.view.render!({ id }, renderOptions).map((line) =>
     line.kind === "segments" ? line.parts.map((part) => part.text).join("") : line.text,
   )
-  expect(lines[0]).toBe("├ ✓ Explore")
-  expect(lines.slice(1, 4).map((l) => l.replace(/ · \d+s$/, ""))).toEqual([
-    "│ ├ ✓ api · 100 tok",
-    "│ ├ ✓ core · 100 tok",
-    "│ └ ✓ tui · 100 tok",
-  ])
-  expect(lines[4]).toBe("└ ✓ Verify")
+  expect(lines[0]).toBe("Explore")
+  expect(lines.slice(1, 4)).toEqual(["> v done    api", "  v done    core", "  v done    tui"])
+  expect(lines[4]).toBe("Verify")
+  expect(lines.some((line) => line?.startsWith("Result:"))).toBe(true)
   expect(t.view.title({ id }, renderOptions)).toBe(`Workflow fanout · ${id} · done`)
 })
 
@@ -1018,6 +1015,45 @@ test("/workflow view opens the progress view; /workflow stop stops a run", async
   expect(t.printed.at(-1)).toBe(`Stopped workflow run ${id}.`)
   await until(() => t.notices.length === 1)
   expect(t.notices[0]!.display?.text).toMatch(/^◆ workflow slow ⊘ /)
+})
+
+test("/workflow view opens a read-only archived run even without its script, with no stop hint", async () => {
+  const t = setup()
+  const dir = path.join(t.home, "workflow-runs", "wf_archived")
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(
+    path.join(dir, "run.json"),
+    JSON.stringify({
+      id: "wf_archived",
+      meta: { name: "archive", description: "A saved run", phases: ["Verify"] },
+      args: null,
+      source: "inline",
+      status: "done",
+      startedAt: 1000,
+      endedAt: 2000,
+    }),
+  )
+  writeFileSync(
+    path.join(dir, "journal.jsonl"),
+    `${JSON.stringify({
+      key: "call#0",
+      call: 1,
+      phase: "Verify",
+      label: "review",
+      status: "done",
+      text: "saved result",
+      durationMs: 1000,
+    })}\n`,
+  )
+  await t.run("view wf_archived")
+  expect(t.opened).toEqual([{ kind: "workflow", data: { id: "wf_archived" } }])
+  const requests: number[] = []
+  const opts = { now: 5000, width: 100, requestRefresh: (ms: number) => requests.push(ms) }
+  expect(JSON.stringify(t.view.header!({ id: "wf_archived" }, opts))).toContain("read-only")
+  expect(JSON.stringify(t.view.render!({ id: "wf_archived" }, opts))).toContain("saved result")
+  expect(requests).toEqual([])
+  expect(t.groups).toHaveLength(0)
+  expect(t.view.keys!.every((key) => key.label === "")).toBe(true)
 })
 
 test("x in the view asks before it stops the run; no keeps it running", async () => {

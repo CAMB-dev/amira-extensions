@@ -161,7 +161,7 @@ export default defineExtension((api) => {
                     phases: [],
                     note: "This dashboard source was unregistered. Reopen /dashboard to choose another source.",
                   },
-            details: (agentId) => (registered() ? source.details(agentId) : undefined),
+            details: (agentId, opts) => (registered() ? source.details(agentId, opts) : undefined),
             subscribe: (changed) => (registered() ? registry.subscribe(id, changed) : () => {}),
             act: (agentId, action, text) =>
               registered() && source.act

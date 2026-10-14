@@ -12,9 +12,9 @@ import {
   type DashboardAgent,
   type DashboardGroup,
   type DashboardSource,
-  type DashboardStatus,
   languageOf,
 } from "./source.ts"
+import { dashboardStatus } from "./status.ts"
 
 const MAX_AGENTS = 128
 const MAX_LOGS = 200
@@ -44,10 +44,6 @@ function messageText(message: Pick<Message, "content">): string {
     if (block.type === "text") text = tail(text + tail(block.text))
   }
   return text
-}
-
-function statusOf(agent: SubagentInfo): DashboardStatus {
-  return agent.status === "error" ? "failed" : agent.status === "aborted" ? "stopped" : agent.status
 }
 
 const stoppable = (agent: SubagentInfo): boolean =>
@@ -275,12 +271,13 @@ export function createLiveSource(
           sessionId: agent.id,
           name: agent.title,
           task: agent.task,
-          status: statusOf(agent),
+          status: dashboardStatus(agent),
+          note: agent.note,
           startedAt: agent.startedAt,
           durationMs: agent.durationMs,
           cost: agent.usage.cost,
           language: languageOf(files),
-          ...(agent.status === "done" ? { progress: 1 } : {}),
+          ...(dashboardStatus(agent) === "done" ? { progress: 1 } : {}),
           files,
           actions: actionsOf(agent),
         }

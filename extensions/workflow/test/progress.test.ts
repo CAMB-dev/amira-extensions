@@ -63,6 +63,22 @@ test("totals preserve unknown usage and count each status", () => {
   expect(totals(flow).cost).toBeUndefined()
 })
 
+test("textual progress retains cleanup recovery information separately from early-end notes", () => {
+  const node: AgentNode = {
+    ...agent(1, "done"),
+    worktreeNote: "Not merged; recover at D:/worktrees/conflict",
+  }
+  const flow: FlowNode = {
+    kind: "workflow",
+    name: "recover",
+    state: "done",
+    phases: [{ title: "", items: [node] }],
+  }
+  expect(treeLines(flow, 0)[0]!.text).toBe("└ ✓ agent 1 · Not merged; recover at D:/worktrees/conflict")
+  node.note = "Ended early"
+  expect(treeLines(flow, 0)[0]!.text).toContain("Ended early · Not merged; recover at D:/worktrees/conflict")
+})
+
 test("times are written as Amira writes them", () => {
   expect(formatDuration(12_000)).toBe("12s")
   expect(formatDuration(65_000)).toBe("1m 05s")

@@ -38,12 +38,68 @@ model start one unasked, and every start was still confirmed). The earlier defau
 | `/workflow` | Saved workflows and this session's runs |
 | `/workflow <name> [args]` | Run a saved workflow; `args` is JSON, or else plain text |
 | `/workflow <task>` | Ask the model to do the task with a workflow |
-| `/workflow view [id]` | The live progress tree: phases, agents, status, tokens, cost (`x` stops the run) |
+| `/workflow view [id]` | Inspect phases and selected-agent activity; `x` stops a live run after confirmation |
 | `/workflow stop [id]` | Stop a run; its unfinished agents are stopped |
 | `/workflow resume <id> [args]` | Resume a run from its journal |
 
 A running workflow shows as one line under the call that started it. When it ends, its result
 goes to the model as a message, and the transcript shows a short line.
+
+### Workflow screen
+
+Since **0.2.0** (Amira **0.1.48** or later), the screen splits at **80 columns**. Phases
+and nested workflows are nonselectable group labels on the left; only agent rows take
+selection. Each agent row is its shared status badge and name, without usage or activity
+clutter. Below 80 columns, the agent list stacks above the selected agent's details.
+
+```text
+  Workflow triple-check · ⠋ working · 12s · $0.04                 working 1 · done 2
+
+  Look                     │ check · reviewer · ⠋ working · 3s · $0.02
+    ✓ done    api          │ Current tool: read
+    ✓ done    core         │
+  Verify                   │ Events / result · folded (Enter to expand)
+  > ⠋ working check        │ 0s: Started agent
+                           │ 1s: Started read
+
+  d panes · Enter expand · ? summary · x stop · Tab input · Esc close
+```
+
+Counts have protected space on the right, using plain shared labels before their counts:
+`queued 1 · working 1 · done 2`. Identity is shortened before state, elapsed time or cost;
+`?` opens the full, scrollable summary with run ID and attribution when space is short. Workflow and
+selected-agent states use the host's shared badges. Running workflows use the working
+badge. Cached calls count as done; errors as failed; aborted calls and done results with
+an early-end note (even an empty one) count as stopped. Paused and idle agents retain
+those states, including in the optional dashboard adapter and archived early-end outcomes.
+Worktree cleanup information is separate from early-end notes: a successful merge is
+still done, and textual progress retains not-merged notes and recovery paths. Unknown
+cost is labeled unknown in totals and omitted from the selected-agent summary, never
+shown as zero. The elapsed-time clock refreshes only while a live run or agent is active.
+
+Up/Down skips group labels. Enter expands or folds the selected agent's own events and
+result from either pane, with the newest event/result last; folded entries occupy one
+row. `d` switches the active pane; only that pane uses native selectable widgets, so
+inactive content keeps its selection and expansion without a second highlight. Expansion
+is retained when switching agents, panes or terminal widths. Host PgUp/PgDn scrolls long
+expanded details. `x` retains the stop confirmation for live runs. Tab, `/`, `i`, Esc and
+input focus remain host-owned; selection dims while the composer owns focus.
+
+The wide layout uses a 22–28-cell agent pane, a native divider and one-cell gap. Both pane
+headers use the same compact style, and the screen has a two-cell left inset. One owned
+hint row replaces the generic host footer; at 60 columns it reads:
+`d · Enter expand · ? · x stop · Tab input · Esc close`. Finished and archived runs
+omit `x stop`.
+
+`/workflow view <id>` can also open a saved run from this session's workflow directory or
+Amira's workflow-runs directory. Archived snapshots are **read-only**: they show the final
+attempt's recorded agents/results, do not run a clock and offer no action keys. Unclosed
+running records appear as interrupted/stopped, not as live working spinners. Older
+journals without attempt numbers use the latest recorded outcome of each call. When a
+journal records nested invocation ancestry, groups retain their actual parent phases and
+depth, including phases with no root agent. Legacy nested entries without that metadata
+appear under **Unknown parent phase**; the screen never guesses from another agent's phase.
+Recorded invocations before any `phase()` remain unphased.
 
 Only the main session has the `workflow` tool and command: sub-agents, at any depth, never do.
 Since **0.1.9**, swarm members can instead use the swarm's own workflow tools through the
@@ -131,7 +187,10 @@ including validation and spawn errors, failed children, stopped calls, and cache
 Each new entry includes `status` (`done`, `error`, `aborted`, or `cached`), `startedAt`,
 `durationMs`, call and attempt numbers, and the prompt and phase. `error`, `model`, tokens,
 and cost are included when known. `sessionId` is the **child** session ID, never the parent:
-cached calls retain the original child ID; pre-spawn failures have no child ID. Journal lines
+cached calls retain the original child ID, events (with their original timebase), notes and
+worktree cleanup information while spending no new tokens or cost; pre-spawn failures have
+no child ID. Nested entries include `nestPath`, recording each invocation's parent phase.
+Journal lines
 retain completion order; `call` records script-call order, including parallel calls.
 
 The script and the run's state are kept alongside the journal. Resuming replays only
@@ -196,9 +255,21 @@ or `"never"` (refuse every start). Explicit settings override the permission mod
 ## Tests
 
 The tests run sandboxed workflow scripts with fake spawn groups and a fake dashboard service
-registry, without model or network calls. Link Amira's public API packages for development:
+registry, without model or network calls. View tests cover wide/narrow screens, host keyboard
+navigation, folding, focus, shared statuses and redraw demand; host-render tests use the
+linked checkout's headless renderer, not a live Amira session. Filesystem/worktree tests use
+temporary directories. Link Amira's public API packages and development types:
 
 ```sh
+bun install
 bun run link-amira <path to an Amira checkout>   # after `bun install` there
 bun test
+bun run typecheck
+bun run lint
 ```
+
+Run bun install in this extension to install its declared development dependencies, including
+@types/bun, TypeScript and Biome. The linker touches only @amira/* package junctions and
+never creates or replaces @types or other development packages. No extra PATH or typeRoots
+flags are needed. Dashboard Summary and Logs retain per-agent worktree recovery notes
+even after run-level log eviction or loading an archived run; those notes do not imply stopped.

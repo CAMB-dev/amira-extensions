@@ -8,7 +8,7 @@ session watch and step in.
 amira ext install swarm
 ```
 
-Needs Amira's extension API 0.1.1 or newer (persistent sub-agents, spawn groups, views).
+Needs Amira ^0.1.48 (persistent sub-agents, spawn groups, split views and shared status badges).
 
 ## Starting one
 
@@ -87,10 +87,20 @@ member workflows, including outstanding confirmations and starts racing with shu
 
 ## Watching and stepping in
 
-- `/swarm view` opens the live view: members with their states, the blackboard, and the
-  timeline of every message, write and finish. Its keys: `m` message a member
-  (`name: text`, or `all: text` for every member), `p` pause or resume a member (`all`
-  for the whole swarm), `x` stop a member, `s` stop the swarm.
+- `/swarm view` opens a split view: select a member with Up/Down on the left; the right
+  shows its role, state, elapsed time, own cost, current tool or last action, result,
+  its own board entries and recent events/messages (newest last). At narrow widths the
+  panes stack. Long text stays folded to one line; Enter opens the selected member's
+  details, then Enter expands/collapses a selected detail. `[` returns to members and
+  `]` focuses details. Only the active pane has a selection bar; switching panes keeps
+  the selected member and each member's expanded details. Host focus keys (Tab, `/`, or `i`)
+  switch to the input; the selection dims there. `?` opens the full summary (identity, goal,
+  state, elapsed time, known cost and counts), and Esc returns from it or closes the root view.
+  The compact header keeps state counts visible before identity, elapsed time or cost;
+  counts wrap if even they cannot fit on one row.
+  Live keys: `m` message a member (`name: text`, or `all: text`), `p` pause or resume a
+  member (`all` for the whole swarm), `x` stop a member, `s` stop the swarm after confirmation.
+  Swarms read back from the session are read-only and show no action keys or hints.
 - `@name text` while a swarm runs sends `text` to that member instead of to the model.
   `/swarm msg <name> <text>` does the same.
 - `@all text` (or `/swarm msg all <text>`) sends `text` to every member that is still
@@ -101,6 +111,57 @@ member workflows, including outstanding confirmations and starts racing with shu
   and deliver them later.
 - `/swarm stop [name]`: stop one member, or the whole swarm.
 - `/swarm list`: swarms of this session, including ones from before a resume.
+
+With at least 80 inner columns (82 including the inset), the view reads like this
+(badge glyphs follow the host theme; here the members pane is active):
+
+```text
+  Swarm sw_example · ⠋ working · 42s · $0.08                          working 1 · idle 1
+
+  > ⠋ working researcher     │ researcher · research · ⠋ working · 42s · $0.05
+    ○ idle    reviewer       │ Tool: read
+                             │
+                             │   ▸ Brief: Compare the two options...
+                             │   ▸ Board findings: Option A...
+                             │   ▸ 10:24:01 Started read
+                             │   ▸ 10:24:05 you → researcher: Check B...
+
+  [] panes · Enter details · ? summary · m message/all · p pause/resume · x stop member · s stop · Tab input · Esc close
+```
+
+At 60 columns, panes stack, identity yields to counts/metrics, and hints use one compact row:
+
+```text
+  ⠋ working · 42s · $0.08                working 1 · idle 1
+
+  > ⠋ working researcher
+    ○ idle    reviewer
+
+  researcher · research · ⠋ working · 42s · $0.05
+  Tool: read
+
+      ▸ Brief: Compare the two options...
+
+  m msg · p pause/resume · x member · s stop · Tab · Esc · ?
+```
+
+Maintainer conventions shared with the workflow view: use a two-cell outer left spacer
+(the semantic host has no margin flag), then calculate layouts from the inner `ctx.width`.
+Wide panes use `divider: true`, `gap: 1` and a 22–28-cell member column. Keep counts on the
+header's protected right side; truncate identity before metrics or counts, with `?` for
+full summary access. Own the hints in one area with `hostKeys: "none"`: this intentionally
+removes the generic host footer, not prompts or confirmation questions. Show only applicable
+view actions plus Tab/input and Esc/close. Render the inactive pane as nonfocusable static
+text: native trees highlight selected rows even when unfocused. `UiControl.focus(id)` stores
+focus for the next frame, so choose the active native widget from `ctx.state.focused`
+(default members); keep selection and expansion host-owned. Put the shared badge symbol
+in the tree's two-cell `node` slot with `gap: 0`; selected symbol, state word and name all
+use the same text/dim semantic style, while unselected badges retain their theme roles.
+
+Member costs are own reported usage; missing costs stay unknown, and known zero costs
+show `$0.00`. Only active working members request elapsed-time refreshes; idle, paused
+and ended views do not keep a timer running. Enter reveals full saved text, including
+newlines, without truncating the underlying records.
 
 Since 0.1.9, the main session has the same controls through the `swarm` tool:
 
@@ -236,6 +297,14 @@ The integration tests run swarms on a real agent tree with a scripted model, so 
 Amira's packages. Start-policy tests use public API fakes:
 
 ```sh
+bun install
 bun run link-amira <path to an Amira checkout>   # after `bun install` there
+bun run typecheck
+bun run lint
 bun test
 ```
+
+Run bun install in this extension to install its declared development dependencies, including
+@types/bun, TypeScript and Biome. The linker touches only @amira/* package junctions; it
+never installs, creates or replaces @types, bun-types, compiler or lint packages.
+No extra PATH or typeRoots flags are needed for the documented check commands.

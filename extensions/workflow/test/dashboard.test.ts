@@ -10,6 +10,7 @@ import {
   type DashboardSources,
 } from "../src/dashboard.ts"
 import { callHash, Journal, type RunRecord, writeRun } from "../src/journal.ts"
+import { type AgentNode, phaseOf } from "../src/progress.ts"
 import { WorkflowRun } from "../src/run.ts"
 import { fakeGroup } from "./fakes.ts"
 
@@ -228,6 +229,135 @@ test("finished run loading exposes script phases, call details, and original chi
   expect(adapter.source.details(agents[0]!.id)!.summary.map(lineText)).toContain(
     "Started by: researcher (s_member)",
   )
+})
+
+test("dashboard maps whole live agents and restores archived early-end notes", () => {
+  const root = tmp()
+  const run = new WorkflowRun({
+    id: "wf_states",
+    dir: path.join(root, "wf_states"),
+    source: `export const meta = { name: "states", description: "States", phases: [] }`,
+    origin: "inline",
+    args: null,
+    group: fakeGroup({ name: "states" }, () => ({ text: "unused" })),
+    cwd: root,
+    home: root,
+    roles: () => new Map(),
+    git: async () => ({ ok: false, output: "" }),
+    loadWorkflow: () => undefined,
+    onChange() {},
+  })
+  const nodes: AgentNode[] = [
+    { kind: "agent", call: 1, label: "early", status: "done", note: "" },
+    { kind: "agent", call: 2, label: "paused", status: "working", paused: true },
+    { kind: "agent", call: 3, label: "idle", status: "working", idle: true },
+    { kind: "agent", call: 4, label: "merged", status: "done", worktreeNote: "Changes merged" },
+  ]
+  phaseOf(run.flow, "").items.push(...nodes)
+  const adapter = createWorkflowSource(root)
+  adapter.update(run)
+  const agents = adapter.source
+    .snapshot()
+    .phases.flatMap((phase) => phase.groups.flatMap((group) => group.agents))
+  expect(agents.map((agent) => agent.status)).toEqual(["stopped", "paused", "idle", "done"])
+  expect(adapter.source.details(agents[0]!.id)!.summary.map(lineText)).toContain("Call 1: stopped")
+  expect(agents[0]!.progress).toBeUndefined()
+
+  const dir = path.join(root, "wf_states")
+  writeRun(dir, { ...run.record, status: "done" })
+  const journal = new Journal(dir)
+  for (const node of [nodes[0]!, nodes[3]!])
+    journal.record({
+      key: `call${node.call}#0`,
+      call: node.call,
+      label: node.label,
+      status: "done",
+      note: node.note,
+      worktreeNote: node.worktreeNote,
+      text: "result",
+      durationMs: 1,
+    })
+  const saved = createWorkflowSource(root)
+  saved.load([root])
+  const archived = saved.source
+    .snapshot()
+    .phases.flatMap((phase) => phase.groups.flatMap((group) => group.agents))
+  expect(archived.map((agent) => agent.status)).toEqual(["stopped", "done"])
+  expect(saved.source.details(archived[0]!.id)!.summary.map(lineText)).toContain("Call 1: stopped")
+})
+
+test("live dashboard retains worktree recovery in Summary and Logs after run-log eviction", () => {
+  const root = tmp()
+  const recovery = "worktree NOT merged: recover patch D:/recovery/unmerged.diff"
+  const run = new WorkflowRun({
+    id: "wf_recovery",
+    dir: path.join(root, "wf_recovery"),
+    source: `export const meta = { name: "recovery", description: "Recovery", phases: ["Code"] }`,
+    origin: "inline",
+    args: null,
+    group: fakeGroup({ name: "recovery" }, () => ({ text: "unused" })),
+    cwd: root,
+    home: root,
+    roles: () => new Map(),
+    git: async () => ({ ok: false, output: "" }),
+    loadWorkflow: () => undefined,
+    onChange() {},
+  })
+  run.status = "done"
+  phaseOf(run.flow, "Code").items.push({
+    kind: "agent",
+    call: 1,
+    label: "Implement",
+    status: "done",
+    worktreeNote: recovery,
+    text: "Implemented",
+  })
+  run.logs.push({ level: "warning", text: recovery })
+  const adapter = createWorkflowSource(root)
+  for (const laterLogs of [0, 51]) {
+    for (let index = 0; index < laterLogs; index++)
+      run.logs.push({ level: "info", text: `Later log ${index}` })
+    adapter.update(run)
+    const agent = adapter.source.snapshot().phases[0]!.groups[0]!.agents[0]!
+    const details = adapter.source.details(agent.id)!
+    expect(agent.status).toBe("done")
+    expect(details.summary.map(lineText)).toContain(recovery)
+    expect(details.logs.map(lineText)).toContain(recovery)
+    expect(details.summary).toContainEqual({ kind: "warning", text: recovery })
+  }
+})
+
+test("archived dashboard retains worktree recovery independently of early-stop notes", () => {
+  const root = tmp()
+  const dir = path.join(root, "wf_recovery")
+  const recovery = "worktree NOT merged: recover patch D:/recovery/unmerged.diff"
+  writeRun(dir, {
+    id: "wf_recovery",
+    meta: { name: "recovery", description: "Recovery", phases: ["Code"] },
+    args: null,
+    source: "inline",
+    status: "done",
+    startedAt: 10,
+    endedAt: 20,
+  })
+  new Journal(dir).record({
+    key: "implement#0",
+    call: 1,
+    phase: "Code",
+    label: "Implement",
+    status: "done",
+    worktreeNote: recovery,
+    text: "Implemented",
+    durationMs: 10,
+  })
+  const saved = createWorkflowSource(root)
+  saved.load([root])
+  const agent = saved.source.snapshot().phases[0]!.groups[0]!.agents[0]!
+  const details = saved.source.details(agent.id)!
+  expect(agent.status).toBe("done")
+  expect(details.summary.map(lineText)).toContain(recovery)
+  expect(details.logs.map(lineText)).toContain(recovery)
+  expect(details.summary).toContainEqual({ kind: "warning", text: recovery })
 })
 
 test("legacy resumed runs retain calls without attempt metadata", () => {

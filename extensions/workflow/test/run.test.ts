@@ -3,9 +3,12 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import type { SpawnGroupOptions, SpawnOptions } from "@amira/api"
-import { readJournal } from "../src/journal.ts"
+import { callHash, readJournal } from "../src/journal.ts"
+import { agentsOf } from "../src/progress.ts"
 import { BUILTIN_ROLES } from "../src/roles.ts"
 import { WorkflowRun } from "../src/run.ts"
+import { agentStatusState } from "../src/status.ts"
+import { agentDetails, archivedWorkflow } from "../src/view.ts"
 import type { RunGit } from "../src/worktree.ts"
 import { type Answer, fakeGroup } from "./fakes.ts"
 
@@ -610,4 +613,191 @@ test("an unknown saved workflow rejects workflow()", async () => {
   const { run } = start({ source: `${META}try { await workflow("nope") } catch (e) { return e.message }` })
   await run.done
   expect(run.result).toMatch(/no saved workflow named "nope"/)
+})
+
+for (const note of ["ended early", ""]) {
+  test(`a clean lifecycle result retains its early-end note ${JSON.stringify(note)} for shared display, including on replay`, async () => {
+    const first = start({
+      source: `${META}return await agent("scan", { role: "explorer" })`,
+      answer: () => ({
+        text: "partial result",
+        note,
+        events: [
+          {
+            seq: 1,
+            type: "tool.execute.start",
+            sessionId: "s_child1",
+            ts: 10,
+            data: { name: "read", toolCallId: "one", args: {} },
+          },
+          {
+            seq: 1,
+            type: "tool.execute.start",
+            sessionId: "descendant",
+            ts: 11,
+            data: { name: "secret", toolCallId: "other", args: {} },
+          },
+          {
+            seq: 1,
+            type: "tool.execute.end",
+            sessionId: "s_child1",
+            ts: 12,
+            data: {
+              name: "read",
+              toolCallId: "one",
+              durationMs: 2,
+              result: { content: [{ type: "text", text: "read result" }] },
+            },
+          },
+        ],
+      }),
+    })
+    await first.run.done
+    const node = agentsOf(first.run.flow)[0]!
+    expect(node.status).toBe("done")
+    expect(node.note).toBe(note)
+    expect(node.role).toBe("explorer")
+    expect(agentStatusState(node)).toBe("stopped")
+    expect(node.events!.map((event) => event.text)).toEqual([
+      "Started agent",
+      "Started read",
+      "read: done · read result",
+      "Received response",
+    ])
+    expect(node.currentTools).toEqual([])
+    const entries = readJournal(first.dir)
+    expect(entries[0]?.note).toBe(note)
+    expect(entries[0]?.role).toBe("explorer")
+    expect(entries[0]?.events).toEqual(node.events)
+    const resumed = start({
+      source: `${META}return await agent("scan", { role: "explorer" })`,
+      previous: entries,
+    })
+    await resumed.run.done
+    expect(resumed.group.spawned).toHaveLength(0)
+    expect(agentStatusState(agentsOf(resumed.run.flow)[0]!)).toBe("stopped")
+  })
+}
+
+test("cached display metadata survives repeated resumes and archives without charging original usage", async () => {
+  const source = `${META}return await agent("scan", { role: "explorer" })`
+  const original = {
+    key: `${callHash("scan", { role: "explorer" })}#0`,
+    label: "scan",
+    status: "done" as const,
+    text: "original result",
+    note: "",
+    worktreeNote: "Changes merged",
+    role: "explorer",
+    model: "x/y",
+    sessionId: "original-child",
+    startedAt: 1000,
+    durationMs: 5000,
+    tokens: 200,
+    cost: 0.5,
+    events: [{ ts: 3000, text: "Original event" }],
+  }
+  const first = start({ source, previous: [original], resumes: 1 })
+  await first.run.done
+  const second = start({ source, dir: first.dir, previous: readJournal(first.dir), resumes: 2 })
+  await second.run.done
+  for (const current of [first, second]) {
+    expect(current.group.spawned).toHaveLength(0)
+    expect(current.run.record.totals).toMatchObject({ tokens: 0, cost: 0 })
+    const node = agentsOf(current.run.flow)[0]!
+    expect(node).toMatchObject({
+      status: "cached",
+      note: "",
+      worktreeNote: "Changes merged",
+      role: "explorer",
+      model: "x/y",
+      childId: "original-child",
+      events: original.events,
+      text: original.text,
+      tokens: 0,
+      cost: 0,
+    })
+    expect(node.startedAt).toBeGreaterThan(original.startedAt)
+    expect(node.durationMs).toBeLessThan(original.durationMs)
+    const archive = archivedWorkflow(current.run.record, readJournal(current.dir))
+    const archived = agentsOf(archive.flow)[0]!
+    expect(archived.events).toEqual(original.events)
+    expect(archived.worktreeNote).toBe(original.worktreeNote)
+    const details = agentDetails(archived, { width: 100, now: 10000 }, true)
+    expect(details).toContainEqual({ kind: "text", text: "2s:" })
+  }
+})
+
+for (const rootAgent of [true, false]) {
+  test(`nested invocation journals its actual parent phase with root agent=${rootAgent}`, async () => {
+    const { run, dir } = start({
+      source: `${META}
+        phase("Explore")
+        ${rootAgent ? 'await agent("outer")' : ""}
+        phase("Verify")
+        return await workflow("child", {})`,
+      saved: {
+        child:
+          'export const meta = { name: "child", description: "nested", phases: ["Check"] }\nphase("Check")\nreturn await agent("inner")',
+      },
+    })
+    await run.done
+    expect(run.error).toBeUndefined()
+    const archive = archivedWorkflow(run.record, readJournal(dir))
+    const verify = archive.flow.phases.find((phase) => phase.title === "Verify")!
+    expect(verify.items[0]).toMatchObject({ kind: "workflow", name: "child#1" })
+    expect(agentsOf(archive.flow).map((node) => node.text)).toEqual(
+      rootAgent ? ["did: outer", "did: inner"] : ["did: inner"],
+    )
+    const child = verify.items[0]!
+    if (child.kind !== "workflow") throw new Error("Expected nested workflow")
+    expect(agentsOf(child)[0]?.text).toBe("did: inner")
+  })
+}
+
+test("a nested invocation before any phase or root agent stays unphased in the archive and on replay", async () => {
+  const source = `${META}return await workflow("child", { x: 1 })`
+  const first = start({ source, saved: { child: CHILD } })
+  await first.run.done
+  const second = start({ source, saved: { child: CHILD }, previous: readJournal(first.dir), resumes: 1 })
+  await second.run.done
+  expect(second.group.spawned).toHaveLength(0)
+  for (const current of [first, second]) {
+    const entries = readJournal(current.dir)
+    expect(entries[0]?.nestPath).toEqual([{ nest: "child#1" }])
+    const archive = archivedWorkflow(current.run.record, entries)
+    expect(archive.flow.phases[0]?.title).toBe("")
+    expect(archive.flow.phases[0]?.items[0]).toMatchObject({ kind: "workflow", name: "child#1" })
+  }
+})
+
+test("full tool result text is journaled and available in expanded archived details", async () => {
+  const full = `${"x".repeat(5000)}\nSENTINEL`
+  const { run, dir } = start({
+    source: `${META}return await agent("read")`,
+    answer: () => ({
+      text: "done",
+      events: [
+        {
+          seq: 1,
+          type: "tool.execute.end",
+          sessionId: "s_child1",
+          ts: 1200,
+          data: {
+            name: "read",
+            toolCallId: "one",
+            durationMs: 100,
+            result: { content: [{ type: "text", text: full }] },
+          },
+        },
+      ],
+    }),
+  })
+  await run.done
+  expect(readJournal(dir)[0]!.events).toContainEqual({ ts: 1200, text: `read: done · ${full}` })
+  const archived = agentsOf(archivedWorkflow(run.record, readJournal(dir)).flow)[0]!
+  expect(agentDetails(archived, { width: 100, now: 10000 }, true)).toContainEqual({
+    kind: "text",
+    text: "SENTINEL",
+  })
 })

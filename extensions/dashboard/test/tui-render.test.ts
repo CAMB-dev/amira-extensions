@@ -3,8 +3,9 @@
  * UPDATE_DASHBOARD_README=1 bun test test/tui-render.test.ts refreshes the README captures.
  */
 import { describe, expect, mock, test } from "bun:test"
-import type { SessionControl } from "@amira/api"
+import { AGENT_STATUS_BADGES, type AgentStatusState, type SessionControl, type TraceRecord } from "@amira/api"
 import { agentsOf } from "../src/source.ts"
+import { createTraceSource } from "../src/trace.ts"
 import { dashboardView } from "../src/view.ts"
 import { viewFixture } from "./view-fixture.ts"
 
@@ -13,6 +14,9 @@ import { viewFixture } from "./view-fixture.ts"
 const load = async (name: string): Promise<any> => import(name).catch(() => undefined)
 const tui = await load("@amira/tui")
 const kit = await load("@amira/tui-kit")
+const hostGlyphs = tui
+  ? await load(new URL("./glyphs.ts", import.meta.resolve("@amira/tui")).href)
+  : undefined
 const available = Boolean(tui && kit)
 
 function open(width: number, height: number) {
@@ -58,14 +62,14 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
     test(`${width}x${height}: first frame shows a shared phase box and selected details without input`, async () => {
       const { first, viewer } = open(width, height)
       const text = first.join("\n")
-      expect(text).toContain(width === 180 ? "◉ Implementation" : "◉ Implementatio")
-      expect(text).toMatch(/09:00:30\s+●\s+◉ Implementatio/)
-      expect(text).toContain("├──▶ ● Payment")
-      if (width === 180) expect(text).toContain("[TypeScript]")
+      expect(text).toContain(width === 180 ? "⠋ Implementation" : "⠋ Implementatio")
+      expect(text).toMatch(/09:00:30\s+⠋\s+⠋ Implementatio/)
+      expect(text).toContain("├──▶ ⠋ working Payment")
+      if (width === 180) expect(text).toMatch(/[▏[]TypeScript[▕\]]/)
       expect(text).toContain("≡")
       expect(text).toContain("[Summary]")
       expect(text).not.toContain("Checkout run ─")
-      expect(text).toContain("Esc close")
+      expect(text).toMatch(/esc close/i)
       expect(text).not.toContain("b back")
       await capture(`${width}x${height}`, first)
       viewer.dispose()
@@ -83,6 +87,123 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
     })
   }
 
+  async function openTrace(records: TraceRecord[]) {
+    const session = {
+      info: () => ({ id: "root", title: "Root task", cwd: "/project", busy: false }),
+      subagents: () => [],
+      trace: async (id: string) => (id === "root" ? records : []),
+    } as unknown as SessionControl
+    const source = await createTraceSource(session)
+    const viewer = new tui.ExtensionViewer(dashboardView, { source }, { now: () => 1000 })
+    viewer.mount()
+    const render = (): string[] =>
+      viewer.render(60, { theme: kit.monoTheme, color: false, rows: 18 }).map(kit.stripAnsi)
+    const press = (...names: string[]) => {
+      for (const name of names) {
+        viewer.handleInput(kit.key(name))
+        render()
+      }
+    }
+    render()
+    press("enter", "3", "tab", "home")
+    return { viewer, render, press }
+  }
+
+  for (const kind of ["subagent", "turn", "status"] as const) {
+    test(`60 columns: ${kind} diagnostics remain fully reachable by scrolling Logs`, async () => {
+      const title = "A very long historical agent or turn title ".repeat(4)
+      const diagnostic = Array.from({ length: 100 }, (_, index) => `detail${index}`).join(" ")
+      const record: TraceRecord =
+        kind === "subagent"
+          ? {
+              type: "subagent",
+              childSessionId: "child",
+              title,
+              start: 0,
+              end: 10,
+              durationMs: 10,
+              status: "error",
+              error: diagnostic,
+            }
+          : kind === "turn"
+            ? {
+                type: "turn",
+                turnId: title,
+                start: 0,
+                end: 10,
+                reason: "error",
+                steps: 1,
+                failure: { kind: "provider", message: diagnostic },
+              }
+            : { type: "status", at: 10, status: "idle", reason: diagnostic }
+      const { viewer, render, press } = await openTrace([
+        { type: "trace", v: 1, sessionId: "root", startedAt: 0 },
+        record,
+        { type: "status", at: 20, status: "idle" },
+      ])
+      try {
+        const first = render().join("\n")
+        expect(first).toContain("[Logs]")
+        const frames = [first]
+        for (let index = 0; index < 40; index++) {
+          press("down")
+          frames.push(render().join("\n"))
+        }
+        const visible = frames.join("\n")
+        for (const word of diagnostic.split(" ")) expect(visible).toContain(word)
+        expect(first).not.toContain("detail99")
+        expect(frames.at(-1)).toContain("detail99")
+        expect(visible).toContain("idle")
+      } finally {
+        viewer.dispose()
+      }
+    })
+  }
+
+  test("completed trace Logs do not animate a historical working transition", async () => {
+    const { viewer, render } = await openTrace([
+      { type: "trace", v: 1, sessionId: "root", startedAt: 0 },
+      { type: "status", at: 1, status: "working" },
+      { type: "status", at: 10, status: "idle" },
+    ])
+    try {
+      expect(render().join("\n")).toContain("working")
+      expect(viewer.animating).toBe(false)
+      expect(viewer.refreshIntervalMs ?? 0).toBe(0)
+    } finally {
+      viewer.dispose()
+    }
+  })
+
+  test("opened child trace Logs stay static while the underlying live dashboard is working", async () => {
+    const { render, press, fixture, viewer } = open(80, 24)
+    try {
+      expect(viewer.animating).toBe(true)
+      agentsOf(fixture.snapshot)[0]!.sessionId = "child-session"
+      fixture.data.session = {
+        info: () => ({ id: "root" }),
+        subagents: () => [{ id: "child-session" }],
+        trace: async () => [
+          { type: "trace", v: 1, sessionId: "child-session", startedAt: 0 },
+          { type: "status", at: 1, status: "working" },
+          { type: "status", at: 10, status: "idle" },
+        ],
+      } as unknown as SessionControl
+      press("enter", "a", "down", "down", "enter")
+      await Promise.resolve()
+      await Promise.resolve()
+      render()
+      press("right")
+      expect(render().join("\n")).toContain("* working")
+      expect(viewer.animating).toBe(false)
+      expect(viewer.refreshIntervalMs ?? 0).toBe(0)
+      press("escape", "escape")
+      expect(viewer.animating).toBe(true)
+    } finally {
+      viewer.dispose()
+    }
+  })
+
   test("new workers expand without e, and a folded last card keeps a closed frame and count", () => {
     const { render, press, fixture, viewer } = open(180, 100)
     press("down", "left")
@@ -97,11 +218,37 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
       actions: [],
     })
     const rows = render().join("\n")
-    expect(rows).toContain("├──▶ ● New worker")
+    expect(rows).toContain("├──▶ ⠋ working New worker")
     expect(rows).toContain("New worker summary")
     expect(rows).toContain("3 agents · 2 running")
     expect(rows).toContain("e expand all")
     viewer.dispose()
+  })
+
+  test.skipIf(!hostGlyphs)("badges honor the host's ASCII theme and custom glyphs", () => {
+    const before = { ...hostGlyphs.glyphs }
+    let viewer: ReturnType<typeof open>["viewer"]
+    try {
+      hostGlyphs.setGlyphs({ pointer: ">" })
+      const fixture = open(180, 52)
+      viewer = fixture.viewer
+      const agent = agentsOf(fixture.fixture.snapshot)[0]!
+      for (const state of Object.keys(AGENT_STATUS_BADGES) as AgentStatusState[]) {
+        agent.status = state === "working" ? "running" : state
+        const rows = fixture.render().join("\n")
+        const symbol = state === "working" ? "|" : AGENT_STATUS_BADGES[state].ascii
+        expect(rows).toContain(`${symbol} ${state}`)
+      }
+      hostGlyphs.setGlyphs({ pointer: ">", statusPaused: "P", statusStopped: "S" })
+      agent.status = "paused"
+      expect(fixture.render().join("\n")).toContain("P paused")
+      agent.status = "done"
+      agent.note = ""
+      expect(fixture.render().join("\n")).toContain("S stopped")
+    } finally {
+      viewer?.dispose()
+      hostGlyphs.setGlyphs(before)
+    }
   })
 
   test("narrow shortcut help exposes actions omitted from compact card headers", () => {
@@ -158,7 +305,7 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
     press("a", "down", "enter")
     await Promise.resolve()
     expect(render().join("\n")).toContain("Child transcript contents")
-    expect(render().join("\n")).toContain("Esc back")
+    expect(render().join("\n")).toMatch(/esc back/i)
     press("escape")
     expect(render().join("\n")).toContain("Open transcript")
     press("down", "enter")
@@ -166,7 +313,7 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
     await Promise.resolve()
     expect(render().join("\n")).toContain("First token wait")
     press("escape", "escape")
-    expect(render().join("\n")).toContain("Esc close")
+    expect(render().join("\n")).toMatch(/esc close/i)
     viewer.dispose()
   })
 
@@ -258,11 +405,11 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
         },
       ],
     })
-    expect(render().join("\n")).toContain("├──▶ ● Late agent")
+    expect(render().join("\n")).toContain("├──▶ ⠋ working Late agent")
     press("left")
-    expect(render().join("\n")).not.toContain("├──▶ ● Late agent")
+    expect(render().join("\n")).not.toContain("├──▶ ⠋ working Late agent")
     press("e")
-    expect(render().join("\n")).toContain("├──▶ ● Late agent")
+    expect(render().join("\n")).toContain("├──▶ ⠋ working Late agent")
     viewer.dispose()
   })
 
@@ -273,7 +420,7 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
     expect(root.join("\n")).toContain("[Logs]")
     press("enter")
     expect(render().join("\n")).toContain("[Summary]  Diff  Logs  Actions  Stats")
-    expect(render().join("\n")).toContain("Esc back")
+    expect(render().join("\n")).toMatch(/esc back/i)
     press("5")
     expect(render().join("\n")).toContain("First token wait")
     press("escape")
@@ -290,14 +437,14 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
     expect(stats).toContain("First token wait")
     expect(stats).toContain("bash  2  25.00s / 12.50s / 15.00s")
     press("r")
-    expect(render().join("\n")).toContain("Request changes from Payment validation")
+    expect(render().join("\n")).toMatch(/Request changes from Payment validatio/)
     press("escape")
     await Promise.resolve()
     expect(fixture.act).not.toHaveBeenCalled()
-    expect(render().join("\n")).toContain("Esc back")
+    expect(render().join("\n")).toMatch(/esc back/i)
     expect(closed).not.toHaveBeenCalled()
     press("escape")
-    expect(render().join("\n")).toContain("Esc close")
+    expect(render().join("\n")).toMatch(/esc close/i)
     viewer.dispose()
   })
 

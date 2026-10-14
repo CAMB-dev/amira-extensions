@@ -1,11 +1,13 @@
-import { expect, test } from "bun:test"
+import { expect, mock, test } from "bun:test"
 import {
+  type AgentStatusState,
   emptyUsage,
   type SessionControl,
   type SessionInfo,
   type SubagentInfo,
   summarizeTrace,
   type TraceRecord,
+  type ViewSegment,
 } from "@amira/api"
 import { agentsOf } from "../src/source.ts"
 import { createTraceSource } from "../src/trace.ts"
@@ -410,4 +412,33 @@ test("a session switch during an awaited read rejects instead of mixing sessions
     await expect(replay).rejects.toThrow("Session changed while loading the trace")
     expect(setup.requested.every((id) => id === "root" || id === "child")).toBe(true)
   }
+})
+
+test("replay retains early-end notes from listed children and recovered records", async () => {
+  const recovered = { ...completedChild("recovered"), note: "" }
+  const source = await createTraceSource(
+    host({ root: [header(), recovered] }, [child("listed", { note: "" }), child("complete")]).session,
+  )
+  const agents = agentsOf(source.snapshot())
+  expect(agents.find((agent) => agent.id === "listed")).toMatchObject({ status: "stopped", note: "" })
+  expect(agents.find((agent) => agent.id === "recovered")).toMatchObject({ status: "stopped", note: "" })
+  expect(agents.find((agent) => agent.id === "complete")?.status).toBe("done")
+})
+
+test("trace details keep immutable static badges even when a live host helper is supplied", async () => {
+  const ended = { ...completedChild("child"), note: "" }
+  const source = await createTraceSource(
+    host({
+      root: [header(), { type: "status", at: 10, status: "blocked" }, ended],
+    }).session,
+  )
+  const cached = source.details("root")!
+  const helper = mock((state: AgentStatusState): ViewSegment[] => [{ kind: "accent", text: `host ${state}` }])
+  const themed = source.details("root", { statusBadge: helper })!
+  expect(helper).not.toHaveBeenCalled()
+  expect(themed).toBe(cached)
+  expect(JSON.stringify(themed.logs)).toContain("| paused")
+  expect(JSON.stringify(cached.logs)).toContain("| stopped")
+  expect(Object.isFrozen(themed.logs)).toBe(true)
+  expect(source.details("root")).toBe(cached)
 })

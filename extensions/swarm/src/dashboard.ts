@@ -1,4 +1,5 @@
 import type { ExtensionAPI, UiNode, ViewLine } from "@amira/api"
+import { memberState } from "./status.ts"
 import type { MemberView, SwarmSnapshot } from "./swarm.ts"
 
 /** Structural mirror of dashboard.sources; no cross-extension import or declaration merging. */
@@ -51,13 +52,11 @@ const NOTE =
   "Member costs and tokens are own reported usage only; missing values are unknown. Read-only: use /swarm to message, pause or stop members."
 
 function statusOf(member: MemberView) {
-  if (member.status === "working") return "running" as const
-  if (member.status !== "ended") return member.status
-  if (member.outcome === "error" || (!member.outcome && member.error)) return "failed" as const
-  if (member.stopReason !== undefined) return "stopped" as const
-  if (member.outcome === "done") return "done" as const
-  // An old or interrupted record has no successful outcome; never invent one.
-  return "stopped" as const
+  // An old or interrupted record has no successful outcome; never invent one here.
+  if (member.status === "ended" && !member.outcome)
+    return member.error ? ("failed" as const) : ("stopped" as const)
+  const state = memberState(member)
+  return state === "working" ? ("running" as const) : state
 }
 
 /** Pure reads over current snapshots, with bounded detail output and explicit change notifications. */

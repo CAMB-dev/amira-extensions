@@ -13,9 +13,9 @@
     {
       "name": "dashboard",
       "description": "Experimental default dashboard: live sub-agent timeline, agent detail pages and trace replay statistics: /dashboard",
-      "version": "0.2.2",
+      "version": "0.3.0",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/dashboard" },
-      "engines": { "amira": "^0.1.24" },
+      "engines": { "amira": "^0.1.48" },
       "tags": ["dashboard", "agents", "orchestration", "trace", "statistics"],
       "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/dashboard"
     },
@@ -49,18 +49,18 @@
     {
       "name": "workflow",
       "description": "Dynamic workflows: TypeScript scripts that orchestrate many sub-agents in the background, with limits, a progress view and resume",
-      "version": "0.1.9",
+      "version": "0.2.0",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/workflow" },
-      "engines": { "amira": "^0.1.1" },
+      "engines": { "amira": "^0.1.48" },
       "tags": ["workflow", "orchestration", "sub-agents", "automation"],
       "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/workflow"
     },
     {
       "name": "swarm",
       "description": "Swarm mode: long-lived sub-agents that work on one goal together through a shared blackboard and direct messages: /swarm <goal>",
-      "version": "0.1.10",
+      "version": "0.2.0",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/swarm" },
-      "engines": { "amira": "^0.1.1" },
+      "engines": { "amira": "^0.1.48" },
       "tags": ["agents", "swarm", "multi-agent", "orchestration"],
       "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/swarm"
     },

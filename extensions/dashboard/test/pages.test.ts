@@ -1,5 +1,5 @@
 import { expect, mock, test } from "bun:test"
-import type { Message, SessionControl, TraceRecord, UiNode } from "@amira/api"
+import type { AgentStatusState, Message, SessionControl, TraceRecord, UiNode, ViewSegment } from "@amira/api"
 import { agentsOf } from "../src/source.ts"
 import { dashboardView, performAction } from "../src/view.ts"
 import { viewFixture } from "./view-fixture.ts"
@@ -244,4 +244,21 @@ test("session actions are hidden for sessions the host does not list, and a thro
   const body = JSON.stringify(s.render())
   expect(body).toContain("This tab failed to render: bad tab")
   expect(body).toContain("Summary")
+})
+
+test("trace-page historical working badges stay static in Logs and Stats", async () => {
+  const s = setup()
+  s.records.push({ type: "status", at: 40, status: "working" })
+  await performAction(s.data, s.control, "open-trace", "payments")
+  const helper = mock((state: AgentStatusState): ViewSegment[] => [{ kind: "accent", text: `host ${state}` }])
+  const ctx = { ...s.context(), statusBadge: helper }
+  dashboardView.ui!(s.data, ctx)
+  expect(helper).not.toHaveBeenCalled()
+  ctx.state.activeTabs["session-page:trace"] = "logs"
+  expect(JSON.stringify(dashboardView.ui!(s.data, ctx))).toContain("* working")
+  expect(helper).not.toHaveBeenCalled()
+  helper.mockClear()
+  ctx.state.activeTabs["session-page:trace"] = "stats"
+  dashboardView.ui!(s.data, ctx)
+  expect(helper).not.toHaveBeenCalled()
 })

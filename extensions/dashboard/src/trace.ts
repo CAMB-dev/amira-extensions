@@ -7,6 +7,7 @@ import {
   type DashboardStatus,
   languageOf,
 } from "./source.ts"
+import { dashboardStatus, staticStatusBadge } from "./status.ts"
 
 type ChildRecord = Extract<TraceRecord, { type: "subagent" }>
 
@@ -15,6 +16,7 @@ interface SessionEntry {
   name: string
   task: string
   status: DashboardStatus
+  note?: string
   startedAt?: number
   durationMs?: number
   cost?: number
@@ -23,16 +25,12 @@ interface SessionEntry {
   toolCallId?: string
 }
 
-function statusOf(status: string): DashboardStatus {
+function statusOf(source: { status: string; note?: string; paused?: boolean }): DashboardStatus {
+  const status = source.status === "blocked" ? "paused" : source.status
   switch (status) {
     case "working":
-      return "running"
-    case "blocked":
-      return "paused"
     case "error":
-      return "failed"
     case "aborted":
-      return "stopped"
     case "queued":
     case "running":
     case "idle":
@@ -40,7 +38,7 @@ function statusOf(status: string): DashboardStatus {
     case "done":
     case "failed":
     case "stopped":
-      return status
+      return dashboardStatus({ ...source, status })
     default:
       return "idle"
   }
@@ -51,7 +49,8 @@ function childEntry(record: ChildRecord, parentSessionId: string): SessionEntry 
     id: record.childSessionId,
     name: record.role ?? "agent",
     task: record.title ?? record.childSessionId,
-    status: statusOf(record.status),
+    status: statusOf(record),
+    note: "note" in record && typeof record.note === "string" ? record.note : undefined,
     startedAt: record.start,
     durationMs: record.durationMs,
     cost: record.usage?.cost,
@@ -99,23 +98,39 @@ export function traceLogLines(record: TraceRecord): ViewLine[] {
     case "turn":
       return [
         {
-          kind: record.reason === "done" ? "text" : "warning",
-          text: `Turn ${record.turnId} · ${record.reason}${record.failure ? ` · ${record.failure.message}` : ""}`,
+          kind: "segments",
+          parts: [
+            { kind: "text", text: `Turn ${record.turnId} · ` },
+            ...staticStatusBadge({ status: record.reason }),
+          ],
         },
+        ...(record.failure ? [{ kind: "text" as const, text: record.failure.message }] : []),
       ]
     case "status":
-      return [{ kind: "muted", text: `${record.status}${record.reason ? ` · ${record.reason}` : ""}` }]
+      return [
+        {
+          kind: "segments",
+          parts: [...staticStatusBadge({ ...record, status: statusOf(record) })],
+        },
+        ...(record.reason ? [{ kind: "muted" as const, text: record.reason }] : []),
+      ]
     case "subagent":
       return [
         {
-          kind: "text",
-          text: `${record.title ?? record.childSessionId} · ${record.status}${record.error ? ` · ${record.error}` : ""}`,
+          kind: "segments",
+          parts: [
+            { kind: "text", text: `${record.title ?? record.childSessionId} · ` },
+            ...staticStatusBadge({ ...record, status: statusOf(record) }),
+          ],
         },
+        ...(record.error ? [{ kind: "text" as const, text: record.error }] : []),
       ]
     case "compact":
       return [{ kind: "muted", text: `Compaction · ${record.reason} · ${record.end - record.start} ms` }]
     case "side":
       return [{ kind: "muted", text: `${record.label ?? "Side request"} · ${record.model}` }]
+    default:
+      return []
   }
 }
 
@@ -155,7 +170,8 @@ export async function createTraceSource(
       id: child.id,
       name: child.role,
       task: child.task || child.title,
-      status: statusOf(child.status),
+      status: statusOf(child),
+      note: child.note,
       startedAt: child.startedAt,
       durationMs: child.durationMs,
       cost: child.usage.cost,
@@ -190,6 +206,8 @@ export async function createTraceSource(
       const known = entries.get(record.childSessionId)
       if (!known) entries.set(record.childSessionId, childEntry(record, entry.id))
       else {
+        known.note ??= childEntry(record, entry.id).note
+        known.status = statusOf(known)
         known.startedAt ??= record.start
         known.durationMs ??= record.durationMs
         known.cost ??= record.usage?.cost
@@ -211,8 +229,9 @@ export async function createTraceSource(
     let status = entry.status
     if (entry.id === info.id) {
       for (const record of records) {
-        if (record.type === "status") status = statusOf(record.status)
-        if (record.type === "turn") status = record.reason === "done" ? "done" : statusOf(record.reason)
+        if (record.type === "status") status = statusOf(record)
+        if (record.type === "turn")
+          status = record.reason === "done" ? "done" : statusOf({ status: record.reason })
       }
     }
     const agent: DashboardAgent = {
@@ -220,6 +239,7 @@ export async function createTraceSource(
       name: entry.name,
       task: entry.task,
       status,
+      note: entry.note,
       startedAt: stats?.start ?? entry.startedAt,
       durationMs: stats?.wallTimeMs ?? entry.durationMs,
       cost,
@@ -252,7 +272,7 @@ export async function createTraceSource(
               ]
             : []),
         ],
-        logs: records.flatMap(traceLogLines),
+        logs: records.flatMap((record) => traceLogLines(record)),
         ...(stats ? { stats } : {}),
       }),
     )

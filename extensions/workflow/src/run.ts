@@ -1,4 +1,5 @@
 import type { ChildSession, JSONSchema, SpawnGroup, SubagentResult } from "@amira/api"
+import { observeAgentEvent } from "./activity.ts"
 import { compileScript } from "./compile.ts"
 import { callHash, Journal, type JournalEntry, type RunRecord, type RunStatus, writeRun } from "./journal.ts"
 import type { WorkflowMeta } from "./meta.ts"
@@ -105,6 +106,7 @@ export class WorkflowRun {
   #worker: ScriptWorker | undefined
   #delivered = 0
   #nests = new Map<string, FlowNode>()
+  #nestPaths = new Map<string, NonNullable<JournalEntry["nestPath"]>>()
   #nestCount = 0
   #pending = new Set<Promise<void>>()
   /** True only once all in-flight calls and their journals have settled. */
@@ -276,6 +278,9 @@ export class WorkflowRun {
     const node = newFlow(compiled.meta.name, compiled.meta.phases)
     node.nest = nest
     this.#nests.set(nest, node)
+    this.#nestPaths.set(nest, [
+      { nest, ...(this.flow.current !== undefined ? { parentPhase: this.flow.current } : {}) },
+    ])
     phaseOf(this.flow, this.flow.current).items.push(node)
     this.#log("info", `workflow ${compiled.meta.name} started`)
     this.#reply(m.id, { ok: true, value: { code: compiled.code, args: m.args, name: nest } })
@@ -298,6 +303,7 @@ export class WorkflowRun {
       tokens: 0,
       cost: 0,
       ...(typeof opts.model === "string" ? { model: opts.model } : {}),
+      ...(typeof opts.role === "string" ? { role: opts.role } : {}),
     }
     phaseOf(flow, phase).items.push(node)
     let hash: string
@@ -323,6 +329,12 @@ export class WorkflowRun {
         node.status = "cached"
         node.childId = hit.sessionId
         node.model = hit.model
+        node.note = hit.note
+        node.worktreeNote = hit.worktreeNote
+        node.role = hit.role ?? node.role
+        node.events = hit.events?.map((event) => ({ ...event }))
+        node.eventsStartedAt = hit.eventsStartedAt ?? hit.startedAt ?? hit.events?.[0]?.ts
+        node.lastAction = node.events?.at(-1)?.text.replace(/\s+/g, " ").slice(0, 160)
         text = hit.text
         value = hit.value
       } else {
@@ -390,6 +402,7 @@ export class WorkflowRun {
             )
           }
           node.childId = child.id
+          node.status = child.state === "queued" ? "queued" : "working"
           node.model = `${child.model.provider}/${child.model.model}`
           // A child's usage is unknown until reported; a pre-spawn failure spends zero.
           node.tokens = undefined
@@ -399,6 +412,10 @@ export class WorkflowRun {
           const r: SubagentResult = await child.result()
           const observed = await watching
           node.status = r.status
+          node.note = r.note
+          node.currentTools = []
+          node.paused = false
+          node.idle = false
           node.tokens = r.usage.input + r.usage.output + r.usage.cacheRead + r.usage.cacheWrite
           // Host aggregates can contain only the priced part of a child's usage. Unobserved
           // work (such as commander consultations) cannot establish a complete known cost.
@@ -420,7 +437,7 @@ export class WorkflowRun {
       if (tree && !("error" in tree)) {
         try {
           const line = await finishWorktree(this.#opts.git, tree, node.status === "done")
-          node.note = line
+          node.worktreeNote = line
           this.#log(
             line.includes("NOT merged") || line.includes("kept") ? "warning" : "info",
             `${node.label}: ${line}`,
@@ -432,6 +449,9 @@ export class WorkflowRun {
         }
       }
       node.durationMs = Math.max(0, Date.now() - startedAt)
+      node.currentTools = []
+      node.paused = false
+      node.idle = false
       node.text = text
       if (error !== undefined) node.note = error
       const status = node.status === "queued" || node.status === "working" ? "aborted" : node.status
@@ -447,8 +467,13 @@ export class WorkflowRun {
         durationMs: node.durationMs,
         text,
         ...(phase !== undefined ? { phase } : {}),
-        ...(m.nest ? { nest: m.nest } : {}),
+        ...(m.nest ? { nest: m.nest, nestPath: this.#nestPaths.get(m.nest) } : {}),
         ...(error !== undefined ? { error } : {}),
+        ...(node.note !== undefined ? { note: node.note } : {}),
+        ...(node.worktreeNote !== undefined ? { worktreeNote: node.worktreeNote } : {}),
+        ...(node.role !== undefined ? { role: node.role } : {}),
+        ...(node.events?.length ? { events: node.events } : {}),
+        ...(node.eventsStartedAt !== undefined ? { eventsStartedAt: node.eventsStartedAt } : {}),
         ...(value !== undefined ? { value } : {}),
         ...(node.tokens !== undefined ? { tokens: node.tokens } : {}),
         ...(node.cost !== undefined ? { cost: node.cost } : {}),
@@ -472,6 +497,7 @@ export class WorkflowRun {
     let tokens = 0
     let unknownCost = false
     for await (const e of child.events) {
+      if (observeAgentEvent(node, e)) this.#opts.onChange()
       if (e.sessionId !== child.id) continue
       if (e.type === "session.start") {
         node.status = "working"

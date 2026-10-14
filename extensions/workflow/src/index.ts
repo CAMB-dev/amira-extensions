@@ -15,8 +15,6 @@ import type {
   UiApi,
   UserMessage,
   ViewControl,
-  ViewDefinition,
-  ViewLine,
 } from "@amira/api"
 import { compileScript } from "./compile.ts"
 import { bindWorkflowSource, createWorkflowSource } from "./dashboard.ts"
@@ -26,6 +24,7 @@ import { countsLine, formatDuration, formatTokens, runStateText, totals, treeLin
 import { loadRoles } from "./roles.ts"
 import { type ScriptWorker, WorkflowRun } from "./run.ts"
 import { findSaved, listSaved } from "./saved.ts"
+import { archivedWorkflow, createWorkflowView, type WorkflowViewData, type WorkflowViewRun } from "./view.ts"
 import type { RunGit } from "./worktree.ts"
 
 export { compileScript } from "./compile.ts"
@@ -679,65 +678,10 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       },
     }
 
-    type ViewData = { id?: string }
-    const runOf = (d: ViewData) => (d.id ? runs.get(d.id) : latest())
-    const view: ViewDefinition<ViewData> = {
-      kind: VIEW_KIND,
-      title(d) {
-        const run = runOf(d)
-        return run ? `Workflow ${run.meta.name} · ${run.id} · ${runStateText(run.status)}` : "Workflow"
-      },
-      header(d, o) {
-        const run = runOf(d)
-        if (!run) return [{ kind: "muted", text: "No workflow has run in this session." }]
-        const took = formatDuration((run.endedAt ?? o.now) - run.startedAt)
-        return [
-          { kind: "muted", text: run.meta.description },
-          ...(run.record.startedBy
-            ? [
-                {
-                  kind: "text" as const,
-                  text: `Started by: ${run.record.startedBy.label} (${run.record.startedBy.sessionId})`,
-                },
-              ]
-            : []),
-          { kind: "text", text: `${countsLine(run.flow)} · ${took}` },
-          ...(run.error ? [{ kind: "error" as const, text: run.error }] : []),
-        ]
-      },
-      render(d, o) {
-        const run = runOf(d)
-        if (!run) return []
-        const lines: ViewLine[] = treeLines(run.flow, o.now)
-        if (run.logs.length) {
-          lines.push({ kind: "text", text: "" }, { kind: "muted", text: "Log" })
-          for (const l of run.logs.slice(-50)) {
-            lines.push({
-              kind: l.level === "info" ? "text" : l.level,
-              text: `  ${l.nest ? `[${l.nest.split("#")[0]}] ` : ""}${l.text}`,
-            })
-          }
-        }
-        return lines
-      },
-      keys: [
-        {
-          key: "x",
-          label: "stop",
-          run(d, v) {
-            const run = runOf(d)
-            // A run that has ended has nothing left to stop: no question for it.
-            if (run?.status !== "running") return
-            // Stopping ends every agent of the run: the user says so first, as for a sub-agent.
-            void confirmStop(v, `Stop the workflow run ${run.meta.name}?`).then((yes) => {
-              if (yes) run.stop()
-              v.requestRender()
-            })
-          },
-        },
-      ],
-      follow: false,
-    }
+    const archived = new Map<string, WorkflowViewRun>()
+    const runOf = (data: WorkflowViewData) =>
+      data.id ? (runs.get(data.id) ?? archived.get(data.id)) : latest()
+    const view = createWorkflowView(runOf, confirmStop)
 
     const listText = (sessionOnly = false) => {
       const saved = listSaved(api.cwd, api.home)
@@ -824,11 +768,20 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         }
         if (first === "view") {
           const id = rest[0]
-          const run = id ? runs.get(id) : latest()
+          let run: WorkflowViewRun | undefined = id ? runs.get(id) : latest()
+          if (!run && id) {
+            // Load only known records, so arbitrary IDs never become filesystem paths.
+            const roots = [...new Set([runsRoot(), path.join(api.home, "workflow-runs")])]
+            for (const root of roots) {
+              const record = listRuns(root).find((record) => record.id === id)
+              if (!record) continue
+              run = archivedWorkflow(record, readJournal(path.join(root, record.id)))
+              archived.set(id, run)
+              break
+            }
+          }
           if (!run)
-            throw new Error(
-              id ? `no workflow run ${id} in this session` : "no workflow has run in this session",
-            )
+            throw new Error(id ? `no workflow run ${id} was found` : "no workflow has run in this session")
           if (!ctx.openView) {
             ctx.print(`${run.meta.name} ${run.id} · ${runStateText(run.status)} · ${countsLine(run.flow)}`)
             return

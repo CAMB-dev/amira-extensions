@@ -19,8 +19,19 @@ export interface AgentNode {
   startedAt?: number
   durationMs?: number
   childId?: string
-  /** Why it failed, or what happened to its worktree. */
+  role?: string
+  /** Early-end note or failure; a defined note (even empty) on done means stopped. */
   note?: string
+  /** Informational cleanup outcome, not an early-end note. */
+  worktreeNote?: string
+  paused?: boolean
+  idle?: boolean
+  currentTools?: { id: string; name: string }[]
+  lastAction?: string
+  /** Only this child's events, oldest first; bounded independently of the run log. */
+  events?: { ts: number; text: string }[]
+  /** Original invocation timebase for retained events on cached calls. */
+  eventsStartedAt?: number
 }
 
 export interface PhaseNode {
@@ -227,5 +238,6 @@ function agentText(a: AgentNode, now: number): string {
     if (ms !== undefined) parts.push(formatDuration(ms))
   }
   if (a.note) parts.push(a.note)
+  if (a.worktreeNote !== undefined) parts.push(a.worktreeNote)
   return parts.join(" · ")
 }

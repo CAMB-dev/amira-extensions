@@ -11,6 +11,13 @@ export interface JournalEntry {
   /** Missing on journals written before 0.1.5, which recorded only successes. */
   status?: "done" | "error" | "aborted" | "cached"
   error?: string
+  /** Early-end note, distinct from informational worktree cleanup. */
+  note?: string
+  worktreeNote?: string
+  role?: string
+  events?: { ts: number; text: string }[]
+  /** Original invocation timebase for retained events on cached calls. */
+  eventsStartedAt?: number
   startedAt?: number
   /** Script call order (journal lines retain completion order). */
   call?: number
@@ -19,6 +26,8 @@ export interface JournalEntry {
   model?: string
   phase?: string
   nest?: string
+  /** Root-to-leaf invocation ancestry; absent in older journals. Missing parentPhase means unphased. */
+  nestPath?: { nest: string; parentPhase?: string }[]
   /** The agent's final answer. */
   text: string
   /** With a schema: the value it returned. */

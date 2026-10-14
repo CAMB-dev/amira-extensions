@@ -17,7 +17,7 @@ function structure(line: string): string {
   if (line.includes("≡")) return "details handle"
   if (/Summary.*Diff.*Logs.*Actions/.test(line)) return "tabs"
   if (/[├└]──▶/.test(line)) return "card head"
-  if (/\d\d:\d\d:\d\d|--:--:--/.test(line) && /[○◉]/.test(line)) return "phase"
+  if (/\d\d:\d\d:\d\d|--:--:--/.test(line)) return "phase"
   if (line.includes("╭")) return "frame top"
   if (line.includes("╰")) return "frame bottom"
   if (line.includes("─")) return "rule"
@@ -42,8 +42,8 @@ describe.skipIf(!tui || !kit)("approved prototype fidelity", () => {
         .render(80, { theme: kit.monoTheme, color: false, rows: 24 })
         .map(kit.stripAnsi)
       expect(rows).toHaveLength(24)
-      expect(rows.join("\n")).toContain("├──▶ ● worker-1")
-      expect(rows.join("\n")).not.toContain("▶ ✓ planner")
+      expect(rows.join("\n")).toContain("├──▶ ⠋ working worker-1")
+      expect(rows.join("\n")).not.toContain("▶ ✓ done    planner")
       expect(rows.join("\n")).toContain("[Summary]")
       for (const row of rows) expect(kit.visibleWidth(row)).toBeLessThanOrEqual(80)
       expect(rows.map((row) => row.trimEnd())).toMatchSnapshot()
@@ -87,7 +87,7 @@ describe.skipIf(!tui || !kit)("approved prototype fidelity", () => {
       expect(rows[36]).toContain("Changed files")
       expect(rows[48]).toContain("╭")
       expect(rows[50]).toContain("╰")
-      expect(rows[51]).toContain("Esc close")
+      expect(rows[51]).toMatch(/esc close/i)
       for (const row of rows) expect(kit.visibleWidth(row)).toBeLessThanOrEqual(180)
     } finally {
       viewer.dispose()

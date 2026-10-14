@@ -534,3 +534,34 @@ test("streaming, logs, paths and active detail caches are bounded", () => {
   expect(listed.at(-1)?.files).toEqual([{ path: "src/result.ts" }])
   s.source.dispose()
 })
+
+test("live status mapping distinguishes all outcomes and defined early-end notes", () => {
+  const listed = [
+    agent("queued", { status: "queued" }),
+    agent("working"),
+    agent("idle", { status: "idle" }),
+    agent("paused", { status: "paused" }),
+    agent("done", { status: "done" }),
+    agent("failed", { status: "error" }),
+    agent("stopped", { status: "aborted" }),
+    agent("early", { status: "done", note: "Ended early" }),
+    agent("empty-note", { status: "done", note: "" }),
+  ]
+  const fixture = setup(listed)
+  const rendered = agentsOf(fixture.source.snapshot())
+  expect(rendered.map((agent) => agent.status)).toEqual([
+    "queued",
+    "running",
+    "idle",
+    "paused",
+    "done",
+    "failed",
+    "stopped",
+    "stopped",
+    "stopped",
+  ])
+  expect(rendered.at(-1)?.note).toBe("")
+  expect(rendered.at(-1)?.progress).toBeUndefined()
+  expect(rendered[4]?.progress).toBe(1)
+  fixture.source.dispose()
+})

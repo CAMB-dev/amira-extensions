@@ -3,8 +3,10 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os"
 import path from "node:path"
 import type { SpawnOptions } from "@amira/api"
+import { agentsOf } from "../src/progress.ts"
 import { BUILTIN_ROLES } from "../src/roles.ts"
 import { WorkflowRun } from "../src/run.ts"
+import { agentStatusState } from "../src/status.ts"
 import { createWorktree, finishWorktree, type RunGit, type Worktree } from "../src/worktree.ts"
 import { type Answer, fakeGroup } from "./fakes.ts"
 
@@ -266,6 +268,11 @@ describe.skipIf(!gitBin)("with git", () => {
     await run.done
     expect(run.error).toBeUndefined()
     expect(run.result).toEqual(["wrote it", "wrote it"])
+    for (const node of agentsOf(run.flow)) {
+      expect(node.note).toBeUndefined()
+      expect(node.worktreeNote).toMatch(/^worktree merged:/)
+      expect(agentStatusState(node)).toBe("done")
+    }
     for (const cwd of seen)
       expect(path.relative(path.join(home, "worktrees"), cwd).startsWith("..")).toBe(false)
     expect(read(path.join(root, "x.txt"))).toBe("x\n")

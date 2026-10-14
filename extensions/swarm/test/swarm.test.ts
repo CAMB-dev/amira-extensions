@@ -1,4 +1,4 @@
-import { expect, setDefaultTimeout, test } from "bun:test"
+import { expect, setDefaultTimeout, spyOn, test } from "bun:test"
 import { createAi, createMockDialect, type MockReply, type ModelRequest } from "@amira/ai"
 import {
   type AnyEvent,
@@ -1053,7 +1053,7 @@ test("@all from the input box reaches every member; the timeline keeps it once",
   const messages = past!.timeline.filter((e) => e.kind === "message")
   expect(messages).toHaveLength(1)
   expect(messages[0]).toMatchObject({ from: "user", to: "all", text: "check in" })
-  expect(timelineLine(messages[0]!).text).toMatch(/✉️ you → all: check in$/)
+  expect(timelineLine(messages[0]!).text).toMatch(/you → all: check in$/)
   // Once it ended, @all goes to the model again.
   expect(host.inputs.claim("@all again")).toBeUndefined()
 })
@@ -1140,8 +1140,9 @@ test("explicitly stopping a queued member stays stopped live and after reconstru
   expect(report.members[1]).toMatchObject({ status: "done", turns: 0, stopReason: "stopped by the user" })
   const restored = swarmsFromRecords(JSON.parse(JSON.stringify(records)))
   const historical = createSwarmSource("workspace", () => restored).source
+  // The idle member also has the host's defined early-end note when the group closes.
   expect(historical.snapshot().phases[0]!.groups[0]!.agents.map((agent) => agent.status)).toEqual([
-    "done",
+    "stopped",
     "stopped",
   ])
   expect(swarm.member("a")!.stopReason).toBeUndefined()
@@ -1306,5 +1307,176 @@ test("unobserved commander consultations update live tokens but never invent a c
       expect(reads).toBeGreaterThan(0)
       expect(liveTokens).toContain(10)
     }
+  }
+})
+
+test("live tool activity records only the member's own events, not descendants, and round-trips", async () => {
+  let release!: () => void
+  const waiting = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  let descendantStarted = false
+  const own: ToolDefinition = {
+    name: "own_work",
+    description: "Run nested work",
+    parameters: { type: "object", properties: {} },
+    async execute(_args, ctx) {
+      await ctx.session!.spawn!({ prompt: "nested work" }).result()
+      return textResult("own work finished")
+    },
+  }
+  const descendant: ToolDefinition = {
+    name: "descendant_work",
+    description: "Nested tool",
+    parameters: { type: "object", properties: {} },
+    async execute() {
+      descendantStarted = true
+      await waiting
+      return textResult("nested work finished")
+    },
+  }
+  const { swarm, records } = direct(
+    (req) => {
+      if (who(req) === "b" || lastIsResult(req)) return { text: "done" }
+      return { toolCalls: [{ name: who(req) === "a" ? "own_work" : "descendant_work", args: {} }] }
+    },
+    pair,
+    {},
+    {},
+    { tools: [own, descendant] },
+  )
+  try {
+    await until(() => descendantStarted)
+    const active = swarm.member("a")!
+    expect(active.currentTools?.map((tool) => tool.name)).toEqual(["own_work"])
+    expect(active.events?.some((e) => e.text.includes("descendant_work"))).toBe(false)
+    expect(active.events?.some((e) => e.text === "Started own_work")).toBe(true)
+    release()
+    await swarm.done
+    expect(swarm.member("a")!.currentTools).toBeUndefined()
+    expect(swarm.member("a")!.events?.some((e) => e.text === "Finished own_work")).toBe(true)
+    const restored = swarmsFromRecords(JSON.parse(JSON.stringify(records)))[0]!
+    expect(restored.members[0]!.events).toEqual(swarm.member("a")!.events)
+    expect(restored.members[0]!.lastAction).toBe(swarm.member("a")!.lastAction)
+  } finally {
+    release()
+    await swarm.stop("test cleanup")
+  }
+})
+
+test("own event history is bounded to forty stable, chronological entries", async () => {
+  const ping: ToolDefinition = {
+    name: "own_ping",
+    description: "Record own work",
+    parameters: { type: "object", properties: {} },
+    execute: async () => textResult("ping"),
+  }
+  const { swarm } = direct(
+    (req) =>
+      who(req) === "b" || lastIsResult(req)
+        ? { text: "done" }
+        : { toolCalls: Array.from({ length: 25 }, () => ({ name: "own_ping", args: {} })) },
+    pair,
+    {},
+    {},
+    { tools: [ping] },
+  )
+  await swarm.done
+  const events = swarm.member("a")!.events!
+  expect(events).toHaveLength(40)
+  expect(events[0]!.seq).toBeGreaterThan(1)
+  expect(new Set(events.map((e) => e.seq)).size).toBe(40)
+  expect(events.map((e) => e.seq)).toEqual([...events.map((e) => e.seq)].sort((a, b) => a - b))
+  expect(events.at(-1)!.text).toBe("Finished turn")
+})
+
+test("idle member keeps its 1000ms elapsed through pause and resume", async () => {
+  let now = 1000
+  const clock = spyOn(Date, "now").mockImplementation(() => now)
+  let release = () => {}
+  const held = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const wait: ToolDefinition = {
+    name: "hold_work",
+    description: "Keep the other member working",
+    parameters: { type: "object" },
+    execute: async () => {
+      await held
+      return textResult("done")
+    },
+  }
+  const { swarm } = direct(
+    (req) => {
+      if (who(req) === "a") {
+        now = 2000
+        return { text: "done" }
+      }
+      return lastIsResult(req) ? { text: "done" } : { toolCalls: [{ name: "hold_work", args: {} }] }
+    },
+    pair,
+    {},
+    {},
+    { tools: [wait] },
+  )
+  try {
+    await until(() => swarm.member("a")?.status === "idle" && swarm.member("b")?.status === "working")
+    expect(swarm.member("a")!.durationMs).toBe(1000)
+    now = 11000
+    expect(swarm.pause("a")).toBeUndefined()
+    expect(swarm.member("a")!.status).toBe("paused")
+    expect(swarm.member("a")!.durationMs).toBe(1000)
+    now = 21000
+    expect(swarm.resume("a")).toBeUndefined()
+    expect(swarm.member("a")!.status).toBe("idle")
+    expect(swarm.member("a")!.durationMs).toBe(1000)
+  } finally {
+    clock.mockRestore()
+    release()
+    await swarm.stop("test cleanup")
+  }
+})
+
+test("idle member elapsed stays frozen while another member is working", async () => {
+  let release = () => {}
+  const held = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const wait: ToolDefinition = {
+    name: "hold_work",
+    description: "Keep the other member working",
+    parameters: { type: "object" },
+    execute: async () => {
+      await held
+      return textResult("done")
+    },
+  }
+  const { swarm } = direct(
+    (req) =>
+      who(req) === "a" || lastIsResult(req)
+        ? { text: "done" }
+        : { toolCalls: [{ name: "hold_work", args: {} }] },
+    pair,
+    {},
+    {},
+    { tools: [wait] },
+  )
+  try {
+    await until(
+      () =>
+        swarm.member("a")?.status === "idle" && swarm.member("a")?.events?.at(-1)?.text === "Finished turn",
+    )
+    const before = swarm.member("a")!.durationMs
+    expect(before).toBeDefined()
+    await Bun.sleep(25)
+    expect(swarm.member("b")!.status).toBe("working")
+    expect(swarm.member("a")!.durationMs).toBe(before)
+    swarm.pause("b")
+    const paused = swarm.member("b")!.durationMs
+    await Bun.sleep(25)
+    expect(swarm.member("b")!.durationMs).toBe(paused)
+  } finally {
+    release()
+    await swarm.stop("test cleanup")
   }
 })

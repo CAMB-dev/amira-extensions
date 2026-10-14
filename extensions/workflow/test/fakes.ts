@@ -17,6 +17,8 @@ export type Answer = {
   tokens?: number
   cost?: number
   messageUsages?: Usage[]
+  note?: string
+  events?: AnyEvent[]
 }
 
 export interface FakeGroup extends SpawnGroup {
@@ -87,6 +89,7 @@ export function fakeGroup(
           } catch (err) {
             a = { error: String(err) }
           }
+          for (const event of a.events ?? []) push(event)
           const tokens = a.tokens ?? 100
           const messages = a.messageUsages ?? [
             { input: tokens, output: 0, cacheRead: 0, cacheWrite: 0, cost: a.cost },
@@ -110,6 +113,7 @@ export function fakeGroup(
                   usage,
                   status: "done",
                   text: a.text ?? JSON.stringify(a.value),
+                  ...(a.note !== undefined ? { note: a.note } : {}),
                   ...(a.value !== undefined ? { value: a.value } : {}),
                 },
           )

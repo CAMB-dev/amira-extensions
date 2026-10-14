@@ -14,6 +14,7 @@ import type {
 import { summarizeTrace } from "@amira/api"
 import { clock, phaseInfo, summary, timeline } from "./layout.ts"
 import { agentsOf, type DashboardAgent, type DashboardSource, type DashboardTab } from "./source.ts"
+import { displayState } from "./status.ts"
 import { ownCost, traceLogLines } from "./trace.ts"
 
 export const VIEW_KIND = "dashboard"
@@ -88,7 +89,8 @@ function details(data: DashboardViewData, ctx: UiContext, agent?: DashboardAgent
       [line("Select an agent in the timeline, then press Enter to open its page.")],
       "selection-hint",
     )
-  const detail = data.source.details(agent.id)
+  const id = typeof ctx.page?.data === "string" ? pageWidget(ctx.page.data, "detail") : "detail"
+  const detail = data.source.details(agent.id, ctx.state.activeTabs[id] === "logs" ? ctx : undefined)
   const diff: ViewLine[] = agent.files.length
     ? agent.files.flatMap((file) => [
         { kind: "accent" as const, text: file.path },
@@ -104,7 +106,7 @@ function details(data: DashboardViewData, ctx: UiContext, agent?: DashboardAgent
     : [line("No diff available.")]
   const requested =
     data.pendingAction === "pause-resume"
-      ? agent.status === "paused"
+      ? displayState(agent) === "paused"
         ? "resume"
         : "pause"
       : data.pendingAction
@@ -116,7 +118,11 @@ function details(data: DashboardViewData, ctx: UiContext, agent?: DashboardAgent
           ["open-trace", "Open trace", ""],
         ]
       : []),
-    [agent.status === "paused" ? "resume" : "pause", agent.status === "paused" ? "Resume" : "Pause", "p"],
+    [
+      displayState(agent) === "paused" ? "resume" : "pause",
+      displayState(agent) === "paused" ? "Resume" : "Pause",
+      "p",
+    ],
     ["request-changes", "Request changes", "r"],
     ["stop", "Stop agent", "x"],
   ].filter(([key]) => !requested || requested === key)
@@ -124,7 +130,7 @@ function details(data: DashboardViewData, ctx: UiContext, agent?: DashboardAgent
     {
       key: "summary",
       label: "Summary",
-      body: summary(data.source, agent, ctx),
+      body: text([]),
     },
     { key: "diff", label: "Diff", body: text(diff, "diff") },
     {
@@ -192,8 +198,8 @@ function details(data: DashboardViewData, ctx: UiContext, agent?: DashboardAgent
       ),
     })
   }
-  const id = typeof ctx.page?.data === "string" ? pageWidget(ctx.page.data, "detail") : "detail"
   const active = tabs.find((tab) => tab.key === ctx.state.activeTabs[id]) ?? tabs[0]!
+  if (active.key === "summary") active.body = summary(data.source, agent, ctx)
   return {
     type: "column",
     children: [
@@ -332,7 +338,7 @@ interface SessionPage {
   kind: "session"
   source: DashboardSource
   rootId: string
-  body: UiNode
+  body: UiNode | ((ctx: UiContext) => UiNode)
 }
 
 function transcriptLines(messages: readonly Message[] | undefined): ViewLine[] {
@@ -401,7 +407,9 @@ async function openSessionPage(
               key: "logs",
               label: "Logs",
               body: text(
-                records.length ? records.flatMap(traceLogLines) : [line("No trace records available.")],
+                records.length
+                  ? records.flatMap((record) => traceLogLines(record))
+                  : [line("No trace records available.")],
                 "logs",
               ),
             },
@@ -565,7 +573,7 @@ function onEvent(event: UiEvent, data: DashboardViewData, host: UiControl) {
   } else {
     const actions: Record<string, string> = {
       o: "open-diff",
-      p: agent?.status === "paused" ? "resume" : "pause",
+      p: agent && displayState(agent) === "paused" ? "resume" : "pause",
       r: "request-changes",
       x: "stop",
     }
@@ -591,7 +599,7 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
     const active =
       phases.find((phase) =>
         phaseInfo(phase, Date.now()).agents.some(
-          (agent) => agent.status === "running" || agent.status === "paused",
+          (agent) => displayState(agent) === "working" || displayState(agent) === "paused",
         ),
       ) ?? phases[0]
     const first = active?.groups.flatMap((group) => group.agents)[0]
@@ -617,7 +625,9 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
     const sessionPage = ctx.page?.data as SessionPage | undefined
     if (sessionPage?.kind === "session") {
       return sessionPage.source === data.source && sessionPage.rootId === data.session?.info().id
-        ? sessionPage.body
+        ? typeof sessionPage.body === "function"
+          ? sessionPage.body(ctx)
+          : sessionPage.body
         : text(
             [line("Dashboard source or session changed. Press Esc to return.")],
             "session-page:unavailable",
@@ -633,10 +643,10 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
         : undefined
     const phase =
       snapshot.phases.find((item) =>
-        item.groups.some((group) => group.agents.some((item) => item.status === "running")),
+        item.groups.some((group) => group.agents.some((item) => displayState(item) === "working")),
       ) ?? snapshot.phases[0]
     const narrow = ctx.width < 110
-    const totals = `phase: ${phase?.name ?? "Agents"}  │  running: ${agents.filter((item) => item.status === "running").length}/${agents.length}  │  cost: ${cost === undefined ? "unknown" : `$${cost.toFixed(4)}`}`
+    const totals = `phase: ${phase?.name ?? "Agents"}  │  running: ${agents.filter((item) => displayState(item) === "working").length}/${agents.length}  │  cost: ${cost === undefined ? "unknown" : `$${cost.toFixed(4)}`}`
     const top: UiNode = {
       type: "bar",
       left: [

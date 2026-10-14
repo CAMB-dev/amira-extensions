@@ -1,6 +1,6 @@
 # Dashboard (experimental)
 
-The default dashboard extension for Amira (D103/D104/D105). It lives in **amira-extensions**, not Amira core. Version 0.2.2 targets API **0.1.24**, using host-owned pages, view lifecycle hooks and sub-agent controls. The declarative widgets and source contract remain experimental.
+The default dashboard extension for Amira (D103/D104/D105). It lives in **amira-extensions**, not Amira core. Version 0.3.0 targets API **0.1.48**, using host-owned pages, view lifecycle hooks and sub-agent controls. The declarative widgets and source contract remain experimental.
 
 Runtime code imports only `@amira/api` and local modules. The host owns terminal rendering, themes, clipping, focus and scrolling. Nothing in this extension reads private core state or runs shell commands to infer an agent's changes.
 
@@ -19,6 +19,8 @@ The command offers source-ID completion. Trace replay reads completed records on
 
 ### Screenshots as text
 
+Status badges use Amira’s shared queued, working, idle, paused, done, failed and stopped vocabulary. The host owns theme glyphs, ASCII alternatives and working-spinner timing; compact phase marks use the same badge symbol. A defined early-end note, even empty, displays as stopped rather than done. Hosts without the badge helper get static, ASCII-safe shared badges. The layout, navigation and actions are unchanged.
+
 Real output of the dashboard rendered through Amira's TUI `ExtensionViewer` with fake sub-agents
 (`test/tui-render.test.ts`), plain text without colors, **on the first frame without input**.
 Phases and cards start expanded, with the first active phase’s agent selected. Each phase has one shared card frame, without duplicate group or agent tree rows. Wide view, 180×52:
@@ -28,16 +30,16 @@ Phases and cards start expanded, with the first active phase’s agent selected.
 ```text
  amira  │  workspace: acme/checkout  │  phase: Implementation  │  running: 1/3  │  cost: unknown                                                             ? shortcuts  │  q quit
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-» 09:00:30  ● ◉ Implementation… Validate payment amounts and add regression coverage for partial refunds.   ▏running 90s▕                                             checkout-v2  ▾
+› 09:00:30  ⠋ ⠋ Implementation… Validate payment amounts and add regression coverage for partial refunds.   ▏⠋ working 90s▕                                           checkout-v2  ▾
               │  ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-❯             ├──▶ ● Payment val…  Validate payment amou…  [TypeScript]    ━━━━━━━━──────  60%                      2 files changed ▸  │  Open diff   Pause   Request changes   ⋮ │
+›             ├──▶ ⠋ working Payment val…  Validate payment amou…  ▏TypeScript▕    ━━━━━━━━──────  60%              2 files changed ▸  │  Open diff   Pause   Request changes   ⋮ │
               │  │   Amount validation is implemented; regression tests are in progress.                                                                                          │
               │  │                                                                                                                                                                │
               │  │   Changed files                                                                                                                                                │
               │  │   src/payments.ts                                                                                                                                              │
               │  │   test/payments.test.ts                                                                                                                                        │
               │  │ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── │
-              ├──▶ ‖ Receipt tem…  Check the receipt tem…                  ──────────────  —                                          1 file changed ▸  │  Open diff   Resume   ⋮ │
+              ├──▶ ‖ paused  Receipt tem…  Check the receipt tem…                  ──────────────  —                                  1 file changed ▸  │  Open diff   Resume   ⋮ │
               │  │   Waiting for approval.                                                                                                                                        │
               │  │                                                                                                                                                                │
               │  │   Changed files                                                                                                                                                │
@@ -46,9 +48,9 @@ Phases and cards start expanded, with the first active phase’s agent selected.
               │  │ 2 agents · 1 running                                                                            e expand all · o diff · p pause/resume · r changes · a actions │
               │  ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
               │ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  09:00:00  ✓ ○ Review          1 agent · 45s                                                                                                                              review  ▾
+  09:00:00  ✓ ✓ Review          1 agent · 45s                                                                                                                              review  ▾
               │  ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-              └──▶ ✓ Refund audit  Review authorization …                  ━━━━━━━━━━━━━━  100%                                                      no changes  │  Open diff   ⋮ │
+              └──▶ ✓ done    Refund audit  Review authorization …                  ━━━━━━━━━━━━━━  100%                                              no changes  │  Open diff   ⋮ │
               │  │   No authorization issues found.                                                                                                                               │
               │  │   done in 45s                                                                                                                                                  │
               │  │                                                                                                                                                                │
@@ -65,7 +67,7 @@ Phases and cards start expanded, with the first active phase’s agent selected.
   Agent    Payment validation    │   What this agent is doing                                                                    │   Changed files  2 files
   Task     Validate payment amou…│   Amount validation is implemented; regression tests are in progress.                         │   src/payments.ts
   Kind     TypeScript            │                                                                                               │   test/payments.test.ts
-  Status   running               │                                                                                               │
+  Status   ⠋ working             │                                                                                               │
   Runtime  90s                   │                                                                                               │
   Started  09:00:30              │                                                                                               │
   Tokens   0.0k · $0.1250        │                                                                                               │
@@ -77,7 +79,7 @@ Phases and cards start expanded, with the first active phase’s agent selected.
 ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
 │ > Ask Amira or enter a command after closing this view…                                                                                      Hint only · close this view to send │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
-Tab focus · arrows navigate · Enter open/send · PgUp PgDn scroll · Esc close
+  tab focus · arrows navigate · enter open/send · pgup pgdn scroll · esc close
 ```
 
 <!-- /render:180x52 -->
@@ -92,27 +94,27 @@ At 80×24 only the selected phase’s box is shown, with shorter card fields and
  amira  │  workspace: acme/checkout                              ? help · q quit
 phase: Implementation  │  running: 1/3  │  cost: unknown
 ────────────────────────────────────────────────────────────────────────────────
-» 09:00:30  ● ◉ Implementatio… Validate payment amounts and add regression co… ▾
+› 09:00:30  ⠋ ⠋ Implementatio… Validate payment amounts and add regression co… ▾
               │  ╭────────────────────────────────────────────────────────────╮
-❯             ├──▶ ● Payment v… ━━━━──  60%                            o diff │
+›             ├──▶ ⠋ working Payment v… ━━━━──  60%                    o diff │
               │  │   Amount validation is implemented; regression tests are … │
               │  │   Changed files                                            │
               │  │   src/payments.ts                                          │
               │  │   +1 more · o open diff                                    │
               │  │ ────────────────────────────────────────────────────────── │
-              ├──▶ ‖ Receipt t… ──────  —                              o diff │
+              ├──▶ ‖ paused  Receipt t… ──────  —                      o diff │
               │  │   Waiting for approval.                                    │
               │  │   Changed files                                            │
 ────────────────────────────────────── ≡ ───────────────────────────────────────
   [Summary]  Diff  Logs  Actions  Stats
 ────────────────────────────────────────────────────────────────────────────────
-  Payment validation · running · 90s
+  Payment validation · ⠋ working · 90s
   Validate payment amounts and add regression coverage for partial refunds.
  1–4 tabs · o diff · a actions · ? shortcuts
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │ > Ask Amira after closing this view                                          │
 ╰──────────────────────────────────────────────────────────────────────────────╯
-Tab focus · arrows navigate · Enter open/send · PgUp PgDn scroll · Esc close
+  tab focus · arrows navigate · enter open/send · pgup pgdn scroll · esc close
 ```
 
 <!-- /render:80x24 -->
@@ -175,7 +177,7 @@ interface DashboardSource {
   id: string
   label: string
   snapshot(): DashboardSnapshot
-  details(agentId: string): DashboardDetails | undefined
+  details(agentId: string, opts?: Pick<ViewRenderOptions, "statusBadge">): DashboardDetails | undefined
   subscribe?(changed: () => void): () => void
   act?(
     agentId: string,
@@ -189,10 +191,11 @@ interface DashboardSource {
 
 - `DashboardSnapshot`: `{ workspace, phases, note?, warning? }`. Usage caveats (`note`) stay in Stats; an empty source uses its note as an explanation. Operational warnings (`warning`) appear in Summary’s Notes, including at narrow widths.
 - A phase: `{ id, name, groups }`. A group: `{ id, name, agents }`. Both may report `ref`, `status`, `startedAt`, `durationMs`, `description`, and `stepCount`. The timeline flattens a phase’s groups into one card box. Missing phase metadata falls back to reported group/agent data; unknown start times remain `--:--:--`, and step counts are never inferred from tool calls.
-- An agent: `{ id, name, task, status, files, actions, sessionId?, startedAt?, durationMs?, cost?, language?, progress? }`.
+- An agent: `{ id, name, task, status, files, actions, note?, paused?, sessionId?, startedAt?, durationMs?, cost?, language?, progress? }`.
 - `sessionId?: string` is the actual child session ID, not the dashboard agent ID. When supplied, **Actions → Open transcript / Open trace** opens a host-owned page using `SessionControl.subagentMessages(sessionId)` or `SessionControl.trace(sessionId)`. Transcript shows recorded messages; trace opens the same **Stats** view used by replay, plus recorded logs. These reads remain host-authorized; missing or unrelated sessions show unavailable data. Esc returns to the agent page with its state intact. Sources without `sessionId` keep their existing actions.
-- Status: `queued | running | idle | paused | done | failed | stopped`.
+- Status: `queued | running | idle | paused | done | failed | stopped`. `running` displays as working; `paused?: boolean` preserves an active pause, and `done` with a defined `note` displays as stopped.
 - A file: `{ path, diff?: ViewLine[], added?: number, removed?: number }`; a path alone must not imply diff content or line counts.
+- `details` optionally receives the host’s `statusBadge` helper when Logs is visible, so status-bearing log rows can use the current theme. Sources that ignore it are unchanged.
 - Details: `{ summary: ViewLine[], logs: ViewLine[], stats?: TraceSummary, tabs?: DashboardTab[], notes?: ViewLine[], steps?: { text: string; status: "done" | "running" | "queued" }[] }`. Steps and notes are source-reported, not synthesized.
 - A custom tab: `{ key: string; label: string; render(): UiNode | ViewLine[] }`. Tabs append after the built-ins; use the focused tab bar's arrows (or arrows from its text body) to reach them. Keys must be nonempty, stable and unique. `summary`, `diff`, `logs`, `actions` and `stats` are reserved; duplicate/reserved keys are ignored. `render()` follows the same synchronous, side-effect-free rules as other source reads. Line arrays become scrollable text; widget trees retain host-owned focus, selection and scroll. IDs must be unique within each tab; the dashboard namespaces them across tabs and agent pages. The contract supplies content only, not custom event handlers. Omitting `tabs` preserves the original page.
 - Cost is USD for that agent's **own** usage, not its descendants. Omit unknown cost.
@@ -209,10 +212,10 @@ From this folder, with Bun and a local Amira checkout whose dependencies are ins
 
 ```sh
 bun install
-bun scripts/link-amira.ts D:/dev/Amira
+bun run link-amira D:/dev/Amira
 bun test
 bun run typecheck
-bunx --package @biomejs/biome biome check .
+bun run lint
 ```
 
 The helper links `@amira/api` and its transitive `@amira/ai` dependency, plus `@amira/tui` and `@amira/tui-kit` for the render test when the checkout has them. Extension runtime imports remain API-only; the linking script uses Node filesystem utilities, and tests use `bun:test`. Tests use fake sessions and event buses, no models, network requests, process killing or changes to core. Snapshot updates: `bun test --update-snapshots` after inspecting intentional widget changes. Regenerate the README's first-frame captures with `UPDATE_DASHBOARD_README=1 bun test test/tui-render.test.ts` (PowerShell: set `$env:UPDATE_DASHBOARD_README = "1"` before running the test).
@@ -220,3 +223,8 @@ The helper links `@amira/api` and its transitive `@amira/ai` dependency, plus `@
 The frozen workflow in `test/prototype-fixture.ts` maps User request / Plan / Code Agent ×3 / Integrate / Check / Complete onto the public source contract. `test/prototype-render.test.ts` compares the 180×52 timeline against the approved variant D **line by line**, with full rendered snapshots at both sizes. It uses the prototype’s collapsed-phase state for the wide comparison. Set `DASHBOARD_COMPARE=path/to/comparison.txt` when running that test to write numbered dashboard/target lines side by side. The checked-in target is copied from the approved plain-text artifact; native widget selection markers/chips and unknown timestamps intentionally differ.
 
 License: Apache-2.0.
+
+Run bun install in this extension to install @types/bun, TypeScript and Biome from the
+declared devDependencies. The linker touches only @amira/* package junctions; it never
+creates or replaces @types or other development dependencies. The documented commands
+require no extra PATH or typeRoots flags.

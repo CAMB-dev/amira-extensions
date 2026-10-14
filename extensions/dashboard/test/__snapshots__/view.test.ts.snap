@@ -95,13 +95,17 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
                     "lead": [
                       {
                         "kind": "muted",
-                        "text": "09:00:30  ●",
+                        "text": "09:00:30  ",
+                      },
+                      {
+                        "kind": "accent",
+                        "text": "*",
                       },
                     ],
                     "node": [
                       {
                         "kind": "accent",
-                        "text": "◉",
+                        "text": "*",
                       },
                     ],
                     "rail": true,
@@ -115,8 +119,16 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
                         "text": "Validate payment amounts and add regression coverage for partial refunds.",
                       },
                       {
+                        "kind": "text",
+                        "text": "   ▏",
+                      },
+                      {
                         "kind": "accent",
-                        "text": "   ▏running 90s▕",
+                        "text": "* working",
+                      },
+                      {
+                        "kind": "accent",
+                        "text": " 90s▕",
                       },
                     ],
                     "underline": false,
@@ -532,7 +544,11 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
                       },
                       {
                         "kind": "accent",
-                        "text": "● ",
+                        "text": "* working",
+                      },
+                      {
+                        "kind": "text",
+                        "text": " ",
                       },
                       {
                         "kind": "accent",
@@ -976,8 +992,12 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
                         "text": "─▶ ",
                       },
                       {
-                        "kind": "muted",
-                        "text": "‖ ",
+                        "kind": "warning",
+                        "text": "| paused ",
+                      },
+                      {
+                        "kind": "text",
+                        "text": " ",
                       },
                       {
                         "kind": "accent",
@@ -1025,13 +1045,17 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
                     "lead": [
                       {
                         "kind": "muted",
-                        "text": "09:00:00  ✓",
+                        "text": "09:00:00  ",
+                      },
+                      {
+                        "kind": "success",
+                        "text": "v",
                       },
                     ],
                     "node": [
                       {
                         "kind": "success",
-                        "text": "○",
+                        "text": "v",
                       },
                     ],
                     "rail": true,
@@ -1342,7 +1366,11 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
                       },
                       {
                         "kind": "success",
-                        "text": "✓ ",
+                        "text": "v done   ",
+                      },
+                      {
+                        "kind": "text",
+                        "text": " ",
                       },
                       {
                         "kind": "accent",
@@ -1549,7 +1577,11 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
                                 "parts": [
                                   {
                                     "kind": "text",
-                                    "text": "Status   running",
+                                    "text": "Status   ",
+                                  },
+                                  {
+                                    "kind": "accent",
+                                    "text": "* working",
                                   },
                                 ],
                               },
@@ -1887,7 +1919,11 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 agent 
                                 "parts": [
                                   {
                                     "kind": "text",
-                                    "text": "Status   running",
+                                    "text": "Status   ",
+                                  },
+                                  {
+                                    "kind": "accent",
+                                    "text": "* working",
                                   },
                                 ],
                               },
@@ -2438,13 +2474,17 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 timelin
               "lead": [
                 {
                   "kind": "muted",
-                  "text": "09:00:30  ●",
+                  "text": "09:00:30  ",
+                },
+                {
+                  "kind": "accent",
+                  "text": "*",
                 },
               ],
               "node": [
                 {
                   "kind": "accent",
-                  "text": "◉",
+                  "text": "*",
                 },
               ],
               "rail": true,
@@ -2458,8 +2498,16 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 timelin
                   "text": "Validate payment amounts and add regression coverage for partial refunds.",
                 },
                 {
+                  "kind": "text",
+                  "text": "   ▏",
+                },
+                {
                   "kind": "accent",
-                  "text": "   ▏running 90s▕",
+                  "text": "* working",
+                },
+                {
+                  "kind": "accent",
+                  "text": " 90s▕",
                 },
               ],
               "underline": false,
@@ -2792,7 +2840,11 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 timelin
                 },
                 {
                   "kind": "accent",
-                  "text": "● ",
+                  "text": "* working",
+                },
+                {
+                  "kind": "text",
+                  "text": " ",
                 },
                 {
                   "kind": "accent",
@@ -3100,8 +3152,12 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 timelin
                   "text": "─▶ ",
                 },
                 {
-                  "kind": "muted",
-                  "text": "‖ ",
+                  "kind": "warning",
+                  "text": "| paused ",
+                },
+                {
+                  "kind": "text",
+                  "text": " ",
                 },
                 {
                   "kind": "accent",
@@ -3130,13 +3186,17 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 timelin
               "lead": [
                 {
                   "kind": "muted",
-                  "text": "09:00:00  ✓",
+                  "text": "09:00:00  ",
+                },
+                {
+                  "kind": "success",
+                  "text": "v",
                 },
               ],
               "node": [
                 {
                   "kind": "success",
-                  "text": "○",
+                  "text": "v",
                 },
               ],
               "rail": true,
@@ -3247,7 +3307,15 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 timelin
                           "parts": [
                             {
                               "kind": "accent",
-                              "text": "Payment validation · running · 90s",
+                              "text": "Payment validation · ",
+                            },
+                            {
+                              "kind": "accent",
+                              "text": "* working",
+                            },
+                            {
+                              "kind": "accent",
+                              "text": " · 90s",
                             },
                           ],
                         },
@@ -3277,7 +3345,11 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 timelin
                           "parts": [
                             {
                               "kind": "text",
-                              "text": "Status   running",
+                              "text": "Status   ",
+                            },
+                            {
+                              "kind": "accent",
+                              "text": "* working",
                             },
                           ],
                         },
@@ -3538,7 +3610,15 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 agent w
                           "parts": [
                             {
                               "kind": "accent",
-                              "text": "Payment validation · running · 90s",
+                              "text": "Payment validation · ",
+                            },
+                            {
+                              "kind": "accent",
+                              "text": "* working",
+                            },
+                            {
+                              "kind": "accent",
+                              "text": " · 90s",
                             },
                           ],
                         },
@@ -3568,7 +3648,11 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 agent w
                           "parts": [
                             {
                               "kind": "text",
-                              "text": "Status   running",
+                              "text": "Status   ",
+                            },
+                            {
+                              "kind": "accent",
+                              "text": "* working",
                             },
                           ],
                         },

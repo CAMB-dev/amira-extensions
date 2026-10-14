@@ -92,6 +92,10 @@ export interface MemberView extends MemberMetrics {
   outcome?: SubagentResult["status"]
   /** The member's most recent model reply, when observed. */
   lastMessage?: string
+  /** Own tool activity only, never descendants' events. */
+  currentTools?: { id: string; name: string }[]
+  lastAction?: string
+  events?: { seq: number; at: number; text: string }[]
   /** What it handed in with finish, if it did. */
   result?: string
   /** Why it ended, once it did. */
@@ -118,6 +122,8 @@ export interface SwarmSnapshot {
 }
 
 export interface MemberReport extends MemberMetrics {
+  lastAction?: string
+  events?: MemberView["events"]
   name: string
   role: string
   status: SubagentResult["status"]
@@ -197,11 +203,18 @@ interface Member {
   result?: string
   ended?: SubagentResult
   startedAt?: number
+  /** Freeze elapsed content between turns or while user-held. */
+  idleAt?: number
+  pausedAt?: number
   /** Usage seen in this member's message events, for checking price completeness. */
   usage?: Usage
   authoritativeUsage?: Usage
   unknownCost?: boolean
   lastMessage?: string
+  currentTools?: Map<string, string>
+  eventSequence?: number
+  lastAction?: string
+  events?: { seq: number; at: number; text: string }[]
 }
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`
@@ -433,7 +446,8 @@ export class Swarm {
     if (m.child.state === "ended") return `${m.spec.name} has ended.`
     if (m.paused) return `${m.spec.name} is paused already.`
     m.paused = true
-    this.#log({ kind: "note", text: `${m.spec.name} paused` })
+    m.pausedAt = Date.now()
+    this.#log({ kind: "note", from: m.spec.name, text: `${m.spec.name} paused` })
     return undefined
   }
 
@@ -456,7 +470,8 @@ export class Swarm {
     if (!m) return `No member "${name}".`
     if (!m.paused) return `${m.spec.name} is not paused.`
     m.paused = false
-    this.#log({ kind: "note", text: `${m.spec.name} resumed` })
+    m.pausedAt = undefined
+    this.#log({ kind: "note", from: m.spec.name, text: `${m.spec.name} resumed` })
     this.#flush(m)
     this.#check()
     return undefined
@@ -474,7 +489,7 @@ export class Swarm {
     // What was held for it would never reach it.
     this.#dropped += m.held.splice(0).length
     m.child.stop(reason)
-    this.#log({ kind: "note", text: `${m.spec.name}: ${reason}` })
+    this.#log({ kind: "note", from: m.spec.name, text: `${m.spec.name}: ${reason}` })
     return undefined
   }
 
@@ -732,7 +747,31 @@ export class Swarm {
       for await (const e of m.child.events) {
         // The stream includes descendants: they must not count as the member's own work.
         if (e.sessionId === m.child.id) {
-          if (e.type === "turn.start") m.startedAt ??= e.ts
+          let action: string | undefined
+          if (e.type === "turn.start") action = "Started turn"
+          if (e.type === "turn.end") action = "Finished turn"
+          if (e.type === "message.end") action = "Replied"
+          if (e.type === "tool.execute.start") {
+            m.currentTools ??= new Map()
+            m.currentTools.set(e.data.toolCallId, e.data.name)
+            action = `Started ${e.data.name}`
+          }
+          if (e.type === "tool.execute.end") {
+            m.currentTools?.delete(e.data.toolCallId)
+            action = `${e.data.result.isError ? "Failed" : "Finished"} ${e.data.name}`
+          }
+          if (action) {
+            m.lastAction = action
+            m.events ??= []
+            m.eventSequence = (m.eventSequence ?? 0) + 1
+            m.events.push({ seq: m.eventSequence, at: e.ts, text: action })
+            if (m.events.length > 40) m.events.shift()
+          }
+          if (e.type === "turn.start") {
+            m.startedAt ??= e.ts
+            m.idleAt = undefined
+          }
+          if (e.type === "turn.end") m.idleAt = e.ts
           if (e.type === "message.end") {
             m.lastMessage = e.data.message.content
               .flatMap((b) => (b.type === "text" ? [b.text] : []))
@@ -763,6 +802,7 @@ export class Swarm {
       // The events of a member are best effort; its result still comes.
     }
     m.ended = await m.child.result()
+    m.currentTools?.clear()
     const r = m.ended
     if (this.live) {
       const why =
@@ -771,7 +811,7 @@ export class Swarm {
           : r.status === "aborted"
             ? `stopped: ${r.error ?? "aborted"}`
             : (r.note ?? "ended")
-      this.#log({ kind: "note", text: `${m.spec.name} ${why}` })
+      this.#log({ kind: "note", from: m.spec.name, text: `${m.spec.name} ${why}` })
     }
     this.#hooks.changed?.()
     this.#check()
@@ -861,6 +901,8 @@ export class Swarm {
         return {
           ...this.#metrics(m),
           messagesSent: m.sent,
+          ...(m.lastAction !== undefined ? { lastAction: m.lastAction } : {}),
+          ...(m.events ? { events: m.events.map((e) => ({ ...e })) } : {}),
           name: m.spec.name,
           role: m.spec.role,
           status: r.status,
@@ -906,8 +948,9 @@ export class Swarm {
     // Host totals may sum priced replies and unpriced consultations. A price is complete
     // only when every token component matches the fully observed messages (or known zero).
     if (usage && (m.unknownCost || !sameTokens(usage, m.usage))) delete usage.cost
+    const until = m.idleAt ?? m.pausedAt ?? Date.now()
     const durationMs =
-      m.ended?.durationMs ?? (m.startedAt === undefined ? undefined : Date.now() - m.startedAt)
+      m.ended?.durationMs ?? (m.startedAt === undefined ? undefined : Math.max(0, until - m.startedAt))
     return {
       sessionId: m.child.id,
       ...(m.stopReason !== undefined ? { stopReason: m.stopReason } : {}),
@@ -933,6 +976,11 @@ export class Swarm {
       brief: m.spec.brief,
       ...(m.ended ? { outcome: m.ended.status } : {}),
       ...(lastMessage !== undefined ? { lastMessage } : {}),
+      ...(m.currentTools?.size
+        ? { currentTools: [...m.currentTools].map(([id, name]) => ({ id, name })) }
+        : {}),
+      ...(m.lastAction !== undefined ? { lastAction: m.lastAction } : {}),
+      ...(m.events ? { events: m.events.map((e) => ({ ...e })) } : {}),
       status,
       turns: m.child.turns,
       messagesSent: m.sent,
@@ -1083,7 +1131,7 @@ export function swarmsFromRecords(records: readonly unknown[]): SwarmSnapshot[] 
     } else if (rec.type === "stop-member") {
       const m = s.members.find((x) => x.name === rec.member)
       if (m) m.stopReason = rec.reason
-      push({ at: rec.at, kind: "note", text: `${rec.member}: ${rec.reason}` })
+      push({ at: rec.at, kind: "note", from: rec.member, text: `${rec.member}: ${rec.reason}` })
     } else if (rec.type === "end") {
       s.endReason = rec.reason
       s.endedAt = rec.at

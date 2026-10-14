@@ -1,4 +1,4 @@
-import type { TraceSummary, UiNode, ViewLine } from "@amira/api"
+import type { TraceSummary, UiNode, ViewLine, ViewRenderOptions } from "@amira/api"
 
 export type DashboardStatus = "queued" | "running" | "idle" | "paused" | "done" | "failed" | "stopped"
 export type DashboardAction = "pause" | "resume" | "stop" | "request-changes"
@@ -19,6 +19,9 @@ export interface DashboardAgent {
   name: string
   task: string
   status: DashboardStatus
+  /** A defined early-end note (even empty) presents done as stopped. */
+  note?: string
+  paused?: boolean
   startedAt?: number
   durationMs?: number
   cost?: number
@@ -34,6 +37,8 @@ export interface DashboardGroup {
   name: string
   ref?: string
   status?: DashboardStatus
+  note?: string
+  paused?: boolean
   startedAt?: number
   durationMs?: number
   description?: string
@@ -46,6 +51,8 @@ export interface DashboardPhase {
   name: string
   ref?: string
   status?: DashboardStatus
+  note?: string
+  paused?: boolean
   startedAt?: number
   durationMs?: number
   description?: string
@@ -86,7 +93,8 @@ export interface DashboardSource {
   id: string
   label: string
   snapshot(): DashboardSnapshot
-  details(agentId: string): DashboardDetails | undefined
+  /** Optional host badge helper for rendering visible status-bearing log rows. */
+  details(agentId: string, opts?: Pick<ViewRenderOptions, "statusBadge">): DashboardDetails | undefined
   /** Optional change notification. The returned function releases the subscription. */
   subscribe?(changed: () => void): () => void
   /** Capability must also be present in the agent's actions. A result is user-facing text. */
