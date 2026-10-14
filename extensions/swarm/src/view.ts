@@ -35,18 +35,31 @@ const oneLine = (s: string) => s.replace(/\s+/g, " ").trim()
 const known = (n: number | undefined): n is number => n !== undefined && Number.isFinite(n) && n >= 0
 const cost = (n: number | undefined) => (known(n) ? `$${n.toFixed(2)}` : "cost unknown")
 
+/** API 0.1.49 exposes separator/more, but not arrows or disclosure symbols. */
+function chrome(opts?: ViewRenderOptions) {
+  const glyphs = opts?.glyphs
+  return {
+    separator: ` ${glyphs?.separator ?? "·"} `,
+    more: glyphs?.more ?? "…",
+    ascii: glyphs?.rule !== undefined && /^[\x20-\x7e]+$/.test(glyphs.rule),
+  }
+}
+
 function elapsed(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000))
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`
 }
 
-export function timelineLine(e: TimelineEntry): Exclude<ViewLine, { kind: "segments" }> {
+export function timelineLine(
+  e: TimelineEntry,
+  opts?: ViewRenderOptions,
+): Exclude<ViewLine, { kind: "segments" }> {
   const t = clock(e.at)
   switch (e.kind) {
     case "message":
       return {
         kind: e.from === "user" ? "accent" : "text",
-        text: `${t} ${e.from === "user" ? "you" : e.from} → ${e.to}: ${oneLine(e.text)}`,
+        text: `${t} ${e.from === "user" ? "you" : e.from} ${chrome(opts).ascii ? "->" : "→"} ${e.to}: ${oneLine(e.text)}`,
       }
     case "board":
       return { kind: "success", text: `${t} ${e.from} wrote ${e.key}: ${oneLine(e.text)}` }
@@ -105,28 +118,33 @@ function summary(s: SwarmSnapshot, opts: ViewRenderOptions): ViewSegment[] {
     elapsed((s.endedAt ?? opts.now) - s.startedAt),
     ...(known(totalCost) ? [cost(totalCost)] : []),
   ]
+  const { separator } = chrome(opts)
   return [
-    { kind: "accent", text: `Swarm ${s.id} · ` },
+    { kind: "accent", text: `Swarm ${s.id}${separator}` },
     ...stateBadge(state, opts),
-    { kind: "muted", text: ` · ${parts.join(" · ")}` },
+    { kind: "muted", text: `${separator}${parts.join(separator)}` },
   ]
 }
 
-function protectIdentity(parts: ViewSegment[], counts: string, width: number): ViewSegment[] {
+function protectIdentity(parts: ViewSegment[], counts: string, opts: ViewRenderOptions): ViewSegment[] {
   const [identity, ...details] = parts
   if (!identity) return details
   const room =
-    width - Bun.stringWidth(counts) - 1 - Bun.stringWidth(details.map((part) => part.text).join(""))
+    opts.width - Bun.stringWidth(counts) - 1 - Bun.stringWidth(details.map((part) => part.text).join(""))
   if (room < 8) return details
   if (Bun.stringWidth(identity.text) <= room) return parts
+  const { separator, more } = chrome(opts)
+  const suffix = `${more}${separator}`
+  const suffixWidth = Bun.stringWidth(suffix)
+  if (suffixWidth > room) return details
   let name = ""
   for (const grapheme of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(
-    identity.text.replace(/ · $/, ""),
+    identity.text.slice(0, -separator.length),
   )) {
-    if (Bun.stringWidth(name + grapheme.segment) > room - 4) break
+    if (Bun.stringWidth(name + grapheme.segment) > room - suffixWidth) break
     name += grapheme.segment
   }
-  return [{ ...identity, text: `${name}… · ` }, ...details]
+  return [{ ...identity, text: `${name}${suffix}` }, ...details]
 }
 
 function refresh(s: SwarmSnapshot, opts: ViewRenderOptions) {
@@ -153,7 +171,7 @@ function folded(
   }
 }
 
-function details(s: SwarmSnapshot, m: MemberView): UiTreeItem[] {
+function details(s: SwarmSnapshot, m: MemberView, opts: ViewRenderOptions): UiTreeItem[] {
   const items: UiTreeItem[] = []
   if (m.brief !== undefined) items.push(folded("brief", "Brief", m.brief))
   if (m.note !== undefined) items.push(folded("note", "Note", m.note, "warning"))
@@ -171,7 +189,11 @@ function details(s: SwarmSnapshot, m: MemberView): UiTreeItem[] {
       .filter((e) => e.from === m.name || e.to === m.name || (e.kind === "message" && e.to === "all"))
       .map((e) => ({
         at: e.at,
-        item: folded(`timeline:${e.seq}`, timelineLine({ ...e, text: "" }).text.replace(/: $/, ""), e.text),
+        item: folded(
+          `timeline:${e.seq}`,
+          timelineLine({ ...e, text: "" }, opts).text.replace(/: $/, ""),
+          e.text,
+        ),
       })),
   ]
     .sort((a, b) => a.at - b.at)
@@ -183,8 +205,9 @@ function details(s: SwarmSnapshot, m: MemberView): UiTreeItem[] {
 }
 
 function keyHints(data: SwarmViewData, ctx: UiContext, readOnly: boolean): ViewLine[] {
+  const { separator, ascii } = chrome(ctx)
   if (ctx.focused === false)
-    return [{ kind: "segments", parts: [{ kind: "muted", text: "tab view · esc close" }] }]
+    return [{ kind: "segments", parts: [{ kind: "muted", text: `tab view${separator}esc close` }] }]
   const s = data.snapshot()
   const live = !readOnly && data.control && s && s.state !== "ended" && s.state !== "ending"
   const detailId = ctx.state.focused ?? ""
@@ -196,7 +219,7 @@ function keyHints(data: SwarmViewData, ctx: UiContext, readOnly: boolean): ViewL
     : "enter details"
   return wrappedGroups(
     [
-      "↑↓ select",
+      `${ascii ? "up/down" : "↑↓"} select`,
       "[ ] panes",
       enter,
       "? summary",
@@ -204,16 +227,17 @@ function keyHints(data: SwarmViewData, ctx: UiContext, readOnly: boolean): ViewL
       "tab input",
       "esc close",
     ],
-    ctx.width,
+    ctx,
   )
 }
 
-function wrappedGroups(groups: string[], width: number): ViewLine[] {
+function wrappedGroups(groups: string[], opts: ViewRenderOptions): ViewLine[] {
+  const { separator } = chrome(opts)
   const rows: string[] = []
   let row = ""
   for (const group of groups) {
-    const next = row ? `${row} · ${group}` : group
-    if (row && Bun.stringWidth(next) > width) {
+    const next = row ? `${row}${separator}${group}` : group
+    if (row && Bun.stringWidth(next) > opts.width) {
       rows.push(row)
       row = group
     } else row = next
@@ -254,10 +278,11 @@ function memberItem(m: MemberView, ctx: UiContext, selected: boolean, active: bo
 function pane(id: string, items: UiTreeItem[], ctx: UiContext, active: boolean): UiNode {
   if (active) return { type: "tree", id, items }
   const expanded = new Set(ctx.state.expanded[id])
+  const { ascii } = chrome(ctx)
   const lines: ViewLine[] = items.flatMap((item) => {
     const open = expanded.has(item.key)
     const prefix: ViewSegment[] = item.node ?? [
-      { kind: "muted", text: item.expandable ? (open ? "▾ " : "▸ ") : "  " },
+      { kind: "muted", text: item.expandable ? `${open ? (ascii ? "v" : "▾") : ascii ? ">" : "▸"} ` : "  " },
     ]
     return [
       { kind: "segments" as const, parts: [{ kind: "text" as const, text: "  " }, ...prefix, ...item.row] },
@@ -287,6 +312,7 @@ function screen(data: SwarmViewData, ctx: UiContext, readOnly = false): UiNode {
 
 function innerScreen(data: SwarmViewData, s: SwarmSnapshot, ctx: UiContext, readOnly: boolean): UiNode {
   refresh(s, ctx)
+  const { separator } = chrome(ctx)
   if (ctx.page?.data === "summary")
     return {
       type: "column",
@@ -299,7 +325,10 @@ function innerScreen(data: SwarmViewData, s: SwarmSnapshot, ctx: UiContext, read
               { kind: "text", text: `Swarm ${s.id}` },
               { kind: "text", text: s.goal },
               { kind: "segments", parts: summary(s, ctx).slice(1) },
-              { kind: "text", text: [...stateCounts(s)].map(([state, n]) => `${state} ${n}`).join(" · ") },
+              {
+                kind: "text",
+                text: [...stateCounts(s)].map(([state, n]) => `${state} ${n}`).join(separator),
+              },
               {
                 kind: "text",
                 text: "[ focuses the list pane; ] focuses the details pane. Enter in the list focuses details; Enter in details expands or folds the selected entry.",
@@ -320,7 +349,10 @@ function innerScreen(data: SwarmViewData, s: SwarmSnapshot, ctx: UiContext, read
           node: {
             type: "text",
             lines: [
-              { kind: "muted", text: ctx.focused === false ? "tab view · esc back" : "tab input · esc back" },
+              {
+                kind: "muted",
+                text: `tab ${ctx.focused === false ? "view" : "input"}${separator}esc back`,
+              },
             ],
           },
         },
@@ -358,12 +390,12 @@ function innerScreen(data: SwarmViewData, s: SwarmSnapshot, ctx: UiContext, read
                 {
                   kind: "segments",
                   parts: [
-                    { kind: "accent", text: `${selected.name} · ` },
-                    { kind: "text", text: `${selected.role} · ` },
+                    { kind: "accent", text: `${selected.name}${separator}` },
+                    { kind: "text", text: `${selected.role}${separator}` },
                     ...memberBadge(selected, ctx),
                     {
                       kind: "muted",
-                      text: ` · ${known(duration) ? elapsed(duration) : "elapsed unknown"}${known(selected.cost) ? ` · ${cost(selected.cost)}` : ""}`,
+                      text: `${separator}${known(duration) ? elapsed(duration) : "elapsed unknown"}${known(selected.cost) ? `${separator}${cost(selected.cost)}` : ""}`,
                     },
                   ],
                 },
@@ -381,7 +413,7 @@ function innerScreen(data: SwarmViewData, s: SwarmSnapshot, ctx: UiContext, read
               ],
             },
           },
-          { node: pane(detailId, details(s, selected), ctx, !membersActive) },
+          { node: pane(detailId, details(s, selected, ctx), ctx, !membersActive) },
         ],
       }
     : { type: "text", lines: [{ kind: "muted", text: "No members." }] }
@@ -402,7 +434,7 @@ function innerScreen(data: SwarmViewData, s: SwarmSnapshot, ctx: UiContext, read
   }
   const hints = keyHints(data, ctx, readOnly)
   const counts = [...stateCounts(s)].map(([state, n]) => `${state} ${n}`)
-  const countRows = wrappedGroups(counts, ctx.width)
+  const countRows = wrappedGroups(counts, ctx)
   return {
     type: "column",
     gap: 1,
@@ -414,8 +446,8 @@ function innerScreen(data: SwarmViewData, s: SwarmSnapshot, ctx: UiContext, read
             ? { type: "text", lines: countRows }
             : {
                 type: "bar",
-                left: protectIdentity(summary(s, ctx), counts.join(" · "), ctx.width),
-                right: [{ kind: "muted", text: counts.join(" · ") }],
+                left: protectIdentity(summary(s, ctx), counts.join(separator), ctx),
+                right: [{ kind: "muted", text: counts.join(separator) }],
               },
       },
       ...(data.flash
@@ -444,9 +476,9 @@ const expansions = new WeakMap<SwarmViewData, Record<string, string[]>>()
 
 const base: ViewDefinition<SwarmViewData> = {
   kind: VIEW_KIND,
-  title(data) {
+  title(data, opts) {
     const s = data.snapshot()
-    return s ? `Swarm ${s.id} · ${s.goal}` : "Swarm"
+    return s ? `Swarm ${s.id}${chrome(opts).separator}${s.goal}` : "Swarm"
   },
   follow: false,
   // Intended host API: hide generic navigation footer; prompts/confirmations still appear.

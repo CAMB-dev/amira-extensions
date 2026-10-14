@@ -12,6 +12,7 @@ import type {
   ViewSegment,
 } from "@amira/api"
 import { summarizeTrace } from "@amira/api"
+import { chrome, repeatCells } from "./chrome.ts"
 import { clock, phaseInfo, summary, timeline } from "./layout.ts"
 import { agentsOf, type DashboardAgent, type DashboardSource, type DashboardTab } from "./source.ts"
 import { displayState } from "./status.ts"
@@ -39,7 +40,13 @@ export interface DashboardViewData {
   pendingAction?: string
 }
 
-function statsPanel(stats: TraceSummary | undefined, agents: DashboardAgent[], note?: string): UiNode {
+function statsPanel(
+  stats: TraceSummary | undefined,
+  agents: DashboardAgent[],
+  note?: string,
+  ctx?: Pick<UiContext, "glyphs">,
+): UiNode {
+  const c = chrome(ctx)
   if (!stats) return text([line("No trace statistics available.")], "stats-empty")
   const rows = [
     ["First token wait", stats.modelWaitMs],
@@ -51,11 +58,11 @@ function statsPanel(stats: TraceSummary | undefined, agents: DashboardAgent[], n
   ] as const
   // One scrollable text widget keeps every section reachable on a short terminal.
   const lines: ViewLine[] = [
-    line(`Time split · wall ${seconds(stats.wallTimeMs)}`),
+    line(c`Time split · wall ${seconds(stats.wallTimeMs)}`),
     ...rows.map(([label, ms]) => line(`${label.padEnd(26)} ${seconds(ms)}`)),
     { kind: "muted", text: "Intervals may overlap; these metrics do not add up to wall time." },
     line(""),
-    line("Per-tool table · count / total / average / maximum / outcomes"),
+    line(c`Per-tool table · count / total / average / maximum / outcomes`),
     ...Object.entries(stats.tools).map(([name, tool]) =>
       line(
         `${name}  ${tool.count}  ${seconds(tool.totalMs)} / ${seconds(tool.avgMs)} / ${seconds(tool.maxMs)}  ${Object.entries(
@@ -75,15 +82,17 @@ function statsPanel(stats: TraceSummary | undefined, agents: DashboardAgent[], n
         }))
       : [line("No recorded failures.")]),
     line(""),
-    line("Cost per agent · own usage only, no recursive totals"),
-    { kind: "muted", text: "ⓘ Missing reported costs are unknown, not zero." },
+    line(c`Cost per agent · own usage only, no recursive totals`),
+    { kind: "muted", text: c`ⓘ Missing reported costs are unknown, not zero.` },
     ...agents.map((item) => line(`${item.name}: ${money(item.cost)}`)),
-    ...(note ? [{ kind: "muted" as const, text: `ⓘ ${note}` }] : []),
+    ...(note ? [{ kind: "muted" as const, text: c`ⓘ ${note}` }] : []),
   ]
   return text(lines, "stats")
 }
 
 function details(data: DashboardViewData, ctx: UiContext, agent?: DashboardAgent): UiNode {
+  const c = chrome(ctx)
+  if (!agent && !agentsOf(data.source.snapshot()).length) return text([])
   if (!agent)
     return text(
       [line("Select an agent in the timeline, then press Enter to open its page.")],
@@ -157,7 +166,7 @@ function details(data: DashboardViewData, ctx: UiContext, agent?: DashboardAgent
         rows: labels.map(([key, label, shortcut]) => ({
           key: JSON.stringify([agent.id, key]),
           cells: {
-            action: `${label} · ${agent.name}`,
+            action: c`${label} · ${agent.name}`,
             key: shortcut!,
             available:
               key === "open-diff"
@@ -176,7 +185,7 @@ function details(data: DashboardViewData, ctx: UiContext, agent?: DashboardAgent
     tabs.push({
       key: "stats",
       label: "Stats",
-      body: statsPanel(detail.stats, agentsOf(data.source.snapshot()), data.source.snapshot().note),
+      body: statsPanel(detail.stats, agentsOf(data.source.snapshot()), data.source.snapshot().note, ctx),
     })
   for (const tab of sourceTabs(detail?.tabs)) {
     let body: UiNode | ViewLine[]
@@ -223,7 +232,7 @@ function details(data: DashboardViewData, ctx: UiContext, agent?: DashboardAgent
                     node: {
                       type: "bar" as const,
                       left: [],
-                      right: [part(`${agent.name}  ${agent.task}   ✕ `, "muted")],
+                      right: [part(c`${agent.name}  ${agent.task}   ✕ `, "muted")],
                     },
                   },
                 ]),
@@ -380,10 +389,10 @@ async function openSessionPage(
     kind: "session",
     source: data.source,
     rootId,
-    body: text([line("Loading…")], "session-page:loading"),
+    body: text([line("Loading...")], "session-page:loading"),
   }
   // Push before awaiting. Esc can discard this page; completion must never push it back.
-  view.pushPage({ title: `${trace ? "Trace" : "Transcript"} · ${agent.name}`, data: page })
+  view.pushPage({ title: `${trace ? "Trace" : "Transcript"}: ${agent.name}`, data: page })
   try {
     if (!trace) {
       page.body = text(transcriptLines(session.subagentMessages(sessionId)), "session-page:transcript")
@@ -393,30 +402,36 @@ async function openSessionPage(
       if (records.some((record) => record.type === "trace" && record.sessionId !== sessionId))
         throw new Error("Trace records belong to another session.")
       const stats = records.length ? summarizeTrace(records) : undefined
-      page.body = mapWidgetIds(
-        {
-          type: "tabs",
-          id: "trace",
-          tabs: [
-            {
-              key: "stats",
-              label: "Stats",
-              body: statsPanel(stats, [{ ...agent, cost: ownCost(records, stats?.usage.cost) }]),
-            },
-            {
-              key: "logs",
-              label: "Logs",
-              body: text(
-                records.length
-                  ? records.flatMap((record) => traceLogLines(record))
-                  : [line("No trace records available.")],
-                "logs",
-              ),
-            },
-          ],
-        },
-        (id) => `session-page:${id}`,
-      )
+      page.body = (ctx) =>
+        mapWidgetIds(
+          {
+            type: "tabs",
+            id: "trace",
+            tabs: [
+              {
+                key: "stats",
+                label: "Stats",
+                body: statsPanel(
+                  stats,
+                  [{ ...agent, cost: ownCost(records, stats?.usage.cost) }],
+                  undefined,
+                  ctx,
+                ),
+              },
+              {
+                key: "logs",
+                label: "Logs",
+                body: text(
+                  records.length
+                    ? records.flatMap((record) => traceLogLines(record, ctx))
+                    : [line("No trace records available.")],
+                  "logs",
+                ),
+              },
+            ],
+          },
+          (id) => `session-page:${id}`,
+        )
     }
   } catch (error) {
     page.body = text(
@@ -539,7 +554,7 @@ function onEvent(event: UiEvent, data: DashboardViewData, host: UiControl) {
     view.setState({ expanded: {} })
   } else if (event.key === "?") {
     data.flash =
-      "e expand all · o diff · p pause/resume · r request changes · a actions · x stop · 1–4 tabs · 5 stats"
+      "e expand all / o diff / p pause/resume / r request changes / a actions / x stop / 1-4 tabs / 5 stats / Tab widgets / F6 input"
   } else if (event.key === "a") {
     data.pendingAction = undefined
     setTab(data, view, "actions")
@@ -594,6 +609,7 @@ function onEvent(event: UiEvent, data: DashboardViewData, host: UiControl) {
 
 export const dashboardView: ViewDefinition<DashboardViewData> = {
   kind: VIEW_KIND,
+  needsTab: true,
   onOpen(data, view) {
     const phases = data.source.snapshot().phases
     const active =
@@ -609,7 +625,8 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
       focused: "timeline",
     })
   },
-  title: (data, ctx) => (ctx.page ? "Dashboard · Agent" : `Dashboard · ${data.source.label}`),
+  title: (data, ctx) =>
+    ctx.page ? chrome(ctx)`Dashboard · Agent` : chrome(ctx)`Dashboard · ${data.source.label}`,
   keys: [
     { key: "e", label: "" },
     { key: "o", label: "" },
@@ -622,6 +639,7 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
     ...["1", "2", "3", "4", "5", "left", "right"].map((key) => ({ key, label: "" })),
   ],
   ui(data, ctx) {
+    const c = chrome(ctx)
     const sessionPage = ctx.page?.data as SessionPage | undefined
     if (sessionPage?.kind === "session") {
       return sessionPage.source === data.source && sessionPage.rootId === data.session?.info().id
@@ -646,14 +664,14 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
         item.groups.some((group) => group.agents.some((item) => displayState(item) === "working")),
       ) ?? snapshot.phases[0]
     const narrow = ctx.width < 110
-    const totals = `phase: ${phase?.name ?? "Agents"}  │  running: ${agents.filter((item) => displayState(item) === "working").length}/${agents.length}  │  cost: ${cost === undefined ? "unknown" : `$${cost.toFixed(4)}`}`
+    const totals = c`phase: ${phase?.name ?? "Agents"}  │  running: ${agents.filter((item) => displayState(item) === "working").length}/${agents.length}  │  cost: ${cost === undefined ? "unknown" : `$${cost.toFixed(4)}`}`
     const top: UiNode = {
       type: "bar",
       left: [
         part(" amira", "accent"),
-        part(`  │  workspace: ${snapshot.workspace}${narrow ? "" : `  │  ${totals}`}`),
+        part(c`  │  workspace: ${snapshot.workspace}${narrow ? "" : c`  │  ${totals}`}`),
       ],
-      right: [part(narrow ? "? help · q quit" : "? shortcuts  │  q quit ", "muted")],
+      right: [part(narrow ? c`? help · q quit` : c`? shortcuts  │  q quit `, "muted")],
     }
     const detailHeight = agent ? (narrow ? 6 : Math.min(15, Math.max(9, Math.round(ctx.height * 0.3)))) : 2
     const flashHeight = data.flash ? (narrow ? 2 : 1) : 0
@@ -667,7 +685,7 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
               kind: "segments",
               parts: [
                 part(
-                  `${"─".repeat(Math.max(0, Math.floor((ctx.width - 3) / 2)))} ≡ ${"─".repeat(Math.max(0, Math.ceil((ctx.width - 3) / 2)))}`,
+                  c`${repeatCells(c`─`, Math.floor((ctx.width - 3) / 2))} ≡ ${repeatCells(c`─`, Math.ceil((ctx.width - 3) / 2))}`,
                   "muted",
                 ),
               ],
@@ -680,7 +698,7 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
               {
                 size: 1,
                 node: narrow
-                  ? text([{ kind: "muted" as const, text: " 1–4 tabs · o diff · a actions · ? shortcuts" }])
+                  ? text([{ kind: "muted" as const, text: c` 1–4 tabs · o diff · a actions · ? shortcuts` }])
                   : {
                       type: "bar" as const,
                       left: [
@@ -689,7 +707,7 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
                           "muted",
                         ),
                       ],
-                      right: [part("1–4 tabs · 5 stats (when available) ", "muted")],
+                      right: [part(c`1–4 tabs · 5 stats (when available) `, "muted")],
                     },
               },
             ]
@@ -728,13 +746,11 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
               type: "bar",
               left: [
                 part(
-                  narrow
-                    ? " > Ask Amira after closing this view"
-                    : " > Ask Amira or enter a command after closing this view…",
+                  narrow ? " > Press F6 to ask Amira" : " > Press F6 to ask Amira or enter a command",
                   "muted",
                 ),
               ],
-              right: narrow ? [] : [part("Hint only · close this view to send ", "muted")],
+              right: narrow ? [] : [part(c`Hint only · F6 to input `, "muted")],
             },
           },
         },

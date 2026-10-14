@@ -283,9 +283,27 @@ export function createLiveSource(
         }
         group.agents.push(item)
       }
+      for (const spawnGroup of spawnGroups) {
+        const id = JSON.stringify(["group", spawnGroup.parentSessionId, spawnGroup.id])
+        const group = groups.get(id)!
+        if (group.agents.length) continue
+        const counts = spawnGroup.agents
+        group.status =
+          spawnGroup.state === "ended"
+            ? undefined
+            : counts.working
+              ? "running"
+              : counts.queued
+                ? "queued"
+                : counts.idle
+                  ? "idle"
+                  : undefined
+        // Empty historical/reserved groups are not evidence of queued work.
+        if (group.status === undefined) groups.delete(id)
+      }
       return {
         workspace,
-        phases: [{ id: "agents", name: "Agents", groups: [...groups.values()] }],
+        phases: groups.size ? [{ id: "agents", name: "Agents", groups: [...groups.values()] }] : [],
         warning:
           "Live files and logs cover recent activity while this dashboard is open; older details may be omitted.",
       }

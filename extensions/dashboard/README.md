@@ -1,6 +1,6 @@
 # Dashboard (experimental)
 
-The default dashboard extension for Amira (D103/D104/D105). It lives in **amira-extensions**, not Amira core. Version 0.3.0 targets API **0.1.48**, using host-owned pages, view lifecycle hooks and sub-agent controls. The declarative widgets and source contract remain experimental.
+The default dashboard extension for Amira (D103/D104/D105). It lives in **amira-extensions**, not Amira core. Version 0.4.0 targets API **0.1.49**, using host-owned pages, view lifecycle hooks, sub-agent controls and host glyph metadata. The declarative widgets and source contract remain experimental.
 
 Runtime code imports only `@amira/api` and local modules. The host owns terminal rendering, themes, clipping, focus and scrolling. Nothing in this extension reads private core state or runs shell commands to infer an agent's changes.
 
@@ -19,7 +19,7 @@ The command offers source-ID completion. Trace replay reads completed records on
 
 ### Screenshots as text
 
-Status badges use Amira’s shared queued, working, idle, paused, done, failed and stopped vocabulary. The host owns theme glyphs, ASCII alternatives and working-spinner timing; compact phase marks use the same badge symbol. A defined early-end note, even empty, displays as stopped rather than done. Hosts without the badge helper get static, ASCII-safe shared badges. The layout, navigation and actions are unchanged.
+Status badges use Amira’s shared queued, working, idle, paused, done, failed and stopped vocabulary. The host owns theme glyphs, ASCII alternatives and working-spinner timing; compact phase marks use the same badge symbol. A defined early-end note, even empty, displays as stopped rather than done. Hosts without the badge helper get static, ASCII-safe shared badges. Dashboard-authored frames, connectors, progress bars, separators and hints follow the host glyph profile, with ASCII alternatives in ASCII mode. Source/user content is never rewritten. Tab and Shift+Tab stay inside the dashboard; F6 switches to the main input and back.
 
 Real output of the dashboard rendered through Amira's TUI `ExtensionViewer` with fake sub-agents
 (`test/tui-render.test.ts`), plain text without colors, **on the first frame without input**.
@@ -77,7 +77,7 @@ Phases and cards start expanded, with the first active phase’s agent selected.
                                  │                                                                                               │
  o open diff   p pause/resume   r request changes   a actions   x stop                                                                          1–4 tabs · 5 stats (when available)
 ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│ > Ask Amira or enter a command after closing this view…                                                                                      Hint only · close this view to send │
+│ > Press F6 to ask Amira or enter a command                                                                                                               Hint only · F6 to input │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
   tab focus · arrows navigate · enter open/send · pgup pgdn scroll · esc close
 ```
@@ -112,7 +112,7 @@ phase: Implementation  │  running: 1/3  │  cost: unknown
   Validate payment amounts and add regression coverage for partial refunds.
  1–4 tabs · o diff · a actions · ? shortcuts
 ╭──────────────────────────────────────────────────────────────────────────────╮
-│ > Ask Amira after closing this view                                          │
+│ > Press F6 to ask Amira                                                      │
 ╰──────────────────────────────────────────────────────────────────────────────╯
   tab focus · arrows navigate · enter open/send · pgup pgdn scroll · esc close
 ```
@@ -129,7 +129,8 @@ Replay adds a **Stats** tab: first-token wait, streaming, unclassified model tim
 | ← / → | Expand/collapse the focused tree; switch focused tabs (or page tabs from a text body) |
 | Enter | Open a selected agent page or activate an action |
 | e | Expand all phases and card contents |
-| Tab / Shift+Tab | Move focus between public widgets |
+| Tab / Shift+Tab | Move focus forward/backward between public widgets; never switch to the main input |
+| F6 | Switch focus between the dashboard and main input (Ctrl+Tab is a host alias where delivered) |
 | 1–4 | Summary / Diff / Logs / Actions |
 | 5 | Stats, when the selected agent has trace statistics |
 | o | Open the selected agent's Diff tab |
@@ -141,18 +142,19 @@ Replay adds a **Stats** tab: first-token wait, streaming, unclassified model tim
 | Esc | Cancel a prompt first; otherwise return from an agent page, or close at the timeline |
 | q / Ctrl+C | Close the whole dashboard; q types text inside a prompt, Ctrl+C always closes |
 
-The framed bottom bar is a **hint, not an input**: close the dashboard to ask Amira or enter a command. A focused input would consume navigation shortcuts, and the source contract has no general chat submission action. The host’s own navigation key bar remains the only in-view list of arrows/Tab/Enter/Esc.
+The framed bottom bar is a **hint, not an input**: press **F6** to ask Amira or enter a command in the host's main input without closing the dashboard. A focused input would consume navigation shortcuts, and the source contract has no general chat submission action. The host’s own navigation key bar remains the only in-view list of arrows/Tab/Enter/Esc.
 
 Card action labels are keyboard hints, not pretend clickable buttons: tree detail widgets are display-only in this API. From the timeline, **p/r/x focus a single named action; press Enter to continue**. On an agent page they act directly on that page's fixed target. The Actions table provides an Enter-activated path for every action. Its row keys include the target agent, so host selection repair or same-kind view replacement cannot redirect an action to an old selection. `UiControl` has no state getter; the handler deliberately does not guess the host's current selection. Status always includes a word or mark, not color alone.
 
 ### Behavior and data boundaries
 
+- A new live session with no agents shows **No agents yet** and explains how to delegate a task. It has no queued badge or agent-selection prompt. Real queued work still displays queued; unavailable sources retain their explanation.
 - Agent pages use the host page stack. **Esc** restores the timeline's selection, expansion, tabs, focus and scroll position; it closes only at the root. The old **b** workaround is removed.
 - Live running agents offer **Pause**; paused agents offer **Resume**. Pausing holds before the next model call without aborting current work or freeing an admission slot. **Request changes** prompts for a user-authored message and sends it with `messageSubagent`; queued messages wait for admission, and idle persistent children start another turn. Notes report accepted requests or agents that are no longer running. Accepted delivery does not mean the model has read the message yet.
 - Live event subscriptions and source update subscriptions exist only while the dashboard is open, and close releases them. Session listings and messages remain authoritative; live files/logs cover only observed activity. Files changed before opening may not be known; trace replay can recover persisted `writtenPaths`.
 - Authoritative `writtenPaths` identify files, not their before/after content. Diff shows supplied diff lines when an adapter has them; otherwise it lists reported paths with **No diff available**. It does not attribute the entire workspace's git diff to an agent.
 - Traces contain completed intervals and bounded tool previews, not unfinished work or full tool payloads. An empty trace is not evidence of zero work or zero cost.
-- Semantic snapshots cover widget contracts. `test/tui-render.test.ts` also renders the actual TUI at 180×52 and 80×24, including first-frame expansion and Esc navigation (skipped without a linked checkout). This is not a real-terminal test; runtime code never imports the TUI.
+- Semantic snapshots cover widget contracts. Strict ASCII assertions in `test/ascii.test.ts` cover the complete extension-emitted widget tree at 180×100, 80×24 and 50×20, including agent tabs, plus Unicode-content preservation and custom host glyphs. Trace tests also check ASCII log chrome. `test/tui-render.test.ts` renders the actual TUI at 180×52 and 80×24, including first-frame expansion, Tab/Shift+Tab traversal, F6 focus hints, empty states and Esc navigation (skipped without a linked checkout). This is not a real-terminal test; runtime code never imports the TUI. Host-owned widget clipping ellipses and chip ends can still be Unicode in ASCII mode; the strict semantic tests do not claim those host decorations are fixed.
 
 ## Source interface
 
@@ -177,7 +179,7 @@ interface DashboardSource {
   id: string
   label: string
   snapshot(): DashboardSnapshot
-  details(agentId: string, opts?: Pick<ViewRenderOptions, "statusBadge">): DashboardDetails | undefined
+  details(agentId: string, opts?: Pick<ViewRenderOptions, "statusBadge" | "glyphs">): DashboardDetails | undefined
   subscribe?(changed: () => void): () => void
   act?(
     agentId: string,
@@ -195,7 +197,7 @@ interface DashboardSource {
 - `sessionId?: string` is the actual child session ID, not the dashboard agent ID. When supplied, **Actions → Open transcript / Open trace** opens a host-owned page using `SessionControl.subagentMessages(sessionId)` or `SessionControl.trace(sessionId)`. Transcript shows recorded messages; trace opens the same **Stats** view used by replay, plus recorded logs. These reads remain host-authorized; missing or unrelated sessions show unavailable data. Esc returns to the agent page with its state intact. Sources without `sessionId` keep their existing actions.
 - Status: `queued | running | idle | paused | done | failed | stopped`. `running` displays as working; `paused?: boolean` preserves an active pause, and `done` with a defined `note` displays as stopped.
 - A file: `{ path, diff?: ViewLine[], added?: number, removed?: number }`; a path alone must not imply diff content or line counts.
-- `details` optionally receives the host’s `statusBadge` helper when Logs is visible, so status-bearing log rows can use the current theme. Sources that ignore it are unchanged.
+- `details` optionally receives the host’s `statusBadge` helper and `glyphs` metadata when Logs is visible, so status-bearing log rows and authored separators can use the current theme. Sources that ignore them are unchanged. Historical trace statuses stay static.
 - Details: `{ summary: ViewLine[], logs: ViewLine[], stats?: TraceSummary, tabs?: DashboardTab[], notes?: ViewLine[], steps?: { text: string; status: "done" | "running" | "queued" }[] }`. Steps and notes are source-reported, not synthesized.
 - A custom tab: `{ key: string; label: string; render(): UiNode | ViewLine[] }`. Tabs append after the built-ins; use the focused tab bar's arrows (or arrows from its text body) to reach them. Keys must be nonempty, stable and unique. `summary`, `diff`, `logs`, `actions` and `stats` are reserved; duplicate/reserved keys are ignored. `render()` follows the same synchronous, side-effect-free rules as other source reads. Line arrays become scrollable text; widget trees retain host-owned focus, selection and scroll. IDs must be unique within each tab; the dashboard namespaces them across tabs and agent pages. The contract supplies content only, not custom event handlers. Omitting `tabs` preserves the original page.
 - Cost is USD for that agent's **own** usage, not its descendants. Omit unknown cost.

@@ -104,6 +104,39 @@ test("one top line contains state, elapsed, known zero cost and per-state counts
   )
 })
 
+for (const [width, more, identityVisible] of [
+  [55, "[more]", false],
+  [57, "[more]", true],
+  [82, "[more]".repeat(10), false],
+] as const) {
+  test(`header at ${width} columns protects metrics when the ${more.length}-cell marker consumes identity room`, () => {
+    const s = snapshot({ id: `sw_${"长_identity_".repeat(12)}` })
+    const saved = structuredClone(s)
+    const ctx = context({
+      width,
+      glyphs: {
+        rule: "-",
+        separator: "::",
+        more,
+        treePipe: "|",
+        error: "x",
+        interrupted: "!",
+        statusStopped: "|",
+      },
+    })
+    const bar = nodes(render(s, ctx)).find((n) => n.type === "bar")
+    if (bar?.type !== "bar") throw new Error("Expected semantic header bar")
+    const primary = bar.left.map((part) => part.text).join("")
+    const counts = bar.right!.map((part) => part.text).join("")
+    expect(counts).toBe("working 1 :: idle 1")
+    expect(primary).toContain("* working :: 10s :: $0.00")
+    expect(Bun.stringWidth(primary) + 1 + Bun.stringWidth(counts)).toBeLessThanOrEqual(width - 2)
+    expect(primary).toBe(`${identityVisible ? `${more} :: ` : ""}* working :: 10s :: $0.00`)
+    expect(text(render(s, { ...ctx, page: { depth: 1, data: "summary" } }))).toContain(s.id)
+    expect(s).toEqual(saved)
+  })
+}
+
 test("selected member detail shows role, state, elapsed, cost and tool or last action", () => {
   const s = snapshot({
     members: [member("writer", { currentTools: [{ id: "t1", name: "read" }], lastAction: "Started read" })],
@@ -440,6 +473,33 @@ test("live declarative events still deliver message-all, pause/resume and stop-m
   swarmView.onEvent!({ type: "key", key: "x" }, data, view)
   await Bun.sleep(1)
   expect(calls).toEqual(["all Check this", "pause writer", "resume writer", "stop writer"])
+})
+
+test("view chrome infers ASCII from rule, honors supplied glyphs and keeps Unicode defaults without metadata", () => {
+  const s = snapshot()
+  const data: SwarmViewData = { snapshot: () => s }
+  const ctx = context({
+    glyphs: {
+      rule: "-",
+      separator: ":",
+      more: "[more]",
+      treePipe: "|",
+      error: "x",
+      interrupted: "!",
+      statusStopped: "|",
+    },
+  })
+  expect(swarmView.title(data, ctx)).toBe("Swarm sw1 : Compare options")
+  const output = text(swarmView.ui!(data, ctx))
+  expect(output).not.toMatch(/[^\p{ASCII}]/u)
+  expect(output).toContain("up/down select : [ ] panes")
+  expect(output).toContain("writer : writer role")
+  expect(swarmView.title(data, context())).toBe("Swarm sw1 · Compare options")
+  expect(text(render(s))).toContain("↑↓ select · [ ] panes")
+  ctx.glyphs = { ...ctx.glyphs!, rule: "─", separator: "•" }
+  const unicode = text(swarmView.ui!(data, ctx))
+  expect(unicode).toContain("↑↓ select • [ ] panes")
+  expect(unicode).toContain("writer • writer role")
 })
 
 test("gone and empty swarms render without actions or undefined details", () => {

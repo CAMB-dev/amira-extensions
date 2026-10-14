@@ -23,7 +23,7 @@ exports[`approved prototype fidelity 80x24: selected phase only, compact details
   "  task-auth-middleware",
   " 1–4 tabs · o diff · a actions · ? shortcuts",
   "╭──────────────────────────────────────────────────────────────────────────────╮",
-  "│ > Ask Amira after closing this view                                          │",
+  "│ > Press F6 to ask Amira                                                      │",
   "╰──────────────────────────────────────────────────────────────────────────────╯",
   "  tab focus · arrows navigate · enter open/send · pgup pgdn scroll · esc close",
 ]
@@ -80,7 +80,7 @@ exports[`approved prototype fidelity 180x52: equivalent scenario matches the tar
   "                                 │                                                                                               │",
   " o open diff   p pause/resume   r request changes   a actions   x stop                                                                          1–4 tabs · 5 stats (when available)",
   "╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
-  "│ > Ask Amira or enter a command after closing this view…                                                                                      Hint only · close this view to send │",
+  "│ > Press F6 to ask Amira or enter a command                                                                                                               Hint only · F6 to input │",
   "╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
   "  tab focus · arrows navigate · enter open/send · pgup pgdn scroll · esc close",
 ]

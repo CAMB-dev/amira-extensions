@@ -1,7 +1,7 @@
 {
   "name": "workflow",
   "license": "Apache-2.0",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Dynamic workflows: TypeScript scripts that orchestrate many sub-agents, with a journal to resume them",
   "type": "module",
   "scripts": {
@@ -12,7 +12,7 @@
   },
   "amira": {
     "engines": {
-      "amira": "^0.1.48"
+      "amira": "^0.1.49"
     },
     "extensions": [
       "./src/index.ts"

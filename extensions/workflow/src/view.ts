@@ -68,6 +68,7 @@ const money = (value: number | undefined) =>
   value === undefined
     ? "cost unknown"
     : `$${value < 0.01 && value !== 0 ? value.toFixed(4) : value.toFixed(2)}`
+const separator = (opts: ViewRenderOptions) => ` ${opts.glyphs?.separator ?? "·"} `
 const active = (agent: AgentNode) => agent.status === "working" || agent.status === "queued"
 const inset = (node: UiNode): UiNode => ({
   type: "row",
@@ -75,6 +76,7 @@ const inset = (node: UiNode): UiNode => ({
 })
 
 function summary(run: WorkflowViewRun, opts: ViewRenderOptions): ViewLine {
+  const sep = separator(opts)
   const counts = new Map<AgentStatusState, number>()
   for (const agent of agentsOf(run.flow)) {
     const state = agentStatusState(agent)
@@ -84,7 +86,7 @@ function summary(run: WorkflowViewRun, opts: ViewRenderOptions): ViewLine {
   const countText = states
     .filter((state) => counts.has(state))
     .map((state) => `${state} ${counts.get(state)}`)
-    .join(" · ")
+    .join(sep)
   const elapsed =
     run.readOnly && run.endedAt === undefined
       ? run.record.totals?.durationMs === undefined
@@ -93,28 +95,37 @@ function summary(run: WorkflowViewRun, opts: ViewRenderOptions): ViewLine {
       : formatDuration((run.endedAt ?? opts.now) - run.startedAt)
   const state = run.status === "running" ? "working" : run.status === "error" ? "failed" : run.status
   return segments([
-    { kind: "muted", text: `${countText || "0 agents"} · ` },
-    { kind: "text", text: `Workflow ${run.meta.name} · ` },
+    { kind: "muted", text: `${countText || "0 agents"}${sep}` },
+    { kind: "text", text: `Workflow ${run.meta.name}${sep}` },
     ...stateBadge(state, opts, false),
-    { kind: "muted", text: ` · ${elapsed} · ${money(totals(run.flow).cost)}` },
+    { kind: "muted", text: `${sep}${elapsed}${sep}${money(totals(run.flow).cost)}` },
   ])
 }
 
-function protectIdentity(parts: ViewSegment[], counts: string, width: number): ViewSegment[] {
+function protectIdentity(
+  parts: ViewSegment[],
+  counts: string,
+  width: number,
+  opts: ViewRenderOptions,
+): ViewSegment[] {
+  const sep = separator(opts)
+  const more = opts.glyphs?.more ?? "…"
   const [identity, ...details] = parts
   if (!identity) return details
   const room =
     width - Bun.stringWidth(counts) - 1 - Bun.stringWidth(details.map((part) => part.text).join(""))
   if (room < 8) return details
   if (Bun.stringWidth(identity.text) <= room) return parts
+  const suffixWidth = textCells(more + sep)
+  if (suffixWidth > room) return details
   let name = ""
   for (const grapheme of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(
-    identity.text.replace(/ · $/, ""),
+    identity.text.slice(0, -sep.length),
   )) {
-    if (Bun.stringWidth(name + grapheme.segment) > room - 4) break
+    if (Bun.stringWidth(name + grapheme.segment) > room - suffixWidth) break
     name += grapheme.segment
   }
-  return [{ ...identity, text: `${name}… · ` }, ...details]
+  return [{ ...identity, text: `${name}${more}${sep}` }, ...details]
 }
 
 function fold(label: string, value: string, expanded: boolean): ViewLine[] {
@@ -129,15 +140,16 @@ export function agentDetails(
   expanded: boolean,
 ): ViewLine[] {
   if (!agent) return [text("Agents appear here when the script calls agent().", "muted")]
+  const sep = separator(opts)
   const ms = agent.durationMs ?? (agent.startedAt === undefined ? undefined : opts.now - agent.startedAt)
   return [
     segments([
-      { kind: "accent", text: `${agent.label} · ` },
-      { kind: "text", text: `${agent.role ?? "agent"} · ` },
+      { kind: "accent", text: `${agent.label}${sep}` },
+      { kind: "text", text: `${agent.role ?? "agent"}${sep}` },
       ...statusBadge(agent, opts, false),
       {
         kind: "text",
-        text: ` · ${ms === undefined ? "elapsed unknown" : formatDuration(ms)}${agent.cost === undefined ? "" : ` · ${money(agent.cost)}`}`,
+        text: `${sep}${ms === undefined ? "elapsed unknown" : formatDuration(ms)}${agent.cost === undefined ? "" : `${sep}${money(agent.cost)}`}`,
       },
     ]),
     ...(agent.status === "cached" ? [text("Replayed from journal; no new usage.", "muted")] : []),
@@ -150,7 +162,7 @@ export function agentDetails(
     ...(agent.note !== undefined ? fold("Note", agent.note || "Stopped before completion", expanded) : []),
     text(""),
     text(
-      `Events / result · ${expanded ? "expanded" : "folded"} (Enter to ${expanded ? "fold" : "expand"})`,
+      `Events / result${sep}${expanded ? "expanded" : "folded"} (Enter to ${expanded ? "fold" : "expand"})`,
       "muted",
     ),
     ...(agent.events ?? []).flatMap((event) =>
@@ -243,11 +255,12 @@ function agentTree(
   return { leading, items }
 }
 
-function hintLines(hints: string[], width: number): ViewLine[] {
+function hintLines(hints: string[], width: number, opts: ViewRenderOptions): ViewLine[] {
+  const sep = separator(opts)
   const rows: string[] = []
   let row = ""
   for (const hint of hints) {
-    const next = row ? `${row} · ${hint}` : hint
+    const next = row ? `${row}${sep}${hint}` : hint
     if (row && textCells(next) > width) {
       rows.push(row)
       row = hint
@@ -288,9 +301,10 @@ export function createWorkflowView(
   }
   return {
     kind: "workflow",
-    title(data) {
+    title(data, opts) {
       const run = runOf(data)
-      return run ? `Workflow ${run.meta.name} · ${run.id} · ${runStateText(run.status)}` : "Workflow"
+      const sep = separator(opts)
+      return run ? `Workflow ${run.meta.name}${sep}${run.id}${sep}${runStateText(run.status)}` : "Workflow"
     },
     // The line fallback is kept for frontends which have not adopted semantic widgets.
     header(data, opts) {
@@ -300,7 +314,7 @@ export function createWorkflowView(
         opts.requestRefresh?.(1000)
       return [
         summary(run, opts),
-        ...(run.readOnly ? [text("Archived run · read-only", "muted")] : []),
+        ...(run.readOnly ? [text(`Archived run${separator(opts)}read-only`, "muted")] : []),
         ...(run.record.startedBy
           ? [text(`Started by: ${run.record.startedBy.label} (${run.record.startedBy.sessionId})`)]
           : []),
@@ -338,13 +352,14 @@ export function createWorkflowView(
           (agent) => String(agent.call) === opts.state.selected[`workflow-agents:${run.id}`],
         ) ?? selectedAgent(run, data)
       const expanded = selected !== undefined && (data.expandedCalls ?? []).includes(selected.call)
+      const sep = separator(opts)
       const heading = summary(run, opts)
       const attribution = run.record.startedBy
-        ? ` · Started by: ${run.record.startedBy.label} (${run.record.startedBy.sessionId})`
+        ? `${sep}Started by: ${run.record.startedBy.label} (${run.record.startedBy.sessionId})`
         : ""
       const headingLines = [
         heading,
-        text(`${run.id}${run.readOnly ? " · archived, read-only" : ""}${attribution}`, "muted"),
+        text(`${run.id}${run.readOnly ? `${sep}archived, read-only` : ""}${attribution}`, "muted"),
         ...(run.error ? [segments([{ kind: "error", text: run.error }])] : []),
       ]
       if (opts.page?.data === "summary") {
@@ -372,7 +387,7 @@ export function createWorkflowView(
                   segments([
                     {
                       kind: "muted",
-                      text: opts.focused === false ? "tab view · esc back" : "tab input · esc back",
+                      text: opts.focused === false ? `tab view${sep}esc back` : `tab input${sep}esc back`,
                     },
                   ]),
                 ],
@@ -388,17 +403,20 @@ export function createWorkflowView(
       const detailId = `workflow-details:${run.id}:${selected?.call ?? "none"}`
       const detailsActive = opts.state.focused === detailId
       const enter = detailsActive ? (expanded ? "enter fold" : "enter expand") : "enter details"
+      // API 0.1.49 exposes rule but not arrow labels; an ASCII rule selects word hints.
+      const select = opts.glyphs?.rule && /^[\x20-\x7e]+$/.test(opts.glyphs.rule) ? "up/down" : "↑↓"
       const hints =
         opts.focused === false
-          ? [segments([{ kind: "muted", text: "tab view · esc close" }])]
+          ? [segments([{ kind: "muted", text: `tab view${sep}esc close` }])]
           : hintLines(
-              ["↑↓ select", "[ ] panes", enter, "? summary", ...actions, "tab input", "esc close"],
+              [`${select} select`, "[ ] panes", enter, "? summary", ...actions, "tab input", "esc close"],
               innerWidth,
+              opts,
             )
-      const counts = heading.kind === "segments" ? heading.parts[0]!.text.replace(/ · $/, "") : "0 agents"
+      const counts = heading.kind === "segments" ? heading.parts[0]!.text.slice(0, -sep.length) : "0 agents"
       const primary =
-        heading.kind === "segments" ? protectIdentity(heading.parts.slice(1), counts, innerWidth) : []
-      const countRows = hintLines(counts.split(" · "), innerWidth)
+        heading.kind === "segments" ? protectIdentity(heading.parts.slice(1), counts, innerWidth, opts) : []
+      const countRows = hintLines(counts.split(sep), innerWidth, opts)
       const headerHeight = Math.max(1, countRows.length) + (run.error ? 1 : 0)
       const bodyHeight = Math.max(1, opts.height - headerHeight - hints.length - 2)
       const listHeight = wide
@@ -446,7 +464,7 @@ export function createWorkflowView(
                         row: [
                           {
                             kind: opts.focused === false ? ("dim" as const) : ("text" as const),
-                            text: `Events / result · ${expanded ? "expanded" : "folded"}`,
+                            text: `Events / result${sep}${expanded ? "expanded" : "folded"}`,
                           },
                         ],
                         expandable: true,

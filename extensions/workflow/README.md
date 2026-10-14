@@ -102,6 +102,13 @@ At 60 columns, with the list active, it reads:
 
 Finished and archived runs omit `x stop`. Host focus toggles remain host-owned.
 
+Since **0.2.2**, workflow requires extension API **^0.1.49** (not the CLI version).
+Hand-written screen separators and truncation markers use the host's `ViewRenderOptions.glyphs`,
+including on summary pages and in the line-only fallback. An ASCII rule selects `up/down select`
+for the owned navigation hint because this API exposes no arrow labels. The ASCII profile keeps
+screen chrome ASCII; workflow names, phase labels, attribution, agent notes, events and results
+retain their original Unicode text. Frontends that omit glyph metadata keep the Unicode chrome defaults.
+
 `/workflow view <id>` can also open a saved run from this session's workflow directory or
 Amira's workflow-runs directory. Archived snapshots are **read-only**: they show the final
 attempt's recorded agents/results, do not run a clock and offer no action keys. Unclosed
@@ -268,8 +275,12 @@ or `"never"` (refuse every start). Explicit settings override the permission mod
 The tests run sandboxed workflow scripts with fake spawn groups and a fake dashboard service
 registry, without model or network calls. View tests cover wide/narrow screens, host keyboard
 navigation, folding, focus, shared statuses and redraw demand; host-render tests use the
-linked checkout's headless renderer, not a live Amira session. Filesystem/worktree tests use
-temporary directories. Link Amira's public API packages and development types:
+linked checkout's headless renderer, not a live Amira session. ASCII regressions assert every
+rendered character is ASCII with unchanged ASCII fixture content at 120×36, 80×24 and 50×20,
+across pane focus, expansion, summary pages and archived runs. Separate tests verify Unicode
+content preservation, custom separator/truncation glyphs and the line-only fallback.
+Filesystem/worktree tests use temporary directories. Link Amira's public API packages and
+development types:
 
 ```sh
 bun install

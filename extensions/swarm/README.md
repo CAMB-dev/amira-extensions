@@ -8,7 +8,8 @@ session watch and step in.
 amira ext install swarm
 ```
 
-Needs Amira ^0.1.48 (persistent sub-agents, spawn groups, split views and shared status badges).
+Needs Amira ^0.1.49 (persistent sub-agents, spawn groups, split views, shared status badges
+and host glyph metadata).
 
 ## Starting one
 
@@ -99,6 +100,9 @@ member workflows, including outstanding confirmations and starts racing with shu
   state, elapsed time, known cost and counts), and Esc returns from it or closes the root view.
   The compact header keeps state counts visible before identity, elapsed time or cost;
   counts wrap if even they cannot fit on one row.
+  Since **0.2.2**, handwritten view chrome follows the host glyph profile: ASCII mode uses
+  `up/down select`, `|` separators, `...` truncation and `>`/`v` disclosure markers.
+  Goals, member text, messages, board entries and results keep their original Unicode content.
   Live keys: `m` message a member (`name: text`, or `all: text`), `p` pause or resume a
   member (`all` for the whole swarm), `x` stop a member, `s` stop the swarm after confirmation.
   Swarms read back from the session are read-only and show no action keys or hints.
@@ -163,6 +167,11 @@ focus for the next frame, so choose the active native widget from `ctx.state.foc
 (default members); keep selection and expansion host-owned. Put the shared badge symbol
 in the tree's two-cell `node` slot with `gap: 0`; selected symbol, state word and name all
 use the same text/dim semantic style, while unselected badges retain their theme roles.
+Use `ctx.glyphs.separator` and `ctx.glyphs.more` for separators and truncation, measuring
+these strings rather than assuming single-cell symbols. API 0.1.49 exposes only a subset
+of host glyphs; infer ASCII arrows and static disclosure markers from a printable-ASCII
+`ctx.glyphs.rule`. If metadata is absent, keep the default Unicode chrome. Apply this
+policy only when constructing decorations, never by replacing symbols in content.
 
 Member costs are own reported usage; missing costs stay unknown, and known zero costs
 show `$0.00`. Only active working members request elapsed-time refreshes; idle, paused
@@ -300,7 +309,11 @@ Older settings still work: `"enabled": "explicit"` reads as `"ask"`. Without `en
 ## Tests
 
 The integration tests run swarms on a real agent tree with a scripted model, so they need
-Amira's packages. Start-policy tests use public API fakes:
+Amira's packages. Rendering regressions use the real host `ExtensionViewer` at 120×36,
+80×24 and 50×20 for live and read-only views. ASCII fixtures are checked for any non-ASCII
+output after removing ANSI styling; a separate test verifies Unicode content is preserved.
+Custom separator/more glyphs, full summaries, expansion and inactive panes are covered too.
+Start-policy tests use public API fakes:
 
 ```sh
 bun install

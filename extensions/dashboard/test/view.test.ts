@@ -304,11 +304,11 @@ describe("public semantic rendering (not terminal raster snapshots)", () => {
     fixture.snapshot.phases = []
     fixture.snapshot.note = undefined
     expect(words(fixture, "empty")).toEqual([
-      "No agents yet. Start a task with sub-agents, then return here.",
+      "No agents yet. Close this view and ask Amira to delegate a task.",
     ])
-    expect(words(fixture, "selection-hint")).toEqual([
-      "Select an agent in the timeline, then press Enter to open its page.",
-    ])
+    const rendered = JSON.stringify(render(fixture))
+    expect(rendered).not.toContain("Select an agent")
+    expect(rendered).not.toContain("queued")
   })
 })
 

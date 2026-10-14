@@ -87,6 +87,58 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
     })
   }
 
+  test("audit: Tab stays in widgets and the host advertises F6 for input", () => {
+    let focused: string | undefined
+    const fixture = viewFixture()
+    const viewer = new tui.ExtensionViewer(
+      {
+        ...dashboardView,
+        ui(data: typeof fixture.data, ctx: ReturnType<typeof fixture.context>) {
+          focused = ctx.state.focused
+          return dashboardView.ui!(data, ctx)
+        },
+      },
+      fixture.data,
+    )
+    const render = () => viewer.render(180, { theme: kit.monoTheme, color: false, rows: 52 })
+    viewer.mount()
+    render()
+    try {
+      expect(viewer.needsTab).toBe(true)
+      const before = focused
+      viewer.handleInput(kit.key("tab"))
+      render()
+      expect(focused).not.toBe(before)
+      viewer.handleInput(kit.key("tab", { shift: true }))
+      render()
+      expect(focused).toBe(before)
+      expect(viewer.focusHint(kit.monoTheme, 180)).toContain("f6 → input")
+    } finally {
+      viewer.dispose()
+    }
+  })
+
+  test("audit: zero agents show an actionable empty state, not queued or a selection prompt", () => {
+    const fixture = viewFixture()
+    fixture.snapshot.phases = []
+    delete fixture.snapshot.note
+    fixture.snapshot.warning = "Older activity may be omitted."
+    const viewer = new tui.ExtensionViewer(dashboardView, fixture.data)
+    viewer.mount()
+    try {
+      const rows = viewer
+        .render(120, { theme: kit.monoTheme, color: false, rows: 36 })
+        .map(kit.stripAnsi)
+        .join("\n")
+      expect(rows).toContain("No agents yet.")
+      expect(rows).toContain("ask Amira to delegate a task")
+      expect(rows).not.toContain("queued")
+      expect(rows).not.toContain("Select an agent")
+    } finally {
+      viewer.dispose()
+    }
+  })
+
   async function openTrace(records: TraceRecord[]) {
     const session = {
       info: () => ({ id: "root", title: "Root task", cwd: "/project", busy: false }),

@@ -1,4 +1,11 @@
-import { type SessionControl, summarizeTrace, type TraceRecord, type ViewLine } from "@amira/api"
+import {
+  type SessionControl,
+  summarizeTrace,
+  type TraceRecord,
+  type ViewLine,
+  type ViewRenderOptions,
+} from "@amira/api"
+import { chrome } from "./chrome.ts"
 import {
   type DashboardAgent,
   type DashboardDetails,
@@ -69,38 +76,39 @@ export function ownCost(records: TraceRecord[], reportedCost?: number): number |
   return reportedCost
 }
 
-export function traceLogLines(record: TraceRecord): ViewLine[] {
+export function traceLogLines(record: TraceRecord, opts: Pick<ViewRenderOptions, "glyphs"> = {}): ViewLine[] {
+  const c = chrome(opts)
   switch (record.type) {
     case "trace":
       return [
         {
           kind: "muted",
-          text: `Recording started at ${record.startedAt}${record.title ? ` · ${record.title}` : ""}`,
+          text: c`Recording started at ${record.startedAt}${record.title ? c` · ${record.title}` : ""}`,
         },
       ]
     case "model":
       return [
         {
           kind: "text",
-          text: `${record.model} · ${record.end - record.start} ms${record.stopReason ? ` · ${record.stopReason}` : ""}`,
+          text: c`${record.model} · ${record.end - record.start} ms${record.stopReason ? c` · ${record.stopReason}` : ""}`,
         },
       ]
     case "tool":
       return [
         {
           kind: record.outcome === "ok" ? "text" : "warning",
-          text: `${record.name} · ${record.outcome} · ${record.durationMs} ms`,
+          text: c`${record.name} · ${record.outcome} · ${record.durationMs} ms`,
         },
         ...(record.argsPreview ? [{ kind: "muted" as const, text: record.argsPreview }] : []),
         ...(record.resultPreview ? [{ kind: "text" as const, text: record.resultPreview }] : []),
-        ...(record.artifact ? [{ kind: "muted" as const, text: `Saved output: ${record.artifact}` }] : []),
+        ...(record.artifact ? [{ kind: "muted" as const, text: c`Saved output: ${record.artifact}` }] : []),
       ]
     case "turn":
       return [
         {
           kind: "segments",
           parts: [
-            { kind: "text", text: `Turn ${record.turnId} · ` },
+            { kind: "text", text: c`Turn ${record.turnId} · ` },
             ...staticStatusBadge({ status: record.reason }),
           ],
         },
@@ -119,16 +127,16 @@ export function traceLogLines(record: TraceRecord): ViewLine[] {
         {
           kind: "segments",
           parts: [
-            { kind: "text", text: `${record.title ?? record.childSessionId} · ` },
+            { kind: "text", text: c`${record.title ?? record.childSessionId} · ` },
             ...staticStatusBadge({ ...record, status: statusOf(record) }),
           ],
         },
         ...(record.error ? [{ kind: "text" as const, text: record.error }] : []),
       ]
     case "compact":
-      return [{ kind: "muted", text: `Compaction · ${record.reason} · ${record.end - record.start} ms` }]
+      return [{ kind: "muted", text: c`Compaction · ${record.reason} · ${record.end - record.start} ms` }]
     case "side":
-      return [{ kind: "muted", text: `${record.label ?? "Side request"} · ${record.model}` }]
+      return [{ kind: "muted", text: c`${record.label ?? "Side request"} · ${record.model}` }]
     default:
       return []
   }
@@ -318,6 +326,11 @@ export async function createTraceSource(
     id: "trace",
     label: "Trace",
     snapshot: () => snapshot,
-    details: (agentId: string) => details.get(agentId),
+    details: (agentId: string, opts?: Pick<ViewRenderOptions, "glyphs">) => {
+      const detail = details.get(agentId)
+      return detail && opts?.glyphs
+        ? freeze({ ...detail, logs: traces.get(agentId)!.flatMap((record) => traceLogLines(record, opts)) })
+        : detail
+    },
   })
 }

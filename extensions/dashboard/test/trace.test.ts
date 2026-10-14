@@ -10,7 +10,28 @@ import {
   type ViewSegment,
 } from "@amira/api"
 import { agentsOf } from "../src/source.ts"
-import { createTraceSource } from "../src/trace.ts"
+import { createTraceSource, traceLogLines } from "../src/trace.ts"
+
+test("ASCII trace chrome uses host separators without changing previews", async () => {
+  const glyphs = {
+    rule: "-",
+    treePipe: "|",
+    separator: ".",
+    more: ".",
+    error: "x",
+    interrupted: "o",
+    statusStopped: "|",
+  }
+  const records = fixture()
+  for (const record of records) {
+    expect(JSON.stringify(traceLogLines(record, { glyphs }))).not.toMatch(/[^\p{ASCII}]/u)
+  }
+  const { session } = host({ root: records })
+  const source = await createTraceSource(session)
+  expect(JSON.stringify(source.details("root", { glyphs }))).not.toMatch(/[^\p{ASCII}]/u)
+  const preview = "用户 · ╭─▶ résumé…"
+  expect(JSON.stringify(traceLogLines(tool({ resultPreview: preview }), { glyphs }))).toContain(preview)
+})
 
 function usage(cost?: number) {
   const value = { ...emptyUsage(), input: 10, output: 5 }

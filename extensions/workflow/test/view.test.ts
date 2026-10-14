@@ -1,5 +1,13 @@
 import { expect, test } from "bun:test"
-import type { AgentStatusState, UiContext, UiControl, UiNode, UiState, ViewLine } from "@amira/api"
+import type {
+  AgentStatusState,
+  UiContext,
+  UiControl,
+  UiNode,
+  UiState,
+  ViewLine,
+  ViewRenderOptions,
+} from "@amira/api"
 import { observeAgentEvent } from "../src/activity.ts"
 import type { JournalEntry, RunRecord } from "../src/journal.ts"
 import { type AgentNode, agentsOf, newFlow, phaseOf } from "../src/progress.ts"
@@ -130,6 +138,33 @@ function left(node: UiNode): ViewLine[] {
   return lines(split.children[0]!.node)
 }
 
+test("line fallback uses ASCII host glyphs for live and archived chrome without changing fixture text", () => {
+  const f = fixture()
+  const opts: ViewRenderOptions = {
+    width: 120,
+    now: 5000,
+    glyphs: {
+      rule: "-",
+      separator: "|",
+      more: "...",
+      treePipe: "|",
+      error: "x",
+      interrupted: "o",
+      statusStopped: "|",
+    },
+  }
+  const render = () =>
+    [f.view.title(f.data, opts), ...f.view.header!(f.data, opts), ...f.view.render!(f.data, opts)]
+      .map((line) => (typeof line === "string" ? line : lineText(line)))
+      .join("\n")
+  expect(render()).not.toMatch(/[^\p{ASCII}]/u)
+  expect(render()).toContain("Workflow fanout | wf_test | done")
+  expect(render()).toContain("agent 1 | agent | v done")
+  f.run.readOnly = true
+  expect(render()).not.toMatch(/[^\p{ASCII}]/u)
+  expect(render()).toContain("Archived run | read-only")
+})
+
 for (const [width, expected] of [
   [140, "row"],
   [82, "row"],
@@ -151,6 +186,51 @@ for (const [width, expected] of [
       .filter((line) => line.includes("agent "))
     expect(agentRows.length).toBeGreaterThan(0)
     for (const row of agentRows) expect(row).not.toMatch(/\$|tok|\ds|role:/i)
+  })
+}
+
+for (const [width, more, identityVisible] of [
+  [55, "[more]", false],
+  [57, "[more]", true],
+  [82, "[more]".repeat(10), false],
+] as const) {
+  test(`header at ${width} columns protects metrics when the ${more.length}-cell marker consumes identity room`, () => {
+    const f = fixture()
+    f.run.meta.name = "长_workflow_identity_".repeat(12)
+    f.run.status = "running"
+    f.run.endedAt = undefined
+    agentsOf(f.flow)[0]!.status = "working"
+    const saved = structuredClone({ meta: f.run.meta, flow: f.flow })
+    const ctx = {
+      ...context(width),
+      now: 11000,
+      glyphs: {
+        rule: "-",
+        separator: "::",
+        more,
+        treePipe: "|",
+        error: "x",
+        interrupted: "!",
+        statusStopped: "|",
+      },
+    }
+    const node = f.view.ui!(f.data, ctx)
+    if (node.type !== "row") throw new Error("Expected workflow inset")
+    const column = node.children[1]!.node
+    if (column.type !== "column") throw new Error("Expected workflow column")
+    const header = column.children[0]!.node
+    if (header.type !== "column") throw new Error("Expected workflow header")
+    const bar = header.children[0]!.node
+    if (bar.type !== "bar") throw new Error("Expected semantic header bar")
+    const primary = bar.left.map((part) => part.text).join("")
+    const counts = bar.right!.map((part) => part.text).join("")
+    expect(counts).toBe("working 1 :: done 2")
+    expect(primary).toContain("* working :: 10s :: $0.03")
+    expect(Bun.stringWidth(primary) + 1 + Bun.stringWidth(counts)).toBeLessThanOrEqual(width - 2)
+    expect(primary).toBe(`${identityVisible ? `${more} :: ` : ""}* working :: 10s :: $0.03`)
+    const summary = f.view.ui!(f.data, { ...ctx, page: { depth: 1, data: "summary" } })
+    expect(lines(summary).map(lineText).join("\n")).toContain(f.run.meta.name)
+    expect({ meta: f.run.meta, flow: f.flow }).toEqual(saved)
   })
 }
 

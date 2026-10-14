@@ -1717,13 +1717,13 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
             "left": [
               {
                 "kind": "muted",
-                "text": " > Ask Amira or enter a command after closing this view…",
+                "text": " > Press F6 to ask Amira or enter a command",
               },
             ],
             "right": [
               {
                 "kind": "muted",
-                "text": "Hint only · close this view to send ",
+                "text": "Hint only · F6 to input ",
               },
             ],
             "type": "bar",
@@ -2058,13 +2058,13 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 agent 
             "left": [
               {
                 "kind": "muted",
-                "text": " > Ask Amira or enter a command after closing this view…",
+                "text": " > Press F6 to ask Amira or enter a command",
               },
             ],
             "right": [
               {
                 "kind": "muted",
-                "text": "Hint only · close this view to send ",
+                "text": "Hint only · F6 to input ",
               },
             ],
             "type": "bar",
@@ -2345,13 +2345,13 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 stats 
             "left": [
               {
                 "kind": "muted",
-                "text": " > Ask Amira or enter a command after closing this view…",
+                "text": " > Press F6 to ask Amira or enter a command",
               },
             ],
             "right": [
               {
                 "kind": "muted",
-                "text": "Hint only · close this view to send ",
+                "text": "Hint only · F6 to input ",
               },
             ],
             "type": "bar",
@@ -3443,7 +3443,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 timelin
             "left": [
               {
                 "kind": "muted",
-                "text": " > Ask Amira after closing this view",
+                "text": " > Press F6 to ask Amira",
               },
             ],
             "right": [],
@@ -3745,7 +3745,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 agent w
             "left": [
               {
                 "kind": "muted",
-                "text": " > Ask Amira after closing this view",
+                "text": " > Press F6 to ask Amira",
               },
             ],
             "right": [],
@@ -4022,7 +4022,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 stats w
             "left": [
               {
                 "kind": "muted",
-                "text": " > Ask Amira after closing this view",
+                "text": " > Press F6 to ask Amira",
               },
             ],
             "right": [],

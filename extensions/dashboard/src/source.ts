@@ -93,8 +93,11 @@ export interface DashboardSource {
   id: string
   label: string
   snapshot(): DashboardSnapshot
-  /** Optional host badge helper for rendering visible status-bearing log rows. */
-  details(agentId: string, opts?: Pick<ViewRenderOptions, "statusBadge">): DashboardDetails | undefined
+  /** Optional host badge helper and glyph metadata for visible log chrome. */
+  details(
+    agentId: string,
+    opts?: Pick<ViewRenderOptions, "statusBadge" | "glyphs">,
+  ): DashboardDetails | undefined
   /** Optional change notification. The returned function releases the subscription. */
   subscribe?(changed: () => void): () => void
   /** Capability must also be present in the agent's actions. A result is user-facing text. */

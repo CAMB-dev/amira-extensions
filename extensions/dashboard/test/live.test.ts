@@ -16,6 +16,28 @@ import { agentsOf } from "../src/source.ts"
 import { performAction } from "../src/view.ts"
 import { viewFixture } from "./view-fixture.ts"
 
+test("audit: a new live session has no fabricated queued phase", () => {
+  const { source } = setup([])
+  expect(source.snapshot().phases).toEqual([])
+  source.dispose()
+})
+
+test("audit: empty active and ended spawn groups do not fabricate queued work", () => {
+  const s = setup([])
+  for (const state of ["active", "ended"] as const) {
+    s.setGroups([{ ...group("empty"), state }])
+    expect(s.source.snapshot().phases).toEqual([])
+  }
+  s.source.dispose()
+})
+
+test("audit: an unlisted group with real queued work retains its queued state", () => {
+  const s = setup([])
+  s.setGroups([{ ...group("pending"), agents: { total: 1, queued: 1, working: 0, idle: 0, ended: 0 } }])
+  expect(s.source.snapshot().phases[0]?.groups[0]?.status).toBe("queued")
+  s.source.dispose()
+})
+
 const model = { provider: "test", model: "test" }
 const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
 const assistant = (text: string): AssistantMessage => ({
@@ -206,7 +228,7 @@ test("one Agents phase groups by parent-qualified spawn group or tool call, incl
   expect(groups.find((g) => g.name === "parent group")?.agents.map((a) => a.id)).toEqual(["other-group"])
   expect(groups.filter((g) => g.ref === "same-call")).toHaveLength(2)
   expect(new Set(groups.map((g) => g.id)).size).toBe(groups.length)
-  expect(groups.find((g) => g.ref === "empty")?.agents).toEqual([])
+  expect(groups.find((g) => g.ref === "empty")).toBeUndefined()
   s.source.dispose()
 })
 

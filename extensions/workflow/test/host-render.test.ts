@@ -8,6 +8,8 @@ const packages = path.dirname(realpathSync(path.join(import.meta.dir, "../node_m
 const load = async (name: string) => import(name)
 const tui = await load(path.join(packages, "tui/src/index.ts"))
 const kit = await load(path.join(packages, "tui-kit/src/index.ts"))
+const hostGlyphs = await load(path.join(packages, "tui/src/glyphs.ts"))
+const ascii = (await load(path.join(packages, "cli/themes/ascii.json"))).default
 
 function fixture(): WorkflowViewRun {
   const meta = { name: "layout", description: "Layout fixtures", phases: ["Build", "Review"] }
@@ -62,6 +64,191 @@ function fixture(): WorkflowViewRun {
     },
   }
 }
+
+for (const [width, height] of [
+  [120, 36],
+  [80, 24],
+  [50, 20],
+] as const) {
+  test(`ASCII host ${width}x${height}: all chrome stays ASCII across panes, expansion, focus and summary`, () => {
+    const before = { ...hostGlyphs.glyphs }
+    const run = fixture()
+    const viewer = new tui.ExtensionViewer(
+      createWorkflowView(
+        () => run,
+        async () => false,
+      ),
+      {},
+      { now: () => 10000 },
+    )
+    try {
+      hostGlyphs.setGlyphs(ascii.glyphs)
+      viewer.mount()
+      const render = (): string => {
+        const rows: string[] = viewer
+          .render(width, { theme: kit.monoTheme, glyphs: ascii.glyphs, color: false, rows: height })
+          .map(kit.stripAnsi)
+        expect(rows.length).toBeLessThanOrEqual(height)
+        for (const row of rows) expect(kit.visibleWidth(row)).toBeLessThanOrEqual(width)
+        const screen = rows.join("\n")
+        expect(screen).not.toMatch(/[^\p{ASCII}]/u)
+        return screen
+      }
+      expect(render()).toContain("up/down select")
+      viewer.handleInput(kit.key("down"))
+      expect(render()).toContain("FIRST SECOND")
+      viewer.handleInput(kit.key("]"))
+      expect(render()).toContain("enter expand")
+      viewer.handleInput(kit.key("enter"))
+      expect(render()).toContain("enter fold")
+      viewer.handleInput(kit.key("enter"))
+      expect(render()).toContain("FIRST SECOND")
+      viewer.focused = false
+      expect(render()).toContain("tab view")
+      viewer.focused = true
+      run.meta.name = "a-very-long-workflow-name-for-layout-regressions".repeat(3)
+      if (width === 120) expect(render()).toContain(". . | working")
+      else render()
+      viewer.handleInput(kit.key("?"))
+      expect(render().replace(/\s+/g, "")).toContain(run.meta.name)
+      viewer.focused = false
+      expect(render()).toContain("esc back")
+      viewer.focused = true
+      viewer.handleInput(kit.key("esc"))
+      render()
+      run.status = "done"
+      run.endedAt = 10000
+      run.readOnly = true
+      expect(render()).not.toContain("x stop")
+      viewer.handleInput(kit.key("?"))
+      expect(render()).toContain("archived, read-only")
+    } finally {
+      viewer.dispose()
+      hostGlyphs.setGlyphs(before)
+    }
+  })
+}
+
+for (const [width, more] of [
+  [55, "[more]"],
+  [82, "[more]".repeat(10)],
+] as const) {
+  test(`host ${width}: oversized identity suffix does not clip header metrics`, () => {
+    const before = { ...hostGlyphs.glyphs }
+    const run = fixture()
+    run.meta.name = "long_workflow_identity_".repeat(12)
+    const saved = structuredClone({ meta: run.meta, flow: run.flow })
+    const profile = { ...ascii.glyphs, separator: "::", more }
+    const viewer = new tui.ExtensionViewer(
+      createWorkflowView(
+        () => run,
+        async () => false,
+      ),
+      {},
+      { now: () => 10000 },
+    )
+    try {
+      hostGlyphs.setGlyphs(profile)
+      viewer.mount()
+      const rows: string[] = viewer
+        .render(width, { theme: kit.monoTheme, glyphs: profile, color: false, rows: 32 })
+        .map(kit.stripAnsi)
+      expect(rows[0]).toContain("working :: 10s :: $0.52")
+      expect(rows[0]).toContain("working 1 :: done 1")
+      for (const row of rows) expect(kit.visibleWidth(row)).toBeLessThanOrEqual(width)
+      expect({ meta: run.meta, flow: run.flow }).toEqual(saved)
+    } finally {
+      viewer.dispose()
+      hostGlyphs.setGlyphs(before)
+    }
+  })
+}
+
+test("host metadata controls custom separators and multi-cell truncation markers", () => {
+  const before = { ...hostGlyphs.glyphs }
+  const run = fixture()
+  run.meta.name = "long-workflow-name-".repeat(12)
+  const viewer = new tui.ExtensionViewer(
+    createWorkflowView(
+      () => run,
+      async () => false,
+    ),
+    {},
+    { now: () => 10000 },
+  )
+  const profile = { ...ascii.glyphs, separator: "::", more: "<more>" }
+  try {
+    hostGlyphs.setGlyphs(profile)
+    viewer.mount()
+    const render = (): string =>
+      viewer
+        .render(120, { theme: kit.monoTheme, glyphs: profile, color: false, rows: 36 })
+        .map(kit.stripAnsi)
+        .join("\n")
+    const screen = render()
+    expect(screen).not.toMatch(/[^\p{ASCII}]/u)
+    expect(screen).toContain("<more> :: | working :: 10s :: $0.52")
+    expect(screen).toContain("working 1 :: done 1")
+    expect(screen).toContain("up/down select :: [ ] panes")
+    // Separators alone do not identify an ASCII profile; the API only exposes the rule.
+    hostGlyphs.setGlyphs({ ...profile, rule: "─" })
+    expect(render()).toContain("↑↓ select :: [ ] panes")
+  } finally {
+    viewer.dispose()
+    hostGlyphs.setGlyphs(before)
+  }
+})
+
+test("ASCII host preserves Unicode names, phase labels, attribution, notes, events and results", () => {
+  const before = { ...hostGlyphs.glyphs }
+  const run = fixture()
+  const content = "正文 العربية café · ↑↓ …"
+  run.meta.name = content
+  run.record.startedBy = { label: content, sessionId: "child" }
+  run.flow.phases[0]!.title = content
+  const agent = run.flow.phases[0]!.items[0]!
+  if (agent.kind !== "agent") throw new Error("Expected fixture agent")
+  agent.label = content
+  agent.role = content
+  agent.lastAction = content
+  agent.note = content
+  agent.worktreeNote = content
+  agent.events = [{ ts: 0, text: content }]
+  agent.text = content
+  const viewer = new tui.ExtensionViewer(
+    createWorkflowView(
+      () => run,
+      async () => false,
+    ),
+    {},
+    { now: () => 10000 },
+  )
+  try {
+    hostGlyphs.setGlyphs(ascii.glyphs)
+    viewer.mount()
+    const render = (): string =>
+      viewer
+        .render(160, { theme: kit.monoTheme, glyphs: ascii.glyphs, color: false, rows: 48 })
+        .map(kit.stripAnsi)
+        .join("\n")
+    const folded = render()
+    for (const label of ["Workflow", "Worktree:", "Note:", "Last action:", "Result:"])
+      expect(folded).toContain(`${label} ${content}`)
+    expect(folded).toContain(`${content} . ${content}`)
+    expect(folded.split(content).length).toBeGreaterThanOrEqual(9)
+    viewer.handleInput(kit.key("]"))
+    render()
+    viewer.handleInput(kit.key("enter"))
+    expect(render().split(content).length).toBeGreaterThanOrEqual(9)
+    viewer.handleInput(kit.key("?"))
+    const summary = render()
+    expect(summary).toContain(`Workflow ${content}`)
+    expect(summary).toContain(`Started by: ${content} (child)`)
+  } finally {
+    viewer.dispose()
+    hostGlyphs.setGlyphs(before)
+  }
+})
 
 for (const [width, height] of [
   [120, 30],
