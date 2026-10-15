@@ -1,0 +1,39 @@
+{
+  "name": "project-design",
+  "description": "Offline native project design question; all options include a trade-off.",
+  "prompt": "Help design this local planner.",
+  "routes": {
+    "main": [
+      {
+        "text": "Let's decide the first design constraint. Only your answer will be recorded.\n",
+        "toolCalls": [
+          {
+            "id": "project-architecture-question",
+            "name": "ask_user",
+            "args": {
+              "questions": [
+                {
+                  "header": "Storage",
+                  "question": "Where should the planner keep its data?",
+                  "options": [
+                    {
+                      "label": "Local files (Recommended)",
+                      "description": "Private and works offline; you manage backups and cannot sync automatically."
+                    },
+                    {
+                      "label": "Hosted database",
+                      "description": "Easy multi-device sync; requires network access, hosting cost and account setup."
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "text": "Your confirmed storage decision is saved. Prototypes and implementation are coming later.\n"
+      }
+    ]
+  }
+}

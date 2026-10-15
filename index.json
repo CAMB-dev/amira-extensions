@@ -2,6 +2,15 @@
   "schemaVersion": 1,
   "extensions": [
     {
+      "name": "project",
+      "description": "Experimental project discovery, guided design conversations and durable human decisions: /project",
+      "version": "0.1.0",
+      "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/project" },
+      "engines": { "amira": "^0.1.52" },
+      "tags": ["experimental", "project", "design", "decisions"],
+      "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/project"
+    },
+    {
       "name": "computer-use-uia",
       "description": "Experimental any-window Windows desktop UI Automation with emergency stop; off by default",
       "version": "0.0.2",
