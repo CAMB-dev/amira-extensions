@@ -6,6 +6,10 @@ import path from "node:path"
 
 const root = mkdtempSync(path.join(tmpdir(), "amira-project-offline-"))
 const previousCwd = process.cwd()
+
+// Source-root environment paths remain relative to the test invocation, not the isolated cwd.
+export { previousCwd as testLaunchCwd }
+
 for (const key of Object.keys(process.env)) {
   if (key.startsWith("AMIRA_LIVE_") || /(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|PROXY)$/i.test(key))
     delete process.env[key]

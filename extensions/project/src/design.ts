@@ -17,11 +17,13 @@ import type {
 } from "@amira/api"
 import { textResult } from "@amira/api"
 import { validateAskAnswers } from "./answers.ts"
+import { ProjectCommandError, projectError } from "./diagnostics.ts"
 import { conversationLanguage, LanguagePolicy, localize, resolveLanguage } from "./language.ts"
 import { validateAskQuestions } from "./questions.ts"
 import {
   appendSuggestion,
   DecisionStore,
+  IterationStore,
   type Project,
   readDocument,
   readProject,
@@ -76,6 +78,7 @@ type Binding = {
   store: DecisionStore
   handle?: OwnedConversation
   ready?: Promise<OwnedConversation>
+  paused?: boolean
 }
 
 type SavedIdentity = {
@@ -216,6 +219,7 @@ export class DesignSessions {
       try {
         signal.throwIfAborted()
         const language = await this.refreshLanguage(binding)
+        await this.designState(binding)
         signal.throwIfAborted()
         return {
           action: "modify",
@@ -228,7 +232,12 @@ export class DesignSessions {
         // Request interceptors fail open on throws; explicitly block invalid/missing projects.
         return {
           action: "block",
-          reason: `Unable to refresh project design language: ${error instanceof Error ? error.message : String(error)}`,
+          reason: localize(
+            binding.language,
+            `Unable to refresh project design state: ${projectError(error, binding.language)}`,
+            `无法刷新项目设计状态：${projectError(error, binding.language)}`,
+            `プロジェクト設計の状態を更新できません：${projectError(error, binding.language)}`,
+          ),
         }
       }
     })
@@ -264,6 +273,29 @@ export class DesignSessions {
     return binding.language
   }
 
+  /** Stop/drain this process's old design writers before presenting a stage approval. */
+  async quiesce(project: Project): Promise<void> {
+    const binding = this.bindings.get(`${project.marker.id}/design/${project.marker.currentIteration}`)
+    if (!binding) return
+    binding.paused = true
+    const handle = await binding.ready
+    if (handle?.stop)
+      await handle.stop("Project stage change: preserve design history and stop outstanding questions")
+  }
+
+  private async designState(binding: Binding) {
+    if (binding.paused)
+      throw new Error(
+        "Design is paused for a stage change. Return to main and use /project design to continue.",
+      )
+    const state = await new IterationStore(binding.project).read()
+    if (state.stage !== "design" || state.pending || !["ready", "confirmed", "running"].includes(state.phase))
+      throw new Error(
+        "This saved design is no longer writable at the current stage revision. Use /project revisit design from main.",
+      )
+    return state
+  }
+
   isDesignSession(sessionId: string): boolean {
     return [...this.bindings.values()].some((binding) => binding.handle?.id === sessionId)
   }
@@ -271,21 +303,59 @@ export class DesignSessions {
   async open(project: Project, ctx: CommandContext, language: string): Promise<void> {
     language = this.languages.resolve(language, (message) => ctx.print(message, "warning"))
     if (!this.api.conversations || !ctx.focusConversation || !ctx.unfocusConversation)
-      throw new Error(
-        "Project design requires Amira API 0.1.52 with saved conversations and native conversation focus. Use a supported TUI host.",
+      throw new ProjectCommandError(
+        localize(
+          language,
+          "Project design requires Amira API 0.1.52 with saved conversations and native conversation focus. Use a supported TUI host.",
+          "项目设计需要 Amira API 0.1.52 的持久化会话和原生会话聚焦功能。请使用支持这些功能的 TUI 宿主。",
+          "プロジェクトの設計には、Amira API 0.1.52 の保存済み会話とネイティブフォーカスが必要です。対応する TUI ホストを使用してください。",
+        ),
       )
     const mainId = ctx.session.info().id
     const checkOrigin = () => {
-      if (ctx.signal.aborted) throw new Error("Project design opening was cancelled")
+      if (ctx.signal.aborted)
+        throw new ProjectCommandError(
+          localize(
+            language,
+            "Project design opening was cancelled",
+            "打开项目设计已取消。",
+            "プロジェクト設計を開く操作はキャンセルされました。",
+          ),
+        )
       if (this.api.session()?.info().id !== mainId)
-        throw new Error("The main session changed while opening project design. Run /project design again.")
+        throw new ProjectCommandError(
+          localize(
+            language,
+            "The main session changed while opening project design. Run /project design again.",
+            "打开项目设计期间主会话已改变。请重新运行 /project design。",
+            "設計を開いている間にメインセッションが変わりました。/project design を再実行してください。",
+          ),
+        )
     }
     checkOrigin()
     const snapshot = structuredClone(project)
+    const iteration = await new IterationStore(snapshot).read()
+    if (iteration.stage !== "design" || iteration.pending)
+      throw new ProjectCommandError(
+        localize(
+          language,
+          "Design is not the current writable stage. Review /project next or use /project revisit design from main.",
+          "当前阶段不可编辑设计。请在主会话中使用 /project next 查看方案，或用 /project revisit design 回访设计。",
+          "現在の段階では設計を編集できません。メインで /project next を確認するか、/project revisit design で設計を再検討してください。",
+        ),
+      )
+    checkOrigin()
     const key = `${snapshot.marker.id}/design/${snapshot.marker.currentIteration}`
     let binding = this.bindings.get(key)
     if (binding && path.relative(binding.project.root, snapshot.root))
-      throw new Error("This project identity is already bound to another directory")
+      throw new ProjectCommandError(
+        localize(
+          language,
+          "This project identity is already bound to another directory",
+          "此项目身份已关联到其他目录。请明确选择正确项目。",
+          "このプロジェクトは別のディレクトリに関連付けられています。正しいプロジェクトを明示的に選択してください。",
+        ),
+      )
     if (!binding) {
       binding = {
         project: snapshot,
@@ -298,8 +368,13 @@ export class DesignSessions {
       binding.ready = this.acquire(binding, key).catch((error: unknown) => {
         this.bindings.delete(key)
         if (error instanceof Error && /in use/i.test(error.message))
-          throw new Error(
-            "This project's design conversation is in use in another Amira host. Close it there and try /project design again.",
+          throw new ProjectCommandError(
+            localize(
+              language,
+              "This project's design conversation is in use in another Amira host. Close it there and try /project design again.",
+              "此项目的设计会话正在另一个 Amira 宿主中使用。请先在那里关闭会话，再重试 /project design。",
+              "この設計会話は別の Amira ホストで使用中です。そちらで閉じてから /project design を再実行してください。",
+            ),
             { cause: error },
           )
         throw error
@@ -311,6 +386,7 @@ export class DesignSessions {
     checkOrigin()
     // Only future output changes language. The saved spec and transcript remain untouched.
     binding.ctx = ctx
+    binding.paused = false
     binding.project.marker.settings = snapshot.marker.settings
     binding.conversationLanguage = conversationLanguage(ctx.session.messages?.() ?? []) ?? language
     binding.language = language
@@ -325,8 +401,13 @@ export class DesignSessions {
         "warning",
       )
     if (!ctx.focusConversation(handle))
-      throw new Error(
-        "Native conversation focus is unavailable right now. Return to the main conversation and try /project design again.",
+      throw new ProjectCommandError(
+        localize(
+          language,
+          "Native conversation focus is unavailable right now. Return to the main conversation and try /project design again.",
+          "暂时无法聚焦原生会话。请返回主会话后重试 /project design。",
+          "現在ネイティブの会話フォーカスを利用できません。メインに戻ってから /project design を再実行してください。",
+        ),
       )
   }
 
@@ -350,7 +431,14 @@ export class DesignSessions {
         typeof value.id !== "string" ||
         !value.id
       )
-        throw new Error("Saved project design identity does not match this project and iteration")
+        throw new ProjectCommandError(
+          localize(
+            binding.language,
+            "Saved project design identity does not match this project and iteration",
+            "保存的设计会话身份与当前项目或迭代不匹配。请检查关联的项目。",
+            "保存された設計会話の識別情報が、このプロジェクトまたはイテレーションと一致しません。関連付けを確認してください。",
+          ),
+        )
       saved = value
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
@@ -376,7 +464,14 @@ export class DesignSessions {
         )
     if (handle.key !== key || path.relative(handle.cwd, project.root)) {
       await handle.release()
-      throw new Error("The saved design conversation is bound to a different project directory or iteration")
+      throw new ProjectCommandError(
+        localize(
+          binding.language,
+          "The saved design conversation is bound to a different project directory or iteration",
+          "保存的设计会话已关联到其他项目目录或迭代。请检查项目关联。",
+          "保存された設計会話は、別のディレクトリまたはイテレーションに関連付けられています。プロジェクトの関連付けを確認してください。",
+        ),
+      )
     }
     binding.handle = handle
     if (!saved) {
@@ -421,6 +516,7 @@ export class DesignSessions {
   ) {
     if (!binding.handle || context.sessionId !== binding.handle.id)
       throw new Error("Only the bound design conversation may request decisions")
+    const capturedState = await this.designState(binding)
     const offered = validateAskQuestions(input, true)
     // Capture before showing the dialog. Later setting changes apply to subsequent work only.
     const language = presentedLanguage ?? (await this.refreshLanguage(binding))
@@ -443,6 +539,11 @@ export class DesignSessions {
     const response = await binding.ctx.ui.ask(structuredClone(offered), context)
     if (response === undefined || context.signal.aborted) return declined()
     const confirmed = validateAskAnswers(offered, response)
+    const currentState = await this.designState(binding)
+    if (currentState.revision !== capturedState.revision)
+      throw new Error(
+        "Design changed while this question was open. The stale answer was not recorded; ask again.",
+      )
     // Prepare asynchronously, then commit evidence in one synchronous publication section.
     // Nothing on the owner receipt path may await projection or other pending I/O after commit:
     // otherwise an ordinary Stop can overtake the human answer and the host reports declined.
@@ -471,16 +572,20 @@ export class DesignSessions {
           "warning",
         ),
     }
-    const recorded = await binding.store.record(
-      offered,
-      confirmed,
-      {
-        sessionId: context.sessionId,
-        askId,
-        language,
-        ...(supersedes.length ? { supersedes } : {}),
-      },
-      options,
+    const recorded = await new IterationStore(binding.project).guardDesignRevision(
+      capturedState.revision,
+      () =>
+        binding.store.record(
+          offered,
+          confirmed,
+          {
+            sessionId: context.sessionId,
+            askId,
+            language,
+            ...(supersedes.length ? { supersedes } : {}),
+          },
+          options,
+        ),
     )
     return {
       questions: offered,
@@ -508,9 +613,13 @@ export class DesignSessions {
         if (!binding.handle || ctx.session?.sessionId !== binding.handle.id)
           throw new Error("This tool is available only to the bound project design conversation")
         if (ctx.signal.aborted) throw new Error("Project design operation was cancelled")
+        const capturedState = await this.designState(binding)
         const language = await this.refreshLanguage(binding)
         ctx.signal.throwIfAborted()
-        return execute(object(params, Object.keys(properties)), ctx, language)
+        const run = () => execute(object(params, Object.keys(properties)), ctx, language)
+        return ["record_suggestion", "update_design_doc", "save_research_note"].includes(name)
+          ? new IterationStore(binding.project).guardDesignRevision(capturedState.revision, run)
+          : run()
       },
     })
     const string = { type: "string", minLength: 1 }

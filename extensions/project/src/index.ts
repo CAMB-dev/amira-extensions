@@ -1,8 +1,19 @@
 import path from "node:path"
 import type { CommandContext, Extension, PanelRenderOptions, SessionData, ToolLine } from "@amira/api"
 import { DesignSessions } from "./design.ts"
+import { ProjectCommandError, projectError } from "./diagnostics.ts"
 import { conversationLanguage, LanguagePolicy, localize, resolveLanguage, validLanguage } from "./language.ts"
-import { createProject, discoverProject, type Project, Registry, readProject } from "./store.ts"
+import { type IterationState, initialIteration } from "./stage.ts"
+import { runStageCommand, stageStatus } from "./stage-commands.ts"
+import { nextSuggestion, stageName, statusName } from "./stage-view.ts"
+import {
+  createProject,
+  discoverProject,
+  IterationStore,
+  type Project,
+  Registry,
+  readProject,
+} from "./store.ts"
 
 export const ATTACHMENT_KEY = "project.attachment.v1"
 export interface Attachment {
@@ -32,6 +43,7 @@ export function panelLines(
   collapsed: boolean,
   language?: string,
   designAvailable = false,
+  iterationState?: IterationState,
 ): ToolLine[] {
   const lang = language ?? project?.marker.settings.language ?? "en"
   if (error)
@@ -50,14 +62,17 @@ export function panelLines(
   if (!project) return []
   const name = project.marker.name
   const iteration = project.marker.currentIteration
+  const state = iterationState ?? initialIteration(project.marker.id, iteration)
+  const stage = stageName(state.stage, lang)
+  const status = statusName(state.status, lang)
   const lines: ToolLine[] = [
     {
       kind: "accent",
       text: localize(
         lang,
-        `Project ${name} · iteration ${iteration} · design`,
-        `项目 ${name} · 迭代 ${iteration} · 设计`,
-        `プロジェクト ${name} · イテレーション ${iteration} · 設計`,
+        `Project ${name} · iteration ${iteration} · ${stage} · ${status}`,
+        `项目 ${name} · 迭代 ${iteration} · ${stage} · ${status}`,
+        `プロジェクト ${name} · イテレーション ${iteration} · ${stage} · ${status}`,
       ),
       wrap: true,
     },
@@ -65,19 +80,7 @@ export function panelLines(
       kind: "muted",
       // Host panels receive the MAIN id even while native design has focus. Do not infer focus
       // or keep a stale "next: open" instruction after a saved design has become available.
-      text: designAvailable
-        ? localize(
-            lang,
-            "Continue design decisions · F6 returns to main from design",
-            "继续确认设计决策 · 设计会话中按 F6 返回主会话",
-            "設計の決定を続ける · 設計から F6 でメインに戻る",
-          )
-        : localize(
-            lang,
-            "Open design conversation: /project design",
-            "打开设计会话：/project design",
-            "設計会話を開く：/project design",
-          ),
+      text: nextSuggestion(state, lang, designAvailable),
       wrap: true,
     },
   ]
@@ -89,8 +92,20 @@ const HELP = `/project [list] — choose a known project or the nearest discover
 /project switch [name, id, or directory]
 /project status
 /project design
+/project next
+/project skip batch|design|prototype|implement|accept
+/project revisit design|prototype
 Attachment does not change the main session's working directory.
 Prototypes, implementation, acceptance, ship and archive: coming later.`
+
+function help(language: string): string {
+  return localize(
+    language,
+    HELP,
+    `/project [list] — 选择已知项目或最近识别的项目\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 查看项目阶段和状态\n/project design — 打开设计会话\n/project next — 查看总结并确认下一步\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n关联项目不会改变主会话工作目录。原型、实现、验收执行、发布和归档将在后续版本提供。`,
+    `/project [list] — 登録済みまたは最寄りのプロジェクトを選択\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 段階と状態を確認\n/project design — 設計会話を開く\n/project next — 要約を確認して次の手順を承認\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n関連付けてもメインの作業ディレクトリは変わりません。プロトタイプ、実装、受け入れ確認の実行、リリース、アーカイブは今後対応予定です。`,
+  )
+}
 
 /** Quotes allow explicit Windows directories with spaces; backslashes remain literal. */
 export function words(text: string): string[] {
@@ -103,7 +118,10 @@ export function words(text: string): string[] {
 interface PanelState {
   fingerprint: string
   project?: Project
+  iteration?: IterationState
   error?: string
+  refreshing?: boolean
+  refreshedAt?: number
 }
 
 export function createProjectExtension(): Extension {
@@ -145,8 +163,21 @@ export function createProjectExtension(): Extension {
             placeholder: "en, zh or ja",
             signal: ctx.signal,
           })) ?? ""
-        if (!result) throw new Error("No document language selected. Run the command again to continue.")
+        if (!result)
+          throw commandFailure(
+            ctx,
+            "No document language selected. Run the command again to continue.",
+            "尚未选择文档语言。请重新运行命令后选择语言。",
+            "文書の言語が選択されていません。コマンドを再実行して言語を選んでください。",
+          )
       }
+      if (!validLanguage(result) || result === "conversation")
+        throw commandFailure(
+          ctx,
+          "Choose a valid document language tag, such as en, zh or ja.",
+          "请选择有效的文档语言标签，例如 en、zh 或 ja。",
+          "en、zh、ja など、有効な文書の言語タグを選んでください。",
+        )
       return languagePolicy.resolve(result, (notice) => ctx.print(notice, "warning"))
     }
 
@@ -169,15 +200,24 @@ export function createProjectExtension(): Extension {
       const tag = resolveLanguage(
         undefined,
         settings.get().language,
-        conversationLanguage(ctx.session.messages()) ?? "en",
+        conversationLanguage(ctx.session.messages?.() ?? []) ?? "en",
       )
       return validLanguage(tag) ? languagePolicy.resolve(tag, (notice) => ctx.print(notice, "warning")) : "en"
+    }
+
+    function commandFailure(ctx: CommandContext, en: string, zh: string, ja: string): Error {
+      return new ProjectCommandError(localize(interfaceLanguage(ctx), en, zh, ja))
     }
 
     async function attach(project: Project, ctx: CommandContext, origin: string): Promise<void> {
       await registry.remember(project)
       if (!active(origin) || ctx.signal.aborted)
-        throw new Error("Main session changed. Run /project switch again in the intended session.")
+        throw commandFailure(
+          ctx,
+          "Main session changed. Run /project switch again in the intended session.",
+          "主会话已改变。请在目标会话中重新运行 /project switch。",
+          "メインセッションが変わりました。対象のセッションで /project switch を再実行してください。",
+        )
       const snapshot: Attachment = {
         projectId: project.marker.id,
         root: project.root,
@@ -185,7 +225,17 @@ export function createProjectExtension(): Extension {
       }
       if (ctx.session.data) ctx.session.data.append(ATTACHMENT_KEY, snapshot)
       else memoryAttachments.set(origin, snapshot)
+      // Retain the selected marker/language even when its iteration data cannot be read.
       states.set(origin, { fingerprint: JSON.stringify(snapshot), project })
+      const iteration = await new IterationStore(project).read()
+      if (!active(origin) || ctx.signal.aborted)
+        throw commandFailure(
+          ctx,
+          "Main session changed. Run this command again.",
+          "主会话已改变，请重新运行此命令。",
+          "メインセッションが変わりました。コマンドをもう一度実行してください。",
+        )
+      states.set(origin, { fingerprint: JSON.stringify(snapshot), project, iteration })
       const lang = displayLanguage(project, (notice) => ctx.print(notice, "warning"))
       ctx.print(
         localize(
@@ -211,19 +261,41 @@ export function createProjectExtension(): Extension {
     }
 
     async function attached(ctx: CommandContext, origin: string): Promise<Project> {
+      let lang = interfaceLanguage(ctx)
+      let selectedProject = states.get(origin)?.project
       const attachment = attachmentFor(origin, ctx.session.data)
       if (!attachment)
-        throw new Error("No project attached. Use /project to choose one, or /project new to create one.")
+        throw commandFailure(
+          ctx,
+          "No project attached. Use /project to choose one, or /project new to create one.",
+          "尚未关联项目。请使用 /project 选择项目，或用 /project new 创建。",
+          "プロジェクトが関連付けられていません。/project で選択するか /project new で作成してください。",
+        )
       try {
         const project = await readProject(attachment.root, attachment.projectId)
-        states.set(origin, { fingerprint: JSON.stringify(attachment), project })
+        // A validated marker is the current language source even if iteration loading fails.
+        // Do not fall back to cached/pre-resume settings for compatibility diagnostics.
+        selectedProject = project
+        lang = displayLanguage(project, (notice) => ctx.print(notice, "warning"))
+        const iteration = await new IterationStore(project).read()
+        states.set(origin, { fingerprint: JSON.stringify(attachment), project, iteration })
         api.requestRender()
         return project
       } catch (error) {
-        states.set(origin, { fingerprint: JSON.stringify(attachment), error: message(error) })
+        states.set(origin, {
+          fingerprint: JSON.stringify(attachment),
+          project: selectedProject,
+          error: projectError(error, lang),
+        })
         api.requestRender()
-        throw new Error(
-          `Attached project is missing, moved, or invalid at ${attachment.root}. ${message(error)} Use /project switch explicitly; no replacement was attached.`,
+        throw new ProjectCommandError(
+          localize(
+            lang,
+            `Attached project is missing, moved, or invalid at ${attachment.root}. ${projectError(error, lang)} Use /project switch explicitly; no replacement was attached.`,
+            `关联的项目缺失、已移动或无效：${attachment.root}。${projectError(error, lang)} 请用 /project switch 明确选择项目，未自动替换项目。`,
+            `関連付けたプロジェクトが見つからないか、移動または無効になっています：${attachment.root}。${projectError(error, lang)} /project switch で明示的に選択してください。別のプロジェクトには切り替えていません。`,
+          ),
+          { cause: error },
         )
       }
     }
@@ -240,7 +312,12 @@ export function createProjectExtension(): Extension {
             pathKey(path.resolve(entry.root)) === pathKey(path.resolve(ctx.cwd, target)),
         )
         if (matches.length > 1)
-          throw new Error(`More than one project matches ${target}. Use its full id or directory.`)
+          throw commandFailure(
+            ctx,
+            `More than one project matches ${target}. Use its full id or directory.`,
+            `多个项目匹配 ${target}。请使用完整项目 ID 或目录。`,
+            `${target} に一致するプロジェクトが複数あります。完全な ID またはディレクトリを指定してください。`,
+          )
         const entry = matches[0]
         let project: Project
         try {
@@ -248,8 +325,14 @@ export function createProjectExtension(): Extension {
             ? await readProject(entry.root, entry.id)
             : await readProject(path.resolve(ctx.cwd, target))
         } catch (error) {
-          throw new Error(
-            `Project ${target} is missing, moved, or invalid: ${message(error)}. Restore its directory or select another project.`,
+          throw new ProjectCommandError(
+            localize(
+              lang,
+              `Project ${target} is missing, moved, or invalid: ${projectError(error, lang)}. Restore its directory or select another project.`,
+              `项目 ${target} 缺失、已移动或无效：${projectError(error, lang)} 请恢复项目目录，或明确选择其他项目。`,
+              `プロジェクト ${target} が見つからないか移動または無効になっています：${projectError(error, lang)} ディレクトリを復元するか、別のプロジェクトを明示的に選択してください。`,
+            ),
+            { cause: error },
           )
         }
         await attach(project, ctx, origin)
@@ -260,7 +343,7 @@ export function createProjectExtension(): Extension {
       try {
         discovered = await discoverProject(ctx.cwd)
       } catch (error) {
-        discoveryError = message(error)
+        discoveryError = projectError(error, lang)
         ctx.print(
           localize(
             lang,
@@ -287,7 +370,7 @@ export function createProjectExtension(): Extension {
           try {
             return { entry, project: await readProject(entry.root, entry.id), error: undefined }
           } catch (error) {
-            return { entry, project: undefined, error: message(error) }
+            return { entry, project: undefined, error: projectError(error, lang) }
           }
         }),
       )
@@ -339,8 +422,11 @@ export function createProjectExtension(): Extension {
       if (!label) return
       const selected = checked[labels.indexOf(label)]
       if (!selected?.project)
-        throw new Error(
+        throw commandFailure(
+          ctx,
           `Project is missing, moved, or invalid. ${selected?.error ?? "Choose a listed project."}`,
+          `项目缺失、已移动或无效。${selected?.error ?? "请从列表中选择项目。"}`,
+          `プロジェクトが見つからないか移動または無効になっています。${selected?.error ?? "一覧から選択してください。"}`,
         )
       // Revalidate after the picker; never silently attach a replaced marker.
       await attach(await readProject(selected.entry.root, selected.entry.id), ctx, origin)
@@ -354,17 +440,40 @@ export function createProjectExtension(): Extension {
       if (state?.fingerprint !== fingerprint) {
         state = { fingerprint }
         states.set(opts.sessionId, state)
+      }
+      if (!state.refreshing && (state.refreshedAt === undefined || opts.now - state.refreshedAt >= 1000)) {
         const captured = state
-        void readProject(attachment.root, attachment.projectId).then(
-          (project) => {
+        const priorData = JSON.stringify([captured.project, captured.iteration])
+        captured.refreshing = true
+        captured.refreshedAt = opts.now
+        void readProject(attachment.root, attachment.projectId)
+          .then(async (project) => {
             captured.project = project
-            api.requestRender()
-          },
-          (error) => {
-            captured.error = message(error)
-            api.requestRender()
-          },
-        )
+            return { project, iteration: await new IterationStore(project).read() }
+          })
+          .then(
+            ({ project, iteration }) => {
+              captured.refreshing = false
+              if (states.get(opts.sessionId) !== captured) return
+              const changed =
+                captured.error !== undefined || priorData !== JSON.stringify([project, iteration])
+              captured.project = project
+              captured.iteration = iteration
+              captured.error = undefined
+              if (changed) api.requestRender()
+            },
+            (error) => {
+              captured.refreshing = false
+              if (states.get(opts.sessionId) !== captured) return
+              const errorText = projectError(
+                error,
+                captured.project ? displayLanguage(captured.project) : "en",
+              )
+              const changed = captured.error !== errorText
+              captured.error = errorText
+              if (changed) api.requestRender()
+            },
+          )
       }
       return panelLines(
         state.project,
@@ -372,6 +481,7 @@ export function createProjectExtension(): Extension {
         opts.collapsed,
         state.project && displayLanguage(state.project),
         !!state.project && availableDesigns.has(designKey(state.project)),
+        state.iteration,
       )
     }
     api.registerPanel({ id: "project", order: 10, render })
@@ -394,19 +504,26 @@ export function createProjectExtension(): Extension {
       name: "project",
       description: "Attach a project, inspect its status, or open its saved design conversation",
       args: {
-        hint: "[list|new|switch|status|design]",
+        hint: "[list|new|switch|status|design|next|skip|revisit]",
         complete: (prefix) =>
-          ["list", "new", "switch", "status", "design", "help"]
+          ["list", "new", "switch", "status", "design", "next", "skip", "revisit", "help"]
             .filter((item) => item.startsWith(prefix))
             .map((value) => ({ value })),
       },
       async run(args, ctx) {
         const origin = ctx.session.info().id
         try {
+          if (designs.isDesignSession(origin) || !active(origin))
+            throw commandFailure(
+              ctx,
+              "Project commands are available in the main conversation only. Press F6 to return to main.",
+              "项目命令仅可在主会话中运行。请按 F6 返回主会话。",
+              "プロジェクトのコマンドはメインセッション専用です。F6 でメインに戻ってください。",
+            )
           const tokens = words(args)
           const verb = tokens.shift() ?? "list"
           if (verb === "help") {
-            ctx.print(HELP)
+            ctx.print(help(interfaceLanguage(ctx)))
             return
           }
           if (verb === "list" || verb === "switch") {
@@ -425,7 +542,12 @@ export function createProjectExtension(): Extension {
               } else if (token === "--language") {
                 selectedLanguage = tokens.shift()
                 if (!selectedLanguage || !validLanguage(selectedLanguage))
-                  throw new Error("Use --language with a valid language tag.")
+                  throw commandFailure(
+                    ctx,
+                    "Use --language with a valid language tag.",
+                    "请在 --language 后提供有效的语言标签，例如 en、zh 或 ja。",
+                    "--language に en、zh、ja などの有効な言語タグを指定してください。",
+                  )
               } else if (token === "--commit-documents") commitDocuments = true
               else if (token.startsWith("--")) throw new Error(HELP)
               else nameParts.push(token)
@@ -441,37 +563,131 @@ export function createProjectExtension(): Extension {
             const chosenLanguage =
               selectedLanguage ?? (mustChooseLanguage ? await language(undefined, ctx) : undefined)
             if (!active(origin) || ctx.signal.aborted)
-              throw new Error("Main session changed. Run /project new again in the intended session.")
+              throw commandFailure(
+                ctx,
+                "Main session changed. Run /project new again in the intended session.",
+                "主会话已改变。请在目标会话中重新运行 /project new。",
+                "メインセッションが変わりました。対象のセッションで /project new を再実行してください。",
+              )
             // Following an extension default must not silently pin it as a project override.
             const project = await createProject(root, name, {
               ...(chosenLanguage ? { language: chosenLanguage } : {}),
               commitDocuments,
             })
             await attach(project, ctx, origin)
+          } else if (verb === "next" || verb === "skip" || verb === "revisit") {
+            const project = await attached(ctx, origin)
+            const checkOrigin = () => {
+              if (!active(origin) || ctx.signal.aborted)
+                throw commandFailure(
+                  ctx,
+                  "Main session changed or command cancelled. Run this command again.",
+                  "主会话已改变或命令已取消。请重新运行此命令。",
+                  "メインセッションが変わったか、コマンドがキャンセルされました。もう一度実行してください。",
+                )
+              const selected = attachmentFor(origin, ctx.session.data)
+              if (selected?.projectId !== project.marker.id || selected.root !== project.root)
+                throw commandFailure(
+                  ctx,
+                  "Attached project changed while the dialog was open. Run this command again.",
+                  "对话框打开期间关联的项目已改变。请重新运行此命令。",
+                  "ダイアログを開いている間に関連付けたプロジェクトが変わりました。コマンドを再実行してください。",
+                )
+            }
+            try {
+              await runStageCommand(
+                verb,
+                tokens,
+                project,
+                ctx,
+                displayLanguage(project),
+                checkOrigin,
+                () => designs.quiesce(project),
+                (iteration) => {
+                  states.set(origin, {
+                    fingerprint: JSON.stringify(attachmentFor(origin, ctx.session.data)),
+                    project,
+                    iteration,
+                  })
+                  api.requestRender()
+                },
+              )
+            } finally {
+              if (active(origin)) {
+                const iteration = await new IterationStore(project).read()
+                const selected = attachmentFor(origin, ctx.session.data)
+                if (
+                  active(origin) &&
+                  selected?.projectId === project.marker.id &&
+                  selected.root === project.root
+                ) {
+                  states.set(origin, { fingerprint: JSON.stringify(selected), project, iteration })
+                  api.requestRender()
+                }
+              }
+            }
           } else if (verb === "status" || verb === "design") {
             if (tokens.length) throw new Error(HELP)
             const project = await attached(ctx, origin)
             if (!active(origin) || ctx.signal.aborted)
-              throw new Error("Main session changed. Run this command again.")
+              throw commandFailure(
+                ctx,
+                "Main session changed. Run this command again.",
+                "主会话已改变，请重新运行此命令。",
+                "メインセッションが変わりました。コマンドをもう一度実行してください。",
+              )
             if (verb === "design") {
+              const store = new IterationStore(project)
+              const iteration = await store.read()
+              if (
+                iteration.stage === "design" &&
+                !iteration.pending &&
+                ["finished", "summarized"].includes(iteration.phase) &&
+                iteration.status === "idle"
+              ) {
+                const reopened = await store.dispatch(iteration.revision, {
+                  type: "reopen-design",
+                  expectedRevision: iteration.revision,
+                })
+                states.set(origin, {
+                  fingerprint: JSON.stringify(attachmentFor(origin, ctx.session.data)),
+                  project,
+                  iteration: reopened,
+                })
+              }
               const chosenLanguage = await language(project, ctx)
               if (!active(origin) || ctx.signal.aborted)
-                throw new Error("Main session changed. Run /project design again.")
+                throw commandFailure(
+                  ctx,
+                  "Main session changed. Run /project design again.",
+                  "主会话已改变。请重新运行 /project design。",
+                  "メインセッションが変わりました。/project design を再実行してください。",
+                )
               await designs.open(project, ctx, chosenLanguage)
               availableDesigns.add(designKey(project))
               api.requestRender()
             } else {
+              const iteration = await new IterationStore(project).read()
               states.set(origin, {
                 fingerprint: JSON.stringify(attachmentFor(origin, ctx.session.data)),
                 project,
+                iteration,
               })
+              const lang = displayLanguage(project, (notice) => ctx.print(notice, "warning"))
               ctx.print(
                 localize(
-                  displayLanguage(project, (notice) => ctx.print(notice, "warning")),
-                  `${project.marker.name}\nDirectory: ${project.root}\nIteration: ${project.marker.currentIteration}\nStage: design\nNext: /project design — open design conversation\nPrototypes, implementation, acceptance, ship and archive: coming later.`,
-                  `${project.marker.name}\n目录：${project.root}\n迭代：${project.marker.currentIteration}\n阶段：设计\n下一步：/project design — 打开设计会话\n原型、实现、验收、发布和归档：后续版本提供。`,
-                  `${project.marker.name}\nディレクトリ：${project.root}\nイテレーション：${project.marker.currentIteration}\n段階：設計\n次の手順：/project design — 設計会話を開く\nプロトタイプ、実装、受け入れ確認、リリース、アーカイブは今後対応予定です。`,
-                ),
+                  lang,
+                  `${project.marker.name}\nDirectory: ${project.root}\nIteration: ${project.marker.currentIteration}`,
+                  `${project.marker.name}\n目录：${project.root}\n迭代：${project.marker.currentIteration}`,
+                  `${project.marker.name}\nディレクトリ：${project.root}\nイテレーション：${project.marker.currentIteration}`,
+                ) +
+                  `\n${stageStatus(iteration, lang)}\n${nextSuggestion(iteration, lang, availableDesigns.has(designKey(project)))}` +
+                  localize(
+                    lang,
+                    "\nExecution, ship and archive: coming later.",
+                    "\n执行、发布和归档：后续版本提供。",
+                    "\n実行、リリース、アーカイブは今後対応予定です。",
+                  ),
               )
               api.requestRender()
             }
@@ -479,14 +695,15 @@ export function createProjectExtension(): Extension {
             ctx.print(
               localize(
                 interfaceLanguage(ctx),
-                "Coming later: this batch supports project discovery and design only.",
-                "后续版本提供：当前批次仅支持项目识别与设计。",
-                "今後対応予定です。現在はプロジェクトの検出と設計のみ利用できます。",
+                "Coming later: execution is not available yet. This step stores stage state and human approvals only; no work was started.",
+                "后续版本提供：执行尚未开放。当前仅保存阶段状态和用户审批，未启动任何工作。",
+                "実行はまだ利用できません。現在は段階の状態と承認のみを保存します。作業は開始していません。",
               ),
             )
           } else throw new Error(HELP)
         } catch (error) {
-          ctx.print(message(error), "error")
+          const lang = interfaceLanguage(ctx)
+          ctx.print(message(error) === HELP ? help(lang) : projectError(error, lang), "error")
         }
       },
     })

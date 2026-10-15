@@ -229,11 +229,11 @@ describe("project commands and attachments", () => {
   })
 
   test("quoted Windows paths preserve their separators", () => {
-    expect(words('new "My project" --root "D:\\my work\\src"')).toEqual([
+    expect(words('new "My project" --root ".\\my work\\src"')).toEqual([
       "new",
       "My project",
       "--root",
-      "D:\\my work\\src",
+      ".\\my work\\src",
     ])
   })
 })

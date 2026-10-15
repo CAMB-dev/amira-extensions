@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto"
 import {
   closeSync,
   fsyncSync,
+  linkSync,
   lstatSync,
   openSync,
   readFileSync,
@@ -13,8 +14,33 @@ import { link, lstat, mkdir, open, readdir, readFile, realpath, rename, unlink }
 import path from "node:path"
 import type { AskAnswer, AskQuestion } from "@amira/api"
 import { validateAskAnswers } from "./answers.ts"
+import { type IterationArtifact, validateArtifact } from "./artifacts.ts"
 import { localize } from "./language.ts"
 import { validateAskQuestions } from "./questions.ts"
+import {
+  type AcceptedBatchRef,
+  type ApprovalContext,
+  type BatchManifest,
+  batchProgress,
+  hasManualProblem,
+  type IterationState,
+  initialIteration,
+  reduceStage,
+  type StageEvent,
+  validateIteration,
+} from "./stage.ts"
+
+export type {
+  AcceptanceArtifact,
+  BatchPlanArtifact,
+  CorrectionArtifact,
+  IterationArtifact,
+  ManualTrialArtifact,
+  SpecArtifact,
+  SpecCheck,
+  SpecItem,
+  StageSummaryArtifact,
+} from "./artifacts.ts"
 
 export interface Project {
   root: string
@@ -68,10 +94,18 @@ export interface DecisionRecordOptions {
   onProjectionError?: (error: unknown) => void
 }
 
+export type ProjectStorageDetails =
+  | { reason: "missing" | "replaced" | "invalid" | "unsafe" }
+  | { reason: "stale-revision"; expectedRevision: number; currentRevision: number }
+  | { reason: "unsupported-schema"; document: string; encountered: number; supported: number }
+  | { reason: "transition-rejected" }
+  | { reason: "malformed-storage" | "hash-mismatch"; document: string }
+
 export class ProjectStorageError extends Error {
   constructor(
     readonly code: "missing" | "replaced" | "invalid" | "unsafe",
     message: string,
+    readonly details: ProjectStorageDetails = { reason: code },
   ) {
     super(message)
     this.name = "ProjectStorageError"
@@ -112,6 +146,16 @@ function invalid(message: string): never {
   throw new ProjectStorageError("invalid", message)
 }
 
+/** Unsupported formats are not damaged evidence. Never repair or reinterpret them. */
+function checkSchema(value: unknown, document: string): void {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value !== 1)
+    throw new ProjectStorageError(
+      "invalid",
+      `Unsupported ${document} schema version ${value}; supported version: 1. Use a compatible extension without deleting or rewriting evidence.`,
+      { reason: "unsupported-schema", document, encountered: value, supported: 1 },
+    )
+}
+
 function settings(value: unknown): asserts value is Project["marker"]["settings"] {
   if (!isObject(value)) invalid("Invalid project settings")
   if (Object.keys(value).some((name) => name !== "language" && name !== "commitDocuments")) {
@@ -124,6 +168,7 @@ function settings(value: unknown): asserts value is Project["marker"]["settings"
 }
 
 function marker(value: unknown): asserts value is Project["marker"] {
+  if (isObject(value)) checkSchema(value.schemaVersion, "project marker")
   if (!isObject(value) || value.schemaVersion !== 1 || !nonempty(value.id) || !nonempty(value.name)) {
     invalid("Malformed project marker")
   }
@@ -1180,5 +1225,997 @@ export class DecisionStore {
       await this.projectEvidence([...evidence, entry], projection)
       return structuredClone(records)
     })
+  }
+}
+
+export interface IterationStoreOptions {
+  /** Test-only crash/race boundaries. Publication of the immutable state record is the commit. */
+  beforePublish?: () => void | Promise<void>
+  afterPublish?: () => void | Promise<void>
+  afterArtifactPublish?: () => void | Promise<void>
+}
+type IterationArtifactRef = IterationState["artifacts"][number]
+interface IterationRecord {
+  schemaVersion: 1
+  previousHash: string | null
+  state: IterationState
+}
+interface IterationHead {
+  state: IterationState
+  text: string
+  hash: string
+  history: string[]
+}
+
+/**
+ * The immutable, hash-chained .state records are authoritative; state.json is their
+ * recoverable projection. A crash after the record commit never replays stage work.
+ * Existing publication helpers retain edited inodes, including editor-held fds.
+ */
+export class IterationStore {
+  private readonly project: Project
+  private readonly parts: string[]
+  private captured = false
+
+  constructor(
+    project: Project,
+    private readonly options: IterationStoreOptions = {},
+  ) {
+    this.project = structuredClone(project)
+    marker(this.project.marker)
+    this.parts = [".amira", "project", "iterations", String(project.marker.currentIteration)]
+  }
+
+  private async check(): Promise<void> {
+    if (!this.captured) {
+      await readProject(this.project.root, this.project.marker.id)
+      this.captured = true
+    }
+    // Selection establishes canonical pins once. Rechecking those same pins and the
+    // marker does not need repeated asynchronous canonicalization at every fs boundary.
+    this.checkSync()
+    safePathSync(this.project.root, ...this.parts)
+  }
+
+  private checkSync(): void {
+    const current = this.parse(
+      readFileSync(safePathSync(this.project.root, ".amira", "project.json"), "utf8"),
+    )
+    marker(current)
+    if (
+      current.id !== this.project.marker.id ||
+      current.currentIteration !== this.project.marker.currentIteration
+    )
+      throw new ProjectStorageError(
+        "replaced",
+        "Project identity changed or captured iteration is stale; reopen before publication",
+      )
+  }
+
+  private async directory(...suffix: string[]): Promise<void> {
+    await this.check()
+    const parts = [...this.parts, ...suffix]
+    await mkdir(await safePath(this.project.root, ...parts), { recursive: true })
+    await pinDirectory(this.project.root, ...parts)
+    await syncDirectory(path.dirname(await safePath(this.project.root, ...parts)))
+  }
+
+  private parse(text: string): unknown {
+    try {
+      return JSON.parse(text)
+    } catch {
+      throw new ProjectStorageError("invalid", "Malformed iteration storage; manual edits were preserved", {
+        reason: "malformed-storage",
+        document: "iteration storage",
+      })
+    }
+  }
+
+  private validateState(value: unknown): asserts value is IterationState {
+    if (isObject(value)) checkSchema(value.schemaVersion, "iteration state")
+    try {
+      validateIteration(value)
+    } catch (error) {
+      invalid(`Invalid iteration state: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    const state = value as IterationState
+    if (
+      state.projectId !== this.project.marker.id ||
+      state.iteration !== this.project.marker.currentIteration
+    )
+      throw new ProjectStorageError("replaced", "Iteration state belongs to a different project or iteration")
+    for (const ref of state.artifacts) this.referenceParts(ref)
+  }
+
+  private referenceParts(ref: IterationArtifactRef): string[] {
+    const kinds = ["stage-summary", "spec", "batch-plan", "acceptance", "manual-trial", "correction"]
+    if (
+      !isObject(ref) ||
+      Object.keys(ref).some((field) => !["id", "kind", "path", "hash"].includes(field)) ||
+      typeof ref.id !== "string" ||
+      !/^[a-f0-9-]{36}$/.test(ref.id) ||
+      !kinds.includes(ref.kind) ||
+      !/^[a-f0-9]{64}$/.test(ref.hash)
+    )
+      invalid("Invalid generated iteration artifact reference")
+    const parts = [...this.parts, "artifacts", `${ref.kind}-${ref.id}.json`]
+    if (ref.path !== parts.join("/"))
+      throw new ProjectStorageError("unsafe", "Artifact paths are generated by the iteration store")
+    return parts
+  }
+
+  /** Stage input never controls a filesystem destination. */
+  private async artifact(ref: IterationArtifactRef): Promise<IterationArtifact> {
+    const parts = this.referenceParts(ref)
+    const content = await optionalRead(await safePath(this.project.root, ...parts))
+    if (content === undefined) invalid(`Committed iteration artifact is missing: ${ref.id}`)
+    if (hash(content) !== ref.hash)
+      invalid(`Iteration artifact was edited: ${ref.id}; original bytes were preserved`)
+    const value = this.parse(content)
+    if (isObject(value)) checkSchema(value.schemaVersion, "iteration artifact")
+    if (
+      !isObject(value) ||
+      Object.keys(value).some(
+        (field) => !["schemaVersion", "projectId", "iteration", "id", "artifact"].includes(field),
+      ) ||
+      value.schemaVersion !== 1 ||
+      value.projectId !== this.project.marker.id ||
+      value.iteration !== this.project.marker.currentIteration ||
+      value.id !== ref.id
+    )
+      invalid("Invalid iteration artifact envelope")
+    try {
+      validateArtifact(value.artifact)
+    } catch (error) {
+      invalid(error instanceof Error ? error.message : String(error))
+    }
+    if (value.artifact.kind !== ref.kind) invalid("Iteration artifact kind mismatch")
+    return value.artifact
+  }
+
+  /** Atomic no-clobber publication of a complete, flushed immutable record. */
+  private async immutable(
+    parts: string[],
+    content: string,
+    beforePublish?: () => Promise<void>,
+  ): Promise<void> {
+    const temporaryParts = [...parts.slice(0, -1), `.${parts.at(-1)}.${randomUUID()}.tmp`]
+    const file = await safePath(this.project.root, ...parts)
+    const temporary = await safePath(this.project.root, ...temporaryParts)
+    try {
+      await exclusiveWrite(temporary, content, () => this.check())
+      await beforePublish?.()
+      this.checkSync()
+      safePathSync(this.project.root, ...parts)
+      safePathSync(this.project.root, ...temporaryParts)
+      // No await between final identity checks and the publication syscall.
+      linkSync(temporary, file)
+      if (process.platform !== "win32") {
+        const directory = openSync(path.dirname(file), "r")
+        try {
+          fsyncSync(directory)
+        } finally {
+          closeSync(directory)
+        }
+      }
+    } catch (error) {
+      if (isObject(error) && error.code === "EEXIST")
+        throw new ProjectStorageError(
+          "invalid",
+          "Iteration publication was claimed by another writer; reload state",
+        )
+      throw error
+    } finally {
+      removeTemporarySync(this.project.root, temporaryParts, temporary)
+    }
+  }
+
+  private async claim(parts: string[], depth = 0): Promise<() => void> {
+    if (depth > 32) invalid("Too many abandoned writer recovery claims")
+    const token = randomUUID()
+    const claim = json({ pid: process.pid, token })
+    const file = await safePath(this.project.root, ...parts)
+    for (;;) {
+      if (await publishVersion(this.project.root, parts, claim, undefined, () => this.check())) {
+        return () => {
+          this.checkSync()
+          if (readFileSync(safePathSync(this.project.root, ...parts), "utf8") !== claim)
+            throw new ProjectStorageError("replaced", "Iteration writer claim was replaced")
+          unlinkSync(file)
+        }
+      }
+      const priorText = await optionalRead(await safePath(this.project.root, ...parts))
+      if (priorText === undefined) continue
+      const prior = this.parse(priorText)
+      if (
+        !isObject(prior) ||
+        !Number.isSafeInteger(prior.pid) ||
+        (prior.pid as number) <= 0 ||
+        typeof prior.token !== "string" ||
+        !/^[a-f0-9-]{36}$/.test(prior.token)
+      )
+        invalid("Malformed iteration writer claim; refusing to steal it")
+      try {
+        process.kill(prior.pid as number, 0)
+        throw new ProjectStorageError("invalid", "Iteration is in use by a live writer; reload and retry")
+      } catch (error) {
+        if (!isObject(error) || error.code !== "ESRCH") throw error
+      }
+      // A per-dead-token recovery claim serializes removers. Without this, two stale
+      // removers can accidentally unlink a NEW live claim after the first removes it.
+      const release = await this.claim([...this.parts, `.writer-recovery-${prior.token}.lock`], depth + 1)
+      try {
+        this.checkSync()
+        const current = safePathSync(this.project.root, ...parts)
+        if (readFileSync(current, "utf8") === priorText) unlinkSync(current)
+      } catch (error) {
+        if (!missing(error)) throw error
+      } finally {
+        release()
+      }
+    }
+  }
+
+  private async transaction<T>(action: () => Promise<T>): Promise<T> {
+    return serialized(
+      `iteration:${key(this.project.root)}:${this.project.marker.currentIteration}`,
+      async () => {
+        await this.directory()
+        const release = await this.claim([...this.parts, ".writer.lock"])
+        try {
+          await this.directory(".state")
+          await this.directory("artifacts")
+          return await action()
+        } finally {
+          release()
+        }
+      },
+    )
+  }
+
+  private async auditPreserved(history: string[]): Promise<void> {
+    const directory = await safePath(this.project.root, ...this.parts)
+    for (const name of await readdir(directory)) {
+      if (!/^\.state\.json\.[a-f0-9-]+\.preserved$/.test(name)) continue
+      const content = await readFile(await safePath(this.project.root, ...this.parts, name), "utf8")
+      if (!history.includes(content))
+        invalid("A retained iteration state was manually edited; edits were preserved")
+    }
+  }
+
+  private async projection(head: IterationHead, repair: boolean): Promise<void> {
+    const parts = [...this.parts, "state.json"]
+    const file = await safePath(this.project.root, ...parts)
+    const current = await optionalRead(file)
+    const receiptParts = [
+      ...this.parts,
+      ".state",
+      `${String(head.state.revision).padStart(16, "0")}.projected`,
+    ]
+    const receipt = await optionalRead(await safePath(this.project.root, ...receiptParts))
+    if (receipt !== undefined && receipt !== `${head.hash}\n`)
+      invalid("Iteration projection receipt was edited")
+    const acknowledge = async () => {
+      if (repair && receipt === undefined) await this.immutable(receiptParts, `${head.hash}\n`)
+    }
+    await this.auditPreserved(head.history)
+    if (current === head.text) {
+      await acknowledge()
+      return
+    }
+    // Only an incomplete publication may repair an older byte-exact projection or
+    // the short rename gap. After acknowledgment even a valid old snapshot is an
+    // edit/rollback, not permission to regenerate state.json over the human's save.
+    if (receipt !== undefined || (current !== undefined && !head.history.includes(current)))
+      invalid("Iteration state.json was manually edited; edits were preserved")
+    if (!repair) invalid("Iteration state projection changed during publication")
+    if (!(await publishVersion(this.project.root, parts, head.text, current, () => this.check())))
+      invalid("Iteration state.json changed during recovery; edits were preserved")
+    await this.auditPreserved(head.history)
+    if ((await optionalRead(file)) !== head.text) invalid("Iteration state.json changed during recovery")
+    await acknowledge()
+  }
+
+  private async load(): Promise<IterationHead> {
+    await this.check()
+    const directory = await safePath(this.project.root, ...this.parts, ".state")
+    const names = (await readdir(directory))
+      .filter((name) => !name.endsWith(".tmp") && !/^\d{16}\.projected$/.test(name))
+      .sort()
+    let head: IterationHead | undefined
+    for (const name of names) {
+      const expectedRevision = head ? head.state.revision + 1 : 0
+      if (name !== `${String(expectedRevision).padStart(16, "0")}.json`)
+        invalid("Iteration journal is corrupt or has a missing revision")
+      const content = await readFile(await safePath(this.project.root, ...this.parts, ".state", name), "utf8")
+      const value = this.parse(content)
+      if (isObject(value)) checkSchema(value.schemaVersion, "iteration journal")
+      if (
+        !isObject(value) ||
+        value.schemaVersion !== 1 ||
+        Object.keys(value).some((field) => !["schemaVersion", "previousHash", "state"].includes(field)) ||
+        !(
+          value.previousHash === null ||
+          (typeof value.previousHash === "string" && /^[a-f0-9]{64}$/.test(value.previousHash))
+        )
+      )
+        throw new ProjectStorageError(
+          "invalid",
+          "Malformed iteration journal envelope; evidence was preserved",
+          { reason: "malformed-storage", document: "iteration journal" },
+        )
+      if (value.previousHash !== (head?.hash ?? null))
+        throw new ProjectStorageError("invalid", "Iteration journal hash chain is corrupt", {
+          reason: "hash-mismatch",
+          document: "iteration journal",
+        })
+      this.validateState(value.state)
+      if (value.state.revision !== expectedRevision) invalid("Iteration journal revision mismatch")
+      const stateText = json(value.state)
+      head = {
+        state: value.state,
+        text: stateText,
+        hash: hash(content),
+        history: [...(head?.history ?? []), stateText],
+      }
+    }
+    if (!head) {
+      const existing = await optionalRead(await safePath(this.project.root, ...this.parts, "state.json"))
+      if (existing !== undefined) invalid("Unrecognized iteration state.json; existing bytes were preserved")
+      const state = initialIteration(this.project.marker.id, this.project.marker.currentIteration)
+      head = await this.commit(state)
+    }
+    // Recovery is a publication too: reject incompatible/missing evidence and false
+    // plan metadata before touching state.json or creating a projection acknowledgement.
+    for (const ref of head.state.artifacts) await this.artifact(ref)
+    await this.batchMetadata(head.state, true)
+    await this.projection(head, true)
+    return head
+  }
+
+  private async commit(state: IterationState, previous?: IterationHead): Promise<IterationHead> {
+    this.validateState(state)
+    const record: IterationRecord = { schemaVersion: 1, previousHash: previous?.hash ?? null, state }
+    const content = json(record)
+    await this.immutable(
+      [...this.parts, ".state", `${String(state.revision).padStart(16, "0")}.json`],
+      content,
+      async () => {
+        await this.options.beforePublish?.()
+        if (previous) await this.projection(previous, false)
+        else if (
+          (await optionalRead(await safePath(this.project.root, ...this.parts, "state.json"))) !== undefined
+        )
+          invalid("Iteration state was created concurrently; existing bytes were preserved")
+        await this.check()
+        for (const ref of state.artifacts) await this.artifact(ref)
+        await this.batchMetadata(state)
+      },
+    )
+    // The durable record is now authoritative, even if the caller never receives a receipt.
+    await this.options.afterPublish?.()
+    const text = json(state)
+    const head = { state, text, hash: hash(content), history: [...(previous?.history ?? []), text] }
+    await this.projection(head, true)
+    return head
+  }
+
+  private expected(head: IterationHead, expectedRevision: number): void {
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision !== head.state.revision)
+      throw new ProjectStorageError(
+        "invalid",
+        `Stale iteration writer: expected revision ${expectedRevision}, current revision ${head.state.revision}; reload state`,
+        { reason: "stale-revision", expectedRevision, currentRevision: head.state.revision },
+      )
+  }
+
+  async read(): Promise<IterationState> {
+    return this.transaction(async () => structuredClone((await this.load()).state))
+  }
+
+  /**
+   * Design writers share the iteration claim with stage commands, including across processes.
+   * Invalidate captured summaries/approvals BEFORE publishing human evidence. There is no new
+   * asynchronous state write after the decision's synchronous durable acknowledgment boundary.
+   */
+  async guardDesignRevision<T>(expectedRevision: number, action: () => Promise<T>): Promise<T> {
+    return this.transaction(async () => {
+      const head = await this.load()
+      this.expected(head, expectedRevision)
+      if (
+        head.state.stage !== "design" ||
+        head.state.pending ||
+        !["ready", "confirmed", "running"].includes(head.state.phase)
+      )
+        invalid("The captured design is no longer writable; reopen the current design stage")
+      await this.commit({ ...head.state, revision: head.state.revision + 1 }, head)
+      return action()
+    })
+  }
+
+  async dispatch(expectedRevision: number, event: StageEvent): Promise<IterationState> {
+    const captured = structuredClone(event)
+    return this.transaction(async () => {
+      const head = await this.load()
+      this.expected(head, expectedRevision)
+      if (captured.expectedRevision !== expectedRevision)
+        invalid("Stage event revision does not match the writer revision")
+      await this.validateEventBinding(head.state, captured)
+      const input = structuredClone(head.state)
+      if ("artifact" in captured && captured.artifact) {
+        const ref = captured.artifact
+        if (!head.state.artifacts.some((prior) => stable(prior) === stable(ref)))
+          invalid("Stage event references an artifact not committed by this iteration store")
+        // Reducer artifact events register their input reference. The store has already
+        // durably published it in saveArtifact's separate revision. Present that one
+        // reference as unregistered to the reducer, then restore publication order.
+        input.artifacts = input.artifacts.filter((prior) => prior.id !== ref.id)
+      }
+      let state: IterationState
+      try {
+        state = reduceStage(input, captured)
+      } catch (error) {
+        throw new ProjectStorageError("invalid", error instanceof Error ? error.message : String(error), {
+          reason: "transition-rejected",
+        })
+      }
+      if (state.revision !== expectedRevision + 1) invalid("Reducer must advance exactly one state revision")
+      // Only saveArtifact can introduce evidence. No forged model-selected path/ref is trusted.
+      for (const ref of state.artifacts) {
+        if (!head.state.artifacts.some((prior) => stable(prior) === stable(ref)))
+          invalid("Stage event references an artifact not committed by this iteration store")
+      }
+      if (state.artifacts.length !== head.state.artifacts.length)
+        invalid("Stage events cannot remove immutable artifact history")
+      state.artifacts = head.state.artifacts
+      return structuredClone((await this.commit(state, head)).state)
+    })
+  }
+
+  async saveArtifact(
+    expectedRevision: number,
+    artifact: IterationArtifact,
+  ): Promise<{ state: IterationState; artifact: IterationArtifactRef }> {
+    const captured = structuredClone(artifact)
+    try {
+      validateArtifact(captured)
+    } catch (error) {
+      invalid(error instanceof Error ? error.message : String(error))
+    }
+    return this.transaction(async () => {
+      const head = await this.load()
+      this.expected(head, expectedRevision)
+      await this.validateBinding(head.state, captured)
+      const id = randomUUID()
+      const content = json({
+        schemaVersion: 1,
+        projectId: head.state.projectId,
+        iteration: head.state.iteration,
+        id,
+        artifact: captured,
+      })
+      const parts = [...this.parts, "artifacts", `${captured.kind}-${id}.json`]
+      const ref: IterationArtifactRef = {
+        id,
+        kind: captured.kind,
+        path: parts.join("/"),
+        hash: hash(content),
+      }
+      await this.immutable(parts, content)
+      await this.options.afterArtifactPublish?.()
+      const state: IterationState = {
+        ...head.state,
+        revision: head.state.revision + 1,
+        artifacts: [...head.state.artifacts, ref],
+      }
+      if (captured.kind === "batch-plan") {
+        state.batchManifests = [...(state.batchManifests ?? []), this.manifest(state, ref, captured)]
+      }
+      if (captured.kind === "batch-plan" && state.phase === "confirmed" && state.approvedContext) {
+        // New immutable plans are history, never a mutation of human authorization.
+        delete state.approvedContext
+        delete state.summaryId
+        state.phase = "ready"
+        state.status = "idle"
+      }
+      return { state: structuredClone((await this.commit(state, head)).state), artifact: ref }
+    })
+  }
+
+  async readArtifact(ref: IterationArtifactRef): Promise<IterationArtifact> {
+    const captured = structuredClone(ref)
+    return this.transaction(async () => {
+      const head = await this.load()
+      if (!head.state.artifacts.some((prior) => stable(prior) === stable(captured)))
+        invalid("Artifact reference is not committed by this iteration")
+      return structuredClone(await this.artifact(captured))
+    })
+  }
+
+  private manifest(
+    state: IterationState,
+    ref: IterationArtifactRef,
+    plan: Extract<IterationArtifact, { kind: "batch-plan" }>,
+  ): BatchManifest {
+    const spec = state.artifacts.find((entry) => entry.kind === "spec" && entry.hash === plan.specHash)
+    if (!spec) invalid("Batch manifest requires the immutable spec")
+    return {
+      batchPlan: { artifactId: ref.id, hash: ref.hash },
+      spec: { artifactId: spec.id, hash: spec.hash, revision: plan.specRevision },
+      mode: plan.mode,
+      batchIds: plan.batches.map((batch) => batch.id),
+    }
+  }
+
+  /** Cross-check reducer membership against immutable documents, never a model's list. */
+  private async batchMetadata(state: IterationState, migrate = false): Promise<void> {
+    const manifests: BatchManifest[] = []
+    for (const ref of state.artifacts.filter((entry) => entry.kind === "batch-plan")) {
+      const plan = await this.artifact(ref)
+      if (plan.kind !== "batch-plan") invalid("Invalid batch manifest artifact")
+      manifests.push(this.manifest(state, ref, plan))
+    }
+    const legacy = state.batchManifests === undefined
+    if (legacy && migrate) {
+      state.batchManifests = manifests
+      state.batchResolutions = []
+      // Legacy final transitions may have consumed only one batch of a split plan.
+      // Preserve that evidence, but never infer unreviewed batches from publication.
+      const transition = state.transitions.at(-1)
+      const attempt = state.attempts.findLast((entry) => entry.stage === "accept")
+      const approval = state.receipts.find((entry) => entry.subjectId === transition?.id)
+      const context = attempt?.context
+      if (state.manualTrial && attempt && attempt.id === state.activeAttemptId) {
+        const trialRef = state.artifacts.find((entry) => entry.id === state.manualTrial?.artifactId)
+        const trial = trialRef && (await this.artifact(trialRef))
+        if (
+          trial?.kind === "manual-trial" &&
+          trial.attemptId === attempt.id &&
+          trial.attempt === attempt.review?.attempt &&
+          trial.codeHash === attempt.review?.codeHash &&
+          trial.batchId === context?.batchId &&
+          stable(trial.batchPlan) === stable(context?.batchPlan) &&
+          trial.specHash === context?.spec?.hash &&
+          trial.specRevision === context?.spec?.revision
+        )
+          attempt.manualTrial = state.manualTrial
+      }
+      if (
+        state.completion &&
+        transition?.kind === "complete" &&
+        attempt?.status === "finished" &&
+        attempt.acceptance?.verdict === "pass" &&
+        context?.batchId &&
+        approval &&
+        stable(approval.context) === stable(context)
+      ) {
+        const trial = attempt.manualTrial ?? state.manualTrial
+        if (
+          (!attempt.acceptance.manualTrialRequired || trial) &&
+          (!trial || ["tried", "deferred"].includes(trial.status))
+        ) {
+          if (trial) attempt.manualTrial = trial
+          state.batchResolutions.push({
+            context,
+            batchId: context.batchId,
+            status: "accepted",
+            receiptId: approval.id,
+            attemptId: attempt.id,
+            ...(trial ? { manualTrial: trial } : {}),
+          })
+        }
+      }
+      if (state.completion) {
+        state.approvedContext ??= context
+        const progress = batchProgress(state)
+        if (!progress.manifest || progress.remaining.length || state.completion === "skipped") {
+          delete state.completion
+          state.phase = "summarized"
+          state.status = "idle"
+          state.summaryId = transition?.summaryId
+          if (attempt?.status === "finished") state.activeAttemptId = attempt.id
+        }
+      }
+    }
+    if (stable(state.batchManifests) !== stable(manifests))
+      invalid("Reducer batch manifest does not match immutable plan batch IDs")
+    for (const resolution of state.batchResolutions ?? []) {
+      if (resolution.status !== "accepted") continue
+      const attempt = state.attempts.find((entry) => entry.id === resolution.attemptId)
+      const ref = state.artifacts.find((entry) => entry.id === attempt?.acceptance?.artifactId)
+      const evidence = ref && (await this.artifact(ref))
+      if (
+        evidence?.kind !== "acceptance" ||
+        evidence.outcome !== "pass" ||
+        evidence.attemptId !== attempt?.id ||
+        evidence.attempt !== attempt.review?.attempt ||
+        evidence.codeHash !== attempt.review.codeHash ||
+        evidence.batchId !== resolution.batchId ||
+        stable(evidence.batchPlan) !== stable(resolution.context.batchPlan) ||
+        evidence.specHash !== resolution.context.spec?.hash ||
+        evidence.specRevision !== resolution.context.spec.revision
+      )
+        invalid("Batch resolution must consume exact passing acceptance evidence")
+      const plan = await this.approvedPlan(state, resolution.context)
+      const batch = plan.batches.find((entry) => entry.id === resolution.batchId)!
+      if (stable([...batch.itemIds].sort()) !== stable(evidence.items.map((entry) => entry.itemId).sort()))
+        invalid("Batch resolution must cover every pinned batch item")
+      const specRef = state.artifacts.find((entry) => entry.id === resolution.context.spec?.artifactId)!
+      const spec = await this.artifact(specRef)
+      const trialRequired =
+        spec.kind === "spec" && spec.items.some((entry) => batch.itemIds.includes(entry.id) && entry.ui)
+      if ((attempt.acceptance?.manualTrialRequired ?? false) !== trialRequired)
+        invalid("Batch resolution must retain the reviewed UI manual trial requirement")
+      const trial = resolution.manualTrial ?? attempt.manualTrial
+      if (trial) {
+        const trialRef = state.artifacts.find((entry) => entry.id === trial.artifactId)
+        const payload = trialRef && (await this.artifact(trialRef))
+        if (
+          payload?.kind !== "manual-trial" ||
+          payload.status !== trial.status ||
+          payload.attemptId !== evidence.attemptId ||
+          payload.attempt !== evidence.attempt ||
+          payload.codeHash !== evidence.codeHash ||
+          payload.batchId !== evidence.batchId ||
+          stable(payload.batchPlan) !== stable(evidence.batchPlan) ||
+          payload.specHash !== evidence.specHash ||
+          payload.specRevision !== evidence.specRevision
+        )
+          invalid("Batch resolution manual trial belongs to another review")
+      }
+    }
+    this.validateState(state)
+  }
+
+  private async approvedPlan(state: IterationState, context?: ApprovalContext) {
+    if (!context?.spec || !context.batchPlan || !context.batchId || !context.mode)
+      invalid("Approval must bind an exact saved spec, batch plan, batch and mode")
+    const specRef = state.artifacts.find((ref) => ref.id === context.spec!.artifactId)
+    if (!specRef || specRef.hash !== context.spec.hash)
+      invalid("Approval must bind the exact saved spec revision and hash")
+    const spec = await this.artifact(specRef)
+    if (spec.kind !== "spec" || spec.revision !== context.spec.revision)
+      invalid("Approval must bind the exact saved spec revision and hash")
+    const planRef = state.artifacts.find((ref) => ref.id === context.batchPlan!.artifactId)
+    if (!planRef || planRef.hash !== context.batchPlan.hash)
+      invalid("Approval must bind the exact saved batch plan")
+    const plan = await this.artifact(planRef)
+    if (
+      plan.kind !== "batch-plan" ||
+      plan.specHash !== specRef.hash ||
+      plan.specRevision !== spec.revision ||
+      plan.mode !== context.mode ||
+      !plan.batches.some((batch) => batch.id === context.batchId)
+    )
+      invalid("Approval batch plan does not match the exact spec, batch and mode")
+    return plan
+  }
+
+  /** A model recommendation or a historical trial cannot authorize a manual repair. */
+  private async manualProblemProof(state: IterationState): Promise<void> {
+    if (!hasManualProblem(state)) invalid("Repair requires a bound human manual problem receipt")
+    const ref = state.artifacts.find((entry) => entry.id === state.manualTrial!.artifactId)!
+    const payload = await this.artifact(ref)
+    if (payload.kind !== "manual-trial" || payload.status !== "problem")
+      invalid("Repair requires the actual immutable manual problem artifact")
+    await this.validateBinding(state, payload, true)
+  }
+
+  private async validateEventBinding(state: IterationState, event: StageEvent): Promise<void> {
+    const proposal =
+      event.type === "propose-transition"
+        ? event.proposal
+        : event.type === "confirm-transition"
+          ? state.pending
+          : undefined
+    if (proposal?.kind === "repair") {
+      const active = state.attempts.find((entry) => entry.id === state.activeAttemptId)
+      if (active?.acceptance?.verdict !== "fail") await this.manualProblemProof(state)
+    }
+    const context =
+      event.type === "propose-transition"
+        ? event.proposal.context
+        : event.type === "confirm-transition" || event.type === "confirm-continuation"
+          ? event.receipt.context
+          : state.approvedContext
+    const target =
+      event.type === "propose-transition"
+        ? event.proposal.to
+        : event.type === "confirm-transition"
+          ? state.pending?.to
+          : state.stage
+    if (
+      ["propose-transition", "confirm-transition", "start-work", "confirm-continuation"].includes(
+        event.type,
+      ) &&
+      (target === "implement" || target === "accept")
+    )
+      await this.approvedPlan(state, context)
+    if (event.type === "record-artifact" && event.manifest) {
+      const ref = state.artifacts.find((entry) => entry.id === event.manifest!.batchPlan.artifactId)
+      const payload = ref && (await this.artifact(ref))
+      if (
+        !ref ||
+        payload?.kind !== "batch-plan" ||
+        stable(event.manifest) !== stable(this.manifest(state, ref, payload))
+      )
+        invalid("Batch manifest must match immutable plan membership")
+    }
+    if (!("artifact" in event) || !event.artifact) return
+    if (!state.artifacts.some((ref) => stable(ref) === stable(event.artifact)))
+      invalid("Stage event references an artifact not committed by this iteration store")
+    const payload = await this.artifact(event.artifact)
+    if (
+      event.type === "finish-work" ||
+      event.type === "record-manual-trial" ||
+      event.type === "record-correction"
+    )
+      await this.validateBinding(state, payload, true)
+    const sameSet = (left: string[], right: string[]) =>
+      stable([...new Set(left)].sort()) === stable([...new Set(right)].sort())
+    if (
+      event.type === "prepare-summary" &&
+      (payload.kind !== "stage-summary" || payload.stage !== state.stage)
+    )
+      invalid("Summary artifact belongs to a different stage")
+    if (event.type === "finish-work") {
+      if (payload.kind !== "acceptance" || payload.outcome !== event.acceptance?.verdict)
+        invalid("Acceptance result does not match its immutable artifact")
+      const failing =
+        payload.outcome === "fail"
+          ? payload.items
+              .filter((item) => item.status === "fail" || item.status === "blocked")
+              .map((item) => item.itemId)
+          : []
+      if (!sameSet(failing, event.acceptance?.failingItemIds ?? []))
+        invalid("Acceptance failing item IDs do not match the saved evidence")
+      if (
+        context?.spec &&
+        (payload.specHash !== context.spec.hash || payload.specRevision !== context.spec.revision)
+      )
+        invalid("Acceptance evidence belongs to a different approved spec")
+      if (context?.batchId && payload.batchId !== context.batchId)
+        invalid("Acceptance evidence belongs to a different approved batch")
+      const specRef = state.artifacts.find((ref) => ref.kind === "spec" && ref.hash === payload.specHash)
+      const spec = specRef && (await this.artifact(specRef))
+      const reviewedIds = new Set(payload.items.map((item) => item.itemId))
+      const trialRequired =
+        spec?.kind === "spec" && spec.items.some((item) => reviewedIds.has(item.id) && item.ui)
+      if ((event.acceptance?.manualTrialRequired ?? false) !== trialRequired)
+        invalid("UI acceptance must retain the manual trial requirement from the reviewed spec items")
+      const trialRef = state.artifacts.find((ref) => ref.id === state.manualTrial?.artifactId)
+      const trial = trialRef && (await this.artifact(trialRef))
+      if (
+        trial?.kind === "manual-trial" &&
+        (trial.attemptId !== payload.attemptId ||
+          trial.attempt !== payload.attempt ||
+          trial.codeHash !== payload.codeHash ||
+          stable(trial.batchPlan) !== stable(payload.batchPlan) ||
+          trial.specHash !== payload.specHash ||
+          trial.specRevision !== payload.specRevision ||
+          trial.batchId !== payload.batchId)
+      )
+        invalid("Manual trial belongs to a different acceptance attempt or spec")
+    }
+    if (event.type === "record-manual-trial") {
+      if (payload.kind !== "manual-trial" || payload.status !== event.status)
+        invalid("Manual trial status does not match its immutable artifact")
+      if (
+        context?.spec &&
+        (payload.specHash !== context.spec.hash || payload.specRevision !== context.spec.revision)
+      )
+        invalid("Manual trial belongs to a different approved spec")
+      if (context?.batchId && payload.batchId !== context.batchId)
+        invalid("Manual trial belongs to a different approved batch")
+      const active = state.attempts.find((attempt) => attempt.id === state.activeAttemptId)
+      const verdictRef = state.artifacts.find((ref) => ref.id === active?.acceptance?.artifactId)
+      const verdict = verdictRef && (await this.artifact(verdictRef))
+      if (verdict?.kind === "acceptance" && payload.attempt !== verdict.attempt)
+        invalid("Manual trial belongs to a different acceptance attempt")
+    }
+    if (event.type === "record-correction") {
+      if (payload.kind !== "correction") invalid("Correction event requires a correction artifact")
+      const correction = event.correction
+      if (
+        !sameSet(
+          payload.mappings.map((edge) => stable([edge.oldDecisionId, edge.newDecisionId])),
+          correction.decisionLinks.map((edge) => stable([edge.oldDecisionId, edge.newDecisionId])),
+        ) ||
+        !sameSet(
+          payload.mappings.flatMap((edge) => edge.itemIds),
+          correction.affectedSpecItemIds,
+        ) ||
+        !sameSet(
+          payload.mappings.flatMap((edge) => edge.changedFiles),
+          correction.affectedFiles,
+        ) ||
+        stable(
+          [
+            ...new Set(payload.mappings.flatMap((edge) => edge.acceptedBatches.map((ref) => stable(ref)))),
+          ].sort(),
+        ) !== stable(correction.acceptedBatches.map((ref) => stable(ref)).sort())
+      )
+        invalid("Correction impact mapping does not match its immutable artifact")
+    }
+  }
+
+  /** A correction points at the original acceptance owner, not its new target spec/plan. */
+  private async confirmedAcceptedEvidence(state: IterationState, ref: AcceptedBatchRef): Promise<void> {
+    const resolution = state.batchResolutions?.find(
+      (entry) =>
+        entry.status === "accepted" &&
+        entry.batchId === ref.batchId &&
+        stable(entry.context.spec) === stable(ref.spec) &&
+        stable(entry.context.batchPlan) === stable(ref.batchPlan) &&
+        entry.receiptId === ref.resolutionReceiptId &&
+        entry.attemptId === ref.attemptId,
+    )
+    if (!resolution) invalid("Correction requires qualified confirmed accepted batch evidence")
+    const receipt = state.receipts.find((entry) => entry.id === ref.resolutionReceiptId)
+    const transition = state.transitions.find((entry) => entry.id === receipt?.subjectId)
+    if (
+      receipt?.provenance !== "human" ||
+      receipt.projectId !== state.projectId ||
+      receipt.iteration !== state.iteration ||
+      stable(receipt.context?.spec) !== stable(ref.spec) ||
+      stable(receipt.context?.batchPlan) !== stable(ref.batchPlan) ||
+      transition?.from !== "accept" ||
+      !["complete", "next-batch"].includes(transition.kind)
+    )
+      invalid("Correction accepted evidence requires its confirmed human resolution receipt")
+    const attempt = state.attempts.find((entry) => entry.id === ref.attemptId)
+    const evidenceRef = state.artifacts.find((entry) => entry.id === attempt?.acceptance?.artifactId)
+    const evidence = evidenceRef && (await this.artifact(evidenceRef))
+    if (
+      attempt?.stage !== "accept" ||
+      attempt.status !== "finished" ||
+      attempt.acceptance?.verdict !== "pass" ||
+      stable(attempt.context) !== stable(resolution.context) ||
+      evidence?.kind !== "acceptance" ||
+      evidence.outcome !== "pass" ||
+      evidence.attemptId !== attempt.id ||
+      evidence.attempt !== attempt.review?.attempt ||
+      evidence.codeHash !== attempt.review.codeHash ||
+      evidence.batchId !== ref.batchId ||
+      stable(evidence.batchPlan) !== stable(ref.batchPlan) ||
+      evidence.specHash !== ref.spec.hash ||
+      evidence.specRevision !== ref.spec.revision
+    )
+      invalid("Correction accepted evidence must consume the exact passing review")
+    const plan = await this.approvedPlan(state, resolution.context)
+    const batch = plan.batches.find((entry) => entry.id === ref.batchId)!
+    const specRef = state.artifacts.find((entry) => entry.id === ref.spec.artifactId)!
+    const spec = await this.artifact(specRef)
+    if (spec.kind !== "spec") invalid("Correction accepted evidence requires its saved spec")
+    if (stable([...batch.itemIds].sort()) !== stable(evidence.items.map((entry) => entry.itemId).sort()))
+      invalid("Correction accepted evidence must cover every original batch item")
+    const items = spec.items.filter((entry) => batch.itemIds.includes(entry.id))
+    const checks = new Set(items.flatMap((entry) => entry.checkIds))
+    if (
+      evidence.checks.length !== checks.size ||
+      evidence.checks.some(
+        (check) =>
+          !checks.has(check.checkId) ||
+          spec.checks.find((entry) => entry.id === check.checkId)?.command !== check.command,
+      )
+    )
+      invalid("Correction accepted evidence must include every agreed original check")
+    const trialRequired = items.some((entry) => entry.ui)
+    if ((attempt.acceptance.manualTrialRequired ?? false) !== trialRequired)
+      invalid("Correction accepted evidence must retain its UI trial requirement")
+    const trial = resolution.manualTrial ?? attempt.manualTrial
+    if (trialRequired && !trial) invalid("Correction accepted evidence requires a resolved manual trial")
+    if (!trial) return
+    const trialRef = state.artifacts.find((entry) => entry.id === trial.artifactId)
+    const payload = trialRef && (await this.artifact(trialRef))
+    const trialReceipt = state.receipts.find((entry) => entry.id === trial.receiptId)
+    if (
+      !["tried", "deferred"].includes(trial.status) ||
+      !trialReceipt ||
+      trialReceipt.provenance !== "human" ||
+      trialReceipt.subjectId !== trial.artifactId ||
+      trialReceipt.choice !== trial.status ||
+      payload?.kind !== "manual-trial" ||
+      payload.status !== trial.status ||
+      payload.attemptId !== evidence.attemptId ||
+      payload.attempt !== evidence.attempt ||
+      payload.codeHash !== evidence.codeHash ||
+      payload.batchId !== evidence.batchId ||
+      stable(payload.batchPlan) !== stable(evidence.batchPlan) ||
+      payload.specHash !== evidence.specHash ||
+      payload.specRevision !== evidence.specRevision
+    )
+      invalid("Correction accepted evidence requires its exact resolved trial and human receipt")
+  }
+
+  private async validateBinding(
+    state: IterationState,
+    artifact: IterationArtifact,
+    consuming = false,
+  ): Promise<void> {
+    const saved = await Promise.all(
+      state.artifacts.map(async (ref) => ({ ref, artifact: await this.artifact(ref) })),
+    )
+    if (artifact.kind === "stage-summary") return
+    if (artifact.kind === "spec") {
+      if (
+        saved.some((entry) => entry.artifact.kind === "spec" && entry.artifact.revision >= artifact.revision)
+      )
+        invalid("Spec revisions must increase; old spec artifacts are immutable")
+      return
+    }
+    const specEntry = saved.find((entry) => entry.ref.kind === "spec" && entry.ref.hash === artifact.specHash)
+    if (specEntry?.artifact.kind !== "spec" || specEntry.artifact.revision !== artifact.specRevision)
+      invalid("Artifact must bind an exact saved spec revision and hash")
+    const spec = specEntry.artifact
+    const itemIds = spec.items.map((item) => item.id)
+    const knownItems = (ids: string[]) => {
+      if (ids.some((id) => !itemIds.includes(id))) invalid("Artifact references unknown stable spec item IDs")
+    }
+    if (artifact.kind === "batch-plan") {
+      if (
+        (state.status === "working" || state.phase === "proposed") &&
+        saved.some((entry) => entry.artifact.kind === "batch-plan")
+      )
+        invalid("Cannot replace a batch plan while work is running or approval is proposed")
+      const covered = artifact.batches.flatMap((batch) => batch.itemIds)
+      knownItems(covered)
+      if (new Set(covered).size !== covered.length || itemIds.some((id) => !covered.includes(id)))
+        invalid("Batch plan must cover every spec item exactly once")
+      for (const batch of artifact.batches) {
+        if (batch.decisionIds.some((id) => !spec.decisionIds.includes(id)))
+          invalid("Batch references unknown spec decision IDs")
+      }
+      return
+    }
+    if (artifact.kind === "correction") {
+      for (const mapping of artifact.mappings) knownItems(mapping.itemIds)
+      for (const mapping of artifact.mappings)
+        for (const ref of mapping.acceptedBatches) await this.confirmedAcceptedEvidence(state, ref)
+      return
+    }
+    const active = state.attempts.find((attempt) => attempt.id === state.activeAttemptId)
+    if (
+      state.stage !== "accept" ||
+      active?.stage !== "accept" ||
+      active.id !== artifact.attemptId ||
+      active.review?.attempt !== artifact.attempt ||
+      active.review.codeHash !== artifact.codeHash ||
+      (artifact.kind === "acceptance"
+        ? state.status !== "working" || active.status !== "working"
+        : !["working", "finished"].includes(active.status))
+    )
+      invalid("Acceptance/manual trial must bind the active review attempt ID, ordinal and code snapshot")
+    const context = active.context
+    const plan = await this.approvedPlan(state, context)
+    if (
+      artifact.specHash !== context!.spec!.hash ||
+      artifact.specRevision !== context!.spec!.revision ||
+      artifact.batchId !== context!.batchId ||
+      stable(artifact.batchPlan) !== stable(context!.batchPlan)
+    )
+      invalid("Acceptance/manual trial must bind the exact approved spec, batch and batch plan")
+    const batch = plan.batches.find((batch) => batch.id === artifact.batchId)
+    if (!batch) invalid("Artifact references an unknown batch")
+    if (artifact.kind === "manual-trial") return
+    const reviewed = artifact.items.map((item) => item.itemId)
+    if (reviewed.length !== batch.itemIds.length || batch.itemIds.some((id) => !reviewed.includes(id)))
+      invalid("Acceptance must check every batch spec item exactly once")
+    const checks = new Set(
+      spec.items.filter((item) => batch.itemIds.includes(item.id)).flatMap((item) => item.checkIds),
+    )
+    if (artifact.checks.length !== checks.size || artifact.checks.some((check) => !checks.has(check.checkId)))
+      invalid("Acceptance must include every agreed check result")
+    for (const check of artifact.checks) {
+      if (spec.checks.find((agreed) => agreed.id === check.checkId)?.command !== check.command)
+        invalid("Acceptance command does not match the agreed spec check")
+    }
+    if (
+      !consuming &&
+      saved.some(
+        (entry) => entry.artifact.kind === "acceptance" && entry.artifact.attemptId === artifact.attemptId,
+      )
+    )
+      invalid("Acceptance attempt already exists; save a fresh review attempt")
   }
 }

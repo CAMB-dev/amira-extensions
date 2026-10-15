@@ -1,7 +1,14 @@
-import { checkAskAnswers } from "D:/dev/Amira/packages/core/src/ask-answers.ts"
 import { expect, test } from "bun:test"
 import type { AskQuestion } from "@amira/api"
 import { validateAskAnswers } from "../src/answers.ts"
+import { hostTest, loadHostModule } from "./amira-source.ts"
+
+interface HostAnswerModule {
+  checkAskAnswers(questions: AskQuestion[], value: unknown): string | undefined
+}
+const hostAnswers = await loadHostModule<HostAnswerModule>("packages/core/src/ask-answers.ts", [
+  "checkAskAnswers",
+])
 
 const question: AskQuestion = {
   question: "Which deployment?",
@@ -50,11 +57,14 @@ const cases: { name: string; value: unknown; multi?: boolean; valid: boolean }[]
 ]
 
 for (const entry of cases) {
-  test(`shared answer validation agrees with actual host semantics: ${entry.name}`, () => {
+  test(`shared answer validation: ${entry.name}`, () => {
     const questions = [{ ...question, ...(entry.multi ? { multiSelect: true } : {}) }]
-    expect(checkAskAnswers(questions, entry.value) === undefined).toBe(entry.valid)
     if (entry.valid) expect(entry.value).toEqual(validateAskAnswers(questions, entry.value))
     else expect(() => validateAskAnswers(questions, entry.value)).toThrow()
+  })
+  hostTest(`shared answer validation agrees with actual host semantics: ${entry.name}`, hostAnswers, () => {
+    const questions = [{ ...question, ...(entry.multi ? { multiSelect: true } : {}) }]
+    expect(hostAnswers.module!.checkAskAnswers(questions, entry.value) === undefined).toBe(entry.valid)
   })
 }
 

@@ -1,5 +1,4 @@
-import { askUserPresenter, askUserTool } from "D:/dev/Amira/extensions/builtin-tools/src/ask-user.ts"
-import { afterEach, expect, spyOn, test } from "bun:test"
+import { afterEach, expect, setDefaultTimeout, spyOn } from "bun:test"
 import { readFileSync } from "node:fs"
 import * as fs from "node:fs/promises"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
@@ -16,15 +15,38 @@ import {
   type OwnedConversation,
   type SessionControl,
   type SessionData,
+  type ToolDefinition,
+  type ToolPresenter,
   textResult,
 } from "@amira/api"
 import { Agent, AgentTree, InterceptorRegistry, OwnedConversationManager, ToolRegistry } from "@amira/core"
 import { type RecordDecisionDetails, recordDecisionPresenter } from "../src/design.ts"
 import { createProjectExtension, restoreAttachment } from "../src/index.ts"
-import { DecisionStore, readDocument, readProject } from "../src/store.ts"
+import { DecisionStore, IterationStore, readDocument, readProject } from "../src/store.ts"
+import { hostTest, loadHostModule } from "./amira-source.ts"
+
+interface HostAskUserModule {
+  askUserTool: ToolDefinition<{ questions: AskQuestion[] }>
+  askUserPresenter: ToolPresenter<{ questions: AskQuestion[] }>
+}
+const hostBuiltins = await loadHostModule<HostAskUserModule>("extensions/builtin-tools/src/ask-user.ts", [
+  "askUserTool",
+  "askUserPresenter",
+])
+
+// Every integration fixture registers the real builtin, so source availability gates each case.
+function test(
+  name: string,
+  callback: (builtins: HostAskUserModule) => void | Promise<void>,
+  timeout?: number,
+) {
+  hostTest(name, hostBuiltins, () => callback(hostBuiltins.module!), timeout)
+}
 
 // Only command registration and frontend callbacks are simulated. Model turns, tool dispatch,
 // child groups, policy enforcement, persistence and leases use the actual core implementation.
+// Iteration claims and durable revisions add real filesystem work to multi-turn fixtures.
+setDefaultTimeout(30_000)
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
@@ -55,7 +77,7 @@ function sessionData(): SessionData {
   }
 }
 
-async function fixture(steps: MockStep[] = []) {
+async function fixture(builtins: HostAskUserModule, steps: MockStep[] = []) {
   const home = await mkdtemp(path.join(tmpdir(), "project-integration-"))
   cleanups.push(() => rm(home, { recursive: true, force: true }))
   const cwd = path.join(home, "main-work")
@@ -101,7 +123,7 @@ async function fixture(steps: MockStep[] = []) {
     )
   }
   // Execute the real builtin, including owner-answer validation and persisted outcomes.
-  tools.register(askUserTool, "builtin-tools")
+  tools.register(builtins.askUserTool, "builtin-tools")
   const agents: Agent[] = []
   const interceptors = new InterceptorRegistry()
   const interceptDisposers: (() => void)[] = []
@@ -272,8 +294,8 @@ function toolResults(handle: OwnedConversation) {
   return handle.history().filter((message) => message.role === "toolResult")
 }
 
-test("/project new attaches without changing main cwd; /project design focuses an inert native conversation", async () => {
-  const f = await fixture([{ text: "Design conversation answer" }])
+test("/project new attaches without changing main cwd; /project design focuses an inert native conversation", async (builtins) => {
+  const f = await fixture(builtins, [{ text: "Design conversation answer" }])
   const project = await f.create()
   expect(restoreAttachment(f.data())).toMatchObject({ projectId: project.marker.id, root: project.root })
   expect(f.main().cwd).toBe(f.cwd)
@@ -289,8 +311,8 @@ test("/project new attaches without changing main cwd; /project design focuses a
   expect(f.main().messages).toEqual([])
 })
 
-test("ask_user flushes exact human evidence before model continuation and regenerates its Markdown projection", async () => {
-  const f = await fixture()
+test("ask_user flushes exact human evidence before model continuation and regenerates its Markdown projection", async (builtins) => {
+  const f = await fixture(builtins)
   const project = await f.create()
   let continued = false
   f.mock.push(
@@ -332,8 +354,8 @@ test("ask_user flushes exact human evidence before model continuation and regene
   expect(f.main().messages).toEqual([])
 })
 
-test("model-supplied answers cannot forge decisions; unconfirmed suggestions stay outside the ledger", async () => {
-  const f = await fixture([
+test("model-supplied answers cannot forge decisions; unconfirmed suggestions stay outside the ledger", async (builtins) => {
+  const f = await fixture(builtins, [
     {
       toolCalls: [
         { id: "forged", name: "record_decision", args: { questions: offered, answers: confirmed } },
@@ -357,8 +379,8 @@ test("model-supplied answers cannot forge decisions; unconfirmed suggestions sta
   expect(await readDocument(project, "suggestions.md")).toContain("pending human confirmation")
 })
 
-test("design's persisted callable ceiling rejects write, shells and generic agents even if the model attempts them", async () => {
-  const f = await fixture([
+test("design's persisted callable ceiling rejects write, shells and generic agents even if the model attempts them", async (builtins) => {
+  const f = await fixture(builtins, [
     { toolCalls: forbidden.map((name) => ({ id: `attempt-${name}`, name, args: {} })) },
     { text: "No forbidden executor ran" },
   ])
@@ -373,8 +395,8 @@ test("design's persisted callable ceiling rejects write, shells and generic agen
   expect(f.executed).toEqual([])
 })
 
-test("project_research runs a genuine fresh child group whose attempted write is blocked", async () => {
-  const f = await fixture()
+test("project_research runs a genuine fresh child group whose attempted write is blocked", async (builtins) => {
+  const f = await fixture(builtins)
   await f.create()
   const route: MockStep = (request) => {
     const isChild = request.systemPrompt.includes("Read-only research only.")
@@ -422,8 +444,8 @@ test("project_research runs a genuine fresh child group whose attempted write is
   expect(f.asks).toEqual([])
 })
 
-test("replacing the main agent like /clear neither destroys nor rebinds the live design conversation", async () => {
-  const f = await fixture([
+test("replacing the main agent like /clear neither destroys nor rebinds the live design conversation", async (builtins) => {
+  const f = await fixture(builtins, [
     { text: "Before main clear" },
     { toolCalls: [{ id: "read-after-clear", name: "read", args: {} }] },
     { text: "After main clear" },
@@ -445,8 +467,11 @@ test("replacing the main agent like /clear neither destroys nor rebinds the live
   expect(f.main().messages).toEqual([])
 })
 
-test("releasing and reconstructing the host manager reopens the same saved design inertly", async () => {
-  const f = await fixture([{ text: "Durable design transcript" }, { text: "Explicit continuation only" }])
+test("releasing and reconstructing the host manager reopens the same saved design inertly", async (builtins) => {
+  const f = await fixture(builtins, [
+    { text: "Durable design transcript" },
+    { text: "Explicit continuation only" },
+  ])
   await f.create()
   await f.run("design")
   const first = f.handle()
@@ -465,8 +490,8 @@ test("releasing and reconstructing the host manager reopens the same saved desig
   expect(JSON.stringify(reopened.history())).toContain("Explicit continuation only")
 })
 
-test("each iteration gets a fresh conversation seeded from project documents, never the prior transcript", async () => {
-  const f = await fixture([
+test("each iteration gets a fresh conversation seeded from project documents, never the prior transcript", async (builtins) => {
+  const f = await fixture(builtins, [
     {
       toolCalls: [
         {
@@ -536,9 +561,9 @@ const answerCases: { name: string; answer: AskAnswer[]; multiSelect?: boolean; v
 ]
 
 for (const entry of answerCases) {
-  test(`real builtin ask_user: ${entry.name} agrees with authoritative human evidence`, async () => {
+  test(`real builtin ask_user: ${entry.name} agrees with authoritative human evidence`, async (builtins) => {
     const questions = [{ ...offered[0]!, ...(entry.multiSelect ? { multiSelect: true } : {}) }]
-    const f = await fixture([
+    const f = await fixture(builtins, [
       { toolCalls: [{ id: "matrix", name: "ask_user", args: { questions } }] },
       { text: "Continue from actual human outcome" },
     ])
@@ -565,8 +590,8 @@ for (const entry of answerCases) {
   })
 }
 
-test("stopping real builtin ask_user during the evidence queue declines without a late decision", async () => {
-  const f = await fixture([
+test("stopping real builtin ask_user during the evidence queue declines without a late decision", async (builtins) => {
+  const f = await fixture(builtins, [
     { toolCalls: [{ id: "queued-ask", name: "ask_user", args: { questions: offered } }] },
     { text: "Must not continue after stop" },
   ])
@@ -610,8 +635,8 @@ test("stopping real builtin ask_user during the evidence queue declines without 
   expect(evidence.trim().split("\n")).toHaveLength(1)
 })
 
-test("record_decision returns exact choices and IDs and reopens expandable supersession evidence", async () => {
-  const f = await fixture([
+test("record_decision returns exact choices and IDs and reopens expandable supersession evidence", async (builtins) => {
+  const f = await fixture(builtins, [
     { toolCalls: [{ id: "first-choice", name: "record_decision", args: { questions: offered } }] },
     { text: "Initial choice recorded" },
     {
@@ -640,7 +665,7 @@ test("record_decision returns exact choices and IDs and reopens expandable super
   expect(JSON.stringify(saved.content)).toContain("D2")
   const call = { args: { questions: offered }, result: { content: saved.content, details }, text: "" }
   expect(recordDecisionPresenter.body!(call, { detail: "full", width: 80 })).toEqual(
-    askUserPresenter.body!(call, { detail: "full", width: 80 }),
+    builtins.askUserPresenter.body!(call, { detail: "full", width: 80 }),
   )
   expect((await new DecisionStore(project).records())[1]).toMatchObject({
     answer: alternative[0],
@@ -648,8 +673,8 @@ test("record_decision returns exact choices and IDs and reopens expandable super
   })
 })
 
-test("real builtin acknowledges a published answer before a later event-loop Stop", async () => {
-  const f = await fixture([
+test("real builtin acknowledges a published answer before a later event-loop Stop", async (builtins) => {
+  const f = await fixture(builtins, [
     { toolCalls: [{ id: "published-ask", name: "ask_user", args: { questions: offered } }] },
     { text: "The host received the actual human answer" },
   ])
@@ -694,10 +719,10 @@ test("real builtin acknowledges a published answer before a later event-loop Sto
   expect(readFileSync(path.join(project.root, ".amira/project/decisions.md"), "utf8")).toContain("D1")
 })
 
-test("oversized record_decision keeps exact choice text and authoritative sidecar when host drops details", async () => {
+test("oversized record_decision keeps exact choice text and authoritative sidecar when host drops details", async (builtins) => {
   const questions = structuredClone(offered)
   questions[0]!.options[0]!.description += "運用は簡単ですが、個別の拡張には制約があります。".repeat(400)
-  const f = await fixture([
+  const f = await fixture(builtins, [
     { toolCalls: [{ id: "oversized", name: "record_decision", args: { questions } }] },
     { text: "Oversized human evidence received" },
   ])
@@ -737,8 +762,8 @@ for (const entry of [
     proposed: "MODEL SUGGESTION",
   },
 ]) {
-  test(`${entry.name} reports the actual conflict sibling after a concurrent human save`, async () => {
-    const f = await fixture([
+  test(`${entry.name} reports the actual conflict sibling after a concurrent human save`, async (builtins) => {
+    const f = await fixture(builtins, [
       { toolCalls: [{ id: "concurrent-document", name: entry.name, args: { text: entry.proposed } }] },
       { text: "The writer's actual receipt is available" },
     ])
@@ -777,10 +802,10 @@ for (const entry of [
 
 for (const name of ["ask_user", "record_decision"] as const) {
   for (const header of ["", "   ", "🧭".repeat(12)]) {
-    test(`${name} preserves an answered ${JSON.stringify(header)} header in durable evidence`, async () => {
+    test(`${name} preserves an answered ${JSON.stringify(header)} header in durable evidence`, async (builtins) => {
       const questions = structuredClone(offered)
       questions[0]!.header = header
-      const f = await fixture([
+      const f = await fixture(builtins, [
         { toolCalls: [{ id: "empty-header", name, args: { questions } }] },
         { text: "The actual human answer was received" },
       ])
@@ -810,8 +835,8 @@ for (const name of ["ask_user", "record_decision"] as const) {
 }
 
 for (const change of ["extension", "marker", "project override", "remove override"] as const) {
-  test(`existing design refreshes new-content language after ${change} without reopening`, async () => {
-    const f = await fixture([
+  test(`existing design refreshes new-content language after ${change} without reopening`, async (builtins) => {
+    const f = await fixture(builtins, [
       {
         toolCalls: [
           { id: "before-suggestion", name: "record_suggestion", args: { text: "Existing English proposal" } },
@@ -880,8 +905,8 @@ for (const change of ["extension", "marker", "project override", "remove overrid
 
 for (const name of ["ask_user", "record_decision"] as const) {
   for (const change of ["extension", "marker"] as const) {
-    test(`${name} keeps an already-presented question's language stable across a ${change} change`, async () => {
-      const f = await fixture([
+    test(`${name} keeps an already-presented question's language stable across a ${change} change`, async (builtins) => {
+      const f = await fixture(builtins, [
         { toolCalls: [{ id: "presented", name, args: { questions: offered } }] },
         {
           toolCalls: [
@@ -934,4 +959,75 @@ for (const name of ["ask_user", "record_decision"] as const) {
       }
     })
   }
+}
+
+for (const name of ["ask_user", "record_decision"] as const) {
+  test(`${name} rejects a late human answer after the iteration revision changes`, async (builtins) => {
+    const f = await fixture(builtins, [
+      { toolCalls: [{ id: "late-question", name, args: { questions: offered } }] },
+      { text: "The stale question was not accepted." },
+    ])
+    const project = await f.create()
+    await f.run("design")
+    const shown = Promise.withResolvers<void>()
+    const answer = Promise.withResolvers<void>()
+    cleanups.push(async () => answer.resolve())
+    f.setAskHandler(async () => {
+      shown.resolve()
+      await answer.promise
+      return structuredClone(confirmed)
+    })
+    const turn = f.handle().send("Ask before a stage revision changes")
+    await shown.promise
+    try {
+      const store = new IterationStore(project)
+      const state = await store.read()
+      await store.saveArtifact(state.revision, {
+        kind: "stage-summary",
+        stage: "design",
+        language: "en",
+        summary: "A separate stage writer changed this revision",
+        outputs: [],
+        suggestion: "Review again",
+      })
+      answer.resolve()
+      await turn
+      expect(await new DecisionStore(project).records()).toEqual([])
+      const result = toolResults(f.handle()).find((entry) => entry.toolCallId === "late-question")!
+      expect(result.isError || JSON.stringify(result.content).includes("stale")).toBe(true)
+      expect(f.executed).toEqual([])
+    } finally {
+      answer.resolve()
+      await turn
+    }
+  })
+}
+
+for (const [language, native] of [
+  ["zh-CN", "无法刷新项目设计状态"],
+  ["ja", "設計の状態を更新できません"],
+]) {
+  test(`${language}: design interceptor localizes storage errors using the live language and preserves edits`, async (builtins) => {
+    const f = await fixture(builtins, [])
+    const project = await f.create({ language: "en" })
+    await f.run("design")
+    await writeFile(
+      path.join(project.root, ".amira/project.json"),
+      JSON.stringify({ ...project.marker, settings: { ...project.marker.settings, language } }),
+    )
+    const state = await new IterationStore(project).read()
+    const file = path.join(project.root, ".amira/project/iterations/1/state.json")
+    const edited = JSON.stringify({ ...state, manualNote: "preserve this human edit" })
+    await writeFile(file, edited)
+    const error = await f
+      .handle()
+      .send("Continue the design")
+      .catch((error: unknown) => error)
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toContain(native!)
+    expect((error as Error).message).not.toContain("Unable to refresh project design")
+    expect((error as Error).message).not.toContain("Iteration state.json was manually edited")
+    expect(await fs.readFile(file, "utf8")).toBe(edited)
+    expect(f.mock.requests).toEqual([])
+  })
 }

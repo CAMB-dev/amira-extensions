@@ -1,5 +1,4 @@
-import { askUserPresenter, askUserTool } from "D:/dev/Amira/extensions/builtin-tools/src/ask-user.ts"
-import { afterEach, expect, test } from "bun:test"
+import { afterEach, expect, setDefaultTimeout, test } from "bun:test"
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
@@ -13,12 +12,30 @@ import type {
   OwnedConversation,
   SpawnGroup,
   SpawnOptions,
+  ToolDefinition,
+  ToolPresenter,
 } from "@amira/api"
 import { textResult } from "@amira/api"
 import { DesignSessions, type RecordDecisionDetails, recordDecisionPresenter } from "../src/design.ts"
 import { LanguagePolicy } from "../src/language.ts"
 import { DecisionStore, type Project } from "../src/store.ts"
+import { hostTest, loadHostModule } from "./amira-source.ts"
 
+interface HostAskUserModule {
+  askUserTool: ToolDefinition<{ questions: AskQuestion[] }>
+  askUserPresenter: ToolPresenter<{ questions: AskQuestion[] }>
+}
+const hostBuiltins = await loadHostModule<HostAskUserModule>("extensions/builtin-tools/src/ask-user.ts", [
+  "askUserTool",
+  "askUserPresenter",
+])
+
+function builtinTest(name: string, callback: (builtins: HostAskUserModule) => void | Promise<void>) {
+  hostTest(name, hostBuiltins, () => callback(hostBuiltins.module!))
+}
+
+// Multi-turn mock tests now also flush revision-bound iteration state on Windows.
+setDefaultTimeout(30_000)
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
@@ -70,6 +87,13 @@ async function fixture() {
       release: async () => {},
       createGroup: () => {
         throw new Error("Opening must not spawn research")
+      },
+      // Newer host declarations require this capability. Spreading the extra stub also
+      // typechecks on 0.1.52, and any use fails: project does not depend on this host API.
+      ...{
+        runTool: async () => {
+          throw new Error("Project design must not invoke direct host tool execution")
+        },
       },
     }
     handles.set(id, result)
@@ -504,169 +528,181 @@ test("the design policy exposes only five research operations and narrow control
   expect(f.specs[0]?.systemPrompt).toContain("coming later")
 })
 
-test("real mock dialect enforces forbidden tools, read-only research, direct human evidence and inert restart across main replacement", async () => {
-  const { createAi, createMockDialect } = await import("@amira/ai")
-  const { Agent, AgentTree, OwnedConversationManager, ToolRegistry } = await import("@amira/core")
-  const f = await fixture()
-  const mainHold = Promise.withResolvers<void>()
-  const mainStarted = Promise.withResolvers<void>()
-  const mock = createMockDialect([
-    () => {
-      mainStarted.resolve()
-      return {
-        text: "Main work stays independent of design focus.",
-        hold: { chunks: 1, until: mainHold.promise },
-      }
-    },
-    {
-      toolCalls: [
-        { id: "write", name: "write", args: {} },
-        { id: "bash", name: "bash", args: {} },
-        { id: "powershell", name: "powershell", args: {} },
-        { id: "agent", name: "agent", args: {} },
-      ],
-    },
-    {
-      toolCalls: [
-        {
-          id: "research",
-          name: "project_research",
-          args: { title: "Queue APIs", task: "Compare existing queue APIs." },
-        },
-      ],
-    },
-    {
-      toolCalls: [
-        { id: "child-write", name: "write", args: {} },
-        { id: "child-bash", name: "bash", args: {} },
-        { id: "child-agent", name: "agent", args: {} },
-        { id: "child-decision", name: "record_decision", args: { questions: offered } },
-      ],
-    },
-    { text: "Read-only research found a queue interface." },
-    {
-      toolCalls: [
-        {
-          id: "save",
-          name: "save_research_note",
-          args: { title: "Queue API finding", content: "A queue interface exists." },
-        },
-      ],
-    },
-    { toolCalls: [{ id: "human-ask", name: "ask_user", args: { questions: offered } }] },
-    { toolCalls: [{ id: "human-decision", name: "record_decision", args: { questions: offered } }] },
-    { text: "Design complete; later phases are coming later." },
-    { text: "The design still exists after the main session was replaced." },
-  ])
-  const ai = createAi({
-    dialects: [mock],
-    providers: [{ id: "mock", dialect: "mock", baseUrl: "https://provider.invalid" }],
-    retry: { retries: 0 },
-  })
-  const tools = new ToolRegistry()
-  const tree = new AgentTree({ ai, sections: () => [] })
-  const approvals: string[] = []
-  const approve = async (request: { name: string }) => {
-    approvals.push(request.name)
-    return { approved: true }
-  }
-  let main = new Agent({ ai, model: ai.model("mock/test"), cwd: f.root, tools, tree, sections: [], approve })
-  const executions: string[] = []
-  for (const name of [
-    "read",
-    "grep",
-    "glob",
-    "web_search",
-    "web_fetch",
-    "write",
-    "bash",
-    "powershell",
-    "agent",
-  ]) {
-    tools.register(
-      {
-        name,
-        description: name,
-        parameters: { type: "object" },
-        execute: async () => {
-          executions.push(name)
-          return textResult("stub result")
-        },
+builtinTest(
+  "real mock dialect enforces forbidden tools, read-only research, direct human evidence and inert restart across main replacement",
+  async (builtins) => {
+    const { askUserTool } = builtins
+    const { createAi, createMockDialect } = await import("@amira/ai")
+    const { Agent, AgentTree, OwnedConversationManager, ToolRegistry } = await import("@amira/core")
+    const f = await fixture()
+    const mainHold = Promise.withResolvers<void>()
+    const mainStarted = Promise.withResolvers<void>()
+    const mock = createMockDialect([
+      () => {
+        mainStarted.resolve()
+        return {
+          text: "Main work stays independent of design focus.",
+          hold: { chunks: 1, until: mainHold.promise },
+        }
       },
-      "fixture",
-    )
-  }
-  tools.register(askUserTool, "builtin-tools")
-  const home = path.join(f.home, "host")
-  await mkdir(home, { recursive: true })
-  const managers: InstanceType<typeof OwnedConversationManager>[] = []
-  const manager = () => {
-    const manager = new OwnedConversationManager({ ai, tools, tree, home, agent: () => main })
-    managers.push(manager)
-    return manager
-  }
-  cleanups.push(async () => {
+      {
+        toolCalls: [
+          { id: "write", name: "write", args: {} },
+          { id: "bash", name: "bash", args: {} },
+          { id: "powershell", name: "powershell", args: {} },
+          { id: "agent", name: "agent", args: {} },
+        ],
+      },
+      {
+        toolCalls: [
+          {
+            id: "research",
+            name: "project_research",
+            args: { title: "Queue APIs", task: "Compare existing queue APIs." },
+          },
+        ],
+      },
+      {
+        toolCalls: [
+          { id: "child-write", name: "write", args: {} },
+          { id: "child-bash", name: "bash", args: {} },
+          { id: "child-agent", name: "agent", args: {} },
+          { id: "child-decision", name: "record_decision", args: { questions: offered } },
+        ],
+      },
+      { text: "Read-only research found a queue interface." },
+      {
+        toolCalls: [
+          {
+            id: "save",
+            name: "save_research_note",
+            args: { title: "Queue API finding", content: "A queue interface exists." },
+          },
+        ],
+      },
+      { toolCalls: [{ id: "human-ask", name: "ask_user", args: { questions: offered } }] },
+      { toolCalls: [{ id: "human-decision", name: "record_decision", args: { questions: offered } }] },
+      { text: "Design complete; later phases are coming later." },
+      { text: "The design still exists after the main session was replaced." },
+    ])
+    const ai = createAi({
+      dialects: [mock],
+      providers: [{ id: "mock", dialect: "mock", baseUrl: "https://provider.invalid" }],
+      retry: { retries: 0 },
+    })
+    const tools = new ToolRegistry()
+    const tree = new AgentTree({ ai, sections: () => [] })
+    const approvals: string[] = []
+    const approve = async (request: { name: string }) => {
+      approvals.push(request.name)
+      return { approved: true }
+    }
+    let main = new Agent({
+      ai,
+      model: ai.model("mock/test"),
+      cwd: f.root,
+      tools,
+      tree,
+      sections: [],
+      approve,
+    })
+    const executions: string[] = []
+    for (const name of [
+      "read",
+      "grep",
+      "glob",
+      "web_search",
+      "web_fetch",
+      "write",
+      "bash",
+      "powershell",
+      "agent",
+    ]) {
+      tools.register(
+        {
+          name,
+          description: name,
+          parameters: { type: "object" },
+          execute: async () => {
+            executions.push(name)
+            return textResult("stub result")
+          },
+        },
+        "fixture",
+      )
+    }
+    tools.register(askUserTool, "builtin-tools")
+    const home = path.join(f.home, "host")
+    await mkdir(home, { recursive: true })
+    const managers: InstanceType<typeof OwnedConversationManager>[] = []
+    const manager = () => {
+      const manager = new OwnedConversationManager({ ai, tools, tree, home, agent: () => main })
+      managers.push(manager)
+      return manager
+    }
+    cleanups.push(async () => {
+      mainHold.resolve()
+      for (const manager of managers) await manager.drain()
+      await main.dispose()
+    })
+    const host = manager()
+    const api = { ...f.api, conversations: host.forOwner("project-fixture") }
+    const sessions = new DesignSessions(api)
+    await sessions.open(f.project, f.ctx, "en")
+    const conversation = f.focused[0]!
+    expect(mock.requests).toHaveLength(0)
+    const mainTurn = main.prompt("Keep working in the main conversation.")
+    await mainStarted.promise
+    await conversation.send("Research the queue and ask me to decide.")
+    expect(main.busy).toBe(true)
+    expect(f.ctx.unfocusConversation?.()).toBe(true)
+    expect(main.busy).toBe(true)
     mainHold.resolve()
-    for (const manager of managers) await manager.drain()
+    await mainTurn
+    expect(executions).toEqual([])
+    expect(approvals).toEqual(["save_research_note", "record_decision"])
+    expect(f.asks).toHaveLength(2)
+    expect(await new DecisionStore(f.project).records()).toHaveLength(2)
+    expect(await readdir(path.join(f.documents, "research"))).toHaveLength(1)
+    const childRequest = mock.requests.find((request) =>
+      request.messages.some(
+        (message) =>
+          message.role === "user" && JSON.stringify(message.content).includes("Compare existing queue APIs."),
+      ),
+    )
+    expect(childRequest).toBeDefined()
+    const modelToolResults = conversation.history().filter((message) => message.role === "toolResult")
+    expect(JSON.stringify(modelToolResults)).toContain("not callable")
+    expect(JSON.stringify(modelToolResults)).toContain("Human-confirmed decisions saved: D2")
+    const history = conversation.history()
+    await expect(
+      new DesignSessions({ ...api, conversations: manager().forOwner("project-fixture") }).open(
+        f.project,
+        f.ctx,
+        "en",
+      ),
+    ).rejects.toThrow("in use")
     await main.dispose()
-  })
-  const host = manager()
-  const api = { ...f.api, conversations: host.forOwner("project-fixture") }
-  const sessions = new DesignSessions(api)
-  await sessions.open(f.project, f.ctx, "en")
-  const conversation = f.focused[0]!
-  expect(mock.requests).toHaveLength(0)
-  const mainTurn = main.prompt("Keep working in the main conversation.")
-  await mainStarted.promise
-  await conversation.send("Research the queue and ask me to decide.")
-  expect(main.busy).toBe(true)
-  expect(f.ctx.unfocusConversation?.()).toBe(true)
-  expect(main.busy).toBe(true)
-  mainHold.resolve()
-  await mainTurn
-  expect(executions).toEqual([])
-  expect(approvals).toEqual(["save_research_note", "record_decision"])
-  expect(f.asks).toHaveLength(2)
-  expect(await new DecisionStore(f.project).records()).toHaveLength(2)
-  expect(await readdir(path.join(f.documents, "research"))).toHaveLength(1)
-  const childRequest = mock.requests.find((request) =>
-    request.messages.some(
-      (message) =>
-        message.role === "user" && JSON.stringify(message.content).includes("Compare existing queue APIs."),
-    ),
-  )
-  expect(childRequest).toBeDefined()
-  const modelToolResults = conversation.history().filter((message) => message.role === "toolResult")
-  expect(JSON.stringify(modelToolResults)).toContain("not callable")
-  expect(JSON.stringify(modelToolResults)).toContain("Human-confirmed decisions saved: D2")
-  const history = conversation.history()
-  await expect(
-    new DesignSessions({ ...api, conversations: manager().forOwner("project-fixture") }).open(
-      f.project,
-      f.ctx,
-      "en",
-    ),
-  ).rejects.toThrow("in use")
-  await main.dispose()
-  main = new Agent({ ai, model: ai.model("mock/test"), cwd: f.root, tools, tree, sections: [] })
-  await sessions.open(f.project, f.ctx, "zh-CN")
-  expect(f.focused.at(-1)?.id).toBe(conversation.id)
-  await conversation.send("Continue explicitly after main clear.")
-  expect(
-    mock.requests.at(-1)?.tools.find((tool) => tool.name === "record_suggestion")?.description,
-  ).toContain("zh-CN")
-  expect(conversation.history().length).toBeGreaterThan(history.length)
-  const savedHistory = conversation.history()
-  await host.drain()
-  const requestCount = mock.requests.length
-  const restarted = new DesignSessions({ ...api, conversations: manager().forOwner("project-fixture") })
-  await restarted.open(f.project, f.ctx, "zh-CN")
-  const reopened = f.focused.at(-1)!
-  expect(reopened.id).toBe(conversation.id)
-  expect(reopened.history()).toEqual(savedHistory)
-  expect(mock.requests).toHaveLength(requestCount)
-  expect(f.asks).toHaveLength(2)
-})
+    main = new Agent({ ai, model: ai.model("mock/test"), cwd: f.root, tools, tree, sections: [] })
+    await sessions.open(f.project, f.ctx, "zh-CN")
+    expect(f.focused.at(-1)?.id).toBe(conversation.id)
+    await conversation.send("Continue explicitly after main clear.")
+    expect(
+      mock.requests.at(-1)?.tools.find((tool) => tool.name === "record_suggestion")?.description,
+    ).toContain("zh-CN")
+    expect(conversation.history().length).toBeGreaterThan(history.length)
+    const savedHistory = conversation.history()
+    await host.drain()
+    const requestCount = mock.requests.length
+    const restarted = new DesignSessions({ ...api, conversations: manager().forOwner("project-fixture") })
+    await restarted.open(f.project, f.ctx, "zh-CN")
+    const reopened = f.focused.at(-1)!
+    expect(reopened.id).toBe(conversation.id)
+    expect(reopened.history()).toEqual(savedHistory)
+    expect(mock.requests).toHaveLength(requestCount)
+    expect(f.asks).toHaveLength(2)
+  },
+)
 
 test("an empty multi-select human answer is a decision, not cancellation", async () => {
   const f = await fixture()
@@ -689,33 +725,37 @@ test("a single-select Other answer cannot be combined with a selected option", a
   expect(await new DecisionStore(f.project).records()).toEqual([])
 })
 
-test("record_decision registers expandable builtin-compatible evidence with the displayed supersession context", async () => {
-  const f = await fixture()
-  await new DesignSessions(f.api).open(f.project, f.ctx, "en")
-  expect(f.renderers.get("record_decision")).toBe(recordDecisionPresenter)
-  const tool = runtimeTool(f.runtime(), "record_decision")
-  await tool.execute({ questions: offered }, context("design-1"))
-  f.setAnswers([{ selected: [], other: "A smaller third scope" }])
-  const result = await tool.execute({ questions: offered, supersedes: ["D1"] }, context("design-1"))
-  const details = result.details as RecordDecisionDetails
-  expect(details.questions).toEqual(f.asks.at(-1)!.questions)
-  expect(details.questions[0]?.question).toContain("supersedes these decisions")
-  expect(details.questions[0]?.question).toContain("D1")
-  expect(details.ids).toEqual(["D2"])
-  expect(details.outcome).toEqual({ answers: [{ selected: [], other: "A smaller third scope" }] })
-  const call = {
-    args: { questions: offered },
-    result: { ...result, details },
-    text: JSON.stringify(result.content),
-  }
-  const options = { detail: "full" as const, width: 80 }
-  expect(recordDecisionPresenter.body!(call, options)).toEqual(askUserPresenter.body!(call, options))
-  expect(recordDecisionPresenter.result!(call)).toContain("D2")
-  const record = (await new DecisionStore(f.project).records())[1]!
-  expect(record.question).toEqual(details.questions[0]!)
-  expect(record.answer).toEqual({ selected: [], other: "A smaller third scope" })
-  expect(record.rationale).toBeUndefined()
-})
+builtinTest(
+  "record_decision registers expandable builtin-compatible evidence with the displayed supersession context",
+  async (builtins) => {
+    const { askUserPresenter } = builtins
+    const f = await fixture()
+    await new DesignSessions(f.api).open(f.project, f.ctx, "en")
+    expect(f.renderers.get("record_decision")).toBe(recordDecisionPresenter)
+    const tool = runtimeTool(f.runtime(), "record_decision")
+    await tool.execute({ questions: offered }, context("design-1"))
+    f.setAnswers([{ selected: [], other: "A smaller third scope" }])
+    const result = await tool.execute({ questions: offered, supersedes: ["D1"] }, context("design-1"))
+    const details = result.details as RecordDecisionDetails
+    expect(details.questions).toEqual(f.asks.at(-1)!.questions)
+    expect(details.questions[0]?.question).toContain("supersedes these decisions")
+    expect(details.questions[0]?.question).toContain("D1")
+    expect(details.ids).toEqual(["D2"])
+    expect(details.outcome).toEqual({ answers: [{ selected: [], other: "A smaller third scope" }] })
+    const call = {
+      args: { questions: offered },
+      result: { ...result, details },
+      text: JSON.stringify(result.content),
+    }
+    const options = { detail: "full" as const, width: 80 }
+    expect(recordDecisionPresenter.body!(call, options)).toEqual(askUserPresenter.body!(call, options))
+    expect(recordDecisionPresenter.result!(call)).toContain("D2")
+    const record = (await new DecisionStore(f.project).records())[1]!
+    expect(record.question).toEqual(details.questions[0]!)
+    expect(record.answer).toEqual({ selected: [], other: "A smaller third scope" })
+    expect(record.rationale).toBeUndefined()
+  },
+)
 
 test("cancelled record_decision retains a structured declined outcome without claiming IDs", async () => {
   const f = await fixture()

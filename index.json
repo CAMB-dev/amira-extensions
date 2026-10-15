@@ -3,8 +3,8 @@
   "extensions": [
     {
       "name": "project",
-      "description": "Experimental project discovery, guided design conversations and durable human decisions: /project",
-      "version": "0.1.0",
+      "description": "Experimental project discovery, guided design conversations, durable human decisions and a confirmed stage engine: /project",
+      "version": "0.2.0",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/project" },
       "engines": { "amira": "^0.1.52" },
       "tags": ["experimental", "project", "design", "decisions"],
