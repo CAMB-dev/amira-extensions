@@ -3,9 +3,11 @@ import type { CommandContext, Extension, PanelRenderOptions, SessionData, ToolLi
 import type { PrototypeManifestArtifact } from "./artifacts.ts"
 import { DesignSessions } from "./design.ts"
 import { ProjectCommandError, projectError } from "./diagnostics.ts"
+import { Implementations, implementationStatus } from "./implement.ts"
 import { conversationLanguage, LanguagePolicy, localize, resolveLanguage, validLanguage } from "./language.ts"
 import { latestPrototypeManifest, Prototypes, prototypePanelText } from "./prototype.ts"
 import { supportsPrototype } from "./prototype-sessions.ts"
+import { runSpec } from "./spec.ts"
 import { type IterationState, initialIteration } from "./stage.ts"
 import { runStageCommand, stageStatus } from "./stage-commands.ts"
 import { nextSuggestion, stageName, statusName } from "./stage-view.ts"
@@ -48,6 +50,7 @@ export function panelLines(
   designAvailable = false,
   iterationState?: IterationState,
   prototype?: PrototypeManifestArtifact,
+  worktree?: string,
 ): ToolLine[] {
   const lang = language ?? project?.marker.settings.language ?? "en"
   if (error)
@@ -88,6 +91,12 @@ export function panelLines(
       wrap: true,
     },
   ]
+  if (state.artifacts.some((entry) => entry.kind === "spec"))
+    lines.push({
+      kind: "muted",
+      text: `${implementationStatus(state)}${worktree ? ` · ${worktree}` : ""}`,
+      wrap: true,
+    })
   if (prototype)
     lines.push({
       kind: "muted",
@@ -103,19 +112,21 @@ const HELP = `/project [list] — choose a known project or the nearest discover
 /project status
 /project design
 /project prototype [<variant>|choose|run <variant>]
+/project spec
+/project implement
 /project next
 /project skip batch|design|prototype|implement|accept
 /project revisit design|prototype
 Attachment does not change the main session's working directory.
 Prototype file tools are variant-scoped; shell uses current permissions. This is not a sandbox.
-Implementation, acceptance, ship and archive: coming later.`
+Spec review: /project spec. Single-agent batch execution: /project implement. Acceptance, ship and archive: coming later.`
 
 function help(language: string): string {
   return localize(
     language,
     HELP,
-    `/project [list] — 选择已知项目或最近识别的项目\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 查看项目阶段和状态\n/project design — 打开设计会话\n/project prototype [<variant>|choose|run <variant>] — 查看原型变体、选择结论或显示运行命令\n/project next — 查看总结并确认下一步\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n关联项目不会改变主会话工作目录。原型文件工具仅能写入各自目录，Shell 遵循当前权限模式；这不是沙箱。实现、验收执行、发布和归档将在后续版本提供。`,
-    `/project [list] — 登録済みまたは最寄りのプロジェクトを選択\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 段階と状態を確認\n/project design — 設計会話を開く\n/project prototype [<variant>|choose|run <variant>] — 案の表示・選択・実行コマンドの確認\n/project next — 要約を確認して次の手順を承認\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n関連付けてもメインの作業ディレクトリは変わりません。試作のファイルツールは各案のディレクトリ内だけに書き込みます。シェルは現在の権限モードに従い、サンドボックスではありません。実装、受け入れ確認の実行、リリース、アーカイブは今後対応予定です。`,
+    `/project [list] — 选择已知项目或最近识别的项目\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 查看项目阶段和状态\n/project design — 打开设计会话\n/project prototype [<variant>|choose|run <variant>] — 查看原型变体、选择结论或显示运行命令\n/project next — 查看总结并确认下一步\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n关联项目不会改变主会话工作目录。原型文件工具仅能写入各自目录，Shell 遵循当前权限模式；这不是沙箱。规格审阅：/project spec；单个子代理实现：/project implement。验收执行、发布和归档将在后续版本提供。`,
+    `/project [list] — 登録済みまたは最寄りのプロジェクトを選択\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 段階と状態を確認\n/project design — 設計会話を開く\n/project prototype [<variant>|choose|run <variant>] — 案の表示・選択・実行コマンドの確認\n/project next — 要約を確認して次の手順を承認\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n関連付けてもメインの作業ディレクトリは変わりません。試作のファイルツールは各案のディレクトリ内だけに書き込みます。シェルは現在の権限モードに従い、サンドボックスではありません。仕様確認：/project spec、単一サブエージェント実装：/project implement。受け入れ確認・リリース・アーカイブは今後対応予定です。`,
   )
 }
 
@@ -158,9 +169,22 @@ export function createProjectExtension(): Extension {
     })
     const designs = new DesignSessions(api, languagePolicy, () => settings.get().language)
     const prototypes = new Prototypes(api)
+    const implementations = new Implementations(api, () => {
+      for (const state of states.values()) state.refreshedAt = undefined
+      api.requestRender()
+    })
+    const worktreePanels = new Map<string, string>()
     const prototypePanels = new Map<string, PrototypeManifestArtifact>()
     async function refreshPrototypePanel(project: Project, iteration?: IterationState) {
-      const saved = await latestPrototypeManifest(new IterationStore(project), iteration)
+      const store = new IterationStore(project)
+      const current = iteration ?? (await store.read())
+      const worktreeRef = current.artifacts.findLast((entry) => entry.kind === "iteration-worktree")
+      if (worktreeRef) {
+        const worktree = await store.readArtifact(worktreeRef)
+        if (worktree.kind === "iteration-worktree")
+          worktreePanels.set(designKey(project), `${worktree.status}: ${worktree.cwd}`)
+      }
+      const saved = await latestPrototypeManifest(store, current)
       if (saved) prototypePanels.set(designKey(project), saved.manifest)
     }
     const states = new Map<string, PanelState>()
@@ -504,6 +528,7 @@ export function createProjectExtension(): Extension {
         !!state.project && availableDesigns.has(designKey(state.project)),
         state.iteration,
         state.project && prototypePanels.get(designKey(state.project)),
+        state.project && worktreePanels.get(designKey(state.project)),
       )
     }
     api.registerPanel({ id: "project", order: 10, render })
@@ -526,9 +551,22 @@ export function createProjectExtension(): Extension {
       name: "project",
       description: "Attach a project, inspect its status, or open its saved design conversation",
       args: {
-        hint: "[list|new|switch|status|design|prototype|next|skip|revisit]",
+        hint: "[list|new|switch|status|design|prototype|spec|implement|next|skip|revisit]",
         complete: (prefix) =>
-          ["list", "new", "switch", "status", "design", "prototype", "next", "skip", "revisit", "help"]
+          [
+            "list",
+            "new",
+            "switch",
+            "status",
+            "design",
+            "prototype",
+            "spec",
+            "implement",
+            "next",
+            "skip",
+            "revisit",
+            "help",
+          ]
             .filter((item) => item.startsWith(prefix))
             .map((value) => ({ value })),
       },
@@ -601,6 +639,30 @@ export function createProjectExtension(): Extension {
               commitDocuments,
             })
             await attach(project, ctx, origin)
+          } else if (verb === "spec" || verb === "implement") {
+            if (tokens.length) throw new Error(HELP)
+            const project = await attached(ctx, origin)
+            const checkOrigin = () => {
+              ctx.signal.throwIfAborted()
+              const selected = attachmentFor(origin, ctx.session.data)
+              if (
+                !active(origin) ||
+                selected?.projectId !== project.marker.id ||
+                selected.root !== project.root
+              )
+                throw new Error("Main session or attached project changed. Run the command again.")
+            }
+            try {
+              if (verb === "spec")
+                await runSpec(api, project, ctx, displayLanguage(project), checkOrigin, async () => {
+                  await designs.quiesce(project)
+                  await prototypes.sessions.quiesce(project)
+                })
+              else await implementations.run(project, ctx, displayLanguage(project), checkOrigin)
+            } finally {
+              if (active(origin)) await attached(ctx, origin)
+              api.requestRender()
+            }
           } else if (verb === "prototype") {
             const project = await attached(ctx, origin)
             const checkOrigin = () => {
@@ -698,6 +760,28 @@ export function createProjectExtension(): Extension {
                   await runStageCommand("skip", ["prototype"], project, ctx, lang, checkOrigin, async () => {
                     await designs.quiesce(project)
                     await prototypes.sessions.quiesce(project)
+                    await implementations.quiesce(project)
+                  })
+                return
+              }
+              if (
+                verb === "next" &&
+                current?.stage === "implement" &&
+                !current.pending &&
+                !current.revisit &&
+                !current.approvedContext &&
+                !current.activeAttemptId
+              ) {
+                const choice = await ctx.ui.confirm(
+                  "Generate implementation spec",
+                  "Generate an English spec from verified decisions and confirmed prototype conclusions, with a summary in your language? No implementation starts.",
+                  { signal: ctx.signal, sessionId: origin },
+                )
+                checkOrigin()
+                if (choice === true)
+                  await runSpec(api, project, ctx, displayLanguage(project), checkOrigin, async () => {
+                    await designs.quiesce(project)
+                    await prototypes.sessions.quiesce(project)
                   })
                 return
               }
@@ -711,6 +795,7 @@ export function createProjectExtension(): Extension {
                 async () => {
                   await designs.quiesce(project)
                   await prototypes.sessions.quiesce(project)
+                  await implementations.quiesce(project)
                 },
                 (iteration) => {
                   states.set(origin, {
@@ -719,6 +804,12 @@ export function createProjectExtension(): Extension {
                     iteration,
                   })
                   api.requestRender()
+                },
+                async () => {
+                  await runSpec(api, project, ctx, displayLanguage(project), checkOrigin, async () => {
+                    await designs.quiesce(project)
+                    await prototypes.sessions.quiesce(project)
+                  })
                 },
               )
             } finally {
@@ -794,15 +885,15 @@ export function createProjectExtension(): Extension {
                   `${project.marker.name}\n目录：${project.root}\n迭代：${project.marker.currentIteration}`,
                   `${project.marker.name}\nディレクトリ：${project.root}\nイテレーション：${project.marker.currentIteration}`,
                 ) +
-                  `\n${stageStatus(iteration, lang)}\n${nextSuggestion(iteration, lang, availableDesigns.has(designKey(project)))}` +
+                  `\n${stageStatus(iteration, lang)}\n${implementationStatus(iteration)}${worktreePanels.has(designKey(project)) ? `\nWorktree: ${worktreePanels.get(designKey(project))}` : ""}\n${nextSuggestion(iteration, lang, availableDesigns.has(designKey(project)))}` +
                   (prototypePanels.has(designKey(project))
                     ? `\n${prototypePanelText(prototypePanels.get(designKey(project))!, lang, !!iteration.prototypeChoice)}`
                     : "") +
                   localize(
                     lang,
-                    "\nExecution, ship and archive: coming later.",
-                    "\n执行、发布和归档：后续版本提供。",
-                    "\n実行、リリース、アーカイブは今後対応予定です。",
+                    "\nAcceptance, ship and archive: coming later.",
+                    "\n验收、发布和归档：后续版本提供。",
+                    "\n受け入れ確認、リリース、アーカイブは今後対応予定です。",
                   ),
               )
               api.requestRender()

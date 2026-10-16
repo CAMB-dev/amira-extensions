@@ -64,7 +64,7 @@ test("exact split plan B1=S1 B2=S2: /project next after B1 pass proposes B2, nev
   expect(state.approvedContext?.batchId).toBe("B2")
   expect(state.approvedContext?.changes).toBeUndefined()
   expect(state.attempts).toHaveLength(1)
-  expect(output.join("\n")).toContain("not available yet")
+  expect(output.join("\n")).toContain("/project implement")
 })
 
 test("B1 pass: pending/cancel/stale approval, fresh B2 authorization/start, B2 pass and only then complete", async () => {

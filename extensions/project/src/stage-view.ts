@@ -25,9 +25,9 @@ export function statusName(status: IterationState["status"], language: string): 
 export function executionUnavailable(language: string): string {
   return localize(
     language,
-    "Implementation and acceptance execution is not available yet (coming later). No work was started.",
-    "实现和验收执行尚未开放，将在后续版本提供。未启动任何工作。",
-    "実装と受け入れ確認の実行はまだ利用できません。今後対応予定です。作業は開始していません。",
+    "Acceptance: coming next. Review /project spec, then explicitly start an approved batch with /project implement. No work was started.",
+    "验收：下一步提供。请用 /project spec 审阅规格，再用 /project implement 明确开始已批准的批次。未启动任何工作。",
+    "受け入れ確認は次回対応。/project spec で仕様を確認し、/project implement で承認済みバッチを明示的に開始します。作業は開始していません。",
   )
 }
 
@@ -91,6 +91,19 @@ export function nextSuggestion(state: IterationState, language: string, designAv
       "Work is in progress. /project revisit design|prototype can interrupt or queue a revisit.",
       "工作进行中。/project revisit design|prototype 可中断当前工作或排队回访。",
       "作業中です。/project revisit design|prototype で中断または再検討を予約できます。",
+    )
+  if (state.stage === "implement")
+    return localize(
+      language,
+      state.phase === "confirmed" && state.approvedContext?.spec
+        ? "Start approved batch: /project implement · F6 returns to main"
+        : "Review implementation spec: /project spec",
+      state.phase === "confirmed" && state.approvedContext?.spec
+        ? "开始已批准的批次：/project implement · F6 返回主会话"
+        : "审阅实现规格：/project spec",
+      state.phase === "confirmed" && state.approvedContext?.spec
+        ? "承認済みバッチを開始：/project implement · F6 でメインへ"
+        : "実装仕様を確認：/project spec",
     )
   if (state.stage !== "design") return executionUnavailable(language)
   return designAvailable

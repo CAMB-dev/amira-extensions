@@ -12,7 +12,11 @@ export const ESC = "\x1b[27u"
 export const F6 = "\x1b[17~"
 
 /** The upstream app harness's real runtime, with a host-owned conversation manager and durable session. */
-export async function frontend(mode: "inline" | "fullscreen", existing?: { root: string; file: string }) {
+export async function frontend(
+  mode: "inline" | "fullscreen",
+  existing?: { root: string; file: string },
+  extraTools: import("@amira/api").ToolDefinition[] = [],
+) {
   const {
     ai: { createAi, createMockDialect },
     core: {
@@ -41,6 +45,7 @@ export async function frontend(mode: "inline" | "fullscreen", existing?: { root:
   const tools = new ToolRegistry()
   tools.register(writeTool, "builtin-tools")
   tools.register(applyPatchTool, "builtin-tools")
+  for (const tool of extraTools) tools.register(tool, "offline-fixture")
   const interceptors = new InterceptorRegistry()
   const mock = createMockDialect([])
   const ai = createAi({

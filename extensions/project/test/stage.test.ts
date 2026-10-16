@@ -1340,6 +1340,11 @@ describe("illegal event/phase matrix", () => {
       attemptId: s.activeAttemptId ?? "absent",
       changes: [],
     }),
+    "interrupt-batch": (s) => ({
+      type: "interrupt-batch",
+      attemptId: s.activeAttemptId ?? "absent",
+      changes: [],
+    }),
     "confirm-continuation": (s) => ({
       type: "confirm-continuation",
       receipt: receipt(s, s.activeAttemptId ?? "absent", "resume", s.approvedContext),
@@ -1361,6 +1366,7 @@ describe("illegal event/phase matrix", () => {
     "record-correction": [],
     "record-manual-trial": ["blocked"],
     "interrupt-work": ["running"],
+    "interrupt-batch": [],
     "confirm-continuation": ["interrupted", "blocked"],
   }
   for (const [phase, state] of Object.entries(fixtures)) {
@@ -1775,3 +1781,20 @@ describe("untrusted state/event validation and immutability", () => {
     expect(state.artifacts).toEqual([])
   })
 })
+
+for (const phase of ["running", "finished", "summarized", "proposed"] as const) {
+  test(`batch cancellation retires only unapproved implementation at ${phase}`, () => {
+    let state = start(ready("implement"))
+    if (phase !== "running") state = finish(state)
+    if (phase === "summarized" || phase === "proposed") state = summary(state)
+    if (phase === "proposed") state = propose(state, proposal(state, "accept", "advance", context(state)))
+    const before = structuredClone(state)
+    const attemptId = state.activeAttemptId!
+    const stopped = apply(state, { type: "interrupt-batch", attemptId, changes: ["worktree:retained"] })
+    expect(stopped.status).toBe("interrupted")
+    expect(stopped.pending).toBeUndefined()
+    expect(stopped.artifacts).toEqual(before.artifacts)
+    expect(stopped.attempts.at(-1)?.changes).toContain("worktree:retained")
+    rejects(stopped, { type: "interrupt-batch", attemptId, changes: [] })
+  })
+}

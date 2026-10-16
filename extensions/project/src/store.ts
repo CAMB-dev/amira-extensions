@@ -17,6 +17,7 @@ import { validateAskAnswers } from "./answers.ts"
 import { type IterationArtifact, type PrototypeManifestArtifact, validateArtifact } from "./artifacts.ts"
 import { localize } from "./language.ts"
 import { validateAskQuestions } from "./questions.ts"
+import { requiredChecks, validateSpecIdentity } from "./spec-integrity.ts"
 import {
   type AcceptedBatchRef,
   type ApprovalContext,
@@ -1504,6 +1505,8 @@ export class IterationStore {
       "acceptance",
       "manual-trial",
       "correction",
+      "iteration-worktree",
+      "batch-result",
     ]
     if (
       !isObject(ref) ||
@@ -2149,7 +2152,7 @@ export class IterationStore {
         evidence.specRevision !== resolution.context.spec.revision
       )
         invalid("Batch resolution must consume exact passing acceptance evidence")
-      const plan = await this.approvedPlan(state, resolution.context)
+      const plan = await this.approvedPlan(state, resolution.context, "history")
       const batch = plan.batches.find((entry) => entry.id === resolution.batchId)!
       if (stable([...batch.itemIds].sort()) !== stable(evidence.items.map((entry) => entry.itemId).sort()))
         invalid("Batch resolution must cover every pinned batch item")
@@ -2180,7 +2183,13 @@ export class IterationStore {
     this.validateState(state)
   }
 
-  private async approvedPlan(state: IterationState, context?: ApprovalContext) {
+  /** Historical binding proofs remain schema-only. Every new approval/execution
+   * must explicitly opt into the current spec-use policy, never recovery/load. */
+  private async approvedPlan(
+    state: IterationState,
+    context: ApprovalContext | undefined,
+    use: "history" | "active",
+  ) {
     if (!context?.spec || !context.batchPlan || !context.batchId || !context.mode)
       invalid("Approval must bind an exact saved spec, batch plan, batch and mode")
     const specRef = state.artifacts.find((ref) => ref.id === context.spec!.artifactId)
@@ -2189,6 +2198,7 @@ export class IterationStore {
     const spec = await this.artifact(specRef)
     if (spec.kind !== "spec" || spec.revision !== context.spec.revision)
       invalid("Approval must bind the exact saved spec revision and hash")
+    if (use === "active") requiredChecks(spec)
     const planRef = state.artifacts.find((ref) => ref.id === context.batchPlan!.artifactId)
     if (!planRef || planRef.hash !== context.batchPlan.hash)
       invalid("Approval must bind the exact saved batch plan")
@@ -2243,7 +2253,7 @@ export class IterationStore {
       ["propose-transition", "confirm-transition", "start-work", "confirm-continuation"].includes(
         event.type,
       ) &&
-      (target === "implement" || target === "accept") &&
+      (target === "implement" || target === "accept" || (proposal?.kind === "complete" && !!context?.spec)) &&
       !(
         proposal?.preparationOnly &&
         state.stage === "prototype" &&
@@ -2252,7 +2262,7 @@ export class IterationStore {
         ["propose-transition", "confirm-transition"].includes(event.type)
       )
     )
-      await this.approvedPlan(state, context)
+      await this.approvedPlan(state, context, "active")
     if (event.type === "record-artifact" && event.manifest) {
       const ref = state.artifacts.find((entry) => entry.id === event.manifest!.batchPlan.artifactId)
       const payload = ref && (await this.artifact(ref))
@@ -2404,7 +2414,7 @@ export class IterationStore {
       evidence.specRevision !== ref.spec.revision
     )
       invalid("Correction accepted evidence must consume the exact passing review")
-    const plan = await this.approvedPlan(state, resolution.context)
+    const plan = await this.approvedPlan(state, resolution.context, "history")
     const batch = plan.batches.find((entry) => entry.id === ref.batchId)!
     const specRef = state.artifacts.find((entry) => entry.id === ref.spec.artifactId)!
     const spec = await this.artifact(specRef)
@@ -2480,16 +2490,62 @@ export class IterationStore {
       return
     }
     if (artifact.kind === "spec") {
+      requiredChecks(artifact)
       if (
         saved.some((entry) => entry.artifact.kind === "spec" && entry.artifact.revision >= artifact.revision)
       )
         invalid("Spec revisions must increase; old spec artifacts are immutable")
+      try {
+        validateSpecIdentity(
+          artifact,
+          saved.flatMap((entry) =>
+            entry.artifact.kind === "spec" ? [{ spec: entry.artifact, ref: entry.ref }] : [],
+          ),
+        )
+      } catch (error) {
+        invalid(error instanceof Error ? error.message : String(error))
+      }
+      return
+    }
+    if (artifact.kind === "iteration-worktree") return
+    if (artifact.kind === "batch-result") {
+      const attempt = state.attempts.find((entry) => entry.id === artifact.attemptId)
+      if (attempt?.stage !== "implement" || stable(attempt.context) !== stable(artifact.context))
+        invalid("Batch result must bind its implementation attempt and exact approval")
+      const plan = await this.approvedPlan(state, artifact.context, "active")
+      const spec = saved.find((entry) => entry.ref.id === artifact.context.spec!.artifactId)?.artifact
+      const worktree = saved.findLast(
+        (entry) =>
+          entry.artifact.kind === "iteration-worktree" &&
+          entry.artifact.status === "ready" &&
+          entry.artifact.root === artifact.worktree,
+      )?.artifact
+      if (spec?.kind !== "spec" || worktree?.kind !== "iteration-worktree")
+        invalid("Batch checks require the approved spec and recorded ready worktree")
+      const batch = plan.batches.find((entry) => entry.id === artifact.context.batchId)!
+      const required = requiredChecks(spec, batch.itemIds)
+      if (
+        artifact.checks.length !== required.length ||
+        artifact.checks.some((check) => !required.some((agreed) => agreed.id === check.checkId))
+      )
+        invalid("Batch result must record every approved required check exactly once")
+      for (const check of artifact.checks) {
+        const agreed = required.find((entry) => entry.id === check.checkId)!
+        if (
+          check.command !== agreed.command ||
+          key(check.cwd) !== key(path.resolve(worktree.cwd, agreed.cwd ?? "."))
+        )
+          invalid("Batch result check command/cwd does not match the approved exact check")
+      }
       return
     }
     const specEntry = saved.find((entry) => entry.ref.kind === "spec" && entry.ref.hash === artifact.specHash)
     if (specEntry?.artifact.kind !== "spec" || specEntry.artifact.revision !== artifact.specRevision)
       invalid("Artifact must bind an exact saved spec revision and hash")
     const spec = specEntry.artifact
+    // Only active publication/consumption reaches validateBinding. Historical
+    // recovery uses artifact schema and bound-plan identity without this policy.
+    requiredChecks(spec)
     const itemIds = spec.items.map((item) => item.id)
     const knownItems = (ids: string[]) => {
       if (ids.some((id) => !itemIds.includes(id))) invalid("Artifact references unknown stable spec item IDs")
@@ -2529,7 +2585,7 @@ export class IterationStore {
     )
       invalid("Acceptance/manual trial must bind the active review attempt ID, ordinal and code snapshot")
     const context = active.context
-    const plan = await this.approvedPlan(state, context)
+    const plan = await this.approvedPlan(state, context, "active")
     if (
       artifact.specHash !== context!.spec!.hash ||
       artifact.specRevision !== context!.spec!.revision ||

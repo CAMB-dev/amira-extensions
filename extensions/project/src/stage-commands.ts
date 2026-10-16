@@ -3,6 +3,7 @@ import type { CommandContext } from "@amira/api"
 import type { StageSummaryArtifact } from "./artifacts.ts"
 import { ProjectCommandError } from "./diagnostics.ts"
 import { localize } from "./language.ts"
+import { renderSpec } from "./spec.ts"
 import {
   batchProgress,
   type HumanReceipt,
@@ -125,6 +126,7 @@ export async function runStageCommand(
   checkOrigin: () => void,
   quiesce: () => Promise<void>,
   changed: (state: IterationState) => void = () => {},
+  generateSpec?: () => Promise<void>,
 ): Promise<IterationState> {
   const store = new IterationStore(project)
   let state = normalizeIteration(await store.read())
@@ -161,6 +163,16 @@ export async function runStageCommand(
     if (!ref) return
     const data = await store.readArtifact(ref)
     if (data.kind === "stage-summary") ctx.print(`${data.summary}\n\n${data.suggestion}`)
+    if (state.pending?.to === "implement" && state.pending.context?.spec && state.pending.context.batchPlan) {
+      const specRef = state.artifacts.find((entry) => entry.id === state.pending!.context!.spec!.artifactId)!
+      const planRef = state.artifacts.find(
+        (entry) => entry.id === state.pending!.context!.batchPlan!.artifactId,
+      )!
+      const spec = await store.readArtifact(specRef)
+      const plan = await store.readArtifact(planRef)
+      if (spec.kind === "spec" && plan.kind === "batch-plan")
+        ctx.print(renderSpec(spec, plan), "info", { markdown: true })
+    }
   }
   const approve = async () => {
     const pending = state.pending!
@@ -401,13 +413,23 @@ export async function runStageCommand(
     if (!selected || !options.includes(selected)) return state
     if (state.status !== "working" && selected === options[1]) return state
     const attempt = state.attempts.find((a) => a.id === state.activeAttemptId)
+    let changes = attempt?.changes ?? []
+    if (selected === options[0]) {
+      await quiesce()
+      checkOrigin()
+      const worktreeRef = state.artifacts.findLast((entry) => entry.kind === "iteration-worktree")
+      if (worktreeRef && state.stage === "implement") {
+        const worktree = await store.readArtifact(worktreeRef)
+        if (worktree.kind === "iteration-worktree") changes = [...new Set([...changes, worktree.root])]
+      }
+    }
     state = await store.dispatch(state.revision, {
       type: "request-revisit",
       expectedRevision: state.revision,
       target,
       policy: selected === options[0] ? "interrupt" : "boundary",
       ...(attempt ? { attemptId: attempt.id } : {}),
-      changes: attempt?.changes ?? [],
+      changes,
       receipt: receipt(state, attempt?.id ?? `revisit:${state.stage}`, target, selected),
     })
     if (selected === options[1]) {
@@ -571,16 +593,29 @@ export async function runStageCommand(
   }
   if (state.pending) {
     await showSummary()
-    const choices = [
-      t("Confirm proposed next step", "确认建议的下一步", "提案された次の手順を確認"),
-      t("Choose an alternative", "选择其他方案", "別の案を選ぶ"),
-      t("Skip current stage", "跳过当前阶段", "現在の段階をスキップ"),
-      t("Continue current stage", "继续当前阶段", "現在の段階を続ける"),
-    ]
+    const actions = {
+      confirm: t("Confirm proposed next step", "确认建议的下一步", "提案された次の手順を確認"),
+      alternative: t("Choose an alternative", "选择其他方案", "別の案を選ぶ"),
+      skip: t("Skip current stage", "跳过当前阶段", "現在の段階をスキップ"),
+      continue: t("Continue current stage", "继续当前阶段", "現在の段階を続ける"),
+      generate: t("Generate implementation spec", "生成实现规格", "実装仕様を生成"),
+    }
+    const canGenerate = !!generateSpec && ["design", "prototype"].includes(state.stage)
+    const choices = [actions.confirm, actions.alternative, actions.skip, actions.continue]
+    if (canGenerate) choices.push(actions.generate)
     const selected = await ask(t("Choose the next step", "选择下一步", "次の手順を選ぶ"), choices)
-    if (selected === choices[0]) await approve()
-    else if (selected === choices[2]) await skip(state.stage)
-    else if (selected === choices[3]) {
+    if (selected === undefined || !choices.includes(selected)) return state
+    if (generateSpec && canGenerate && selected === actions.generate) {
+      state = await store.dispatch(state.revision, {
+        type: "cancel-transition",
+        expectedRevision: state.revision,
+      })
+      await generateSpec()
+      return store.read()
+    }
+    if (selected === actions.confirm) await approve()
+    else if (selected === actions.skip) await skip(state.stage)
+    else if (selected === actions.continue) {
       checkOrigin()
       state = await store.dispatch(
         state.revision,
@@ -616,7 +651,7 @@ export async function runStageCommand(
           expectedRevision: state.revision,
         })
       ctx.print(nextSuggestion(state, language))
-    } else if (selected === choices[1]) {
+    } else if (selected === actions.alternative) {
       const base = reduceStage(state, { type: "cancel-transition", expectedRevision: state.revision })
       const proposals = stages
         .filter((s) => stages.indexOf(s) > stages.indexOf(base.stage))
@@ -779,7 +814,7 @@ export async function runStageCommand(
     })
     await showSummary()
     // Persist the proposal first, then offer confirmation / alternative / skip on this same command.
-    return runStageCommand("next", [], project, ctx, language, checkOrigin, quiesce, changed)
+    return runStageCommand("next", [], project, ctx, language, checkOrigin, quiesce, changed, generateSpec)
   }
   if (state.phase === "summarized" && state.summaryId && state.stage !== "design") {
     const attempt = state.attempts.find((a) => a.id === state.activeAttemptId)
@@ -842,7 +877,7 @@ export async function runStageCommand(
       return state
     }
     await propose(proposal)
-    return runStageCommand("next", [], project, ctx, language, checkOrigin, quiesce, changed)
+    return runStageCommand("next", [], project, ctx, language, checkOrigin, quiesce, changed, generateSpec)
   }
   const suggestion = nextSuggestion(state, language)
   const unavailable = executionUnavailable(language)

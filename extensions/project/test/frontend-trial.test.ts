@@ -162,7 +162,7 @@ frontendSuite("frontend-trial", () => {
         expect(continued.artifacts.slice(0, before.artifacts.length)).toEqual(before.artifacts)
         expect(continued.receipts.at(-1)?.choice).toBe("resume")
         expect(continued.completion).toBeUndefined()
-        await f.command("next", "not available yet")
+        await f.command("next", "Acceptance: coming next")
         await f.command("status", "Manual trial: not requested")
         expect(f.host.ui.pending).toEqual([])
         expect((await f.store.read()).revision).toBe(continued.revision)

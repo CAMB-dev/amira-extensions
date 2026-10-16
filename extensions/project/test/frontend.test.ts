@@ -174,7 +174,7 @@ frontendSuite("frontend", () => {
         expect(cancelled.pending).toBeUndefined()
         expect(cancelled.revisit).toBeUndefined()
         const revision = cancelled.revision
-        await f.command("next", "not available yet")
+        await f.command("next", "Acceptance: coming next")
         expect((await f.store.read()).revision).toBe(revision)
         expect(f.host.ui.pending).toEqual([])
         f.send("revisit design")

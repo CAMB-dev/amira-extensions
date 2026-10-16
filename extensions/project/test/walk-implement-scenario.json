@@ -1,0 +1,33 @@
+{
+  "name": "project-spec-implementation",
+  "description": "Offline spec review and running owned coordinator/real child. Use scripts/prepare-implement-walk.ts: Git runTool results are fixture-adapted; production policy is tested by frontend-implement.test.ts.",
+  "prompt": "Review the local result spec, then start its one implementation child.",
+  "routes": {
+    "main": [
+      {
+        "text": "{\"spec\":{\"kind\":\"spec\",\"revision\":1,\"language\":\"en\",\"summary\":\"Build a local result from confirmed decisions; keep prototype code out of production.\",\"body\":\"Goal: expose a local result. Constraints: offline only.\",\"decisionIds\":[],\"items\":[{\"id\":\"S1\",\"description\":\"Expose the approved local result\",\"constraints\":[\"No prototype imports\"],\"verification\":[\"Run C1\"],\"acceptanceCriteria\":[\"The local result is ready\"],\"decisionIds\":[],\"checkIds\":[\"C1\"],\"ui\":false}],\"checks\":[{\"id\":\"C1\",\"command\":\"git --version\",\"cwd\":\".\"}]},\"batches\":[{\"id\":\"B1\",\"itemIds\":[\"S1\"],\"decisionIds\":[],\"files\":[\"result.txt\"]}]}"
+      }
+    ],
+    "coordinator": [
+      {
+        "text": "Starting one fresh implementation sub-agent in the iteration worktree. Prototype conclusions are references, not a patch.",
+        "toolCalls": [
+          {
+            "id": "walk-implement-child",
+            "name": "agent",
+            "args": { "tasks": [{ "isolation": "none", "model": "ui-walk/main" }] }
+          }
+        ]
+      },
+      { "text": "The implementation child finished. Acceptance: coming next; nothing was merged." }
+    ],
+    "implementer": [
+      {
+        "text": "Implementing S1 in the isolated iteration checkout. The confirmed spec, decision records and check commands are the task boundary. Prototype code stays disposable; no design transcript or patch is inherited. ",
+        "repeat": 120,
+        "delayMs": 100,
+        "chunkSize": 8
+      }
+    ]
+  }
+}

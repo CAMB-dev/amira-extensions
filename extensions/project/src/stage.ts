@@ -7,6 +7,8 @@ export type ArtifactKind =
   | "acceptance"
   | "manual-trial"
   | "correction"
+  | "iteration-worktree"
+  | "batch-result"
 export interface ArtifactRef {
   id: string
   kind: ArtifactKind
@@ -190,6 +192,8 @@ export type StageEvent = AtRevision &
         receipt?: HumanReceipt
       }
     | { type: "interrupt-work"; attemptId: string; changes: string[] }
+    /** Cancellation of an implementation lifecycle, including unapproved finalization. */
+    | { type: "interrupt-batch"; attemptId: string; changes: string[] }
     | { type: "confirm-continuation"; receipt: HumanReceipt }
   )
 
@@ -202,6 +206,8 @@ const kinds: ArtifactKind[] = [
   "acceptance",
   "manual-trial",
   "correction",
+  "iteration-worktree",
+  "batch-result",
 ]
 const fail = (message: string): never => {
   throw new Error(`Invalid iteration transition: ${message}`)
@@ -421,6 +427,7 @@ const eventChecks: Record<StageEvent["type"], Record<string, Check>> = {
     receipt: optional(receiptCheck),
   },
   "interrupt-work": { attemptId: text, changes: list(text) },
+  "interrupt-batch": { attemptId: text, changes: list(text) },
   "confirm-continuation": { receipt: receiptCheck },
 }
 
@@ -1360,6 +1367,23 @@ const handlers: Handlers = {
     active!.manualTrial = state.manualTrial
   },
   "interrupt-work": (state, event) => interrupt(state, event.attemptId, event.changes),
+  "interrupt-batch": (state, event) => {
+    const attempt = state.attempts.find((entry) => entry.id === event.attemptId)
+    require(state.stage === "implement" &&
+      state.activeAttemptId === event.attemptId &&
+      ["running", "finished", "summarized", "proposed"].includes(state.phase) &&
+      attempt?.stage === "implement" &&
+      ["working", "finished"].includes(attempt.status), "not an active implementation lifecycle")
+    require(!state.pending ||
+      (state.pending.kind === "advance" &&
+        state.pending.to === "accept"), "cannot cancel another pending transition")
+    attempt!.status = "interrupted"
+    attempt!.changes = [...new Set([...attempt!.changes, ...event.changes])]
+    state.status = "interrupted"
+    state.phase = "finished"
+    delete state.pending
+    delete state.summaryId
+  },
   "confirm-continuation": (state, event) => {
     require(!hasManualProblem(state), "manual problem requires repair, not continuation")
     require((state.status === "interrupted" || state.status === "blocked") &&

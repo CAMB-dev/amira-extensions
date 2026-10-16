@@ -41,6 +41,8 @@ export interface SpecItem {
 export interface SpecCheck {
   id: string
   command: string
+  /** Relative to the mapped project directory; must remain inside the worktree. */
+  cwd?: string
 }
 export interface SpecArtifact {
   kind: "spec"
@@ -52,6 +54,12 @@ export interface SpecArtifact {
   decisionIds: string[]
   items: SpecItem[]
   checks: SpecCheck[]
+  /** Extension-controlled identity lineage; absent only on legacy artifacts. */
+  lineage?: {
+    previousSpec: { artifactId: string; revision: number; hash: string } | null
+    items: { id: string; previousId: string | null }[]
+    retiredItemIds: string[]
+  }
 }
 interface SpecBinding {
   specHash: string
@@ -114,6 +122,31 @@ export interface CorrectionArtifact extends SpecBinding {
     acceptedBatches: AcceptedBatchRef[]
   }[]
 }
+export interface WorktreeArtifact {
+  kind: "iteration-worktree"
+  status: "planned" | "ready"
+  repository: string
+  root: string
+  cwd: string
+  branch: string
+  base: string
+  excluded: string
+  confirmation: string
+  setupKey: string
+}
+export interface BatchResultArtifact {
+  kind: "batch-result"
+  attemptId: string
+  context: import("./stage.ts").ApprovalContext
+  worktree: string
+  base: string
+  snapshot: string
+  diffStat: string
+  summary: string
+  implementerModels: string[]
+  checks: AcceptanceArtifact["checks"]
+  error?: string
+}
 export type IterationArtifact =
   | PrototypeManifestArtifact
   | StageSummaryArtifact
@@ -122,6 +155,8 @@ export type IterationArtifact =
   | AcceptanceArtifact
   | ManualTrialArtifact
   | CorrectionArtifact
+  | WorktreeArtifact
+  | BatchResultArtifact
 
 const fail = (message: string): never => {
   throw new Error(`Invalid iteration artifact: ${message}`)
@@ -189,8 +224,86 @@ function reviewBinding(value: Record<string, unknown>): void {
   digest(value.codeHash)
 }
 
-/** Closed, version-independent payload schema. Identity, filenames and hashes are store-owned. */
+/** Historical payload schema only. Current spec-use policy is checked separately at
+ * publication, approval and execution; it must not make valid old history unreadable.
+ * Identity, filenames and hashes are store-owned. */
 export function validateArtifact(value: unknown): asserts value is IterationArtifact {
+  if (value && typeof value === "object" && "kind" in value) {
+    if (value.kind === "iteration-worktree") {
+      const a = object(value, [
+        "kind",
+        "status",
+        "repository",
+        "root",
+        "cwd",
+        "branch",
+        "base",
+        "excluded",
+        "confirmation",
+        "setupKey",
+      ])
+      oneOf(a.status, ["planned", "ready"])
+      for (const key of ["repository", "root", "cwd", "branch", "base", "confirmation", "setupKey"])
+        text(a[key])
+      if (typeof a.excluded !== "string") fail("invalid excluded input preview")
+      for (const key of ["repository", "root", "cwd"])
+        if (!path.isAbsolute(String(a[key]))) fail("expected absolute Git path")
+      return
+    }
+    if (value.kind === "batch-result") {
+      const a = object(value, [
+        "kind",
+        "attemptId",
+        "context",
+        "worktree",
+        "base",
+        "snapshot",
+        "diffStat",
+        "summary",
+        "implementerModels",
+        "checks",
+        "error",
+      ])
+      for (const key of ["attemptId", "worktree", "base", "snapshot", "summary"]) text(a[key])
+      if (typeof a.diffStat !== "string") fail("invalid diff stat")
+      texts(a.implementerModels)
+      const context = object(a.context, ["spec", "batchPlan", "batchId", "mode", "model", "changes"])
+      text(context.batchId)
+      if (!Array.isArray(a.checks)) fail("invalid check results")
+      for (const entry of list(a.checks)) {
+        const check = object(entry, [
+          "checkId",
+          "cwd",
+          "command",
+          "startedAt",
+          "finishedAt",
+          "status",
+          "exitCode",
+          "output",
+        ])
+        for (const key of ["checkId", "cwd", "command", "startedAt", "finishedAt"]) text(check[key])
+        oneOf(check.status, ["passed", "failed", "blocked", "timed-out", "error"])
+        if (
+          typeof check.output !== "string" ||
+          (check.exitCode !== null && !Number.isInteger(check.exitCode))
+        )
+          fail("invalid check result")
+      }
+      unique(list(a.checks).map((entry) => (entry as Record<string, unknown>).checkId))
+      for (const entry of list(a.checks)) {
+        const check = entry as Record<string, unknown>
+        if (
+          !Number.isFinite(Date.parse(String(check.startedAt))) ||
+          !Number.isFinite(Date.parse(String(check.finishedAt))) ||
+          Date.parse(String(check.finishedAt)) < Date.parse(String(check.startedAt))
+        )
+          fail("invalid check timestamps")
+        if (check.status === "passed" && check.exitCode !== 0) fail("a passed check requires exit code zero")
+      }
+      if (a.error !== undefined) text(a.error)
+      return
+    }
+  }
   const head = object(value, [
     "kind",
     "stage",
@@ -203,6 +316,7 @@ export function validateArtifact(value: unknown): asserts value is IterationArti
     "decisionIds",
     "items",
     "checks",
+    "lineage",
     ...bindings,
     "mode",
     "batches",
@@ -289,6 +403,7 @@ export function validateArtifact(value: unknown): asserts value is IterationArti
         "decisionIds",
         "items",
         "checks",
+        "lineage",
       ])
       integer(a.revision)
       text(a.language)
@@ -297,7 +412,8 @@ export function validateArtifact(value: unknown): asserts value is IterationArti
       ids(a.decisionIds)
       const decisionIds = a.decisionIds
       const checks = list(a.checks).map((entry) => {
-        const check = object(entry, ["id", "command"])
+        const check = object(entry, ["id", "command", "cwd"])
+        if (check.cwd !== undefined) text(check.cwd)
         ids([check.id], true)
         text(check.command)
         return check.id
@@ -328,6 +444,25 @@ export function validateArtifact(value: unknown): asserts value is IterationArti
       })
       if (!items.length) fail("spec requires stable items")
       unique(items)
+      if (a.lineage !== undefined) {
+        const lineage = object(a.lineage, ["previousSpec", "items", "retiredItemIds"])
+        if (lineage.previousSpec !== null) {
+          const previous = object(lineage.previousSpec, ["artifactId", "revision", "hash"])
+          text(previous.artifactId)
+          integer(previous.revision)
+          digest(previous.hash)
+        }
+        ids(lineage.retiredItemIds)
+        const origins = list(lineage.items).map((entry) => {
+          const origin = object(entry, ["id", "previousId"])
+          ids([origin.id], true)
+          if (origin.previousId !== null) ids([origin.previousId], true)
+          return origin.id
+        })
+        unique(origins)
+        if (origins.length !== items.length || origins.some((id) => !items.includes(id)))
+          fail("lineage must cover every spec item")
+      }
       break
     }
     case "batch-plan": {
