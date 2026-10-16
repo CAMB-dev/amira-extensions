@@ -612,6 +612,24 @@ describe("revisit lifecycle regressions", () => {
       },
     })
   }
+  test("a design revisit retires the old active prototype choice before returning through prototype", () => {
+    let state = ready("implement")
+    const oldChoice = state.prototypeChoice!
+    expect(oldChoice).toBeDefined()
+    state = request(state, "design")
+    state = summary(state)
+    state = confirm(propose(state, proposal(state, "design", "revisit")))
+    expect(state.prototypeChoice).toBeUndefined()
+    expect(state.receipts.some((entry) => entry.id === oldChoice.receiptId)).toBe(true)
+    state = summary(finish(start(state)))
+    state = confirm(propose(state, proposal(state, "prototype")))
+    expect(state.stage).toBe("prototype")
+    expect(state.phase).toBe("confirmed")
+    expect(state.prototypeChoice).toBeUndefined()
+    state = select(start(state))
+    expect(state.prototypeChoice?.receiptId).not.toBe(oldChoice.receiptId)
+    expect(state.receipts.some((entry) => entry.id === oldChoice.receiptId)).toBe(true)
+  })
   for (const completion of ["accepted", "skipped"] as const) {
     test(`${completion} acceptance can revisit while iteration stays open and historical evidence remains`, () => {
       let state = ready("accept")
@@ -1279,6 +1297,7 @@ describe("illegal event/phase matrix", () => {
     "cancel-transition": () => ({ type: "cancel-transition" }),
     "cancel-revisit": (s) => ({ type: "cancel-revisit", receipt: receipt(s, "absent", "cancel-revisit") }),
     "reopen-design": () => ({ type: "reopen-design" }),
+    "reopen-prototype": (s) => ({ type: "reopen-prototype", proposalId: s.pending?.id ?? "absent" }),
     "record-artifact": () => ({ type: "record-artifact", artifact: ref("batch-plan") }),
     "select-prototype": (s) => ({
       type: "select-prototype",
@@ -1335,6 +1354,7 @@ describe("illegal event/phase matrix", () => {
     "cancel-transition": ["proposed"],
     "cancel-revisit": [],
     "reopen-design": ["ready", "finished", "summarized"],
+    "reopen-prototype": [],
     "record-artifact": ["ready", "running", "finished", "summarized", "confirmed", "interrupted", "blocked"],
     "select-prototype": [],
     "request-revisit": ["blocked"],
@@ -1355,6 +1375,81 @@ describe("illegal event/phase matrix", () => {
 })
 
 describe("specialized event guards", () => {
+  function prototypeSkip(state: IterationState): IterationState {
+    state = summary(state)
+    return propose(state, { ...proposal(state, "implement", "skip"), preparationOnly: true })
+  }
+  for (const boundary of ["unstarted", "interrupted", "finished"] as const) {
+    test(`reopen-prototype resumes only the identified skip and preserves ${boundary} evidence`, () => {
+      let state = ready("prototype")
+      if (boundary !== "unstarted") {
+        state = start(state)
+        state =
+          boundary === "finished"
+            ? finish(state)
+            : apply(state, {
+                type: "interrupt-work",
+                attemptId: state.activeAttemptId!,
+                changes: ["prototype:preserved"],
+              })
+      }
+      state = prototypeSkip(state)
+      const before = structuredClone(state)
+      rejects(state, { type: "reopen-prototype", proposalId: "wrong-proposal" })
+      state = apply(state, { type: "reopen-prototype", proposalId: state.pending!.id })
+      expect(state).toMatchObject({ stage: "prototype", phase: "confirmed", status: "idle" })
+      expect(state.pending).toBeUndefined()
+      expect(state.summaryId).toBeUndefined()
+      expect(state.activeAttemptId).toBeUndefined()
+      expect(state.attempts).toEqual(before.attempts)
+      expect(state.artifacts).toEqual(before.artifacts)
+      expect(state.receipts).toEqual(before.receipts)
+      expect(state.transitions).toEqual(before.transitions)
+      expect(state.approvedContext).toEqual(before.approvedContext)
+      rejects(state, { type: "reopen-prototype", proposalId: before.pending!.id })
+      state = select(start(state))
+      expect(state.prototypeChoice).toBeDefined()
+      expect(state.attempts.slice(0, -1)).toEqual(before.attempts)
+      state = summary(finish(state))
+      state = confirm(
+        propose(state, {
+          ...proposal(state, "implement", "advance"),
+          preparationOnly: true,
+        }),
+      )
+      rejects(state, { type: "start-work", attemptId: id() }, "implementation needs")
+    })
+  }
+  test("reopen-prototype retains historical choice evidence but restores a fresh editable boundary", () => {
+    let state = prototypeSkip(select(finish(start(ready("prototype")))))
+    const before = structuredClone(state)
+    state = apply(state, { type: "reopen-prototype", proposalId: state.pending!.id })
+    expect(state).toMatchObject({ stage: "prototype", phase: "confirmed", status: "idle" })
+    expect(state.prototypeChoice).toBeUndefined()
+    expect(state.activeAttemptId).toBeUndefined()
+    expect(state.attempts).toEqual(before.attempts)
+    expect(state.receipts).toEqual(before.receipts)
+    expect(state.receipts.some((entry) => entry.id === before.prototypeChoice!.receiptId)).toBe(true)
+    expect(state.artifacts).toEqual(before.artifacts)
+    expect(state.summaryId).toBeUndefined()
+    state = select(start(state))
+    expect(state.prototypeChoice?.receiptId).not.toBe(before.prototypeChoice!.receiptId)
+    expect(state.attempts.slice(0, -1)).toEqual(before.attempts)
+  })
+  test("reopen-prototype cannot reset running, unproposed, cancelled or ordinary advance work", () => {
+    let state = ready("prototype")
+    rejects(state, { type: "reopen-prototype", proposalId: "absent" })
+    state = start(state)
+    rejects(state, { type: "reopen-prototype", proposalId: "absent" })
+    state = finish(state)
+    rejects(state, { type: "reopen-prototype", proposalId: "absent" })
+    const skipped = prototypeSkip(state)
+    const cancelled = apply(skipped, { type: "cancel-transition" })
+    rejects(cancelled, { type: "reopen-prototype", proposalId: skipped.pending!.id })
+    state = summary(select(state))
+    state = propose(state, { ...proposal(state, "implement", "advance"), preparationOnly: true })
+    rejects(state, { type: "reopen-prototype", proposalId: state.pending!.id })
+  })
   test("prototype completion needs a human variant choice, not a model result", () => {
     const state = summary(finish(start(ready("prototype"))))
     rejects(

@@ -1,4 +1,22 @@
+import path from "node:path"
 import type { AcceptedBatchRef, ArtifactKind } from "./stage.ts"
+
+export interface PrototypeManifestArtifact {
+  kind: "prototype-manifest"
+  variants: {
+    id: string
+    idea: string
+    question: string
+    /** Canonical absolute directory, bound to this project/iteration by the store. */
+    directory: string
+    runCommand: string | null
+    cwd: string
+    prerequisites: string[]
+    notes: string
+    status: "planned" | "building" | "ready" | "failed"
+  }[]
+  chosen?: { variantId: string | null; decisionId: string }
+}
 
 export interface StageSummaryArtifact {
   kind: "stage-summary"
@@ -97,6 +115,7 @@ export interface CorrectionArtifact extends SpecBinding {
   }[]
 }
 export type IterationArtifact =
+  | PrototypeManifestArtifact
   | StageSummaryArtifact
   | SpecArtifact
   | BatchPlanArtifact
@@ -200,9 +219,57 @@ export function validateArtifact(value: unknown): asserts value is IterationArti
     "oldDecisionIds",
     "newDecisionIds",
     "mappings",
+    "variants",
+    "chosen",
   ])
   const kind = head.kind as ArtifactKind
   switch (kind) {
+    case "prototype-manifest": {
+      const a = object(value, ["kind", "variants", "chosen"])
+      const variants = list(a.variants)
+      if (variants.length < 1 || variants.length > 3) fail("prototype requires one to three variants")
+      const variantIds = variants.map((entry) => {
+        const variant = object(entry, [
+          "id",
+          "idea",
+          "question",
+          "directory",
+          "runCommand",
+          "cwd",
+          "prerequisites",
+          "notes",
+          "status",
+        ])
+        ids([variant.id], true)
+        if (variant.id === "none" || /[.]$/.test(String(variant.id))) fail("invalid prototype variant ID")
+        text(variant.idea)
+        text(variant.question)
+        text(variant.directory)
+        text(variant.cwd)
+        for (const directory of [variant.directory, variant.cwd]) {
+          if (!path.isAbsolute(directory) || path.resolve(directory) !== directory)
+            fail("prototype paths must be canonical absolute paths")
+        }
+        const relative = path.relative(variant.directory, variant.cwd)
+        if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))
+          fail("prototype command cwd must be inside its variant directory")
+        if (variant.runCommand !== null) text(variant.runCommand)
+        texts(variant.prerequisites)
+        if (typeof variant.notes !== "string") fail("invalid prototype notes")
+        oneOf(variant.status, ["planned", "building", "ready", "failed"])
+        if (variant.status === "ready" && variant.runCommand === null)
+          fail("ready prototype requires a run command")
+        return variant.id
+      })
+      unique(variantIds.map((id) => String(id).toLowerCase()))
+      if (a.chosen !== undefined) {
+        const chosen = object(a.chosen, ["variantId", "decisionId"])
+        if (chosen.variantId !== null && !variantIds.includes(chosen.variantId))
+          fail("unknown chosen prototype variant")
+        ids([chosen.decisionId], true)
+      }
+      break
+    }
     case "stage-summary": {
       const a = object(value, ["kind", "stage", "language", "summary", "outputs", "suggestion"])
       oneOf(a.stage, ["design", "prototype", "implement", "accept"])

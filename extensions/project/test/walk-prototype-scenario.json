@@ -1,0 +1,20 @@
+{
+  "name": "project-prototype",
+  "description": "Offline prototype proposals and native focused session; no executable tool fixtures.",
+  "prompt": "Compare throwaway local planner prototypes.",
+  "routes": {
+    "main": [
+      {
+        "text": "[{\"id\":\"cards\",\"idea\":\"Cards grouped by day\",\"question\":\"Does a day-first layout make planning easier?\"},{\"id\":\"timeline\",\"idea\":\"A compact weekly timeline\",\"question\":\"Does a continuous timeline make conflicts clearer?\"}]"
+      },
+      {
+        "text": "Prototype cards is focused. This is throwaway code, not production. File tools are confined to this variant; shell commands follow your current permission mode. This is not a sandbox.\n"
+      }
+    ],
+    "child": [
+      {
+        "text": "Prototype cards is focused. Build the smallest runnable example answering whether a day-first layout makes planning easier. This prototype is never copied into production.\n"
+      }
+    ]
+  }
+}

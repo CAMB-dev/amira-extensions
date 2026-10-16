@@ -272,7 +272,18 @@ export async function runStageCommand(
           "スキップできるのは現在の段階だけです。",
         ),
       )
-    if (state.activeAttemptId)
+    if (state.stage === "prototype" && state.phase === "running" && state.activeAttemptId) {
+      await quiesce()
+      checkOrigin()
+      const attempt = state.attempts.find((entry) => entry.id === state.activeAttemptId)!
+      state = await store.dispatch(state.revision, {
+        type: "interrupt-work",
+        expectedRevision: state.revision,
+        attemptId: attempt.id,
+        changes: attempt.changes,
+      })
+    }
+    if (state.activeAttemptId && state.stage !== "prototype")
       throw new ProjectCommandError(
         t(
           "This stage has an attempt. Finish it or revisit instead of skipping its evidence.",
@@ -281,9 +292,10 @@ export async function runStageCommand(
         ),
       )
     const target = stages[stages.indexOf(stage) + 1] ?? null
-    const context = state.approvedContext
+    const context = state.stage === "prototype" ? undefined : state.approvedContext
     if (
       (target === "implement" &&
+        stage !== "prototype" &&
         !(context?.spec && context.batchPlan && context.batchId && context.mode && context.model)) ||
       (target === "accept" && !(context?.spec && context.batchPlan && context.changes?.length))
     ) {
@@ -325,6 +337,7 @@ export async function runStageCommand(
         `${stageName(stage, language)}をスキップ${target ? ` → ${stageName(target, language)}` : "（合格ではありません。リリースしません）"}`,
       ),
       skippedStages: [stage],
+      ...(stage === "prototype" && !context ? { preparationOnly: true as const } : {}),
       ...(context ? { context } : {}),
     })
     await showSummary()
@@ -586,10 +599,16 @@ export async function runStageCommand(
                 ),
               ),
             }
-          : {
-              type: "cancel-transition",
-              expectedRevision: state.revision,
-            },
+          : state.stage === "prototype" && state.pending?.kind === "skip"
+            ? {
+                type: "reopen-prototype",
+                expectedRevision: state.revision,
+                proposalId: state.pending.id,
+              }
+            : {
+                type: "cancel-transition",
+                expectedRevision: state.revision,
+              },
       )
       if (state.stage === "design")
         state = await store.dispatch(state.revision, {
@@ -744,9 +763,9 @@ export async function runStageCommand(
         ),
         outputs: decisions.map((d) => d.id),
         suggestion: t(
-          "Continue to prototype; execution is not available yet.",
-          "继续进入原型阶段；执行尚未开放。",
-          "プロトタイプに進みます。実行はまだ利用できません。",
+          "Continue to prototype; use /project prototype to review variants after confirmation.",
+          "继续进入原型阶段；确认后使用 /project prototype 查看变体。",
+          "プロトタイプに進みます。確認後 /project prototype で案を確認してください。",
         ),
       })
     await propose({
@@ -769,9 +788,10 @@ export async function runStageCommand(
       !repair && state.stage === "accept" && attempt?.acceptance?.verdict === "pass"
         ? batchProgress(state).remaining.find((id) => id !== state.approvedContext?.batchId)
         : undefined
-    const context = state.approvedContext
-      ? { ...state.approvedContext, ...(nextBatch ? { batchId: nextBatch } : {}) }
-      : undefined
+    const context =
+      state.stage !== "prototype" && state.approvedContext
+        ? { ...state.approvedContext, ...(nextBatch ? { batchId: nextBatch } : {}) }
+        : undefined
     if (nextBatch && context) delete context.changes
     if (state.stage === "implement" && context) context.changes = attempt?.changes ?? []
     const to = repair || nextBatch ? "implement" : (stages[stages.indexOf(state.stage) + 1] ?? null)
@@ -781,6 +801,7 @@ export async function runStageCommand(
       to,
       kind: repair ? "repair" : nextBatch ? "next-batch" : to === null ? "complete" : "advance",
       summaryId: state.summaryId,
+      ...(state.stage === "prototype" && !context ? { preparationOnly: true as const } : {}),
       suggestion: nextBatch
         ? t(
             `Batch ${state.approvedContext?.batchId} passed; prepare ${nextBatch} for fresh implementation approval`,

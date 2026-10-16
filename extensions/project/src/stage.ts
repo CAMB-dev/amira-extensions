@@ -1,5 +1,6 @@
 export type Stage = "design" | "prototype" | "implement" | "accept"
 export type ArtifactKind =
+  | "prototype-manifest"
   | "stage-summary"
   | "spec"
   | "batch-plan"
@@ -73,6 +74,8 @@ export interface TransitionProposal {
   suggestion: string
   skippedBatchIds?: string[]
   skippedStages: Stage[]
+  /** Enter implementation planning only; never authorizes start-work without spec/plan approval. */
+  preparationOnly?: true
   context?: ApprovalContext
 }
 /** Immutable owner identity of a confirmed, consumed passing batch; never a display label. */
@@ -132,7 +135,7 @@ export interface IterationState {
   revisit?: RevisitRequest
   revisitHistory?: RevisitHistory[]
   correctionObligations?: CorrectionObligation[]
-  prototypeChoice?: { variantId: string; decisionId: string; receiptId: string }
+  prototypeChoice?: { variantId: string | null; decisionId: string; receiptId: string }
   /** A UI acceptance result requires a resolved human trial, even if no prompt was recorded. */
   manualTrialRequired?: boolean
   manualTrial?: {
@@ -161,8 +164,10 @@ export type StageEvent = AtRevision &
     | { type: "confirm-transition"; receipt: HumanReceipt }
     | { type: "cancel-transition" }
     | { type: "reopen-design" }
+    /** Abandon only the identified pending prototype skip, never reset running work. */
+    | { type: "reopen-prototype"; proposalId: string }
     | { type: "record-artifact"; artifact: ArtifactRef; manifest?: BatchManifest }
-    | { type: "select-prototype"; variantId: string; decisionId: string; receipt: HumanReceipt }
+    | { type: "select-prototype"; variantId: string | null; decisionId: string; receipt: HumanReceipt }
     | {
         type: "request-revisit"
         target: "design" | "prototype"
@@ -190,6 +195,7 @@ export type StageEvent = AtRevision &
 
 const stages: Stage[] = ["design", "prototype", "implement", "accept"]
 const kinds: ArtifactKind[] = [
+  "prototype-manifest",
   "stage-summary",
   "spec",
   "batch-plan",
@@ -277,6 +283,7 @@ const proposalCheck = object({
   suggestion: text,
   skippedBatchIds: optional(list(text)),
   skippedStages: list(oneOf(...stages)),
+  preparationOnly: optional(oneOf(true)),
   context: optional(contextCheck),
 })
 const acceptedBatchHashCheck: Check = (v) => typeof v === "string" && /^[a-f0-9]{64}$/.test(v)
@@ -353,7 +360,9 @@ const stateCheck = object({
       }),
     ),
   ),
-  prototypeChoice: optional(object({ variantId: text, decisionId: text, receiptId: text })),
+  prototypeChoice: optional(
+    object({ variantId: (v) => v === null || text(v), decisionId: text, receiptId: text }),
+  ),
   manualTrialRequired: optional((v) => typeof v === "boolean"),
   manualTrial: optional(
     object({
@@ -390,8 +399,9 @@ const eventChecks: Record<StageEvent["type"], Record<string, Check>> = {
   "confirm-transition": { receipt: receiptCheck },
   "cancel-transition": {},
   "reopen-design": {},
+  "reopen-prototype": { proposalId: text },
   "record-artifact": { artifact: artifactCheck, manifest: optional(manifestCheck) },
-  "select-prototype": { variantId: text, decisionId: text, receipt: receiptCheck },
+  "select-prototype": { variantId: (v) => v === null || text(v), decisionId: text, receipt: receiptCheck },
   "request-revisit": {
     target: oneOf("design", "prototype"),
     policy: oneOf("interrupt", "boundary"),
@@ -1076,7 +1086,11 @@ const handlers: Handlers = {
       require(JSON.stringify(skipped) ===
         JSON.stringify(proposal.skippedStages), "exact skipped stages required")
       if (proposal.kind === "skip")
-        require(!active || state.stage === "accept", "cannot skip an executed stage")
+        require(!active ||
+          state.stage === "accept" ||
+          (state.stage === "prototype" &&
+            proposal.preparationOnly &&
+            active.status !== "working"), "cannot skip an executed stage")
       else require(active?.status === "finished", "stage work not finished")
       if (state.stage === "prototype" && proposal.kind !== "skip") {
         require(state.prototypeChoice, "prototype needs a human-selected variant")
@@ -1089,7 +1103,12 @@ const handlers: Handlers = {
         proposal.kind === "skip", "completion kind required")
       if (state.stage === "accept") checkBatchRoute(state, proposal)
     }
-    if (proposal.to === "implement") canImplement(state, proposal.context)
+    if (proposal.preparationOnly)
+      require(state.stage === "prototype" &&
+        proposal.to === "implement" &&
+        ["advance", "skip"].includes(proposal.kind) &&
+        !proposal.context, "planning-only approval is restricted to prototype → implementation without execution context")
+    if (proposal.to === "implement" && !proposal.preparationOnly) canImplement(state, proposal.context)
     if (proposal.to === "accept") {
       require(proposal.context?.spec &&
         proposal.context.batchPlan &&
@@ -1153,6 +1172,8 @@ const handlers: Handlers = {
     } else {
       state.stage = proposal.to
       state.phase = "confirmed"
+      if (proposal.kind === "revisit" && (proposal.to === "design" || proposal.to === "prototype"))
+        delete state.prototypeChoice
     }
   },
   "cancel-transition": (state) => {
@@ -1178,6 +1199,34 @@ const handlers: Handlers = {
     state.phase = "ready"
     state.status = "idle"
   },
+  "reopen-prototype": (state, event) => {
+    const proposal = state.pending
+    const attempt = state.attempts.find((entry) => entry.id === state.activeAttemptId)
+    require(state.stage === "prototype" &&
+      state.phase === "proposed" &&
+      state.status === "awaiting-confirmation" &&
+      proposal?.id === event.proposalId &&
+      proposal.from === "prototype" &&
+      proposal.to === "implement" &&
+      proposal.kind === "skip" &&
+      proposal.preparationOnly === true &&
+      !proposal.context &&
+      proposal.skippedStages.length === 1 &&
+      proposal.skippedStages[0] === "prototype" &&
+      !state.revisit, "prototype resume needs the matching pending skip")
+    require(attempt?.status !== "working", "prototype work must be drained before resuming")
+    require(!state.prototypeChoice ||
+      attempt?.status === "finished", "chosen prototype needs its finished attempt")
+    delete state.pending
+    delete state.summaryId
+    state.status = "idle"
+    // Continue means the stage is editable again, even if it had a conclusion.
+    // Retire only live pointers: the previous decision, receipt, manifest and
+    // finished/interrupted attempts remain history and a new choice supersedes them.
+    delete state.prototypeChoice
+    delete state.activeAttemptId
+    state.phase = "confirmed"
+  },
   "record-artifact": (state, event) => {
     require(state.phase !== "complete" &&
       state.phase !== "proposed", "artifact publication not at writable boundary")
@@ -1195,7 +1244,7 @@ const handlers: Handlers = {
   "select-prototype": (state, event) => {
     require(state.stage === "prototype" &&
       ["running", "finished", "summarized"].includes(state.phase), "not prototype selection")
-    addReceipt(state, event.receipt, event.variantId, event.variantId)
+    addReceipt(state, event.receipt, event.variantId ?? "none", event.variantId ?? "none")
     state.prototypeChoice = {
       variantId: event.variantId,
       decisionId: event.decisionId,

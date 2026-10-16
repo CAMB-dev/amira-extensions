@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test"
-import { mkdir, mkdtemp, rm } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import type {
@@ -13,7 +13,9 @@ import type {
 import { createProjectExtension, restoreAttachment } from "../src/index.ts"
 import { createProject, IterationStore, readProject, writeDocument } from "../src/store.ts"
 
-setDefaultTimeout(30_000)
+// These are durable filesystem/command tests, not latency benchmarks. Full Windows
+// runs can outlive 30s while flushing journals; keep the stale-approval assertions intact.
+setDefaultTimeout(60_000)
 const roots: string[] = []
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
@@ -121,7 +123,7 @@ describe("main-session stage commands", () => {
     expect(f.output.join("\n")).toContain("No design summary is ready")
     expect(f.errors).toEqual([])
   })
-  test("human skip is durable and the next-stage execution boundary is unavailable", async () => {
+  test("human skip is durable and prototype variants are offered without starting work", async () => {
     const f = await fixture()
     f.confirm(async () => true)
     await f.command.run("skip design", f.ctx)
@@ -134,12 +136,95 @@ describe("main-session stage commands", () => {
     expect(state.receipts[0]?.revision).toBe(state.revision - 1)
     expect(f.panelText()).toContain("prototype · idle")
     await f.command.run("next", f.ctx)
-    expect(f.output.at(-1)).toContain("not available yet")
+    expect(f.output.at(-1)).toContain("/project prototype")
     expect((await f.store.read()).revision).toBe(state.revision)
     await f.command.run("status", f.ctx)
     expect(f.output.at(-1)).toContain("Pending approval: none")
     expect(f.output.at(-1)).toContain("Manual trial: not requested")
   })
+  for (const started of [false, true]) {
+    test(`persisted declined prototype skip continues ${started ? "started" : "unstarted"} work at a usable boundary`, async () => {
+      const f = await fixture()
+      f.confirm(async () => true)
+      await f.command.run("skip design", f.ctx)
+      let state = await f.store.read()
+      const directory = await f.store.preparePrototypeDirectory("alpha")
+      const file = path.join(directory, "demo.ts")
+      await writeFile(file, "// preserved prototype work\n")
+      const saved = await f.store.saveArtifact(state.revision, {
+        kind: "prototype-manifest",
+        variants: [
+          {
+            id: "alpha",
+            idea: "Compact view",
+            question: "Is this easier to scan?",
+            directory,
+            cwd: directory,
+            runCommand: "bun run demo.ts",
+            prerequisites: [],
+            notes: "Offline fixture; never executed",
+            status: "ready",
+          },
+        ],
+      })
+      state = saved.state
+      if (started)
+        state = await f.store.dispatch(state.revision, {
+          type: "start-work",
+          expectedRevision: state.revision,
+          attemptId: "abandoned-prototype-attempt",
+        })
+      f.confirm(async () => false)
+      await f.command.run("skip prototype", f.ctx)
+      const declined = await new IterationStore(f.project).read()
+      expect(declined.pending?.kind).toBe("skip")
+      expect(declined.receipts).toEqual(state.receipts)
+      if (started)
+        expect(declined.attempts.at(-1)).toMatchObject({
+          id: "abandoned-prototype-attempt",
+          status: "interrupted",
+        })
+      f.pick(async (_title, options) => options.find((option) => option === "Continue current stage"))
+      await f.command.run("next", f.ctx)
+      const reopened = new IterationStore(f.project)
+      state = await reopened.read()
+      expect(f.errors).toEqual([])
+      expect(state).toMatchObject({ stage: "prototype", phase: "confirmed", status: "idle" })
+      expect(state.pending).toBeUndefined()
+      expect(state.summaryId).toBeUndefined()
+      expect(state.activeAttemptId).toBeUndefined()
+      expect(state.attempts).toEqual(declined.attempts)
+      expect(state.artifacts).toEqual(declined.artifacts)
+      expect(state.receipts).toEqual(declined.receipts)
+      expect(state.skips.map((entry) => entry.stage)).toEqual(["design"])
+      expect(await readFile(file, "utf8")).toBe("// preserved prototype work\n")
+      // Both reopening and choosing use this separately started reducer/store boundary.
+      state = await reopened.dispatch(state.revision, {
+        type: "start-work",
+        expectedRevision: state.revision,
+        attemptId: "fresh-prototype-attempt",
+      })
+      const chosen = await reopened.recordPrototypeChoice(
+        state.revision,
+        saved.artifact,
+        {
+          question: "Which prototype?",
+          options: [
+            { label: "alpha", description: "Compact view" },
+            { label: "none", description: "Keep findings only" },
+          ],
+        },
+        { selected: ["alpha"] },
+        { sessionId: "main", askId: "resumed-choice", language: "en", reason: "Easier to scan" },
+        "alpha",
+      )
+      const usable = await new IterationStore(f.project).read()
+      expect(usable.prototypeChoice?.decisionId).toBe(chosen.records[0]!.id)
+      expect(usable.attempts.slice(0, -1)).toEqual(declined.attempts)
+      expect(usable.attempts.at(-1)?.status).toBe("working")
+      expect(await readFile(file, "utf8")).toBe("// preserved prototype work\n")
+    }, 60_000)
+  }
   test("saved design produces summary then proposal then human receipt, not an executor", async () => {
     const f = await fixture()
     await writeDocument(f.project, "design.md", "# Design\nUse local storage.\n")
@@ -154,7 +239,7 @@ describe("main-session stage commands", () => {
     expect(state.artifacts.some((a) => a.kind === "stage-summary")).toBe(true)
     expect(state.receipts).toHaveLength(1)
     expect(f.output.join("\n")).toContain("Use local storage")
-    expect(f.output.at(-1)).toContain("not available yet")
+    expect(f.output.at(-1)).toContain("/project prototype")
     expect(f.dialogs).toEqual(["Prepare the design summary?", "Choose the next step", "Confirm stage change"])
   })
   test("dismissed approval leaves a pending proposal but no receipt", async () => {
@@ -363,9 +448,9 @@ describe("main-session stage commands", () => {
     expect(recovered.transitions.at(-1)?.summaryId).toBe(saved.artifact.id)
     expect(recovered.artifacts.filter((artifact) => artifact.kind === "stage-summary")).toEqual(summaries)
   })
-  for (const [language, stage, unavailable] of [
-    ["zh-CN", "原型", "尚未开放"],
-    ["ja", "プロトタイプ", "まだ利用できません"],
+  for (const [language, stage, variantHint] of [
+    ["zh-CN", "原型", "原型变体"],
+    ["ja", "プロトタイプ", "プロトタイプ案"],
   ]) {
     test(`${language} stage status, dialogs and panel follow the project language`, async () => {
       const f = await fixture(language)
@@ -373,7 +458,7 @@ describe("main-session stage commands", () => {
       await f.command.run("skip design", f.ctx)
       expect(f.errors).toEqual([])
       expect(f.panelText()).toContain(stage!)
-      expect(f.panelText()).toContain(unavailable!)
+      expect(f.panelText()).toContain(variantHint!)
       expect(f.dialogs.join("\n")).not.toContain("Confirm stage change")
       await f.command.run("status", f.ctx)
       expect(f.output.at(-1)).toContain(stage!)

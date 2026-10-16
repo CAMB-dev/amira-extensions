@@ -16,6 +16,10 @@ interface FrontendHost {
   core: typeof import("@amira/core")
   app: { runInteractive(options: Record<string, unknown>): Promise<number> }
   files: { fileList(list: () => Promise<string[]>): unknown }
+  builtin: {
+    writeTool: import("@amira/api").ToolDefinition
+    applyPatchTool: import("@amira/api").ToolDefinition
+  }
   harness: { noProbe(): Promise<unknown>; paste(text: string): string; waitFor: WaitFor }
   kit: { FakeTerminal: new (cols: number, rows: number) => TestTerminal }
   screen: { VirtualScreen: new (cols: number, rows: number) => TestScreen }
@@ -24,7 +28,7 @@ interface FrontendHost {
 }
 
 async function loadFrontend(): Promise<HostModule<FrontendHost>> {
-  const [ai, core, app, files, harness, kit, screen] = await Promise.all([
+  const [ai, core, app, files, builtin, patch, harness, kit, screen] = await Promise.all([
     loadHostModule<FrontendHost["ai"]>("packages/ai/src/index.ts", ["createAi", "createMockDialect"]),
     loadHostModule<FrontendHost["core"]>("packages/core/src/index.ts", [
       "Agent",
@@ -38,6 +42,13 @@ async function loadFrontend(): Promise<HostModule<FrontendHost>> {
     ]),
     loadHostModule<FrontendHost["app"]>("packages/tui/src/app.ts", ["runInteractive"]),
     loadHostModule<FrontendHost["files"]>("packages/tui/src/file-index.ts", ["fileList"]),
+    loadHostModule<Pick<FrontendHost["builtin"], "writeTool">>("extensions/builtin-tools/src/write.ts", [
+      "writeTool",
+    ]),
+    loadHostModule<Pick<FrontendHost["builtin"], "applyPatchTool">>(
+      "extensions/builtin-tools/src/apply-patch.ts",
+      ["applyPatchTool"],
+    ),
     loadHostModule<FrontendHost["harness"]>("packages/tui/test/app-harness.ts", [
       "noProbe",
       "paste",
@@ -46,7 +57,9 @@ async function loadFrontend(): Promise<HostModule<FrontendHost>> {
     loadHostModule<FrontendHost["kit"]>("packages/tui-kit/src/index.ts", ["FakeTerminal"]),
     loadHostModule<FrontendHost["screen"]>("packages/tui-kit/test/screen.ts", ["VirtualScreen"]),
   ])
-  const missing = [ai, core, app, files, harness, kit, screen].find((entry) => entry.module === undefined)
+  const missing = [ai, core, app, files, builtin, patch, harness, kit, screen].find(
+    (entry) => entry.module === undefined,
+  )
   if (missing) return { reason: missing.reason! }
   // A source override need not imply that this extension's development links exist.
   try {
@@ -65,6 +78,7 @@ async function loadFrontend(): Promise<HostModule<FrontendHost>> {
       core: requireHostModule(core),
       app: requireHostModule(app),
       files: requireHostModule(files),
+      builtin: { ...requireHostModule(builtin), ...requireHostModule(patch) },
       harness: requireHostModule(harness),
       kit: requireHostModule(kit),
       screen: requireHostModule(screen),

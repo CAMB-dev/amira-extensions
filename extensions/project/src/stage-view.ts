@@ -25,9 +25,9 @@ export function statusName(status: IterationState["status"], language: string): 
 export function executionUnavailable(language: string): string {
   return localize(
     language,
-    "Prototype, implementation and acceptance execution is not available yet (coming later). No work was started.",
-    "原型、实现和验收执行尚未开放，将在后续版本提供。未启动任何工作。",
-    "プロトタイプ、実装、受け入れ確認の実行はまだ利用できません。今後対応予定です。作業は開始していません。",
+    "Implementation and acceptance execution is not available yet (coming later). No work was started.",
+    "实现和验收执行尚未开放，将在后续版本提供。未启动任何工作。",
+    "実装と受け入れ確認の実行はまだ利用できません。今後対応予定です。作業は開始していません。",
   )
 }
 
@@ -77,6 +77,13 @@ export function nextSuggestion(state: IterationState, language: string, designAv
       `Batch ${state.approvedContext?.batchId ?? "—"} accepted, manual trial pending · /project next reviews the trial prompt`,
       `批次 ${state.approvedContext?.batchId ?? "—"} 已通过自动验收，等待手动试用 · /project next 查看试用提示`,
       `バッチ ${state.approvedContext?.batchId ?? "—"} は自動確認済み、手動試用待ち · /project next で試用手順を確認`,
+    )
+  if (state.stage === "prototype")
+    return localize(
+      language,
+      "Prototype variants: /project prototype · F6 returns to main · Compare and choose: /project prototype choose",
+      "原型变体：/project prototype · F6 返回主会话 · 对比并选择：/project prototype choose",
+      "プロトタイプ案：/project prototype · F6 でメインへ · 比較と選択：/project prototype choose",
     )
   if (state.status === "working")
     return localize(

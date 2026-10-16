@@ -9,7 +9,7 @@ setDefaultTimeout(120_000)
 
 frontendSuite("frontend", () => {
   for (const mode of ["inline", "fullscreen"] as const) {
-    test(`${mode}: persisted stage/status panel, cancelled confirmation, and unavailable execution`, async () => {
+    test(`${mode}: persisted stage/status panel, cancelled confirmation, and inert prototype offer`, async () => {
       const f = await frontend(mode)
       let resumed: Awaited<ReturnType<typeof frontend>> | undefined
       try {
@@ -38,12 +38,17 @@ frontendSuite("frontend", () => {
         expect(skipped.skips.map((s) => s.stage)).toEqual(["design"])
         expect(skipped.receipts).toHaveLength(1)
         expect(skipped.attempts).toEqual([])
-        await f.command("next", "not available yet")
+        f.send("next")
+        await f.dialog("Prototype next step")
+        expect(f.live()).toContain("Open prototype variants")
+        f.terminal.send(ESC)
+        await f.dismissed()
+        expect(f.mock.requests).toEqual([])
         expect((await f.store.read()).revision).toBe(skipped.revision)
         await f.stop()
         resumed = await frontend(mode, { root: f.root, file: f.file })
         await resumed.visible("Project Frontend · iteration 1 · prototype · idle")
-        expect(resumed.live()).toContain("not available yet")
+        expect(resumed.live()).toContain("/project prototype")
         await resumed.command("status", "Stage: prototype")
         expect(resumed.all()).toContain("Pending approval: none")
         expect((await resumed.store.read()).revision).toBe(skipped.revision)

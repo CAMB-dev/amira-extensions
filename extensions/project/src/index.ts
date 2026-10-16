@@ -1,8 +1,11 @@
 import path from "node:path"
 import type { CommandContext, Extension, PanelRenderOptions, SessionData, ToolLine } from "@amira/api"
+import type { PrototypeManifestArtifact } from "./artifacts.ts"
 import { DesignSessions } from "./design.ts"
 import { ProjectCommandError, projectError } from "./diagnostics.ts"
 import { conversationLanguage, LanguagePolicy, localize, resolveLanguage, validLanguage } from "./language.ts"
+import { latestPrototypeManifest, Prototypes, prototypePanelText } from "./prototype.ts"
+import { supportsPrototype } from "./prototype-sessions.ts"
 import { type IterationState, initialIteration } from "./stage.ts"
 import { runStageCommand, stageStatus } from "./stage-commands.ts"
 import { nextSuggestion, stageName, statusName } from "./stage-view.ts"
@@ -44,6 +47,7 @@ export function panelLines(
   language?: string,
   designAvailable = false,
   iterationState?: IterationState,
+  prototype?: PrototypeManifestArtifact,
 ): ToolLine[] {
   const lang = language ?? project?.marker.settings.language ?? "en"
   if (error)
@@ -84,6 +88,12 @@ export function panelLines(
       wrap: true,
     },
   ]
+  if (prototype)
+    lines.push({
+      kind: "muted",
+      text: prototypePanelText(prototype, lang, !!state.prototypeChoice),
+      wrap: true,
+    })
   return collapsed ? lines.slice(0, 1) : lines
 }
 
@@ -92,18 +102,20 @@ const HELP = `/project [list] — choose a known project or the nearest discover
 /project switch [name, id, or directory]
 /project status
 /project design
+/project prototype [<variant>|choose|run <variant>]
 /project next
 /project skip batch|design|prototype|implement|accept
 /project revisit design|prototype
 Attachment does not change the main session's working directory.
-Prototypes, implementation, acceptance, ship and archive: coming later.`
+Prototype file tools are variant-scoped; shell uses current permissions. This is not a sandbox.
+Implementation, acceptance, ship and archive: coming later.`
 
 function help(language: string): string {
   return localize(
     language,
     HELP,
-    `/project [list] — 选择已知项目或最近识别的项目\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 查看项目阶段和状态\n/project design — 打开设计会话\n/project next — 查看总结并确认下一步\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n关联项目不会改变主会话工作目录。原型、实现、验收执行、发布和归档将在后续版本提供。`,
-    `/project [list] — 登録済みまたは最寄りのプロジェクトを選択\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 段階と状態を確認\n/project design — 設計会話を開く\n/project next — 要約を確認して次の手順を承認\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n関連付けてもメインの作業ディレクトリは変わりません。プロトタイプ、実装、受け入れ確認の実行、リリース、アーカイブは今後対応予定です。`,
+    `/project [list] — 选择已知项目或最近识别的项目\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 查看项目阶段和状态\n/project design — 打开设计会话\n/project prototype [<variant>|choose|run <variant>] — 查看原型变体、选择结论或显示运行命令\n/project next — 查看总结并确认下一步\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n关联项目不会改变主会话工作目录。原型文件工具仅能写入各自目录，Shell 遵循当前权限模式；这不是沙箱。实现、验收执行、发布和归档将在后续版本提供。`,
+    `/project [list] — 登録済みまたは最寄りのプロジェクトを選択\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 段階と状態を確認\n/project design — 設計会話を開く\n/project prototype [<variant>|choose|run <variant>] — 案の表示・選択・実行コマンドの確認\n/project next — 要約を確認して次の手順を承認\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n関連付けてもメインの作業ディレクトリは変わりません。試作のファイルツールは各案のディレクトリ内だけに書き込みます。シェルは現在の権限モードに従い、サンドボックスではありません。実装、受け入れ確認の実行、リリース、アーカイブは今後対応予定です。`,
   )
 }
 
@@ -145,6 +157,12 @@ export function createProjectExtension(): Extension {
       ],
     })
     const designs = new DesignSessions(api, languagePolicy, () => settings.get().language)
+    const prototypes = new Prototypes(api)
+    const prototypePanels = new Map<string, PrototypeManifestArtifact>()
+    async function refreshPrototypePanel(project: Project, iteration?: IterationState) {
+      const saved = await latestPrototypeManifest(new IterationStore(project), iteration)
+      if (saved) prototypePanels.set(designKey(project), saved.manifest)
+    }
     const states = new Map<string, PanelState>()
     const memoryAttachments = new Map<string, Attachment>()
     const active = (id: string) => api.session()?.info().id === id
@@ -278,6 +296,7 @@ export function createProjectExtension(): Extension {
         selectedProject = project
         lang = displayLanguage(project, (notice) => ctx.print(notice, "warning"))
         const iteration = await new IterationStore(project).read()
+        await refreshPrototypePanel(project, iteration)
         states.set(origin, { fingerprint: JSON.stringify(attachment), project, iteration })
         api.requestRender()
         return project
@@ -449,7 +468,9 @@ export function createProjectExtension(): Extension {
         void readProject(attachment.root, attachment.projectId)
           .then(async (project) => {
             captured.project = project
-            return { project, iteration: await new IterationStore(project).read() }
+            const iteration = await new IterationStore(project).read()
+            await refreshPrototypePanel(project, iteration)
+            return { project, iteration }
           })
           .then(
             ({ project, iteration }) => {
@@ -482,6 +503,7 @@ export function createProjectExtension(): Extension {
         state.project && displayLanguage(state.project),
         !!state.project && availableDesigns.has(designKey(state.project)),
         state.iteration,
+        state.project && prototypePanels.get(designKey(state.project)),
       )
     }
     api.registerPanel({ id: "project", order: 10, render })
@@ -504,16 +526,20 @@ export function createProjectExtension(): Extension {
       name: "project",
       description: "Attach a project, inspect its status, or open its saved design conversation",
       args: {
-        hint: "[list|new|switch|status|design|next|skip|revisit]",
+        hint: "[list|new|switch|status|design|prototype|next|skip|revisit]",
         complete: (prefix) =>
-          ["list", "new", "switch", "status", "design", "next", "skip", "revisit", "help"]
+          ["list", "new", "switch", "status", "design", "prototype", "next", "skip", "revisit", "help"]
             .filter((item) => item.startsWith(prefix))
             .map((value) => ({ value })),
       },
       async run(args, ctx) {
         const origin = ctx.session.info().id
         try {
-          if (designs.isDesignSession(origin) || !active(origin))
+          if (
+            designs.isDesignSession(origin) ||
+            prototypes.sessions.isPrototypeSession(origin) ||
+            !active(origin)
+          )
             throw commandFailure(
               ctx,
               "Project commands are available in the main conversation only. Press F6 to return to main.",
@@ -575,6 +601,34 @@ export function createProjectExtension(): Extension {
               commitDocuments,
             })
             await attach(project, ctx, origin)
+          } else if (verb === "prototype") {
+            const project = await attached(ctx, origin)
+            const checkOrigin = () => {
+              ctx.signal.throwIfAborted()
+              const selected = attachmentFor(origin, ctx.session.data)
+              if (
+                !active(origin) ||
+                selected?.projectId !== project.marker.id ||
+                selected.root !== project.root
+              )
+                throw new Error("Main session or attached project changed. Run /project prototype again.")
+            }
+            try {
+              await prototypes.run(
+                tokens,
+                project,
+                ctx,
+                displayLanguage(project),
+                checkOrigin,
+                async () => {
+                  checkOrigin()
+                  await attached(ctx, origin)
+                },
+                () => designs.quiesce(project),
+              )
+            } finally {
+              if (active(origin)) await attached(ctx, origin)
+            }
           } else if (verb === "next" || verb === "skip" || verb === "revisit") {
             const project = await attached(ctx, origin)
             const checkOrigin = () => {
@@ -595,6 +649,58 @@ export function createProjectExtension(): Extension {
                 )
             }
             try {
+              let current = states.get(origin)?.iteration
+              if (
+                verb === "next" &&
+                current?.stage === "prototype" &&
+                !current.revisit &&
+                !current.pending &&
+                current.artifacts.some((artifact) => artifact.kind === "prototype-manifest")
+              ) {
+                // Revisit/skip handling belongs to the stage engine. Without a manifest
+                // no prototype choice can exist, so avoid extra journal scans on that path.
+                if (await prototypes.recoverChoice(project, displayLanguage(project), checkOrigin))
+                  current = await new IterationStore(project).read()
+              }
+              if (
+                verb === "next" &&
+                current?.stage === "prototype" &&
+                !current.revisit &&
+                !current.pending &&
+                ["ready", "confirmed", "running"].includes(current.phase) &&
+                !current.prototypeChoice
+              ) {
+                const lang = displayLanguage(project)
+                const choices = [
+                  localize(lang, "Open prototype variants", "打开原型变体", "プロトタイプ案を開く"),
+                  localize(lang, "Skip prototype", "跳过原型", "プロトタイプをスキップ"),
+                ]
+                const choice = await ctx.ui.select(
+                  localize(lang, "Prototype next step", "原型下一步", "プロトタイプの次の手順"),
+                  choices,
+                  { signal: ctx.signal, sessionId: origin },
+                )
+                checkOrigin()
+                if (choice === choices[0])
+                  await prototypes.run(
+                    [],
+                    project,
+                    ctx,
+                    lang,
+                    checkOrigin,
+                    async () => {
+                      checkOrigin()
+                      await attached(ctx, origin)
+                    },
+                    () => designs.quiesce(project),
+                  )
+                else if (choice === choices[1])
+                  await runStageCommand("skip", ["prototype"], project, ctx, lang, checkOrigin, async () => {
+                    await designs.quiesce(project)
+                    await prototypes.sessions.quiesce(project)
+                  })
+                return
+              }
               await runStageCommand(
                 verb,
                 tokens,
@@ -602,7 +708,10 @@ export function createProjectExtension(): Extension {
                 ctx,
                 displayLanguage(project),
                 checkOrigin,
-                () => designs.quiesce(project),
+                async () => {
+                  await designs.quiesce(project)
+                  await prototypes.sessions.quiesce(project)
+                },
                 (iteration) => {
                   states.set(origin, {
                     fingerprint: JSON.stringify(attachmentFor(origin, ctx.session.data)),
@@ -621,6 +730,7 @@ export function createProjectExtension(): Extension {
                   selected?.projectId === project.marker.id &&
                   selected.root === project.root
                 ) {
+                  await refreshPrototypePanel(project, iteration)
                   states.set(origin, { fingerprint: JSON.stringify(selected), project, iteration })
                   api.requestRender()
                 }
@@ -667,13 +777,16 @@ export function createProjectExtension(): Extension {
               availableDesigns.add(designKey(project))
               api.requestRender()
             } else {
+              const lang = displayLanguage(project, (notice) => ctx.print(notice, "warning"))
+              if (supportsPrototype(api.apiVersion) && states.get(origin)?.iteration?.stage === "prototype")
+                await prototypes.refresh(project, ctx, lang)
               const iteration = await new IterationStore(project).read()
+              await refreshPrototypePanel(project, iteration)
               states.set(origin, {
                 fingerprint: JSON.stringify(attachmentFor(origin, ctx.session.data)),
                 project,
                 iteration,
               })
-              const lang = displayLanguage(project, (notice) => ctx.print(notice, "warning"))
               ctx.print(
                 localize(
                   lang,
@@ -682,6 +795,9 @@ export function createProjectExtension(): Extension {
                   `${project.marker.name}\nディレクトリ：${project.root}\nイテレーション：${project.marker.currentIteration}`,
                 ) +
                   `\n${stageStatus(iteration, lang)}\n${nextSuggestion(iteration, lang, availableDesigns.has(designKey(project)))}` +
+                  (prototypePanels.has(designKey(project))
+                    ? `\n${prototypePanelText(prototypePanels.get(designKey(project))!, lang, !!iteration.prototypeChoice)}`
+                    : "") +
                   localize(
                     lang,
                     "\nExecution, ship and archive: coming later.",

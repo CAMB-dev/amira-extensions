@@ -14,7 +14,7 @@ import { link, lstat, mkdir, open, readdir, readFile, realpath, rename, unlink }
 import path from "node:path"
 import type { AskAnswer, AskQuestion } from "@amira/api"
 import { validateAskAnswers } from "./answers.ts"
-import { type IterationArtifact, validateArtifact } from "./artifacts.ts"
+import { type IterationArtifact, type PrototypeManifestArtifact, validateArtifact } from "./artifacts.ts"
 import { localize } from "./language.ts"
 import { validateAskQuestions } from "./questions.ts"
 import {
@@ -36,6 +36,7 @@ export type {
   CorrectionArtifact,
   IterationArtifact,
   ManualTrialArtifact,
+  PrototypeManifestArtifact,
   SpecArtifact,
   SpecCheck,
   SpecItem,
@@ -64,7 +65,7 @@ export interface RegistryEntry {
 export interface DecisionRecord {
   id: string
   /** Missing on legacy records; keeps their original projection/hash-chain wording intact. */
-  formatVersion?: 2
+  formatVersion?: 2 | 3
   question: AskQuestion
   answer: AskAnswer
   date: string
@@ -74,6 +75,10 @@ export interface DecisionRecord {
   provenance: "human"
   /** Only the human's free text, never an inferred model explanation. */
   rationale?: string
+  /** Version 3 captures a separate human response, never AskAnswer.other. */
+  reason?: string
+  reasonSkipped?: true
+  prototypeChoice?: PrototypeChoiceEvidence
   /** Original writer copied Other into rationale; the semantic view never treats that as an explanation. */
   legacyRationaleUnverified?: true
   supersedes: string[]
@@ -85,10 +90,25 @@ export interface DecisionMeta {
   askId: string
   language: string
   supersedes?: string[]
+  /** A separately captured human reason; not the choice question's Other field. */
+  reason?: string
+  reasonSkipped?: true
+  /** Optional OCC guard for direct design recording; prototype choice verifies its own revision. */
+  expectedRevision?: number
+}
+
+export interface PrototypeChoiceEvidence {
+  projectId: string
+  iteration: number
+  revision: number
+  manifest: IterationState["artifacts"][number]
+  variantId: string | null
 }
 
 export interface DecisionRecordOptions {
   signal?: AbortSignal
+  /** Store-supplied immutable pointers captured in the same atomic evidence write as the answer. */
+  prototypeChoice?: PrototypeChoiceEvidence
   /** Design asks acknowledge committed evidence first; project Markdown later and report its status. */
   onProjection?: (result: { conflict: boolean; path: string }) => void
   onProjectionError?: (error: unknown) => void
@@ -391,6 +411,7 @@ async function atomicWrite(
   beforePublish?: () => void | Promise<void>,
   signal?: AbortSignal,
   commitProjectId?: string,
+  commitIteration?: number,
 ): Promise<void> {
   const file = await safePath(root, ...parts)
   const temporaryParts = [...parts.slice(0, -1), `.${parts.at(-1)}.${randomUUID()}.tmp`]
@@ -405,8 +426,14 @@ async function atomicWrite(
       safePathSync(root, ...temporaryParts)
       const current: unknown = JSON.parse(readFileSync(safePathSync(root, ".amira", "project.json"), "utf8"))
       marker(current)
-      if (current.id !== commitProjectId)
-        throw new ProjectStorageError("replaced", "Project marker was replaced before evidence publication")
+      if (
+        current.id !== commitProjectId ||
+        (commitIteration !== undefined && current.currentIteration !== commitIteration)
+      )
+        throw new ProjectStorageError(
+          "replaced",
+          "Project marker or captured iteration was replaced before evidence publication",
+        )
       // One short, non-yielding commit section. Otherwise a queued Stop can overtake a
       // completed rename during post-commit fsync/cleanup and the host reports declined.
       signal?.throwIfAborted()
@@ -875,10 +902,40 @@ function validateAnswers(
   }
 }
 
+function reasonMetadata(meta: Record<string, unknown>): boolean {
+  return (
+    (meta.reason === undefined || nonempty(meta.reason)) &&
+    (meta.reasonSkipped === undefined || meta.reasonSkipped === true) &&
+    !(meta.reason !== undefined && meta.reasonSkipped !== undefined)
+  )
+}
+
+function validatePrototypeChoice(value: unknown): asserts value is PrototypeChoiceEvidence {
+  if (
+    !isObject(value) ||
+    !exactKeys(value, ["projectId", "iteration", "revision", "manifest", "variantId"]) ||
+    !nonempty(value.projectId) ||
+    !Number.isSafeInteger(value.iteration) ||
+    (value.iteration as number) < 1 ||
+    !Number.isSafeInteger(value.revision) ||
+    (value.revision as number) < 0 ||
+    (value.variantId !== null && !nonempty(value.variantId)) ||
+    !isObject(value.manifest) ||
+    !exactKeys(value.manifest, ["id", "kind", "path", "hash"]) ||
+    !nonempty(value.manifest.id) ||
+    value.manifest.kind !== "prototype-manifest" ||
+    !nonempty(value.manifest.path) ||
+    typeof value.manifest.hash !== "string" ||
+    !/^[a-f0-9]{64}$/.test(value.manifest.hash)
+  )
+    invalid("Invalid prototype choice evidence")
+}
+
 interface Evidence {
   schemaVersion: 1
   /** New projections correct legacy rationale semantics without rewriting old evidence/hash links. */
-  projectionVersion?: 2
+  projectionVersion?: 2 | 3
+  prototypeChoice?: PrototypeChoiceEvidence
   meta: DecisionMeta
   questions: AskQuestion[]
   answers: AskAnswer[]
@@ -891,14 +948,14 @@ function renderHistorical(records: DecisionRecord[]): string {
   return records
     .map((record) => {
       const text = (en: string, zh: string, ja: string) =>
-        record.formatVersion === 2
+        record.formatVersion !== undefined
           ? localize(record.language, en, zh, ja)
           : record.language.startsWith("zh")
             ? zh
             : en
       const choice =
         record.answer.selected.join(", ") ||
-        (record.answer.other !== undefined || record.formatVersion !== 2
+        (record.answer.other !== undefined || record.formatVersion === undefined
           ? text("Other", "其他", "その他")
           : text("None selected", "未选择", "選択なし"))
       const lines = [
@@ -920,7 +977,7 @@ function renderHistorical(records: DecisionRecord[]): string {
           `${text("Other (exact human text)", "其他（用户原文）", "その他（ユーザーの原文）")}: ${record.answer.other}`,
         )
       lines.push(
-        `${text("Rationale", "理由", "理由")}: ${record.rationale ?? text("Not supplied by the human.", "用户未提供。", "ユーザーからの説明はありません。")}`,
+        `${text("Rationale", "理由", "理由")}: ${record.rationale ?? (record.reasonSkipped ? text("Explicitly skipped by the human.", "用户明确跳过。", "ユーザーが明示的に省略しました。") : text("Not supplied by the human.", "用户未提供。", "ユーザーからの説明はありません。"))}`,
       )
       lines.push(
         "",
@@ -984,7 +1041,9 @@ export class DecisionStore {
       if (
         !isObject(value) ||
         value.schemaVersion !== 1 ||
-        (value.projectionVersion !== undefined && value.projectionVersion !== 2) ||
+        (value.projectionVersion !== undefined &&
+          value.projectionVersion !== 2 &&
+          value.projectionVersion !== 3) ||
         !isObject(value.meta) ||
         !nonempty(value.meta.sessionId) ||
         !nonempty(value.meta.askId) ||
@@ -994,6 +1053,17 @@ export class DecisionStore {
         !Array.isArray(value.records)
       )
         invalid("Malformed decision evidence")
+      const modern = value.projectionVersion === 3
+      if (
+        modern &&
+        (!reasonMetadata(value.meta) ||
+          (value.meta.reason === undefined && value.meta.reasonSkipped !== true))
+      )
+        invalid("Version 3 evidence requires an explicit reason or skip")
+      if (value.prototypeChoice !== undefined) {
+        validatePrototypeChoice(value.prototypeChoice)
+        if (!modern || value.records.length !== 1) invalid("Prototype choice requires version 3 evidence")
+      }
       const legacy = value.records.every((record) => isObject(record) && record.formatVersion === undefined)
       validateAnswers(value.questions, value.answers, legacy)
       const records = value.records as DecisionRecord[]
@@ -1022,10 +1092,20 @@ export class DecisionStore {
           !Number.isFinite(Date.parse(record.date)) ||
           JSON.stringify(record.question) !== JSON.stringify(value.questions[i]) ||
           JSON.stringify(record.answer) !== JSON.stringify((value.answers as AskAnswer[])[i]) ||
-          (record.formatVersion !== undefined && record.formatVersion !== 2) ||
-          (record.formatVersion === 2
-            ? record.rationale !== undefined
-            : record.rationale !== (value.answers as AskAnswer[])[i]?.other) ||
+          (modern
+            ? record.formatVersion !== 3
+            : record.formatVersion !== undefined && record.formatVersion !== 2) ||
+          (modern
+            ? record.reason !== value.meta.reason ||
+              record.rationale !== value.meta.reason ||
+              record.reasonSkipped !== value.meta.reasonSkipped ||
+              stable(record.prototypeChoice) !== stable(value.prototypeChoice)
+            : record.reason !== undefined ||
+              record.reasonSkipped !== undefined ||
+              record.prototypeChoice !== undefined ||
+              (record.formatVersion === 2
+                ? record.rationale !== undefined
+                : record.rationale !== (value.answers as AskAnswer[])[i]?.other)) ||
           JSON.stringify(record.supersedes) !== JSON.stringify(supersedes) ||
           !Array.isArray(record.supersededBy) ||
           record.supersededBy.length !== 0
@@ -1033,7 +1113,9 @@ export class DecisionStore {
           invalid("Invalid human decision record")
       }
       const priorProjection =
-        value.projectionVersion === 2 ? render(folded(result)) : renderHistorical(folded(result, true))
+        value.projectionVersion !== undefined
+          ? render(folded(result))
+          : renderHistorical(folded(result, true))
       if (value.priorGeneratedHash !== hash(priorProjection)) invalid("Broken decision evidence hash chain")
       ids.add(value.meta.askId)
       result.push(value as unknown as Evidence)
@@ -1152,7 +1234,18 @@ export class DecisionStore {
     validateAnswers(questions, answers)
     if (
       !isObject(meta) ||
-      !exactKeys(meta, ["sessionId", "askId", "language", "supersedes"]) ||
+      !exactKeys(meta, [
+        "sessionId",
+        "askId",
+        "language",
+        "supersedes",
+        "reason",
+        "reasonSkipped",
+        "expectedRevision",
+      ]) ||
+      !reasonMetadata(meta) ||
+      (meta.expectedRevision !== undefined &&
+        (!Number.isSafeInteger(meta.expectedRevision) || (meta.expectedRevision as number) < 0)) ||
       !nonempty(meta.sessionId) ||
       !nonempty(meta.askId) ||
       !nonempty(meta.language) ||
@@ -1168,7 +1261,20 @@ export class DecisionStore {
       questions,
       answers,
       meta: { ...meta, supersedes: meta.supersedes ?? [] },
+      ...(options.prototypeChoice ? { prototypeChoice: options.prototypeChoice } : {}),
     })
+    const modern = meta.reason !== undefined || meta.reasonSkipped === true
+    if (captured.prototypeChoice !== undefined) {
+      validatePrototypeChoice(captured.prototypeChoice)
+      if (!modern || questions.length !== 1) invalid("Prototype choice requires an explicit reason or skip")
+    }
+    if (meta.expectedRevision !== undefined) {
+      if (captured.prototypeChoice) invalid("Use recordPrototypeChoice for prototype revision guards")
+      const { expectedRevision, ...guardedMeta } = captured.meta
+      return new IterationStore(this.project).guardDesignRevision(expectedRevision!, () =>
+        this.record(captured.questions, captured.answers, guardedMeta, options),
+      )
+    }
     return serialized(`decisions:${key(this.project.root)}`, async () => {
       // A queued ask can have been cancelled while another transaction held this queue.
       signal?.throwIfAborted()
@@ -1176,8 +1282,12 @@ export class DecisionStore {
       const duplicate = evidence.find((entry) => entry.meta.askId === captured.meta.askId)
       if (duplicate) {
         if (
-          stable({ questions: duplicate.questions, answers: duplicate.answers, meta: duplicate.meta }) !==
-          stable(captured)
+          stable({
+            questions: duplicate.questions,
+            answers: duplicate.answers,
+            meta: duplicate.meta,
+            ...(duplicate.prototypeChoice ? { prototypeChoice: duplicate.prototypeChoice } : {}),
+          }) !== stable(captured)
         )
           invalid("askId was already recorded with different evidence")
         await this.projectEvidence(evidence, projection)
@@ -1188,7 +1298,15 @@ export class DecisionStore {
         invalid("Cannot supersede an unknown decision")
       const records: DecisionRecord[] = captured.questions.map((question, index) => ({
         id: `D${existing.length + index + 1}`,
-        formatVersion: 2,
+        formatVersion: modern ? 3 : 2,
+        ...(modern
+          ? {
+              ...(captured.meta.reason !== undefined
+                ? { reason: captured.meta.reason, rationale: captured.meta.reason }
+                : { reasonSkipped: true as const }),
+              ...(captured.prototypeChoice ? { prototypeChoice: captured.prototypeChoice } : {}),
+            }
+          : {}),
         question,
         answer: captured.answers[index]!,
         date,
@@ -1201,7 +1319,7 @@ export class DecisionStore {
       }))
       const entry: Evidence = {
         schemaVersion: 1,
-        projectionVersion: 2,
+        projectionVersion: modern ? 3 : 2,
         ...captured,
         records,
         priorGeneratedHash: hash(render(existing)),
@@ -1220,6 +1338,7 @@ export class DecisionStore {
         },
         signal,
         this.project.marker.id,
+        captured.prototypeChoice?.iteration,
       )
       await this.hooks.afterEvidenceSync?.()
       await this.projectEvidence([...evidence, entry], projection)
@@ -1300,6 +1419,55 @@ export class IterationStore {
     await syncDirectory(path.dirname(await safePath(this.project.root, ...parts)))
   }
 
+  private prototypeParts(variantId: string): string[] {
+    if (
+      typeof variantId !== "string" ||
+      variantId === "none" ||
+      !/^[A-Za-z][A-Za-z0-9._-]*$/.test(variantId) ||
+      variantId.endsWith(".") ||
+      /^(con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\.|$)/i.test(variantId)
+    )
+      invalid("Invalid prototype variant ID")
+    return [".amira", "project", "prototypes", String(this.project.marker.currentIteration), variantId]
+  }
+
+  /** Create/check a variant-scoped directory without trusting model-selected paths. */
+  async preparePrototypeDirectory(variantId: string): Promise<string> {
+    const parts = this.prototypeParts(variantId)
+    return this.transaction(async () => {
+      for (let length = 3; length <= parts.length; length++) {
+        const prefix = parts.slice(0, length)
+        await this.check()
+        await mkdir(await safePath(this.project.root, ...prefix), { recursive: true })
+        await pinDirectory(this.project.root, ...prefix)
+        await syncDirectory(path.dirname(await safePath(this.project.root, ...prefix)))
+      }
+      await this.check()
+      return safePath(this.project.root, ...parts)
+    })
+  }
+
+  private async prototypePaths(manifest: PrototypeManifestArtifact, live = false): Promise<void> {
+    // Historical evidence outlives disposable output. Only publication of a fresh report
+    // checks live paths; recovery checks recorded identity/containment without pinning code.
+    for (const variant of manifest.variants) {
+      const parts = this.prototypeParts(variant.id)
+      const directory = path.resolve(this.project.root, ...parts)
+      if (variant.directory !== directory)
+        throw new ProjectStorageError(
+          "unsafe",
+          "Prototype directory must match its project, iteration and variant ID",
+        )
+      if (path.resolve(variant.cwd) !== variant.cwd) invalid("Prototype cwd is not canonical")
+      if (live && variant.status === "ready") {
+        for (const location of [directory, variant.cwd]) {
+          safePathSync(this.project.root, location)
+          if (!lstatSync(location).isDirectory()) invalid(`Prototype output is not a directory: ${location}`)
+        }
+      }
+    }
+  }
+
   private parse(text: string): unknown {
     try {
       return JSON.parse(text)
@@ -1328,7 +1496,15 @@ export class IterationStore {
   }
 
   private referenceParts(ref: IterationArtifactRef): string[] {
-    const kinds = ["stage-summary", "spec", "batch-plan", "acceptance", "manual-trial", "correction"]
+    const kinds = [
+      "prototype-manifest",
+      "stage-summary",
+      "spec",
+      "batch-plan",
+      "acceptance",
+      "manual-trial",
+      "correction",
+    ]
     if (
       !isObject(ref) ||
       Object.keys(ref).some((field) => !["id", "kind", "path", "hash"].includes(field)) ||
@@ -1370,6 +1546,7 @@ export class IterationStore {
       invalid(error instanceof Error ? error.message : String(error))
     }
     if (value.artifact.kind !== ref.kind) invalid("Iteration artifact kind mismatch")
+    if (value.artifact.kind === "prototype-manifest") await this.prototypePaths(value.artifact)
     return value.artifact
   }
 
@@ -1686,23 +1863,7 @@ export class IterationStore {
       const head = await this.load()
       this.expected(head, expectedRevision)
       await this.validateBinding(head.state, captured)
-      const id = randomUUID()
-      const content = json({
-        schemaVersion: 1,
-        projectId: head.state.projectId,
-        iteration: head.state.iteration,
-        id,
-        artifact: captured,
-      })
-      const parts = [...this.parts, "artifacts", `${captured.kind}-${id}.json`]
-      const ref: IterationArtifactRef = {
-        id,
-        kind: captured.kind,
-        path: parts.join("/"),
-        hash: hash(content),
-      }
-      await this.immutable(parts, content)
-      await this.options.afterArtifactPublish?.()
+      const ref = await this.publishArtifact(head.state, captured)
       const state: IterationState = {
         ...head.state,
         revision: head.state.revision + 1,
@@ -1719,6 +1880,158 @@ export class IterationStore {
         state.status = "idle"
       }
       return { state: structuredClone((await this.commit(state, head)).state), artifact: ref }
+    })
+  }
+
+  private async publishArtifact(
+    state: IterationState,
+    artifact: IterationArtifact,
+  ): Promise<IterationArtifactRef> {
+    const id = randomUUID()
+    const content = json({
+      schemaVersion: 1,
+      projectId: state.projectId,
+      iteration: state.iteration,
+      id,
+      artifact,
+    })
+    const parts = [...this.parts, "artifacts", `${artifact.kind}-${id}.json`]
+    const ref: IterationArtifactRef = { id, kind: artifact.kind, path: parts.join("/"), hash: hash(content) }
+    await this.immutable(parts, content)
+    await this.options.afterArtifactPublish?.()
+    return ref
+  }
+
+  /**
+   * Hold the iteration writer claim across the stale check and atomic decision evidence write.
+   * Evidence contains the immutable manifest pointers, choice and separate reason together.
+   * Journal/manifest projection follows that commit; retrying the same ask completes a partial
+   * projection without duplicating the decision. No stage work or command is replayed.
+   */
+  async recordPrototypeChoice(
+    expectedRevision: number,
+    manifestRef: IterationArtifactRef,
+    question: AskQuestion,
+    answers: AskAnswer | AskAnswer[],
+    meta: DecisionMeta,
+    selectedVariantId?: string | null,
+    options: DecisionRecordOptions = {},
+  ): Promise<{ state: IterationState; artifact: IterationArtifactRef; records: DecisionRecord[] }> {
+    const captured = structuredClone({
+      manifestRef,
+      question,
+      answers: Array.isArray(answers) ? answers : [answers],
+      meta,
+      selectedVariantId,
+    })
+    validateAnswers([captured.question], captured.answers)
+    if (
+      captured.question.multiSelect ||
+      captured.answers[0]!.selected.length !== 1 ||
+      captured.answers[0]!.other !== undefined
+    )
+      invalid("Prototype selection requires one explicit variant or none option, not Other")
+    if (captured.meta.reason === undefined && captured.meta.reasonSkipped !== true)
+      invalid("Prototype selection requires a separately captured reason or explicit skip")
+    if (captured.meta.expectedRevision !== undefined && captured.meta.expectedRevision !== expectedRevision)
+      invalid("Prototype decision revision does not match the writer revision")
+    return this.transaction(async () => {
+      const head = await this.load()
+      this.expected(head, expectedRevision)
+      if (
+        head.state.stage !== "prototype" ||
+        !["running", "finished", "summarized"].includes(head.state.phase)
+      )
+        invalid("Prototype choice is not at a writable prototype boundary")
+      const latest = head.state.artifacts.findLast((entry) => entry.kind === "prototype-manifest")
+      if (!latest || stable(latest) !== stable(captured.manifestRef))
+        invalid("Prototype choice must bind the latest committed manifest")
+      const manifest = await this.artifact(latest)
+      if (manifest.kind !== "prototype-manifest") invalid("Prototype choice requires a manifest")
+      const selected = captured.answers[0]!.selected[0]!
+      // Stable IDs identify variants. A localized none label needs the caller's explicit null.
+      const variantId =
+        captured.selectedVariantId === undefined
+          ? selected === "none"
+            ? null
+            : selected
+          : captured.selectedVariantId
+      if (
+        (variantId !== null && selected !== variantId) ||
+        (variantId === null && manifest.variants.some((variant) => variant.id === selected))
+      )
+        invalid("Prototype answer does not match the selected variant")
+      if (
+        variantId !== null &&
+        !manifest.variants.some((variant) => variant.id === variantId && variant.status === "ready")
+      )
+        invalid("Choose a ready variant from the captured prototype manifest")
+      const labels = captured.question.options.map((option) => option.label)
+      if (
+        manifest.variants.some((variant) => !labels.includes(variant.id)) ||
+        labels.filter((label) => !manifest.variants.some((variant) => variant.id === label)).length > 1
+      )
+        invalid("Prototype question must show the manifest variants using their stable IDs")
+      options.signal?.throwIfAborted()
+      const { expectedRevision: _revision, ...suppliedMeta } = captured.meta
+      const decisions = new DecisionStore(this.project)
+      const existing = await decisions.records()
+      const replay = existing.find((record) => record.askId === suppliedMeta.askId)
+      // A prototype conclusion is one replaceable decision per iteration, not an
+      // accumulating set of contradictory active choices. Resolve the predecessor
+      // under this iteration's writer claim, including legacy multiple-active choices.
+      // A partially committed ask must retain its ORIGINAL supersession edges.
+      const predecessors = replay
+        ? replay.supersedes
+        : existing
+            .filter(
+              (record) =>
+                record.prototypeChoice?.projectId === head.state.projectId &&
+                record.prototypeChoice.iteration === head.state.iteration &&
+                !record.supersededBy.length,
+            )
+            .map((record) => record.id)
+      const decisionMeta = {
+        ...suppliedMeta,
+        supersedes:
+          replay && suppliedMeta.supersedes !== undefined
+            ? suppliedMeta.supersedes
+            : [...new Set([...(suppliedMeta.supersedes ?? []), ...predecessors])],
+      }
+      const records = await decisions.record([captured.question], captured.answers, decisionMeta, {
+        ...options,
+        prototypeChoice: {
+          projectId: head.state.projectId,
+          iteration: head.state.iteration,
+          revision: expectedRevision,
+          manifest: latest,
+          variantId,
+        },
+      })
+      const chosen: PrototypeManifestArtifact = {
+        ...manifest,
+        chosen: { variantId, decisionId: records[0]!.id },
+      }
+      await this.validateBinding(head.state, chosen)
+      const ref = await this.publishArtifact(head.state, chosen)
+      const state = reduceStage(head.state, {
+        type: "select-prototype",
+        expectedRevision,
+        variantId,
+        decisionId: records[0]!.id,
+        receipt: {
+          id: randomUUID(),
+          provenance: "human",
+          projectId: head.state.projectId,
+          iteration: head.state.iteration,
+          revision: expectedRevision,
+          subjectId: variantId ?? "none",
+          choice: variantId ?? "none",
+          reason: decisionMeta.reason ?? "Reason skipped by the human.",
+        },
+      })
+      state.artifacts = [...head.state.artifacts, ref]
+      return { state: structuredClone((await this.commit(state, head)).state), artifact: ref, records }
     })
   }
 
@@ -1902,6 +2215,8 @@ export class IterationStore {
   }
 
   private async validateEventBinding(state: IterationState, event: StageEvent): Promise<void> {
+    if (event.type === "select-prototype")
+      invalid("Use recordPrototypeChoice to bind the manifest, human answer and separate reason atomically")
     const proposal =
       event.type === "propose-transition"
         ? event.proposal
@@ -1928,7 +2243,14 @@ export class IterationStore {
       ["propose-transition", "confirm-transition", "start-work", "confirm-continuation"].includes(
         event.type,
       ) &&
-      (target === "implement" || target === "accept")
+      (target === "implement" || target === "accept") &&
+      !(
+        proposal?.preparationOnly &&
+        state.stage === "prototype" &&
+        target === "implement" &&
+        !context &&
+        ["propose-transition", "confirm-transition"].includes(event.type)
+      )
     )
       await this.approvedPlan(state, context)
     if (event.type === "record-artifact" && event.manifest) {
@@ -2137,6 +2459,26 @@ export class IterationStore {
       state.artifacts.map(async (ref) => ({ ref, artifact: await this.artifact(ref) })),
     )
     if (artifact.kind === "stage-summary") return
+    if (artifact.kind === "prototype-manifest") {
+      await this.prototypePaths(artifact, !artifact.chosen)
+      if (artifact.chosen) {
+        const decision = (await new DecisionStore(this.project).records()).find(
+          (entry) => entry.id === artifact.chosen!.decisionId,
+        )
+        const choice = decision?.prototypeChoice
+        const prior = choice && saved.find((entry) => stable(entry.ref) === stable(choice.manifest))
+        if (
+          !choice ||
+          choice.projectId !== state.projectId ||
+          choice.iteration !== state.iteration ||
+          choice.variantId !== artifact.chosen.variantId ||
+          prior?.artifact.kind !== "prototype-manifest" ||
+          stable(prior.artifact.variants) !== stable(artifact.variants)
+        )
+          invalid("Chosen prototype must bind recorded human choice evidence and the exact manifest")
+      }
+      return
+    }
     if (artifact.kind === "spec") {
       if (
         saved.some((entry) => entry.artifact.kind === "spec" && entry.artifact.revision >= artifact.revision)
