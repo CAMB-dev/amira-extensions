@@ -12,7 +12,12 @@ import {
 } from "@amira/api"
 import { Blackboard, type BoardEntry, type BoardWrite, MAX_VALUE_CHARS } from "./blackboard.ts"
 import type { SwarmLimits } from "./limits.ts"
-import { type MemberWorkflowSettings, MemberWorkflows, type WorkflowRunner } from "./workflows.ts"
+import {
+  type BoundWorkflow,
+  type MemberWorkflowSettings,
+  MemberWorkflows,
+  type WorkflowRunner,
+} from "./workflows.ts"
 
 /** One member of a swarm, as the commander describes it. */
 export interface MemberSpec {
@@ -69,6 +74,8 @@ export type SwarmRecord =
 
 /** Own reported usage only; omitted fields are unknown, not zero. */
 export interface MemberMetrics {
+  /** Effective model from the child handle, not merely the requested role default. */
+  model?: string
   sessionId?: string
   startedAt?: number
   usage?: Usage
@@ -173,10 +180,13 @@ export interface SwarmOptions {
   /** The group its members are spawned in; the swarm ends it when it ends. */
   group: SpawnGroup
   /** Added to every member's spawn options: tools to leave out, the calling tool's id. */
-  spawn?: Pick<SpawnOptions, "excludeTools" | "toolCallId" | "tools">
+  spawn?: Pick<SpawnOptions, "excludeTools" | "toolCallId" | "tools" | "cwd" | "context"> & {
+    /** Local runner policy; public spawn groups already operate without role worktrees. */
+    isolation?: "none"
+  }
   hooks?: SwarmHooks
-  /** Own member tools, only when the workflow.runner service is available and enabled. */
-  workflows?: { runner: WorkflowRunner; limits: MemberWorkflowSettings }
+  /** Bound runs expose a disabled tool with a reason when the optional service is incompatible. */
+  workflows?: { runner?: WorkflowRunner; limits: MemberWorkflowSettings; bound?: BoundWorkflow }
 }
 
 /** Names a member may have. */
@@ -282,27 +292,32 @@ export class Swarm {
       this.#resolve = resolve
     })
     if (opts.workflows?.limits.enabled) {
-      this.#workflows = new MemberWorkflows(opts.workflows.runner, opts.workflows.limits, {
-        canStart: (owner) => {
-          const m = this.#find(owner)
-          return this.live && !!m && !m.stopping && m.child.state !== "ended"
+      this.#workflows = new MemberWorkflows(
+        opts.workflows.runner,
+        opts.workflows.limits,
+        {
+          canStart: (owner) => {
+            const m = this.#find(owner)
+            return this.live && !!m && !m.stopping && m.child.state !== "ended"
+          },
+          board: (value) => {
+            value = clip(value, MAX_VALUE_CHARS)
+            const r = this.board.write("swarm", "workflows", value)
+            if (!r.changed) return
+            this.#record({ type: "board", swarm: this.id, write: r.write! })
+            this.#log({ kind: "board", from: "swarm", key: "workflows", text: value })
+          },
+          result: (owner, text) => {
+            const m = this.#find(owner)
+            if (this.live && m && !m.stopping && m.child.state !== "ended") {
+              this.#progress(owner)
+              this.#deliver("workflow", m, text)
+            }
+          },
+          changed: () => this.#check(),
         },
-        board: (value) => {
-          value = clip(value, MAX_VALUE_CHARS)
-          const r = this.board.write("swarm", "workflows", value)
-          if (!r.changed) return
-          this.#record({ type: "board", swarm: this.id, write: r.write! })
-          this.#log({ kind: "board", from: "swarm", key: "workflows", text: value })
-        },
-        result: (owner, text) => {
-          const m = this.#find(owner)
-          if (this.live && m && !m.stopping && m.child.state !== "ended") {
-            this.#progress(owner)
-            this.#deliver("workflow", m, text)
-          }
-        },
-        changed: () => this.#check(),
-      })
+        opts.workflows.bound,
+      )
     }
     const roster = opts.members
     for (const spec of roster) {
@@ -953,6 +968,7 @@ export class Swarm {
       m.ended?.durationMs ?? (m.startedAt === undefined ? undefined : Math.max(0, until - m.startedAt))
     return {
       sessionId: m.child.id,
+      ...(m.child.model ? { model: `${m.child.model.provider}/${m.child.model.model}` } : {}),
       ...(m.stopReason !== undefined ? { stopReason: m.stopReason } : {}),
       ...(m.startedAt !== undefined ? { startedAt: m.startedAt } : {}),
       ...(usage ? { usage, tokens: usage.input + usage.output + usage.cacheRead + usage.cacheWrite } : {}),

@@ -50,6 +50,13 @@ export interface RunRecord {
   status: RunStatus
   /** The member that requested this run through workflow.runner, when present. */
   startedBy?: { sessionId: string; label: string }
+  /** Execution metadata; absent on runs written before 0.3.0. */
+  cwd?: string
+  ownerSessionId?: string
+  groupId?: string
+  sessionIds?: string[]
+  /** Effective child model references, not just requested role defaults. */
+  models?: string[]
   startedAt: number
   endedAt?: number
   result?: unknown

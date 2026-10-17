@@ -1,3 +1,4 @@
+import { isAbsolute, resolve } from "node:path"
 import type {
   CommandCandidate,
   CommandContext,
@@ -15,6 +16,7 @@ import type {
 import { textResult } from "@amira/api"
 import { connectDashboardSource, createSwarmSource } from "./dashboard.ts"
 import { readSettings, type SwarmSettings, withOverrides } from "./limits.ts"
+import { createSwarmRunner, type RunnerOwner } from "./runner.ts"
 import {
   checkRoster,
   type MemberSpec,
@@ -32,7 +34,7 @@ import {
   timelineLine,
   VIEW_KIND,
 } from "./view.ts"
-import type { WorkflowRunner } from "./workflows.ts"
+import { isWorkflowRunner } from "./workflows.ts"
 
 export { Blackboard } from "./blackboard.ts"
 export {
@@ -41,6 +43,14 @@ export {
   type SwarmLimits,
   type SwarmSettings,
 } from "./limits.ts"
+export type {
+  RunnerCapabilities,
+  RunnerOwner,
+  SwarmRunner,
+  SwarmRunReport,
+  SwarmRunSnapshot,
+  SwarmStartRequest,
+} from "./runner.ts"
 export * from "./swarm.ts"
 export { READONLY_VIEW_KIND, readonlySwarmView, swarmView, VIEW_KIND } from "./view.ts"
 
@@ -68,6 +78,9 @@ interface Live {
   swarm: Swarm
   /** The top-level session that started it. */
   owner: string
+  /** Service runs follow the caller's lifetime, never main-session switch events. */
+  bound?: boolean
+  settled?: boolean
   /** The report its commander expects, until it is delivered. */
   final?: PendingNotice
   /**
@@ -79,6 +92,9 @@ interface Live {
 
 /** Where a swarm starts from: the swarm tool of the main session, or a command. */
 interface Launch {
+  sessionId?: string
+  owner?: RunnerOwner
+  cwd?: string
   goal: string
   members: MemberSpec[]
   limits?: Record<string, unknown>
@@ -122,6 +138,10 @@ export function createSwarmExtension(): Extension {
     const declined = new Set<string>()
     let historical: SwarmSnapshot[] = []
     let seq = 0
+    let starting = false
+    const lifetime = new AbortController()
+    let rootLifetime = new AbortController()
+    let runnerChanged = (_runId: string) => {}
 
     const settings = (): SwarmSettings =>
       readSettings(api.settings.extensions?.[DATA_KEY], (problem) =>
@@ -143,142 +163,250 @@ export function createSwarmExtension(): Extension {
     }
 
     const launch = async (l: Launch): Promise<Swarm | string> => {
-      const s = settings()
-      if (s.enabled === "never") return "Swarms are turned off in settings (extensions.swarm.enabled: never)."
-      if (live()) return `Swarm ${live()!.swarm.id} is still running; stop it first or talk to its members.`
-      const goal = typeof l.goal === "string" ? oneLine(l.goal) : ""
-      if (!goal) return '"goal" is required.'
-      if (l.initiator === "model" && declined.has(goalKey(goal))) {
-        return "The user already declined a swarm for this goal in this session, so it was not proposed again. Do not propose it again, reworded or with another roster; carry on without it (e.g. with the agent tool) unless the user asks for a swarm."
-      }
-      const members = (l.members ?? []).map((m) => ({
-        ...m,
-        name: typeof m?.name === "string" ? m.name.trim() : (m?.name as string),
-        role: typeof m?.role === "string" ? oneLine(m.role) : (m?.role as string),
-      }))
-      const problem = checkRoster(members, s.maxMembers)
-      if (problem) return problem
-      const limits = withOverrides(s.limits, l.limits)
-      const auto = s.enabled === "mode" && api.session?.()?.info().permissions?.mode === "auto"
-      if (s.enabled === "ask" || (s.enabled === "mode" && !auto)) {
-        const roster = members
-          .map((m) => `  ${m.name} (${m.role}): ${clip(oneLine(m.brief), 100)}`)
-          .join("\n")
-        // The swarm's own budget, else the session's: what stops it spending more.
-        const cap = limits.budget ?? api.settings.budget
-        const budget = [
-          cap?.tokens !== undefined ? `${cap.tokens.toLocaleString("en-US")} tokens` : "",
-          cap?.costUsd !== undefined ? `$${cap.costUsd}` : "",
-        ].filter(Boolean)
-        const ok = await l.ui.confirm(
-          `Start a swarm of ${members.length} agents?`,
-          [
-            l.initiator === "user" ? "You asked for this swarm." : "The model proposes this swarm.",
-            `Goal: ${goal}`,
-            "",
-            roster,
-            "",
-            `Agents: ${members.length}${limits.maxConcurrent ? `, ${limits.maxConcurrent} at a time` : ", all at once"}; each works up to ${limits.maxTurnsPerMember} turns and sends up to ${limits.maxMessagesPerMember} messages (${limits.maxMessages} in all).`,
-            `Cost: ${budget.length ? `stops at ${budget.join(" or ")}` : "no cost cap"}.`,
-            "Files: the members work in your working tree and can change your files.",
-          ].join("\n"),
-          l.signal ? { signal: l.signal } : {},
-        )
-        if (ok !== true) {
-          declined.add(goalKey(goal))
-          // The user's ask is used up: asking again is what lets this goal be proposed again.
-          explicit = false
-          requested = false
-          // The user said no to the model's proposal: tell them how to start it after all.
-          if (l.initiator === "model") {
-            api.notify(
-              `Swarm not started; it will not be proposed again for this goal in this session. To start it yourself, run /swarm ${clip(goal, 200)}.`,
-            )
-          }
-          if (ok === false)
-            return "The user declined the swarm, so it did not start. Do not propose a swarm for this goal again in this session unless the user asks for one; carry on without it (e.g. with the agent tool), or ask the user how they want to proceed."
-          // After /swarm <goal> the user already did the first; only the setting is left to suggest.
-          const how =
-            l.initiator === "user"
-              ? `The user can set extensions.swarm.enabled to "always" in settings.json to start swarms without confirming.`
-              : `To start it themselves, the user can run /swarm ${clip(goal, 200)} in the interactive UI, or set extensions.swarm.enabled to "always" in settings.json to start swarms without confirming.`
-          return `Nobody confirmed the swarm, so it did not start: the confirmation was dismissed, or nobody can answer it here (print mode, or an rpc client that does not answer dialogs). Do not propose it again in this session unless the user asks. ${how}`
+      if (lifetime.signal.aborted) return "The swarm extension was unloaded; no swarm started."
+      const busy = [...swarms.values()].find((entry) => !entry.settled)
+      if (starting || busy)
+        return "A swarm is running, stopping or awaiting confirmation; stop it or wait for it to finish."
+      // Reserve before awaiting confirmation, for tool and service starts alike.
+      starting = true
+      const owner = l.owner?.sessionId ?? l.sessionId ?? root ?? ""
+      const signal = AbortSignal.any([
+        lifetime.signal,
+        ...(l.signal ? [l.signal] : []),
+        ...(l.owner ? [l.owner.signal] : [rootLifetime.signal]),
+      ])
+      l = { ...l, signal }
+      try {
+        if (signal.aborted) return "The swarm start was cancelled."
+        const s = settings()
+        if (s.enabled === "never")
+          return "Swarms are turned off in settings (extensions.swarm.enabled: never)."
+        if (live()) return `Swarm ${live()!.swarm.id} is still running; stop it first or talk to its members.`
+        const goal = typeof l.goal === "string" ? oneLine(l.goal) : ""
+        if (!goal) return '"goal" is required.'
+        if (l.initiator === "model" && declined.has(goalKey(goal))) {
+          return "The user already declined a swarm for this goal in this session, so it was not proposed again. Do not propose it again, reworded or with another roster; carry on without it (e.g. with the agent tool) unless the user asks for a swarm."
         }
-      }
-      let group: SpawnGroup
-      try {
-        group = l.createGroup({
-          name: `swarm: ${clip(goal, 40)}`,
-          ...(limits.maxConcurrent ? { maxConcurrent: limits.maxConcurrent } : {}),
-          ...(limits.budget ? { budget: limits.budget } : {}),
-          maxTurnsPerAgent: limits.maxTurnsPerMember,
-          maxAgents: members.length * 4,
-        })
-      } catch (err) {
-        return `The swarm could not start: ${err instanceof Error ? err.message : String(err)}`
-      }
-      const id = `sw${Date.now().toString(36).slice(-5)}${++seq}`
-      const final = l.expectNotice?.()
-      const data = l.data
-      const owner = root ?? ""
-      let entry: Live | undefined
-      let swarm: Swarm
-      const runner = s.memberWorkflows.enabled
-        ? (api.useService?.("workflow.runner") as WorkflowRunner | undefined)
-        : undefined
-      try {
-        swarm = new Swarm({
-          id,
-          goal,
-          members,
-          limits,
-          group,
-          ...(runner ? { workflows: { runner, limits: s.memberWorkflows } } : {}),
-          spawn: { excludeTools: MEMBER_EXCLUDED, ...(l.toolCallId ? { toolCallId: l.toolCallId } : {}) },
-          hooks: {
-            changed,
-            record: (rec) => {
-              data?.append(DATA_KEY, rec)
-              if (owner === (root ?? "") && !entry?.orphaned) historical = pastSwarms(data)
-            },
-            ownUsage: (id) => {
-              const session = api.session?.()
-              if (session?.info().id !== owner) return undefined
-              return session.subagents?.().find((child) => child.id === id)?.usage
-            },
-            toCommander: (from, text) => {
-              if (entry?.orphaned) return
-              l.expectNotice?.()?.deliver(
-                notice(
-                  `[swarm ${id} · message from ${from}] ${text}\n\n(If it needs an answer, give it with the swarm tool: action "message", to "${from}". Otherwise just end your turn.)`,
-                  `✉️ swarm · ${from}: ${clip(oneLine(text), 160)}`,
-                ),
+        const members = (l.members ?? []).map((m) => ({
+          ...m,
+          name: typeof m?.name === "string" ? m.name.trim() : (m?.name as string),
+          role: typeof m?.role === "string" ? oneLine(m.role) : (m?.role as string),
+        }))
+        const problem = checkRoster(members, s.maxMembers)
+        if (problem) return problem
+        const limits = withOverrides(s.limits, l.limits)
+        // RunnerOwner deliberately grants no mutable root-session access. Ask in mode policy.
+        const auto = !l.owner && s.enabled === "mode" && api.session?.()?.info().permissions?.mode === "auto"
+        if (s.enabled === "ask" || (s.enabled === "mode" && !auto)) {
+          const roster = members
+            .map((m) => `  ${m.name} (${m.role}): ${clip(oneLine(m.brief), 100)}`)
+            .join("\n")
+          // The swarm's own budget, else the session's: what stops it spending more.
+          const cap = limits.budget ?? api.settings.budget
+          const budget = [
+            cap?.tokens !== undefined ? `${cap.tokens.toLocaleString("en-US")} tokens` : "",
+            cap?.costUsd !== undefined ? `$${cap.costUsd}` : "",
+          ].filter(Boolean)
+          let cancel!: () => void
+          const cancelled = new Promise<undefined>((done) => {
+            cancel = () => done(undefined)
+            signal.addEventListener("abort", cancel, { once: true })
+            if (signal.aborted) cancel()
+          })
+          const ok = await Promise.race([
+            l.ui.confirm(
+              `Start a swarm of ${members.length} agents?`,
+              [
+                l.initiator === "user" ? "You asked for this swarm." : "The model proposes this swarm.",
+                `Goal: ${goal}`,
+                "",
+                roster,
+                "",
+                `Agents: ${members.length}${limits.maxConcurrent ? `, ${limits.maxConcurrent} at a time` : ", all at once"}; each works up to ${limits.maxTurnsPerMember} turns and sends up to ${limits.maxMessagesPerMember} messages (${limits.maxMessages} in all).`,
+                `Cost: ${budget.length ? `stops at ${budget.join(" or ")}` : "no cost cap"}.`,
+                "Files: the members work in your working tree and can change your files.",
+              ].join("\n"),
+              { signal, sessionId: owner },
+            ),
+            cancelled,
+          ]).finally(() => signal.removeEventListener("abort", cancel))
+          if (signal.aborted) return "The swarm start was cancelled."
+          if (ok !== true) {
+            if (!l.owner) declined.add(goalKey(goal))
+            // The user's ask is used up: asking again is what lets this goal be proposed again.
+            explicit = false
+            requested = false
+            // The user said no to the model's proposal: tell them how to start it after all.
+            if (l.initiator === "model") {
+              api.notify(
+                `Swarm not started; it will not be proposed again for this goal in this session. To start it yourself, run /swarm ${clip(goal, 200)}.`,
               )
+            }
+            if (ok === false)
+              return "The user declined the swarm, so it did not start. Do not propose a swarm for this goal again in this session unless the user asks for one; carry on without it (e.g. with the agent tool), or ask the user how they want to proceed."
+            // After /swarm <goal> the user already did the first; only the setting is left to suggest.
+            const how =
+              l.initiator === "user"
+                ? `The user can set extensions.swarm.enabled to "always" in settings.json to start swarms without confirming.`
+                : `To start it themselves, the user can run /swarm ${clip(goal, 200)} in the interactive UI, or set extensions.swarm.enabled to "always" in settings.json to start swarms without confirming.`
+            return `Nobody confirmed the swarm, so it did not start: the confirmation was dismissed, or nobody can answer it here (print mode, or an rpc client that does not answer dialogs). Do not propose it again in this session unless the user asks. ${how}`
+          }
+        }
+        if (signal.aborted) return "The swarm start was cancelled."
+        let group: SpawnGroup
+        try {
+          group = l.createGroup({
+            name: `swarm: ${clip(goal, 40)}`,
+            ...(limits.maxConcurrent ? { maxConcurrent: limits.maxConcurrent } : {}),
+            ...(limits.budget ? { budget: limits.budget } : {}),
+            maxTurnsPerAgent: limits.maxTurnsPerMember,
+            maxAgents: members.length * 4,
+          })
+        } catch (err) {
+          return `The swarm could not start: ${err instanceof Error ? err.message : String(err)}`
+        }
+        if (signal.aborted) {
+          group.end("the swarm start was cancelled")
+          await group.ended()
+          return "The swarm start was cancelled."
+        }
+        const id = `sw${Date.now().toString(36).slice(-5)}${++seq}`
+        let final: PendingNotice | undefined
+        const data = l.data
+        let entry: Live | undefined
+        let swarm: Swarm
+        try {
+          final = l.expectNotice?.()
+          const service = s.memberWorkflows.enabled ? api.useService?.("workflow.runner") : undefined
+          const runner = isWorkflowRunner(service) ? service : undefined
+          swarm = new Swarm({
+            id,
+            goal,
+            members,
+            limits,
+            group,
+            ...(runner || l.owner
+              ? {
+                  workflows: {
+                    runner,
+                    limits: s.memberWorkflows,
+                    ...(l.owner
+                      ? {
+                          bound: {
+                            cwd: l.cwd!,
+                            owner: { ...l.owner, signal },
+                            current: () => api.useService?.("workflow.runner"),
+                          },
+                        }
+                      : {}),
+                  },
+                }
+              : {}),
+            spawn: {
+              excludeTools: MEMBER_EXCLUDED,
+              context: "fresh",
+              ...(l.cwd ? { cwd: l.cwd, isolation: "none" as const } : {}),
+              ...(l.toolCallId ? { toolCallId: l.toolCallId } : {}),
             },
-            askStuck: async (question, signal) => {
-              const answer = await api.ui.select(question, ["Keep going", "Stop the swarm"], { signal })
-              return answer === "Keep going" ? "continue" : answer === undefined ? undefined : "stop"
+            hooks: {
+              changed: () => {
+                changed()
+                runnerChanged(id)
+              },
+              record: (rec) => {
+                data?.append(DATA_KEY, rec)
+                if (owner === (root ?? "") && !entry?.orphaned) historical = pastSwarms(data)
+              },
+              ownUsage: (id) => {
+                const session = api.session?.()
+                if (session?.info().id !== owner) return undefined
+                return session.subagents?.().find((child) => child.id === id)?.usage
+              },
+              toCommander: (from, text) => {
+                if (entry?.orphaned) return
+                l.expectNotice?.()?.deliver(
+                  notice(
+                    `[swarm ${id} · message from ${from}] ${text}\n\n(If it needs an answer, give it with the swarm tool: action "message", to "${from}". Otherwise just end your turn.)`,
+                    `✉️ swarm · ${from}: ${clip(oneLine(text), 160)}`,
+                  ),
+                )
+              },
+              askStuck: async (question, signal) => {
+                const answer = await l.ui.select(question, ["Keep going", "Stop the swarm"], {
+                  signal: AbortSignal.any([signal, l.signal!]),
+                  sessionId: owner,
+                })
+                return answer === "Keep going" ? "continue" : answer === undefined ? undefined : "stop"
+              },
             },
-          },
+          })
+        } catch (err) {
+          group.end("the swarm could not start")
+          await group.ended()
+          final?.cancel()
+          return `The swarm could not start: ${err instanceof Error ? err.message : String(err)}`
+        }
+        requested = false
+        const started: Live = { swarm, owner, bound: !!l.owner, ...(final ? { final } : {}) }
+        entry = started
+        swarms.set(id, started)
+        const abort = () =>
+          void swarm.stop(
+            lifetime.signal.aborted
+              ? "swarm extension unloaded"
+              : !l.owner && typeof signal.reason === "string"
+                ? signal.reason
+                : "its owner cancelled",
+          )
+        signal.addEventListener("abort", abort, { once: true })
+        if (signal.aborted) abort()
+        if (auto) api.notify(`Swarm ${id} started without asking: permission mode is auto.`)
+        void swarm.done.then((report) => {
+          started.settled = true
+          signal.removeEventListener("abort", abort)
+          changed()
+          runnerChanged(id)
+          if (started.orphaned) return
+          final?.deliver(notice(reportText(report), `◆ swarm ${id} ended: ${clip(report.reason, 80)}`))
         })
-      } catch (err) {
-        group.end("the swarm could not start")
-        final?.cancel()
-        return `The swarm could not start: ${err instanceof Error ? err.message : String(err)}`
-      }
-      requested = false
-      const started: Live = { swarm, owner, ...(final ? { final } : {}) }
-      entry = started
-      swarms.set(id, started)
-      if (auto) api.notify(`Swarm ${id} started without asking: permission mode is auto.`)
-      void swarm.done.then((report) => {
         changed()
-        if (started.orphaned) return
-        final?.deliver(notice(reportText(report), `◆ swarm ${id} ended: ${clip(report.reason, 80)}`))
-      })
-      changed()
-      return swarm
+        return swarm
+      } catch (error) {
+        return `The swarm could not start: ${error instanceof Error ? error.message : String(error)}`
+      } finally {
+        starting = false
+      }
     }
+
+    const service = createSwarmRunner(
+      async (request, owner) => {
+        if (!request || typeof request.cwd !== "string" || !isAbsolute(request.cwd))
+          return "An absolute cwd is required for a bound swarm."
+        if (!owner?.sessionId || !owner.label || !owner.signal || typeof owner.createGroup !== "function")
+          return "A bound swarm requires an owner session, label, signal and createGroup."
+        if (!request.startedBy?.sessionId || !request.startedBy.label)
+          return "A bound swarm requires startedBy sessionId and label."
+        return launch({
+          ...request,
+          cwd: resolve(request.cwd),
+          owner,
+          createGroup: (options) => owner.createGroup(options),
+          ui: api.ui,
+          initiator: "user",
+        })
+      },
+      (message) => api.reportError(message),
+    )
+    runnerChanged = service.changed
+    api.provideService?.("swarm.runner", service.runner)
+    api.onUnload?.(() => {
+      lifetime.abort()
+      for (const entry of swarms.values()) {
+        entry.orphaned = true
+        entry.final?.cancel()
+        if (entry.swarm.live) void entry.swarm.stop("swarm extension unloaded")
+      }
+    })
 
     const statusText = (s: SwarmSnapshot, tail = 20): string => {
       const lines = [
@@ -347,6 +475,7 @@ export function createSwarmExtension(): Extension {
             return textResult("A swarm can only be started from the main session.", true)
           }
           const r = await launch({
+            sessionId: session.sessionId,
             goal: p.goal ?? "",
             members: p.members ?? [],
             ...(p.limits ? { limits: p.limits } : {}),
@@ -597,11 +726,13 @@ export function createSwarmExtension(): Extension {
     }
     api.on("session.start", (e) => {
       if (e.parentSessionId !== undefined) return
+      rootLifetime.abort("its session was closed")
+      rootLifetime = new AbortController()
       root = e.sessionId
       const session = api.session?.()
       historical = pastSwarms(session?.info().id === root ? session.data : undefined)
       // Switch the cached session before orphaning: stopping can synchronously notify views.
-      for (const l of swarms.values()) if (l.owner !== root) orphan(l, "its session was closed")
+      for (const l of swarms.values()) if (!l.bound && l.owner !== root) orphan(l, "its session was closed")
       changed()
       explicit = false
       requested = false
@@ -610,7 +741,8 @@ export function createSwarmExtension(): Extension {
     api.on("session.end", (e) => {
       if (e.parentSessionId !== undefined) return
       historical = []
-      for (const l of swarms.values()) orphan(l, "the session ended")
+      if (e.sessionId === root) rootLifetime.abort("the session ended")
+      for (const l of swarms.values()) if (!l.bound && l.owner === e.sessionId) orphan(l, "the session ended")
       changed()
     })
     api.on("turn.end", (e) => {

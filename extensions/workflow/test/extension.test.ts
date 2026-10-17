@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test"
+import { afterEach, expect, spyOn, test } from "bun:test"
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
@@ -17,7 +17,10 @@ import type {
 } from "@amira/api"
 import type { DashboardSource } from "../src/dashboard.ts"
 import { asksForWorkflow, createWorkflowExtension, readSettings } from "../src/index.ts"
-import { readRun } from "../src/journal.ts"
+import { listRuns, readJournal, readRun } from "../src/journal.ts"
+import type { ScriptWorker } from "../src/run.ts"
+import type { RunnerResult as BoundResult, RunnerOwner, RunSnapshot, WorkflowRunner } from "../src/runner.ts"
+import type { RunGit } from "../src/worktree.ts"
 import { type Answer, type FakeGroup, fakeGroup } from "./fakes.ts"
 
 const dirs: string[] = []
@@ -73,6 +76,8 @@ function setup(
     answer?: (o: { prompt: string }) => Answer | Promise<Answer>
     /** false: the session has no file yet (runs go to ~/.amira/workflow-runs). */
     sessionFile?: false
+    git?: RunGit
+    worker?: () => ScriptWorker
   } = {},
 ) {
   const root = mkdtempSync(path.join(tmpdir(), "wf-ext-"))
@@ -85,7 +90,7 @@ function setup(
   let command!: CommandDefinition
   let view!: ViewDefinition
   const handlers = new Map<string, Handler[]>()
-  const confirms: { title: string; message: string | undefined }[] = []
+  const confirms: { title: string; message: string | undefined; sessionId?: string }[] = []
   const errors: string[] = []
   /** What the extension told the user (api.notify). */
   const told: string[] = []
@@ -145,8 +150,12 @@ function setup(
     notify: (t: string) => told.push(t),
     runCommand: async () => ({ output: "", exitCode: 1 }),
     ui: {
-      confirm: async (title: string, message?: string, options?: { signal?: AbortSignal }) => {
-        confirms.push({ title, message })
+      confirm: async (
+        title: string,
+        message?: string,
+        options?: { signal?: AbortSignal; sessionId?: string },
+      ) => {
+        confirms.push({ title, message, ...(options?.sessionId ? { sessionId: options.sessionId } : {}) })
         return opts.confirmDialog ? opts.confirmDialog(options?.signal) : confirmAnswer
       },
     },
@@ -156,7 +165,7 @@ function setup(
     },
     intercept: () => () => {},
   } as unknown as ExtensionAPI
-  createWorkflowExtension()(api)
+  createWorkflowExtension({ git: opts.git, worker: opts.worker })(api)
   const emit = (type: string, e: { sessionId?: string; parentSessionId?: string; data: unknown }) => {
     for (const h of handlers.get(type) ?? []) h({ sessionId: "s_root", ...e })
   }
@@ -215,7 +224,7 @@ function setup(
   return {
     cwd,
     home,
-    runner: services.get("workflow.runner") as Runner,
+    runner: services.get("workflow.runner") as WorkflowRunner,
     async dispose() {
       for (const exit of exits) await exit()
     },
@@ -275,7 +284,9 @@ const startedBy = { sessionId: "s_child", label: "researcher" }
 
 test("runner auto start shares limits, journal, progress and dashboard attribution; results replay", async () => {
   const t = setup({ permissionMode: "auto", settings: { maxAgents: 7, maxConcurrent: 2 } })
-  const start = await t.runner.start({ script: SCRIPT, args: { topic: "api" }, startedBy }, t.memberContext())
+  // Existing consumers can keep their old structural contract unchanged.
+  const legacy: Runner = t.runner
+  const start = await legacy.start({ script: SCRIPT, args: { topic: "api" }, startedBy }, t.memberContext())
   if ("error" in start) throw new Error(start.error)
   expect(t.confirms).toHaveLength(0)
   expect(t.groups[0]!.options).toMatchObject({ maxAgents: 7, maxConcurrent: 2 })
@@ -298,6 +309,8 @@ test("runner auto start shares limits, journal, progress and dashboard attributi
   // Workflow children cannot inherit orchestration or the member's private tools.
   for (const spawned of t.groups[0]!.spawned) {
     expect(spawned.extraTools).toBeUndefined()
+    expect(spawned.cwd).toBe(t.cwd)
+    expect(spawned.context).toBe("fresh")
     for (const name of [
       "swarm",
       "workflow",
@@ -1155,4 +1168,518 @@ test("settings are checked: bad fields are reported once and left at their defau
   expect(readSettings(undefined)).toEqual({})
   expect(readSettings({ enabled: "mode" })).toEqual({ enabled: "mode" })
   expect(readSettings({ enabled: "explicit" })).toEqual({ enabled: "ask" })
+})
+
+function boundOwner(answer: (o: { prompt: string }) => Answer | Promise<Answer> = () => ({ text: "done" })) {
+  const abort = new AbortController()
+  const groups: FakeGroup[] = []
+  const owner: RunnerOwner = {
+    sessionId: "s_owned",
+    label: "iteration",
+    signal: abort.signal,
+    createGroup(options) {
+      const group = fakeGroup(options, answer)
+      groups.push(group)
+      return group
+    },
+  }
+  return { owner, abort, groups }
+}
+
+const BOUND_SCRIPT = `export const meta = { name: "bound", description: "Bound test", phases: ["Build"] }
+phase("Build")
+return await agent("implement", { model: "requested/implementer" })`
+
+function resultOf(runner: WorkflowRunner, runId: string): Promise<BoundResult> {
+  return new Promise((resolve) => runner.onResult(runId, resolve))
+}
+
+test("bound runs resolve saved/nested source and roles at cwd, force fresh isolation none, and record effective execution", async () => {
+  let gitCalls = 0
+  const t = setup({
+    settings: { enabled: "always", maxAgents: 8, maxConcurrent: 2 },
+    git: async () => {
+      gitCalls++
+      throw new Error("bound agents must not create worktrees")
+    },
+  })
+  expect(t.runner.capabilities).toEqual({
+    cwd: true,
+    freshRun: true,
+    models: true,
+    ownedLifetime: true,
+    progress: true,
+  })
+  const cwd = path.join(t.cwd, "iteration")
+  for (const dir of [t.cwd, cwd]) {
+    mkdirSync(path.join(dir, ".amira", "agents"), { recursive: true })
+    mkdirSync(path.join(dir, ".amira", "workflows"), { recursive: true })
+    writeFileSync(
+      path.join(dir, ".amira", "agents", "builder.md"),
+      `---\nmodel: requested/${dir === cwd ? "iteration" : "main"}\nisolation: worktree\n---\n${dir === cwd ? "Iteration role" : "Wrong main role"}`,
+    )
+    writeFileSync(
+      path.join(dir, ".amira", "workflows", "nested.ts"),
+      `export const meta = { name: "nested", description: "Nested", phases: ["Nested"] }; phase("Nested"); return await agent("${dir === cwd ? "nested work" : "wrong source"}", { role: "builder", isolation: "worktree" })`,
+    )
+    writeFileSync(
+      path.join(dir, ".amira", "workflows", "parent.ts"),
+      `export const meta = { name: "parent", description: "Parent", phases: ["Build"] }; phase("Build"); await agent("${dir === cwd ? "root work" : "wrong source"}", { role: "builder" }); await agent("override", { role: "builder", model: "requested/override", isolation: "worktree" }); return await workflow("nested", {})`,
+    )
+  }
+  const b = boundOwner()
+  const ids: string[] = []
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const started = await t.runner.startBound({ name: "parent", cwd, startedBy }, b.owner)
+    if ("error" in started) throw new Error(started.error)
+    ids.push(started.runId)
+    const snapshots: RunSnapshot[] = []
+    t.runner.onProgress(started.runId, (s) => snapshots.push(s))
+    const result = await resultOf(t.runner, started.runId)
+    expect(result).toMatchObject({
+      status: "done",
+      cwd,
+      ownerSessionId: b.owner.sessionId,
+      groupId: "g1",
+      sessionIds: ["s_child1", "s_child2", "s_child3"],
+      models: ["x/y"],
+      startedBy,
+    })
+    expect(b.groups[attempt]!.spawned.map((o) => [o.prompt, o.model, o.cwd, o.context])).toEqual([
+      ["root work", "requested/iteration", cwd, "fresh"],
+      ["override", "requested/override", cwd, "fresh"],
+      ["nested work", "requested/iteration", cwd, "fresh"],
+    ])
+    for (const spawn of b.groups[attempt]!.spawned) {
+      expect(spawn.systemPrompt).toContain("Iteration role")
+      expect(spawn.systemPrompt).not.toContain("Wrong main role")
+      expect(spawn.systemPrompt).not.toContain("your own git worktree")
+      expect("isolation" in spawn).toBe(false) // Host SpawnOptions has no isolation field.
+    }
+    expect(snapshots.at(-1)).toMatchObject({
+      settled: true,
+      phase: "Build",
+      children: [
+        { sessionId: "s_child1", model: "x/y", state: "done" },
+        { sessionId: "s_child2", model: "x/y", state: "done" },
+        { sessionId: "s_child3", model: "x/y", phase: "Nested", nest: expect.any(String), state: "done" },
+      ],
+    })
+    const stored = readRun(path.join(t.home, "sessions", "workflows", started.runId))!
+    expect(stored.record).toMatchObject({
+      cwd,
+      ownerSessionId: b.owner.sessionId,
+      sessionIds: result.sessionIds,
+      models: ["x/y"],
+    })
+    expect(readJournal(path.join(t.home, "sessions", "workflows", started.runId))).toHaveLength(3)
+    expect(t.text(await t.call({ resume: started.runId }))).toContain("start a fresh bound run")
+  }
+  expect(ids[0]).not.toBe(ids[1])
+  expect(gitCalls).toBe(0)
+  expect(t.groups).toHaveLength(0)
+  expect(t.notices).toHaveLength(0)
+  expect(t.expected).toBe(0)
+})
+
+test("bound lifetime survives main root replacement/end but owner abort drains children and replays progress", async () => {
+  const t = setup({ settings: { enabled: "always" } })
+  const b = boundOwner(() => new Promise(() => {}))
+  const start = await t.runner.startBound({ script: BOUND_SCRIPT, cwd: t.cwd, startedBy }, b.owner)
+  if ("error" in start) throw new Error(start.error)
+  await until(() => b.groups[0]!.spawned.length === 1)
+  t.emit("session.start", { sessionId: "s_new_main", data: { reason: "clear" } })
+  t.emit("session.end", { sessionId: "s_new_main", data: {} })
+  expect(t.runner.status(start.runId)?.status).toBe("running")
+  const snapshots: RunSnapshot[] = []
+  t.runner.onProgress(start.runId, (s) => snapshots.push(s))
+  await Promise.resolve()
+  expect(snapshots[0]).toMatchObject({
+    phase: "Build",
+    children: [{ sessionId: "s_child1", model: "x/y", state: "working" }],
+  })
+  b.abort.abort()
+  const result = await resultOf(t.runner, start.runId)
+  expect(result).toMatchObject({
+    status: "stopped",
+    cwd: t.cwd,
+    ownerSessionId: "s_owned",
+    sessionIds: ["s_child1"],
+    error: "the workflow owner was aborted",
+  })
+  expect(snapshots.at(-1)).toMatchObject({
+    settled: true,
+    status: "stopped",
+    children: [{ state: "stopped", error: expect.any(String) }],
+  })
+  expect(b.groups[0]!.endReason).toBeDefined()
+  expect(t.notices).toEqual([])
+})
+
+test("bound confirmation targets the owner session and owner cancellation prevents group creation", async () => {
+  for (const cancel of [false, true]) {
+    let respond!: (answer: boolean) => void
+    const t = setup({
+      settings: { enabled: "ask" },
+      confirmDialog: (signal) =>
+        new Promise((resolve) => {
+          respond = resolve
+          signal?.addEventListener("abort", () => resolve(undefined), { once: true })
+        }),
+    })
+    const b = boundOwner()
+    const pending = t.runner.startBound({ script: BOUND_SCRIPT, cwd: t.cwd, startedBy }, b.owner)
+    await until(() => t.confirms.length === 1)
+    expect(t.confirms[0]).toMatchObject({ sessionId: b.owner.sessionId })
+    expect(b.groups).toHaveLength(0)
+    if (cancel) b.abort.abort()
+    else respond(true)
+    const start = await pending
+    if (cancel) {
+      expect(start).toEqual({ error: "The workflow start was cancelled." })
+      expect(b.groups).toHaveLength(0)
+    } else {
+      if ("error" in start) throw new Error(start.error)
+      expect((await resultOf(t.runner, start.runId)).status).toBe("done")
+    }
+  }
+})
+
+test("bound declines are scoped to the owner and do not suppress another owner or legacy start", async () => {
+  const t = setup({ settings: { enabled: "ask" }, confirm: false })
+  const a = boundOwner()
+  const request = { script: BOUND_SCRIPT, cwd: t.cwd, startedBy }
+  expect(await t.runner.startBound(request, a.owner)).toHaveProperty("error")
+  t.answerConfirm(true)
+  expect(JSON.stringify(await t.runner.startBound(request, a.owner))).toContain("already declined")
+  const b = boundOwner()
+  b.owner.sessionId = "s_other_owner"
+  const start = await t.runner.startBound(request, b.owner)
+  if ("error" in start) throw new Error(start.error)
+  expect((await resultOf(t.runner, start.runId)).status).toBe("done")
+  const legacy = await t.runner.start(request, t.memberContext())
+  if ("error" in legacy) throw new Error(legacy.error)
+  await resultOf(t.runner, legacy.runId)
+  expect(t.confirms).toHaveLength(3)
+})
+
+test("immediate bound completion replays detached snapshots/results; unsubscribe cancels queued callbacks", async () => {
+  const t = setup({
+    settings: { enabled: "always" },
+    worker: () => {
+      const worker: ScriptWorker = {
+        onmessage: null,
+        onerror: null,
+        terminate() {},
+        postMessage(m) {
+          if (m.t === "run") worker.onmessage?.({ data: { t: "done", value: { ok: [1] } } })
+        },
+      }
+      return worker
+    },
+  })
+  const b = boundOwner()
+  const start = await t.runner.startBound({ script: BOUND_SCRIPT, cwd: t.cwd, startedBy }, b.owner)
+  if ("error" in start) throw new Error(start.error)
+  let called = 0
+  const snapshots: RunSnapshot[] = []
+  t.runner.onProgress(start.runId, (s) => snapshots.push(s))
+  const unsubProgress = t.runner.onProgress(start.runId, () => called++)
+  const unsubResult = t.runner.onResult(start.runId, () => called++)
+  unsubProgress()
+  unsubResult()
+  expect(snapshots).toEqual([])
+  await Promise.resolve()
+  expect(called).toBe(0)
+  expect(snapshots[0]).toMatchObject({
+    settled: true,
+    status: "done",
+    cwd: t.cwd,
+    children: [],
+    result: { ok: [1] },
+  })
+  snapshots[0]!.models!.push("tampered/model")
+  ;(snapshots[0]!.result as { ok: number[] }).ok.push(2)
+  snapshots[0]!.startedBy!.label = "tampered"
+  expect(await resultOf(t.runner, start.runId)).toMatchObject({ models: [], result: { ok: [1] }, startedBy })
+  t.runner.onProgress(start.runId, () => {
+    throw new Error("bad progress subscriber")
+  })
+  t.runner.onResult(start.runId, () => {
+    throw new Error("bad result subscriber")
+  })
+  await Promise.resolve()
+  expect(t.errors).toHaveLength(2)
+  expect(t.runner.onProgress("missing", () => called++)()).toBeUndefined()
+  expect(t.runner.onResult("missing", () => called++)()).toBeUndefined()
+  b.abort.abort() // A completed run no longer listens to its owner.
+  expect(t.runner.status(start.runId)?.status).toBe("done")
+})
+
+test("bound progress reports effective models, nested child errors and failed run state", async () => {
+  const t = setup({ settings: { enabled: "always" } })
+  const b = boundOwner(() => ({ error: "mock model failed" }))
+  const start = await t.runner.startBound({ script: BOUND_SCRIPT, cwd: t.cwd, startedBy }, b.owner)
+  if ("error" in start) throw new Error(start.error)
+  const snapshots: RunSnapshot[] = []
+  t.runner.onProgress(start.runId, (s) => snapshots.push(s))
+  const result = await resultOf(t.runner, start.runId)
+  expect(result).toMatchObject({ status: "error", models: ["x/y"], sessionIds: ["s_child1"] })
+  expect(result.error).toContain("mock model failed")
+  expect(snapshots.at(-1)).toMatchObject({
+    settled: true,
+    phase: "Build",
+    children: [
+      {
+        childId: "s_child1",
+        sessionId: "s_child1",
+        status: "error",
+        state: "failed",
+        model: "x/y",
+        error: "mock model failed",
+      },
+    ],
+  })
+})
+
+test("bound stop and extension unload settle active runs and reject retained service starts", async () => {
+  for (const unload of [false, true]) {
+    const t = setup({ settings: { enabled: "always" } })
+    const b = boundOwner(() => new Promise(() => {}))
+    const request = { script: BOUND_SCRIPT, cwd: t.cwd, startedBy }
+    const start = await t.runner.startBound(request, b.owner)
+    if ("error" in start) throw new Error(start.error)
+    await until(() => b.groups[0]!.spawned.length === 1)
+    if (unload) await t.dispose()
+    else expect(t.runner.stop(start.runId)).toBe(true)
+    expect((await resultOf(t.runner, start.runId)).status).toBe("stopped")
+    expect(t.runner.stop(start.runId)).toBe(false)
+    if (unload)
+      expect(await t.runner.startBound(request, b.owner)).toEqual({
+        error: "The workflow start was cancelled.",
+      })
+  }
+})
+
+test("unload cancels owner-targeted bound confirmation", async () => {
+  const t = setup({
+    settings: { enabled: "ask" },
+    confirmDialog: (signal) =>
+      new Promise((resolve) => {
+        signal?.addEventListener("abort", () => resolve(undefined), { once: true })
+      }),
+  })
+  const b = boundOwner()
+  const pending = t.runner.startBound({ script: BOUND_SCRIPT, cwd: t.cwd, startedBy }, b.owner)
+  await until(() => t.confirms.length === 1)
+  await t.dispose()
+  expect(await pending).toEqual({ error: "The workflow start was cancelled." })
+  expect(b.groups).toHaveLength(0)
+})
+
+test("bound start validates owner, cwd, source, attribution, settings and group errors before executing", async () => {
+  const t = setup({ settings: { enabled: "always" } })
+  const b = boundOwner()
+  const request = { script: BOUND_SCRIPT, cwd: t.cwd, startedBy }
+  expect(await t.runner.startBound({ ...request, cwd: "relative" }, b.owner)).toHaveProperty("error")
+  expect(await t.runner.startBound(request, { ...b.owner, sessionId: "" })).toHaveProperty("error")
+  expect(await t.runner.startBound(request, { ...b.owner, createGroup: undefined! })).toHaveProperty("error")
+  expect(
+    await t.runner.startBound({ ...request, startedBy: { sessionId: "", label: "" } }, b.owner),
+  ).toHaveProperty("error")
+  expect(await t.runner.startBound({ ...request, script: "return 1" }, b.owner)).toHaveProperty("error")
+  expect(await t.runner.startBound({ cwd: t.cwd, name: "missing", startedBy }, b.owner)).toHaveProperty(
+    "error",
+  )
+  expect(
+    await t.runner.startBound(request, {
+      ...b.owner,
+      createGroup() {
+        throw new Error("owner group denied")
+      },
+    }),
+  ).toEqual({ error: "The workflow could not start: owner group denied" })
+  b.abort.abort()
+  expect(await t.runner.startBound(request, b.owner)).toEqual({ error: "The workflow start was cancelled." })
+  expect(b.groups).toHaveLength(0)
+  const disabled = setup({ settings: { enabled: "never" } })
+  expect(
+    JSON.stringify(await disabled.runner.startBound({ ...request, cwd: disabled.cwd }, boundOwner().owner)),
+  ).toContain("turned off")
+})
+
+test("result subscription waits for pending calls and worktree finalization before final progress and replay", async () => {
+  let worker!: ScriptWorker
+  let finish!: () => void
+  let finalizing = false
+  const finishing = new Promise<void>((resolve) => {
+    finish = resolve
+  })
+  const t = setup({
+    settings: { enabled: "always" },
+    answer: () => new Promise(() => {}),
+    worker: () => {
+      worker = {
+        onmessage: null,
+        onerror: null,
+        terminate() {},
+        postMessage(m) {
+          if (m.t === "run")
+            worker.onmessage?.({
+              data: { t: "agent", id: 1, seen: 0, prompt: "work", opts: { isolation: "worktree" } },
+            })
+        },
+      }
+      return worker
+    },
+    git: async (args, cwd) => {
+      if (args.includes("--show-toplevel")) return { output: cwd, ok: true }
+      if (args[0] === "add") {
+        finalizing = true
+        await finishing
+      }
+      return { output: args.includes("HEAD") ? "abc123" : "", ok: true }
+    },
+  })
+  const start = await t.runner.start({ script: BOUND_SCRIPT, startedBy }, t.memberContext())
+  if ("error" in start) throw new Error(start.error)
+  await until(() => t.groups[0]!.spawned.length === 1)
+  const snapshots: RunSnapshot[] = []
+  const results: BoundResult[] = []
+  t.runner.onProgress(start.runId, (s) => snapshots.push(s))
+  t.runner.onResult(start.runId, (r) => results.push(r))
+  worker.onmessage?.({ data: { t: "done", value: "early terminal" } })
+  await until(() => finalizing)
+  expect(t.runner.status(start.runId)?.status).toBe("done")
+  expect(results).toEqual([])
+  expect(snapshots.at(-1)!.settled).toBe(false)
+  finish()
+  await until(() => results.length === 1)
+  expect(snapshots.at(-1)).toMatchObject({
+    settled: true,
+    status: "done",
+    children: [{ status: "aborted", sessionId: "s_child1" }],
+  })
+  const dir = path.join(t.home, "sessions", "workflows", start.runId)
+  expect(readJournal(dir)).toHaveLength(1)
+  expect(readRun(dir)!.record).toMatchObject({ status: "done", cwd: t.cwd, sessionIds: ["s_child1"] })
+  expect(await resultOf(t.runner, start.runId)).toEqual(results[0]!)
+})
+
+test("legacy start preserves caller cwd inheritance while ignoring an unknown request cwd", async () => {
+  const t = setup({ settings: { enabled: "always" } })
+  const callerCwd = path.join(t.cwd, "legacy-caller")
+  const saved = path.join(t.cwd, ".amira", "workflows")
+  mkdirSync(callerCwd, { recursive: true })
+  mkdirSync(saved, { recursive: true })
+  writeFileSync(path.join(saved, "legacy.ts"), BOUND_SCRIPT)
+  const request = { name: "legacy", startedBy, cwd: path.join(t.cwd, "ignored") }
+  const start = await t.runner.start(request, { ...t.memberContext(), cwd: callerCwd })
+  if ("error" in start) throw new Error(start.error)
+  expect((await resultOf(t.runner, start.runId)).status).toBe("done")
+  expect(t.groups[0]!.spawned[0]!.cwd).toBe(callerCwd)
+  expect(t.groups[0]!.spawned[0]!.prompt).toBe("implement")
+})
+
+for (const bound of [false, true]) {
+  for (const failure of ["construction", "handlers", "dispatch"] as const) {
+    test(`${bound ? "bound" : "legacy"} startup ${failure} exception drains and settles without leaked listeners`, async () => {
+      let terminated = 0
+      const t = setup({
+        settings: { enabled: "always" },
+        worker: () => {
+          if (failure === "construction") throw new Error("worker construction failed")
+          const worker: ScriptWorker = {
+            onmessage: null,
+            onerror: null,
+            postMessage() {
+              if (failure === "dispatch") throw new Error("worker dispatch failed")
+            },
+            terminate() {
+              terminated++
+            },
+          }
+          if (failure === "handlers")
+            Object.defineProperty(worker, "onmessage", {
+              set() {
+                throw new Error("worker handlers failed")
+              },
+            })
+          return worker
+        },
+      })
+      const owner = boundOwner().owner
+      const groups: FakeGroup[] = []
+      let release!: () => void
+      const drain = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      const createGroup = (options: SpawnGroupOptions) => {
+        const group = fakeGroup(options, () => ({ text: "unexpected" }))
+        const ended = group.ended.bind(group)
+        group.ended = async () => {
+          const info = await ended()
+          await drain
+          return info
+        }
+        groups.push(group)
+        return group
+      }
+      const added = spyOn(AbortSignal.prototype, "addEventListener")
+      const removed = spyOn(AbortSignal.prototype, "removeEventListener")
+      const request = { script: BOUND_SCRIPT, startedBy }
+      const ctx = t.memberContext()
+      ctx.session!.createGroup = createGroup
+      const pending = bound
+        ? t.runner.startBound({ ...request, cwd: t.cwd }, { ...owner, createGroup })
+        : t.runner.start(request, ctx)
+      let returned = false
+      void pending.then(() => {
+        returned = true
+      })
+      try {
+        await Bun.sleep(1)
+        expect(groups).toHaveLength(1)
+        expect(groups[0]!.endReason).toBeDefined()
+        expect(returned).toBe(false)
+        release()
+        expect(await pending).toEqual({ error: `worker ${failure} failed` })
+        const records = listRuns(path.join(t.home, "sessions", "workflows"))
+        expect(records).toHaveLength(1)
+        expect(records[0]!.status).not.toBe("running")
+        expect(t.runner.status(records[0]!.id)?.status).not.toBe("running")
+        expect((await resultOf(t.runner, records[0]!.id)).status).not.toBe("running")
+        expect(terminated).toBe(failure === "construction" ? 0 : 1)
+        const aborts = added.mock.calls.filter(([type]) => type === "abort")
+        if (bound) expect(aborts.length).toBeGreaterThan(0)
+        for (const [, listener] of aborts)
+          expect(removed.mock.calls.some(([type, removed]) => type === "abort" && removed === listener)).toBe(
+            true,
+          )
+        expect(t.notices).toEqual([])
+        expect(t.expected).toBe(0)
+      } finally {
+        release()
+        added.mockRestore()
+        removed.mockRestore()
+      }
+    })
+  }
+}
+
+test("tool startup failure cancels its notice reservation without delivering a completion", async () => {
+  const t = setup({
+    settings: { enabled: "always" },
+    worker: () => {
+      throw new Error("worker construction failed")
+    },
+  })
+  const result = await t.call({ script: BOUND_SCRIPT })
+  expect(result.isError).toBe(true)
+  expect(t.text(result)).toContain("worker construction failed")
+  expect(t.groups[0]!.endReason).toBeDefined()
+  expect(t.expected).toBe(1)
+  expect(t.cancelled).toBe(1)
+  expect(t.notices).toEqual([])
+  expect(listRuns(path.join(t.home, "sessions", "workflows"))).toMatchObject([{ status: "error" }])
 })
