@@ -3,7 +3,7 @@ import { observeAgentEvent } from "./activity.ts"
 import { compileScript } from "./compile.ts"
 import { callHash, Journal, type JournalEntry, type RunRecord, type RunStatus, writeRun } from "./journal.ts"
 import type { WorkflowMeta } from "./meta.ts"
-import { type AgentNode, type FlowNode, newFlow, phaseOf, totals } from "./progress.ts"
+import { type AgentNode, agentsOf, type FlowNode, newFlow, phaseOf, totals } from "./progress.ts"
 import type { AgentOpts, HostMessage, WorkerMessage } from "./protocol.ts"
 import type { Role } from "./roles.ts"
 import { createWorktree, finishWorktree, type RunGit } from "./worktree.ts"
@@ -29,8 +29,13 @@ export interface RunOptions {
   origin: string
   args: unknown
   startedBy?: { sessionId: string; label: string }
+  ownerSessionId?: string
+  /** Bound callers provide iteration isolation; never create per-agent auto-merge worktrees. */
+  isolation?: "none"
   group: SpawnGroup
   cwd: string
+  /** Preserve the legacy caller group's cwd without retargeting source/role/worktree lookup. */
+  childCwd?: string
   home: string
   /** Journaled results of an earlier attempt of this run. */
   previous?: JournalEntry[]
@@ -140,6 +145,13 @@ export class WorkflowRun {
       args: this.#opts.args,
       source: this.#opts.origin,
       status: this.status,
+      cwd: this.#opts.childCwd ?? this.#opts.cwd,
+      groupId: this.group.id,
+      sessionIds: [...new Set(agentsOf(this.flow).flatMap((node) => (node.childId ? [node.childId] : [])))],
+      models: [
+        ...new Set(agentsOf(this.flow).flatMap((node) => (node.childId && node.model ? [node.model] : []))),
+      ],
+      ...(this.#opts.ownerSessionId ? { ownerSessionId: this.#opts.ownerSessionId } : {}),
       ...(this.#opts.startedBy ? { startedBy: { ...this.#opts.startedBy } } : {}),
       startedAt: this.startedAt,
       ...(this.endedAt !== undefined ? { endedAt: this.endedAt } : {}),
@@ -166,13 +178,20 @@ export class WorkflowRun {
     worker.onerror = (e) =>
       this.#end("error", undefined, `the script crashed: ${e.message ?? "unknown error"}`)
     const total = this.#opts.budgetTokens
-    this.#post({
+    // Startup dispatch must reach the launcher's failure cleanup, unlike later best-effort replies.
+    worker.postMessage({
       t: "run",
       code: this.#code,
       args: this.#opts.args ?? null,
       budgetTotal: total ?? null,
       spent: 0,
     })
+  }
+
+  /** Startup may throw after worker assignment; use the same termination and drain barrier. */
+  async failStart(error: string): Promise<RunRecord> {
+    await this.#end("error", undefined, error)
+    return this.done
   }
 
   /** Stops the run: its agents are stopped and the script is ended where it is. */
@@ -225,7 +244,8 @@ export class WorkflowRun {
         this.#log(m.level, m.msg, m.nest)
         break
       case "agent": {
-        const pending = this.#agent(m)
+        // Reserve the call before spawning: progress callbacks can synchronously stop the run.
+        const pending = Promise.resolve().then(() => this.#agent(m))
         this.#pending.add(pending)
         try {
           await pending
@@ -345,7 +365,7 @@ export class WorkflowRun {
           )
         }
         node.model = opts.model ?? role?.model
-        if ((opts.isolation ?? role?.isolation ?? "none") === "worktree") {
+        if ((this.#opts.isolation ?? opts.isolation ?? role?.isolation ?? "none") === "worktree") {
           tree = await createWorktree(this.#opts.git, {
             cwd: this.#opts.cwd,
             home: this.#opts.home,
@@ -385,7 +405,8 @@ export class WorkflowRun {
                 "finish",
               ],
               ...(opts.schema ? { schema: opts.schema as JSONSchema } : {}),
-              ...(tree && !("error" in tree) ? { cwd: tree.cwd } : {}),
+              context: "fresh",
+              cwd: tree && !("error" in tree) ? tree.cwd : (this.#opts.childCwd ?? this.#opts.cwd),
               systemPrompt: [
                 WORKER_INSTRUCTIONS,
                 tree && !("error" in tree)
@@ -537,7 +558,7 @@ export class WorkflowRun {
         : `the workflow ${status === "stopped" ? "was stopped" : "failed"}`,
     )
     if (status !== "done") this.#log(status === "stopped" ? "warning" : "error", error ?? status)
-    await Promise.allSettled([...this.#pending])
+    await Promise.allSettled([...this.#pending, this.#opts.group.ended()])
     this.endedAt = Date.now()
     this.settled = true
     writeRun(this.#opts.dir, this.record)

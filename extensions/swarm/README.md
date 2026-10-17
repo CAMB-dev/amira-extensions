@@ -8,8 +8,8 @@ session watch and step in.
 amira ext install swarm
 ```
 
-Needs Amira ^0.1.49 (persistent sub-agents, spawn groups, split views, shared status badges
-and host glyph metadata).
+Needs Amira ^0.1.52. The bound runner uses owner-associated UI requests (`sessionId`),
+available in the verified 0.1.52 API, as well as persistent sub-agents and spawn groups.
 
 ## Starting one
 
@@ -36,8 +36,9 @@ confirmation is required, nobody answering (print mode, or an rpc client that do
 dialogs) means no swarm starts. Run it in the interactive UI, or set `enabled` to `"always"`
 to skip confirmation in every permission mode.
 
-Only the main session can start a swarm; members and other sub-agents cannot. The start
-returns at once. The swarm runs in the background and, when it ends, sends the main session
+Only the main session can start a swarm through the `swarm` tool; members and other
+sub-agents cannot. Other extensions can use the owner-bound service below. The start
+returns after any required confirmation. The swarm runs in the background and, when it ends, sends the main session
 a report with every member's result and the blackboard.
 
 ## What members get
@@ -60,7 +61,10 @@ before its next model call; messages from one sender arrive in the order they we
 
 Since 0.1.10, members can start workflows when the workflow extension provides the optional
 `workflow.runner` service and `memberWorkflows.enabled` is true (the default). Without that
-service, or when disabled, these tools are absent; the rest of the swarm works as before.
+service, or when disabled in settings, these tools are absent for main-session starts;
+the rest of the swarm works as before. Bound service runs require the updated workflow
+contract below; an absent or incompatible service exposes a disabled `start_workflow`
+tool explaining why, rather than falling back to legacy execution.
 The main-session `workflow` tool stays excluded. Members get their own tools instead:
 
 | Tool | What it does |
@@ -228,6 +232,95 @@ tokens, known cost, duration, final reply and error. Ended snapshots reconstruct
 values after resume. Old records still work; unrecorded metrics and session IDs stay unknown.
 The swarm's total token count includes descendants; per-member totals do not.
 
+## Service for other extensions
+
+Since **0.3.0**, `api.useService("swarm.runner")` provides execution without the dashboard
+or a fabricated `ToolContext`. Treat the value as `unknown`: check its methods and **all
+five** capability flags at recommendation time and again at launch. Installed packages,
+`swarm.dashboardSource`, or a legacy runner without the flags do not establish compatibility.
+These are provider/consumer-local structural contracts, not new `@amira/api` exports:
+
+```ts
+interface RunnerOwner {
+  sessionId: string
+  label: string
+  signal: AbortSignal
+  createGroup(options: SpawnGroupOptions): SpawnGroup
+}
+interface RunnerCapabilities {
+  cwd: true
+  freshRun: true
+  models: true
+  ownedLifetime: true
+  progress: true
+}
+interface MemberSpec {
+  name: string
+  role: string
+  brief: string
+  model?: string // provider/model
+}
+interface SwarmRunner {
+  capabilities: RunnerCapabilities
+  startBound(request: {
+    goal: string
+    members: MemberSpec[]
+    cwd: string // absolute directory; explicitly supplied to every member
+    startedBy: { sessionId: string; label: string }
+    limits?: Record<string, unknown> // same lower-limit overrides as the tool
+  }, owner: RunnerOwner): Promise<{ runId: string } | { error: string }>
+  status(runId: string): SwarmRunSnapshot | undefined
+  stop(runId: string): boolean
+  onProgress(runId: string, listener: (snapshot: SwarmRunSnapshot) => void): () => void
+  onResult(runId: string, listener: (report: SwarmRunReport) => void): () => void
+}
+```
+
+`SpawnGroupOptions` and `SpawnGroup` are public API types. Bind `createGroup` to the
+caller's owned handle (for example, `options => owned.createGroup(options)`), not
+`api.session()` or another mutable root. `startedBy` is attribution; the owner determines
+group creation, lifetime and the UI session for confirmations and no-progress questions.
+Start still follows swarm settings: `never` returns an error, `always` skips confirmation,
+and bound starts under `mode` ask because the structural owner does not expose permission
+mode. A project approval does not bypass this provider confirmation.
+
+Each start creates a new board, group and fresh member context, uses explicit cwd with
+no role worktree isolation, and preserves member model selections. Members remain persistent
+within this run only. Snapshots include state, members' child session IDs, effective
+models, activity and errors. `SwarmRunSnapshot` extends the usual swarm snapshot with
+`runId`, effective `cwd` and `startedBy`; `SwarmRunReport` adds those fields to the final
+report (member outcomes, session IDs, effective models, errors, board, usage and reason).
+Status and progress payloads are detached copies. Progress replays the current snapshot
+in a microtask; final results replay in a microtask **only after** `done` settles, including
+member results, member workflow shutdown and group settlement. Unsubscribing suppresses
+queued replay. Unknown run IDs have no status or callbacks; stop returns false for a
+non-live run. Listener errors are reported without failing the run. Settlement covers public
+group/child lifecycles, not the host's stronger resource-disposal barrier: stop/drain the
+owning conversation before acceptance checks or reusing/removing its iteration worktree.
+
+There is **one live or stopping swarm per extension**, shared by tool and service starts.
+A pending confirmation also reserves that slot, so concurrent starts cannot bypass it.
+Stopping does not release the slot until shutdown settles. Owner abort and provider unload
+cancel pending confirmations and stop members; late confirmation cannot launch work.
+Switching the main session does not orphan bound runs or redirect their UI. The old
+main-session tool's `/clear` and `/resume` behavior is unchanged. Service results remain
+available in memory for this provider instance; consumers must persist their own evidence.
+
+Member workflows of a bound swarm use `workflow.runner.startBound` with the **same cwd and
+owner**, member attribution, and a signal combining owner, tool and swarm cancellation.
+The workflow service must structurally provide `start`, `startBound`, `status`, `stop`,
+`onProgress`, `onResult` and all five true capability flags. Its `startBound` request adds
+`cwd` to `{ script?, name?, args?, startedBy }`, takes the same `RunnerOwner`, and returns
+`{ runId } | { error }`. A missing method/flag, service replacement or unload disables new
+member workflow starts with a clear reason; **legacy `start` is never a fallback** for a
+bound run. Explicit `memberWorkflows.enabled: false` removes the tools. Legacy main-session
+swarms keep their existing workflow integration.
+
+Consumers must handle start errors and recheck service identity/capabilities, never silently
+switch an approved mode or cwd. If the provider is absent, disabled, old or unloaded, block
+that mode and obtain fresh human approval before choosing a different execution mode.
+Cwd is an execution binding, not a filesystem write sandbox.
+
 ## Optional dashboard
 
 With the dashboard extension installed, `/dashboard swarm` shows one phase per swarm in
@@ -255,9 +348,9 @@ Older dashboards can ignore the optional fields and still read Summary and Logs.
 This source is read-only. Use `/swarm` commands to message, pause, resume or stop members.
 No file changes or progress percentages are inferred.
 
-Registration tolerates dashboard being absent, loaded later or reloaded. The API has no
-extension-unload callback or service-change event: a host-owned `swarm.dashboardSource`
-lease immediately disables stale source reads on swarm unload, and an unref'ed one-second
+Registration tolerates dashboard being absent, loaded later or reloaded. Services have no
+change event: a host-owned `swarm.dashboardSource` lease immediately disables stale source
+reads on swarm unload, and an unref'ed one-second
 check releases its registration and detects dashboard replacement. Exit releases it too.
 
 ## Settings

@@ -8,7 +8,6 @@ import type {
   PendingNotice,
   SpawnGroup,
   SpawnGroupOptions,
-  ToolContext,
   ToolDefinition,
   ToolPresenter,
   ToolResult,
@@ -18,11 +17,12 @@ import type {
 } from "@amira/api"
 import { compileScript } from "./compile.ts"
 import { bindWorkflowSource, createWorkflowSource } from "./dashboard.ts"
-import { type JournalEntry, listRuns, type RunRecord, readJournal, readRun, successful } from "./journal.ts"
+import { type JournalEntry, listRuns, readJournal, readRun, successful } from "./journal.ts"
 import { estimate, readMeta, sizeLine, type WorkflowMeta, workspaceLine } from "./meta.ts"
 import { countsLine, formatDuration, formatTokens, runStateText, totals, treeLines } from "./progress.ts"
 import { loadRoles } from "./roles.ts"
 import { type ScriptWorker, WorkflowRun } from "./run.ts"
+import { type RunSnapshot, runnerResult, runSnapshot, type WorkflowRunner } from "./runner.ts"
 import { findSaved, listSaved } from "./saved.ts"
 import { archivedWorkflow, createWorkflowView, type WorkflowViewData, type WorkflowViewRun } from "./view.ts"
 import type { RunGit } from "./worktree.ts"
@@ -160,33 +160,13 @@ export interface WorkflowExtensionOptions {
   git?: RunGit
 }
 
-// Structural service contract: consumers mirror it without importing workflow or augmenting AmiraServices.
-interface RunnerResult {
-  runId: string
-  name: string
-  status: string
-  startedBy?: { sessionId: string; label: string }
-  result?: unknown
-  error?: string
-}
-
-interface WorkflowRunner {
-  start(
-    request: {
-      script?: string
-      name?: string
-      args?: unknown
-      startedBy: { sessionId: string; label: string }
-    },
-    ctx: ToolContext,
-  ): Promise<{ runId: string } | { error: string }>
-  status(runId: string): RunnerResult | undefined
-  stop(runId: string): boolean
-  onResult(runId: string, listener: (result: RunnerResult) => void): () => void
-}
-
 interface Launch {
   startedBy?: { sessionId: string; label: string }
+  cwd?: string
+  /** Legacy groups inherit the caller cwd, independently of main-workspace source lookup. */
+  childCwd?: string
+  /** Bound runs use the supplied owner, not the mutable main session. */
+  ownerSessionId?: string
   source: string
   origin: string
   args: unknown
@@ -228,6 +208,18 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         api.reportError(error)
       })
     const runs = new Map<string, WorkflowRun>()
+    const progressListeners = new Map<string, Set<(snapshot: RunSnapshot) => void>>()
+    const publishProgress = (run: WorkflowRun) => {
+      for (const listener of progressListeners.get(run.id) ?? []) {
+        try {
+          // Each listener receives its own detached snapshot.
+          listener(runSnapshot(run))
+        } catch (err) {
+          api.reportError(`Workflow progress listener failed: ${errorText(err)}`)
+        }
+      }
+      if (run.settled) progressListeners.delete(run.id)
+    }
     const lifetime = new AbortController()
     /** Which session started each run. */
     const owners = new Map<string, string>()
@@ -241,6 +233,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
      * model may not propose them again unless the user asks.
      */
     const declined = new Set<string>()
+    const boundDeclined = new Set<string>()
     const declineKeys = (meta: WorkflowMeta, source: string) => {
       let body = source
       try {
@@ -266,8 +259,8 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
     const runsRoot = () =>
       sessionFile ? path.join(path.dirname(sessionFile), "workflows") : path.join(api.home, "workflow-runs")
 
-    const loadWorkflow = (name: string) => {
-      const saved = findSaved(api.cwd, api.home, name)
+    const loadWorkflow = (name: string, cwd: string) => {
+      const saved = findSaved(cwd, api.home, name)
       if (!saved) return undefined
       try {
         return readFileSync(saved.file, "utf8")
@@ -288,6 +281,8 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
     }
     loadDashboard()
     api.on("extension.loaded", loadDashboard)
+    // Unload does not run exit handlers; revoke retained runners and pending starts immediately.
+    api.onUnload?.(() => dashboardBinding.dispose())
     api.onExit?.(async () => {
       dashboardBinding.dispose()
       await Promise.all([...runs.values()].map((run) => run.done))
@@ -355,6 +350,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       l = { ...l, signal: AbortSignal.any([lifetime.signal, ...(l.signal ? [l.signal] : [])]) }
       if (l.signal?.aborted) return "The workflow start was cancelled."
       const s = settings()
+      const cwd = l.cwd ?? api.cwd
       const startedBy = l.startedBy ?? l.resume?.startedBy
       const mode = s.enabled ?? "mode"
       const auto = mode === "mode" && api.session?.()?.info().permissions?.mode === "auto"
@@ -366,21 +362,24 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       } catch (err) {
         return `The script cannot run: ${errorText(err)}`
       }
-      const keys = declineKeys(meta, l.source)
-      if (l.initiator === "model" && keys.some((k) => declined.has(k))) {
+      const keys = declineKeys(meta, l.source).map((key) =>
+        l.ownerSessionId ? `${l.ownerSessionId}:${key}` : key,
+      )
+      const refusals = l.ownerSessionId ? boundDeclined : declined
+      if (l.initiator === "model" && keys.some((k) => refusals.has(k))) {
         return `The user already declined the workflow "${meta.name}" in this session, so it was not proposed again. Do not propose it again, renamed or reworded; carry on without it (e.g. with the agent tool) unless the user asks for a workflow.`
       }
       if (mode !== "always" && !auto) {
         const ok = await l.ui.confirm(
           `${l.resume ? "Resume" : "Start"} workflow "${meta.name}"?`,
           confirmText(meta, l.source, l.initiator, l.resume, startedBy),
-          l.signal ? { signal: l.signal } : {},
+          { signal: l.signal, ...(l.ownerSessionId ? { sessionId: l.ownerSessionId } : {}) },
         )
         if (l.signal?.aborted) return "The workflow start was cancelled."
         if (ok !== true) {
-          for (const k of keys) declined.add(k)
-          // The user's ask is used up: asking again is what lets this workflow be proposed again.
-          explicit = false
+          for (const k of keys) refusals.add(k)
+          // A bound owner's confirmation does not consume the main session's ask.
+          if (!l.ownerSessionId) explicit = false
           if (l.command) {
             return ok === false
               ? `Workflow "${meta.name}" not started.`
@@ -425,36 +424,55 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
           args: l.args,
           ...(startedBy ? { startedBy: { ...startedBy } } : {}),
           group,
-          cwd: api.cwd,
+          cwd,
+          ...(l.childCwd ? { childCwd: l.childCwd } : {}),
           home: api.home,
+          ...(l.ownerSessionId ? { ownerSessionId: l.ownerSessionId, isolation: "none" as const } : {}),
           ...(l.resume ? { previous: l.resume.previous, resumes: l.resume.resumes } : {}),
           ...(s.budget?.tokens !== undefined ? { budgetTokens: s.budget.tokens } : {}),
-          roles: () => loadRoles(api.cwd, api.home),
+          roles: () => loadRoles(cwd, api.home),
           git,
-          loadWorkflow,
+          loadWorkflow: (name) => loadWorkflow(name, cwd),
           ...(opts.worker ? { worker: opts.worker } : {}),
           onChange: () => {
             setStatus(run)
             dashboard.update(run)
             dashboardBinding.refresh()
             api.requestRender()
+            publishProgress(run)
           },
         })
       } catch (err) {
         group.end("the workflow could not start")
+        await group.ended()
         return `The script cannot run: ${errorText(err)}`
       }
       runs.delete(id)
       runs.set(id, run)
-      if (root) owners.set(id, root)
-      const notice = l.expectNotice()
+      if (root && !l.ownerSessionId) owners.set(id, root)
+      const abort = () => run.stop("the workflow owner was aborted")
+      if (l.ownerSessionId) l.signal?.addEventListener("abort", abort, { once: true })
+      let notice: PendingNotice | undefined
+      let started = false
       run.done.then(() => {
+        l.signal?.removeEventListener("abort", abort)
+        if (!started) return
         setStatus(run)
         const message = noticeFor(run)
         if (notice) notice.deliver(message)
         else l.send?.(message)
       })
-      run.start()
+      try {
+        notice = l.expectNotice()
+        run.start()
+        started = true
+      } catch (err) {
+        l.signal?.removeEventListener("abort", abort)
+        notice?.cancel()
+        await run.failStart(errorText(err))
+        return errorText(err)
+      }
+      if (l.ownerSessionId && l.signal?.aborted) abort()
       if (auto) api.notify(`Workflow "${meta.name}" started without asking: permission mode is auto.`)
       dashboard.update(run)
       dashboardBinding.refresh()
@@ -480,6 +498,8 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       )
       const stored = dir ? readRun(dir) : undefined
       if (!dir || !stored) return `No workflow run ${id} was found.`
+      if (stored.record.ownerSessionId)
+        return "Bound workflows cannot be resumed from the main session; start a fresh bound run."
       return {
         dir,
         source: stored.script,
@@ -508,26 +528,61 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
     }
 
     /** Shared inline/saved source resolution for the main tool and service callers. */
-    const resolveSource = (script?: string, name?: string): { source: string; origin: string } | string => {
+    const resolveSource = (
+      script?: string,
+      name?: string,
+      cwd = api.cwd,
+    ): { source: string; origin: string } | string => {
       if (script !== undefined) return { source: script, origin: "inline" }
       if (!name) return 'Give "script", "name" or "resume".'
-      const saved = findSaved(api.cwd, api.home, name)
+      const saved = findSaved(cwd, api.home, name)
       if (!saved) {
-        const names = listSaved(api.cwd, api.home).map((w) => w.name)
+        const names = listSaved(cwd, api.home).map((w) => w.name)
         return `No saved workflow "${name}". Saved workflows: ${names.join(", ") || "none"}.`
       }
       return { source: readFileSync(saved.file, "utf8"), origin: saved.file }
     }
 
-    const runnerResult = (record: RunRecord): RunnerResult => ({
-      runId: record.id,
-      name: record.meta.name,
-      status: record.status,
-      ...(record.startedBy ? { startedBy: { ...record.startedBy } } : {}),
-      ...(record.status === "done" ? { result: record.result } : {}),
-      ...(record.error !== undefined ? { error: record.error } : {}),
-    })
     const runner: WorkflowRunner = {
+      capabilities: { cwd: true, freshRun: true, models: true, ownedLifetime: true, progress: true },
+      async startBound(request, owner) {
+        if (!owner || typeof owner.createGroup !== "function" || !owner.signal?.addEventListener)
+          return { error: "Workflows need an owner with a signal and createGroup." }
+        if (owner.signal.aborted || lifetime.signal.aborted)
+          return { error: "The workflow start was cancelled." }
+        if (!owner.sessionId?.trim() || !owner.label?.trim())
+          return { error: "Give an owner with a sessionId and label." }
+        if (
+          !request.startedBy ||
+          typeof request.startedBy.sessionId !== "string" ||
+          !request.startedBy.sessionId.trim() ||
+          typeof request.startedBy.label !== "string" ||
+          !request.startedBy.label.trim()
+        )
+          return { error: "Give startedBy with a sessionId and label." }
+        if (typeof request.cwd !== "string" || !path.isAbsolute(request.cwd))
+          return { error: "Give an absolute workflow cwd." }
+        try {
+          const cwd = path.resolve(request.cwd)
+          const source = resolveSource(request.script, request.name, cwd)
+          if (typeof source === "string") return { error: source }
+          const run = await launch({
+            ...source,
+            cwd,
+            args: request.args,
+            startedBy: { ...request.startedBy },
+            ownerSessionId: owner.sessionId,
+            initiator: "model",
+            ui: api.ui,
+            signal: owner.signal,
+            createGroup: (o) => owner.createGroup(o),
+            expectNotice: () => undefined,
+          })
+          return typeof run === "string" ? { error: run } : { runId: run.id }
+        } catch (err) {
+          return { error: owner.signal.aborted ? "The workflow start was cancelled." : errorText(err) }
+        }
+      },
       async start(request, ctx) {
         if (ctx.signal.aborted) return { error: "The workflow start was cancelled." }
         const session = ctx.session
@@ -548,6 +603,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
             ...source,
             args: request.args,
             startedBy: { ...request.startedBy },
+            childCwd: ctx.cwd,
             initiator: explicit ? "user" : "model",
             ui: api.ui,
             signal: ctx.signal,
@@ -566,6 +622,34 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
         return run ? runnerResult(run.record) : undefined
       },
       stop: (runId) => runs.get(runId)?.stop("stopped by the caller") ?? false,
+      onProgress(runId, listener) {
+        const run = runs.get(runId)
+        if (!run) return () => {}
+        let active = true
+        const deliver = (snapshot: RunSnapshot) => {
+          if (active) listener(snapshot)
+        }
+        if (!run.settled) {
+          const listeners = progressListeners.get(runId) ?? new Set()
+          listeners.add(deliver)
+          progressListeners.set(runId, listeners)
+        }
+        // Replay the current snapshot, even after immediate completion. Cancellation suppresses it.
+        queueMicrotask(() => {
+          if (!active) return
+          try {
+            deliver(runSnapshot(run))
+          } catch (err) {
+            api.reportError(`Workflow progress listener failed: ${errorText(err)}`)
+          }
+        })
+        return () => {
+          active = false
+          const listeners = progressListeners.get(runId)
+          listeners?.delete(deliver)
+          if (listeners?.size === 0) progressListeners.delete(runId)
+        }
+      },
       onResult(runId, listener) {
         let active = true
         // Promise callbacks replay settled runs in a microtask too: a fast completion cannot
@@ -861,7 +945,7 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
     })
     api.on("session.end", (e) => {
       if (e.sessionId !== root || e.parentSessionId !== undefined) return
-      for (const r of runs.values()) r.stop("the session ended")
+      for (const r of runs.values()) if (!r.record.ownerSessionId) r.stop("the session ended")
       dashboardBinding.pause()
     })
     api.on("turn.start", (e) => {

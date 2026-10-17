@@ -170,6 +170,8 @@ async function harness(
   const stop = async () => {
     await tool.execute({ action: "stop" }, ctx)
     await Promise.all(groups)
+    // group.end() precedes group.ended() and the swarm's settled done callback.
+    await Bun.sleep(0)
   }
   cleanups.push(stop)
   return {

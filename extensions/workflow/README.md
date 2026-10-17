@@ -250,6 +250,112 @@ service lease with a one-second, unref'ed check to release its registration and 
 after workflow unload/reload. This check is needed because the public API has no service
 removal or extension unload event.
 
+## Service for other extensions
+
+Since **0.3.0** (Amira **0.1.52** or later), `api.useService("workflow.runner")` offers
+owner-bound execution in addition to the original `start(request, ToolContext)` service.
+The contract is provider-local: consumers mirror and structurally validate it, without
+importing workflow code or augmenting `AmiraServices`. Host group types below come from
+`@amira/api`.
+
+```ts
+type StartRequest = {
+  script?: string
+  name?: string
+  args?: unknown
+  startedBy: { sessionId: string; label: string }
+}
+type StartResult = { runId: string } | { error: string }
+interface RunnerOwner {
+  sessionId: string
+  label: string
+  signal: AbortSignal
+  createGroup(options: SpawnGroupOptions): SpawnGroup
+}
+interface RunnerResult {
+  runId: string
+  name: string
+  status: string // running | done | error | stopped
+  startedBy?: { sessionId: string; label: string }
+  cwd?: string
+  ownerSessionId?: string
+  groupId?: string
+  sessionIds?: string[]
+  models?: string[]
+  result?: unknown
+  error?: string
+}
+interface RunSnapshot extends RunnerResult {
+  settled: boolean
+  phase?: string
+  children: {
+    call: number
+    label: string
+    phase: string
+    nest?: string
+    childId?: string
+    sessionId?: string
+    model?: string
+    status: string // queued | working | done | error | aborted | cached
+    state: string // queued | working | idle | paused | done | failed | stopped
+    error?: string
+  }[]
+}
+interface WorkflowRunner {
+  start(request: StartRequest, ctx: ToolContext): Promise<StartResult>
+  status(runId: string): RunnerResult | undefined
+  stop(runId: string): boolean
+  onResult(runId: string, listener: (result: RunnerResult) => void): () => void
+  // Optional when mirroring older providers:
+  capabilities?: { cwd: true; freshRun: true; models: true; ownedLifetime: true; progress: true }
+  startBound?(request: StartRequest & { cwd: string }, owner: RunnerOwner): Promise<StartResult>
+  onProgress?(runId: string, listener: (snapshot: RunSnapshot) => void): () => void
+}
+```
+
+Bind `createGroup` to the owned handle, for example `createGroup: (o) => owned.createGroup(o)`,
+and supply its session ID and abort signal. `startedBy` attributes the requester (which may
+be a member rather than the owner). Bound starts require an absolute cwd and preserve the
+provider's enabled/confirmation/limit/budget settings; confirmations target the owner's
+session and are cancelled by its signal. `enabled: "never"` returns an error. A caller's
+approval of its own execution plan does not bypass a separate provider confirmation.
+
+Each bound start creates a new run/journal and explicitly fresh children, with saved source,
+roles and nested workflow lookup rooted at that cwd (retaining user-level fallbacks). Every
+spawn receives an explicit cwd. Bound runs force internal effective isolation to `"none"`,
+even when a role or script requests `"worktree"`: the caller owns iteration isolation and
+workflow must not create or auto-merge per-agent worktrees. This is an internal workflow
+setting, **not** a nonexistent host `SpawnOptions.isolation` field. Agent model requests and
+role defaults still apply; reported models are the effective child metadata references,
+not promises inferred from requested models. Bound runs cannot be resumed from the main
+session; start a fresh run for each batch instead.
+
+`onProgress` asynchronously replays the current detached snapshot, including after instant
+completion, then reports changes through final settlement. Child/session IDs and effective
+models appear once children exist; failures before spawn have no invented execution ID.
+`status` returns a detached current result summary, or undefined for an unknown run. A
+terminal status alone is not a settlement barrier: `onResult` fires only after pending
+calls, journal writes and worktree finalization, and replays settled results in a microtask.
+Both subscriptions return an unsubscribe function that also cancels queued replay; unknown
+IDs do not call listeners. Listener exceptions are reported without interrupting other
+subscribers. Final results include effective cwd, group/session IDs and model references.
+Settlement covers public group/child lifecycles and provider finalization, not the host's
+stronger resource-disposal barrier: stop/drain the owning conversation before acceptance
+checks or reusing/removing its iteration worktree.
+
+Owner abort, explicit `stop`, group end and provider unload stop bound work. Switching or
+ending the mutable main session does not. The owner must actually supply its bound group
+and cancellation signal; this structural service is not an authentication or sandbox
+boundary. The original `start` remains caller-group/main-session compatible and retains
+its previous confirmation and result behavior, without duplicate root notices.
+
+Discover the service when recommending a mode **and again at launch**. If it is absent,
+unloaded, disabled, or has no `startBound`/`onProgress` or any of the five true capability
+flags, do not treat it as a bound runner. Old providers can still serve old `start` callers,
+but an injected cwd or fabricated ToolContext does not make them compatible. Keep the
+approved mode blocked and ask for fresh approval before any single-agent/other-provider
+fallback; never silently change cwd or execution mode. Dashboard is not required.
+
 ## Settings
 
 ```jsonc
