@@ -233,133 +233,131 @@ async function accept(f: Frontend, outcome: "pass" | "fail", hold = false) {
 }
 
 frontendSuite("frontend-acceptance", () => {
-  for (const mode of ["inline", "fullscreen"] as const) {
-    test(`${mode}: real offline acceptance renders progress, summary and a human-only manual trial`, async () => {
-      const f = await frontend(mode, undefined, [fixtureShell])
-      try {
-        await prepare(f, true)
-        await implement(f)
-        await cancelNext(f)
-        await approveNext(f, "accept")
-        await cancelNext(f, "Review this batch")
-        const review = await accept(f, "pass", true)
-        expect(review.state.completion).toBeUndefined()
-        expect(review.state.manualTrialRequired).toBe(true)
-        expect(review.state.manualTrial?.status).toBe("pending")
-        await f.command(
-          "status",
-          ["Stage: acceptance", "Manual trial: pending", "Batch B1 automated pass, manual trial pending"],
-          90_000,
-        )
-        const trialRef = review.state.artifacts.find(
-          (entry) => entry.id === review.state.manualTrial!.artifactId,
-        )!
-        const trial = await f.store.readArtifact(trialRef)
-        expect(trial).toMatchObject({
-          kind: "manual-trial",
-          status: "pending",
-          batchId: "B1",
-          attemptId: review.verdict.attemptId,
-          attempt: review.verdict.attempt,
-          codeHash: review.verdict.codeHash,
-        })
-        if (trial.kind !== "manual-trial") throw new Error("Missing human trial prompt")
-        expect(trial.instructions.length).toBeGreaterThan(0)
-        expect(trial.observe.length).toBeGreaterThan(0)
-        const before = await f.store.read()
-        const calls = f.mock.requests.length
-        f.send("next")
-        await f.dialog("Record manual UI trial")
-        expect(f.all()).toContain("Record tried")
-        f.terminal.send(ESC)
-        await dismissed(f)
-        expect(await f.store.read()).toEqual(before)
-        expect(f.mock.requests).toHaveLength(calls)
-        f.send("next")
-        await f.dialog("Record manual UI trial")
-        f.terminal.send("\r")
-        await f.dialog("Confirm manual trial record")
-        f.terminal.send(ESC)
-        await dismissed(f)
-        expect(await f.store.read()).toEqual(before)
-        expect(f.mock.requests).toHaveLength(calls)
-        expect(await f.store.readArtifact(trialRef)).toEqual(trial)
-        f.send("next")
-        await f.dialog("Record manual UI trial")
-        f.terminal.send("\r")
-        await f.dialog("Confirm manual trial record")
-        f.terminal.send("\x1b[B\r")
-        await dismissed(f)
-        await f.command("status", "Manual trial: tried", 90_000)
-        const tried = await f.store.read()
-        expect(tried.receipts.at(-1)).toMatchObject({ provenance: "human", choice: "tried" })
-        expect(tried.completion).toBeUndefined()
-        const accepted = await approveNext(f)
-        expect(accepted.completion).toBe("accepted")
-        expect(accepted.batchResolutions).toMatchObject([
-          { batchId: "B1", status: "accepted", attemptId: review.verdict.attemptId },
-        ])
-        expect(f.mock.requests).toHaveLength(calls)
-        await f.command("status", ["Accepted batches: B1", "Manual trial: tried"], 90_000)
-        expect(await f.store.readArtifact(review.ref)).toEqual(review.verdict)
-      } finally {
-        await f.cleanup()
-      }
-    }, 600_000)
+  test(`fullscreen: real offline acceptance renders progress, summary and a human-only manual trial`, async () => {
+    const f = await frontend(undefined, [fixtureShell])
+    try {
+      await prepare(f, true)
+      await implement(f)
+      await cancelNext(f)
+      await approveNext(f, "accept")
+      await cancelNext(f, "Review this batch")
+      const review = await accept(f, "pass", true)
+      expect(review.state.completion).toBeUndefined()
+      expect(review.state.manualTrialRequired).toBe(true)
+      expect(review.state.manualTrial?.status).toBe("pending")
+      await f.command(
+        "status",
+        ["Stage: acceptance", "Manual trial: pending", "Batch B1 automated pass, manual trial pending"],
+        90_000,
+      )
+      const trialRef = review.state.artifacts.find(
+        (entry) => entry.id === review.state.manualTrial!.artifactId,
+      )!
+      const trial = await f.store.readArtifact(trialRef)
+      expect(trial).toMatchObject({
+        kind: "manual-trial",
+        status: "pending",
+        batchId: "B1",
+        attemptId: review.verdict.attemptId,
+        attempt: review.verdict.attempt,
+        codeHash: review.verdict.codeHash,
+      })
+      if (trial.kind !== "manual-trial") throw new Error("Missing human trial prompt")
+      expect(trial.instructions.length).toBeGreaterThan(0)
+      expect(trial.observe.length).toBeGreaterThan(0)
+      const before = await f.store.read()
+      const calls = f.mock.requests.length
+      f.send("next")
+      await f.dialog("Record manual UI trial")
+      expect(f.all()).toContain("Record tried")
+      f.terminal.send(ESC)
+      await dismissed(f)
+      expect(await f.store.read()).toEqual(before)
+      expect(f.mock.requests).toHaveLength(calls)
+      f.send("next")
+      await f.dialog("Record manual UI trial")
+      f.terminal.send("\r")
+      await f.dialog("Confirm manual trial record")
+      f.terminal.send(ESC)
+      await dismissed(f)
+      expect(await f.store.read()).toEqual(before)
+      expect(f.mock.requests).toHaveLength(calls)
+      expect(await f.store.readArtifact(trialRef)).toEqual(trial)
+      f.send("next")
+      await f.dialog("Record manual UI trial")
+      f.terminal.send("\r")
+      await f.dialog("Confirm manual trial record")
+      f.terminal.send("\x1b[B\r")
+      await dismissed(f)
+      await f.command("status", "Manual trial: tried", 90_000)
+      const tried = await f.store.read()
+      expect(tried.receipts.at(-1)).toMatchObject({ provenance: "human", choice: "tried" })
+      expect(tried.completion).toBeUndefined()
+      const accepted = await approveNext(f)
+      expect(accepted.completion).toBe("accepted")
+      expect(accepted.batchResolutions).toMatchObject([
+        { batchId: "B1", status: "accepted", attemptId: review.verdict.attemptId },
+      ])
+      expect(f.mock.requests).toHaveLength(calls)
+      await f.command("status", ["Accepted batches: B1", "Manual trial: tried"], 90_000)
+      expect(await f.store.readArtifact(review.ref)).toEqual(review.verdict)
+    } finally {
+      await f.cleanup()
+    }
+  }, 600_000)
 
-    test(`${mode}: failure requires repair approval and a fresh acceptance without rewriting the old verdict`, async () => {
-      const f = await frontend(mode, undefined, [fixtureShell])
-      try {
-        await prepare(f, false)
-        const worktree = await implement(f, "needs-repair\n")
-        await approveNext(f, "accept")
-        const failed = await accept(f, "fail")
-        const oldAttempt = failed.state.attempts.find((attempt) => attempt.id === failed.verdict.attemptId)!
-        expect(oldAttempt.acceptance).toMatchObject({ verdict: "fail", failingItemIds: ["S1"] })
-        expect(failed.state.completion).toBeUndefined()
-        expect(failed.state.batchResolutions).toEqual([])
-        const calls = f.mock.requests.length
-        f.send("next")
-        await f.dialog("Choose the next step")
-        f.terminal.send("\r")
-        await f.dialog("Confirm stage change")
-        expect(f.live()).toContain('"batchId": "B1"')
-        const proposed = await f.store.read()
-        expect(proposed.pending).toMatchObject({
-          kind: "repair",
-          to: "implement",
-          context: failed.state.approvedContext,
-        })
-        f.terminal.send(ESC)
-        await dismissed(f)
-        expect((await f.store.read()).stage).toBe("accept")
-        expect((await f.store.read()).attempts).toEqual(failed.state.attempts)
-        expect(f.mock.requests).toHaveLength(calls)
-        await cancelNext(f)
-        const repair = await approveNext(f, "implement")
-        expect(repair.approvedContext).toEqual(failed.state.approvedContext)
-        expect(repair.attempts).toEqual(failed.state.attempts)
-        expect(repair.activeAttemptId).toBeUndefined()
-        const repairedWorktree = await implement(f, "ready\n", false)
-        expect(repairedWorktree.root).toBe(worktree.root)
-        await approveNext(f, "accept")
-        const fresh = await accept(f, "pass")
-        expect(fresh.verdict.attempt).toBe(failed.verdict.attempt + 1)
-        expect(fresh.verdict.attemptId).not.toBe(failed.verdict.attemptId)
-        expect(fresh.verdict.codeHash).not.toBe(failed.verdict.codeHash)
-        expect(fresh.state.attempts.find((attempt) => attempt.id === oldAttempt.id)).toEqual(oldAttempt)
-        expect(await f.store.readArtifact(failed.ref)).toEqual(failed.verdict)
-        const accepted = await approveNext(f)
-        expect(accepted.completion).toBe("accepted")
-        expect(accepted.batchResolutions).toMatchObject([
-          { batchId: "B1", status: "accepted", attemptId: fresh.verdict.attemptId },
-        ])
-        expect(accepted.attempts.filter((attempt) => attempt.stage === "accept")).toHaveLength(2)
-        expect(await f.store.readArtifact(failed.ref)).toEqual(failed.verdict)
-        await f.command("status", "Accepted batches: B1", 90_000)
-      } finally {
-        await f.cleanup()
-      }
-    }, 600_000)
-  }
+  test(`fullscreen: failure requires repair approval and a fresh acceptance without rewriting the old verdict`, async () => {
+    const f = await frontend(undefined, [fixtureShell])
+    try {
+      await prepare(f, false)
+      const worktree = await implement(f, "needs-repair\n")
+      await approveNext(f, "accept")
+      const failed = await accept(f, "fail")
+      const oldAttempt = failed.state.attempts.find((attempt) => attempt.id === failed.verdict.attemptId)!
+      expect(oldAttempt.acceptance).toMatchObject({ verdict: "fail", failingItemIds: ["S1"] })
+      expect(failed.state.completion).toBeUndefined()
+      expect(failed.state.batchResolutions).toEqual([])
+      const calls = f.mock.requests.length
+      f.send("next")
+      await f.dialog("Choose the next step")
+      f.terminal.send("\r")
+      await f.dialog("Confirm stage change")
+      expect(f.live()).toContain('"batchId": "B1"')
+      const proposed = await f.store.read()
+      expect(proposed.pending).toMatchObject({
+        kind: "repair",
+        to: "implement",
+        context: failed.state.approvedContext,
+      })
+      f.terminal.send(ESC)
+      await dismissed(f)
+      expect((await f.store.read()).stage).toBe("accept")
+      expect((await f.store.read()).attempts).toEqual(failed.state.attempts)
+      expect(f.mock.requests).toHaveLength(calls)
+      await cancelNext(f)
+      const repair = await approveNext(f, "implement")
+      expect(repair.approvedContext).toEqual(failed.state.approvedContext)
+      expect(repair.attempts).toEqual(failed.state.attempts)
+      expect(repair.activeAttemptId).toBeUndefined()
+      const repairedWorktree = await implement(f, "ready\n", false)
+      expect(repairedWorktree.root).toBe(worktree.root)
+      await approveNext(f, "accept")
+      const fresh = await accept(f, "pass")
+      expect(fresh.verdict.attempt).toBe(failed.verdict.attempt + 1)
+      expect(fresh.verdict.attemptId).not.toBe(failed.verdict.attemptId)
+      expect(fresh.verdict.codeHash).not.toBe(failed.verdict.codeHash)
+      expect(fresh.state.attempts.find((attempt) => attempt.id === oldAttempt.id)).toEqual(oldAttempt)
+      expect(await f.store.readArtifact(failed.ref)).toEqual(failed.verdict)
+      const accepted = await approveNext(f)
+      expect(accepted.completion).toBe("accepted")
+      expect(accepted.batchResolutions).toMatchObject([
+        { batchId: "B1", status: "accepted", attemptId: fresh.verdict.attemptId },
+      ])
+      expect(accepted.attempts.filter((attempt) => attempt.stage === "accept")).toHaveLength(2)
+      expect(await f.store.readArtifact(failed.ref)).toEqual(failed.verdict)
+      await f.command("status", "Accepted batches: B1", 90_000)
+    } finally {
+      await f.cleanup()
+    }
+  }, 600_000)
 })

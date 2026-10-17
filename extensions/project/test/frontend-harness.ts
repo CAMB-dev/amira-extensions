@@ -12,9 +12,8 @@ export { frontendSuite, waitFor }
 export const ESC = "\x1b[27u"
 export const F6 = "\x1b[17~"
 
-/** The upstream app harness's real runtime, with a host-owned conversation manager and durable session. */
+/** The upstream fullscreen app runtime (D128), with host-owned conversations and durable sessions. */
 export async function frontend(
-  mode: "inline" | "fullscreen",
   existing?: { root: string; file: string },
   extraTools: import("@amira/api").ToolDefinition[] = [],
 ) {
@@ -149,14 +148,14 @@ export async function frontend(
     setup: noProbe,
     files: fileList(async () => []),
     env: {},
-    settings: { mode, margin: 0, marginRows: 0 },
+    settings: { margin: 0, marginRows: 0 },
     onReady: () => agent.start("startup"),
   })
   const live = () => screen.lines.join("\n")
   const all = () => [...screen.scrollback, ...screen.lines].join("\n")
   const visible = async (text: string) => {
     try {
-      await waitFor(() => live().includes(text), `${mode} screen: ${text}`, 20_000)
+      await waitFor(() => live().includes(text), `fullscreen screen: ${text}`, 20_000)
     } catch (error) {
       throw new Error(`${String(error)}\n${live()}`)
     }
@@ -165,7 +164,7 @@ export async function frontend(
     try {
       await waitFor(
         () => host.ui.pending[0]?.title === title && live().includes(`╭ ${title}`),
-        `${mode} visible dialog: ${title}`,
+        `fullscreen visible dialog: ${title}`,
         timeoutMs,
       )
     } catch (error) {

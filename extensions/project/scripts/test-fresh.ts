@@ -8,7 +8,7 @@ const root = path.resolve(import.meta.dir, "..")
 const directory = await mkdtemp(path.join(tmpdir(), "project-fresh-tests-"))
 const files = (await readdir(path.join(root, "test"))).filter((name) => name.endsWith(".test.ts")).sort()
 const jobs = Number(process.env.PROJECT_TEST_JOBS ?? 2)
-if (!Number.isSafeInteger(jobs) || jobs < 1 || jobs > 6) throw new Error("PROJECT_TEST_JOBS must be 1–6")
+if (!Number.isSafeInteger(jobs) || jobs < 1 || jobs > 3) throw new Error("PROJECT_TEST_JOBS must be 1–3")
 const excluded = new Set(process.argv.slice(2))
 const selected = files.filter((file) => !excluded.has(file))
 const results: {

@@ -167,7 +167,8 @@ for (const source of [undefined, "missing-explicit-source"]) {
       path.join(copy, "test/offline.ts"),
     )
     expect(result.code).toBe(0)
-    expect(result.text).toContain("30 skip")
+    // Fullscreen-only: 10 general + 2 batch + 2 trial + 1 manual-repair case.
+    expect(result.text).toContain("15 skip")
     expect(result.text.match(/\[project tests\] Host-dependent suites skipped:/g)).toHaveLength(1)
     expect(result.text).toContain("AMIRA_SOURCE")
     expect(result.text).not.toContain("Cannot find module")
