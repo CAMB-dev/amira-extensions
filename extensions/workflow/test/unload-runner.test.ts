@@ -48,9 +48,11 @@ test("unload immediately revokes retained runner handles without dashboard polli
     startedBy: { sessionId: "owner", label: "owner" },
   }
   try {
+    expect(runner.available()).toBe(true)
     // The real host runs unload hooks and removes registrations, but does not run exit hooks.
     for (const unload of unloads) unload()
     services.clear()
+    expect(runner.available()).toEqual({ reason: "The workflow extension was unloaded." })
     const bound = await runner.startBound(
       { ...request, cwd: dir },
       { sessionId: "owner", label: "owner", signal, createGroup },

@@ -4,7 +4,7 @@ import { expect } from "bun:test"
 import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import type { SessionControl, TerminalApi } from "@amira/api"
+import type { Extension, SessionControl, TerminalApi } from "@amira/api"
 import { frontendSuite, requireFrontendHost, waitFor } from "./frontend-host.ts"
 import { fixtureShell } from "./implement-fixture.ts"
 
@@ -16,6 +16,11 @@ export const F6 = "\x1b[17~"
 export async function frontend(
   existing?: { root: string; file: string },
   extraTools: import("@amira/api").ToolDefinition[] = [],
+  options: {
+    extensions?: { name: string; extension: Extension }[]
+    rows?: number
+    commandTimeoutMs?: number
+  } = {},
 ) {
   const {
     ai: { createAi, createMockDialect },
@@ -104,6 +109,9 @@ export async function frontend(
     settingsSources: { cwd, home: process.env.AMIRA_HOME! },
   })
   host.setSessionControl(control, () => agent)
+  for (const fixture of options.extensions ?? []) {
+    expect(await host.load(fixture.extension, `test:${fixture.name}`, fixture.name)).toBe(true)
+  }
   expect(
     await host.load(createProjectExtension(), "test:project-frontend", `frontend-${path.basename(root)}`),
   ).toBe(true)
@@ -119,8 +127,9 @@ export async function frontend(
       commandRunning = false
     }
   }
-  const terminal = new FakeTerminal(120, 42)
-  const screen = new VirtualScreen(120, 42)
+  const rows = options.rows ?? 42
+  const terminal = new FakeTerminal(120, rows)
+  const screen = new VirtualScreen(120, rows)
   const write = terminal.write.bind(terminal)
   let commandScreen: InstanceType<typeof VirtualScreen> | undefined
   terminal.write = (data) => {
@@ -173,7 +182,11 @@ export async function frontend(
     expect(host.ui.pending).toHaveLength(1)
   }
   const idle = () =>
-    waitFor(() => !commandRunning && !live().includes("esc cancel command"), "command completed", 60_000)
+    waitFor(
+      () => !commandRunning && !live().includes("esc cancel command"),
+      "command completed",
+      options.commandTimeoutMs ?? 60_000,
+    )
   const dismissed = async () => {
     await waitFor(() => host.ui.pending.length === 0, "dialog dismissed", 20_000)
     await idle()
@@ -183,7 +196,7 @@ export async function frontend(
     const before = outputs.length
     // Only terminal writes after this command count as rendering. Old model/tool
     // scrollback (for example bun main.ts) must not satisfy a new command's wait.
-    const freshScreen = new VirtualScreen(120, 42)
+    const freshScreen = new VirtualScreen(120, rows)
     commandScreen = freshScreen
     terminal.send(`${paste(`/project ${text}`)}\r`)
     try {

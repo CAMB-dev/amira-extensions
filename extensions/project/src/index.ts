@@ -7,6 +7,7 @@ import { DesignSessions } from "./design.ts"
 import { ProjectCommandError, projectError } from "./diagnostics.ts"
 import { Implementations, implementationStatus } from "./implement.ts"
 import { conversationLanguage, LanguagePolicy, localize, resolveLanguage, validLanguage } from "./language.ts"
+import { runModeChange } from "./mode-change.ts"
 import { latestPrototypeManifest, Prototypes, prototypePanelText } from "./prototype.ts"
 import { supportsPrototype } from "./prototype-sessions.ts"
 import { runSpec } from "./spec.ts"
@@ -54,6 +55,7 @@ export function panelLines(
   prototype?: PrototypeManifestArtifact,
   worktree?: string,
   acceptance?: AcceptanceView,
+  executionProgress?: string,
 ): ToolLine[] {
   const lang = language ?? project?.marker.settings.language ?? "en"
   if (error)
@@ -100,6 +102,7 @@ export function panelLines(
       text: `${implementationStatus(state)}${worktree ? ` · ${worktree}` : ""}`,
       wrap: true,
     })
+  if (executionProgress) lines.push({ kind: "accent", text: executionProgress, wrap: true })
   if (acceptance)
     lines.push({
       kind: acceptance.stale ? "warning" : "muted",
@@ -122,6 +125,7 @@ const HELP = `/project [list] — choose a known project or the nearest discover
 /project design
 /project prototype [<variant>|choose|run <variant>]
 /project spec
+/project mode
 /project implement
 /project accept
 /project next
@@ -129,14 +133,14 @@ const HELP = `/project [list] — choose a known project or the nearest discover
 /project revisit design|prototype
 Attachment does not change the main session's working directory.
 Prototype file tools are variant-scoped; shell uses current permissions. This is not a sandbox.
-Spec review: /project spec. Single-agent batch execution: /project implement. Acceptance: /project next, then /project accept. Ship and archive: coming later.`
+Spec and mode review: /project spec. Approved batch execution: /project implement. Acceptance: /project next, then /project accept. Ship and archive: coming later.`
 
 function help(language: string): string {
   return localize(
     language,
     HELP,
-    `/project [list] — 选择已知项目或最近识别的项目\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 查看项目阶段和状态\n/project design — 打开设计会话\n/project prototype [<variant>|choose|run <variant>] — 查看原型变体、选择结论或显示运行命令\n/project next — 查看总结并确认下一步\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n关联项目不会改变主会话工作目录。原型文件工具仅能写入各自目录，Shell 遵循当前权限模式；这不是沙箱。规格审阅：/project spec；单个子代理实现：/project implement。验收：/project next 确认后用 /project accept。发布和归档将在后续版本提供。`,
-    `/project [list] — 登録済みまたは最寄りのプロジェクトを選択\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 段階と状態を確認\n/project design — 設計会話を開く\n/project prototype [<variant>|choose|run <variant>] — 案の表示・選択・実行コマンドの確認\n/project next — 要約を確認して次の手順を承認\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n関連付けてもメインの作業ディレクトリは変わりません。試作のファイルツールは各案のディレクトリ内だけに書き込みます。シェルは現在の権限モードに従い、サンドボックスではありません。仕様確認：/project spec、単一サブエージェント実装：/project implement。受け入れ確認：/project next で承認後 /project accept。リリース・アーカイブは今後対応予定です。`,
+    `/project [list] — 选择已知项目或最近识别的项目\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 查看项目阶段和状态\n/project design — 打开设计会话\n/project prototype [<variant>|choose|run <variant>] — 查看原型变体、选择结论或显示运行命令\n/project next — 查看总结并确认下一步\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n关联项目不会改变主会话工作目录。原型文件工具仅能写入各自目录，Shell 遵循当前权限模式；这不是沙箱。规格和执行模式审阅：/project spec；保留已完成批次并重新批准执行模式：/project mode；按已批准的模式实现批次：/project implement。验收：/project next 确认后用 /project accept。发布和归档将在后续版本提供。`,
+    `/project [list] — 登録済みまたは最寄りのプロジェクトを選択\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 段階と状態を確認\n/project design — 設計会話を開く\n/project prototype [<variant>|choose|run <variant>] — 案の表示・選択・実行コマンドの確認\n/project next — 要約を確認して次の手順を承認\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n関連付けてもメインの作業ディレクトリは変わりません。試作のファイルツールは各案のディレクトリ内だけに書き込みます。シェルは現在の権限モードに従い、サンドボックスではありません。仕様と実行モードの確認：/project spec、完了済みバッチを保持してモードを再承認：/project mode、承認済みモードでのバッチ実装：/project implement。受け入れ確認：/project next で承認後 /project accept。リリース・アーカイブは今後対応予定です。`,
   )
 }
 
@@ -565,6 +569,7 @@ export function createProjectExtension(): Extension {
         state.project && prototypePanels.get(designKey(state.project)),
         state.project && worktreePanels.get(designKey(state.project)),
         state.project && acceptancePanels.get(designKey(state.project)),
+        state.project && implementations.progress(state.project),
       )
     }
     api.registerPanel({ id: "project", order: 10, render })
@@ -597,6 +602,7 @@ export function createProjectExtension(): Extension {
             "design",
             "prototype",
             "spec",
+            "mode",
             "implement",
             "accept",
             "next",
@@ -676,7 +682,7 @@ export function createProjectExtension(): Extension {
               commitDocuments,
             })
             await attach(project, ctx, origin)
-          } else if (verb === "spec" || verb === "implement" || verb === "accept") {
+          } else if (verb === "spec" || verb === "mode" || verb === "implement" || verb === "accept") {
             if (tokens.length) throw new Error(HELP)
             const project = await attached(ctx, origin)
             const checkOrigin = () => {
@@ -694,6 +700,11 @@ export function createProjectExtension(): Extension {
                 await runSpec(api, project, ctx, displayLanguage(project), checkOrigin, async () => {
                   await designs.quiesce(project)
                   await prototypes.sessions.quiesce(project)
+                })
+              else if (verb === "mode")
+                await runModeChange(api, project, ctx, displayLanguage(project), checkOrigin, async () => {
+                  await implementations.quiesce(project)
+                  await acceptances.quiesce(project)
                 })
               else if (verb === "implement")
                 await implementations.run(project, ctx, displayLanguage(project), checkOrigin)
@@ -765,7 +776,8 @@ export function createProjectExtension(): Extension {
                 )
             }
             try {
-              let current = states.get(origin)?.iteration
+              let current =
+                verb === "next" ? await new IterationStore(project).read() : states.get(origin)?.iteration
               if (
                 verb === "next" &&
                 current?.stage === "prototype" &&
@@ -827,6 +839,15 @@ export function createProjectExtension(): Extension {
                 !current.approvedContext &&
                 !current.activeAttemptId
               ) {
+                const draftRef = current.artifacts.findLast((entry) => entry.kind === "batch-plan")
+                const draft = draftRef && (await new IterationStore(project).readArtifact(draftRef))
+                if (draft?.kind === "batch-plan" && draft.modeChange) {
+                  await runModeChange(api, project, ctx, displayLanguage(project), checkOrigin, async () => {
+                    await implementations.quiesce(project)
+                    await acceptances.quiesce(project)
+                  })
+                  return
+                }
                 const choice = await ctx.ui.confirm(
                   "Generate implementation spec",
                   "Generate an English spec from verified decisions and confirmed prototype conclusions, with a summary in your language? No implementation starts.",
@@ -964,7 +985,7 @@ export function createProjectExtension(): Extension {
                   `${project.marker.name}\n目录：${project.root}\n迭代：${project.marker.currentIteration}`,
                   `${project.marker.name}\nディレクトリ：${project.root}\nイテレーション：${project.marker.currentIteration}`,
                 ) +
-                  `\n${stageStatus(iteration, lang)}\n${implementationStatus(iteration)}${worktreePanels.has(designKey(project)) ? `\nWorktree: ${worktreePanels.get(designKey(project))}` : ""}\n${nextSuggestion(iteration, lang, availableDesigns.has(designKey(project)))}` +
+                  `\n${stageStatus(iteration, lang)}\n${implementationStatus(iteration)}${implementations.progress(project) ? `\n${implementations.progress(project)}` : ""}${worktreePanels.has(designKey(project)) ? `\nWorktree: ${worktreePanels.get(designKey(project))}` : ""}\n${nextSuggestion(iteration, lang, availableDesigns.has(designKey(project)))}` +
                   (acceptancePanels.has(designKey(project))
                     ? `\n${acceptancePanelText(acceptancePanels.get(designKey(project))!, lang)}`
                     : "") +

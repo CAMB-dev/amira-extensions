@@ -14,6 +14,7 @@ for (const pendingStart of [false, true]) {
       releaseStart = resolve
     })
     const runner: WorkflowRunner = {
+      available: () => true,
       capabilities: RUNNER_CAPABILITIES,
       start: async () => {
         throw new Error("legacy start must not be used")

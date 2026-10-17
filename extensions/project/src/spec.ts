@@ -10,6 +10,7 @@ import {
   recordCorrection,
 } from "./correction.ts"
 import { collectCorrectionChanges } from "./correction-checkout.ts"
+import { discoverModes, recommendMode } from "./execution-modes.ts"
 import { localize } from "./language.ts"
 import { bindSpecIdentity, requiredChecks, type SavedSpec } from "./spec-integrity.ts"
 import type { ApprovalContext, IterationState } from "./stage.ts"
@@ -46,7 +47,7 @@ export async function specInputs(project: Project, state: IterationState) {
 }
 
 export function renderSpec(spec: SpecArtifact, plan: BatchPlanArtifact): string {
-  return `# Spec revision ${spec.revision}\n\n${spec.summary}\n\n${spec.body}\n\n## Spec items\n\n${spec.items.map((item, index) => `${index + 1}. **${item.id}** — ${item.description}${spec.lineage ? ` (${spec.lineage.items.find((entry) => entry.id === item.id)?.previousId ?? "new item"})` : ""}\n   - Constraints: ${item.constraints.join("; ") || "None"}\n   - Verification: ${item.verification.join("; ")}\n   - Acceptance: ${item.acceptanceCriteria.join("; ")}\n   - Checks: ${item.checkIds.join(", ") || "None"}`).join("\n\n")}\n\n## Exact checks\n\n${spec.checks.map((check) => `- ${check.id}: cwd (relative to iteration project): \`${check.cwd ?? "."}\`; command: \`${check.command}\``).join("\n")}\n\n## Batch plan — single implementation agent\n\n${plan.batches.map((batch, index) => `${index + 1}. ${batch.id}: ${batch.itemIds.join(", ")}`).join("\n")}\n\n${spec.lineage?.retiredItemIds.length ? `Retired item IDs: ${spec.lineage.retiredItemIds.join(", ")}\n\n` : ""}Prototype code must not be copied, patched, imported or merged into production. No automatic merge or worktree removal.`
+  return `# Spec revision ${spec.revision}\n\n${spec.summary}\n\n${spec.body}\n\n## Spec items\n\n${spec.items.map((item, index) => `${index + 1}. **${item.id}** — ${item.description}${spec.lineage ? ` (${spec.lineage.items.find((entry) => entry.id === item.id)?.previousId ?? "new item"})` : ""}\n   - Constraints: ${item.constraints.join("; ") || "None"}\n   - Verification: ${item.verification.join("; ")}\n   - Acceptance: ${item.acceptanceCriteria.join("; ")}\n   - Checks: ${item.checkIds.join(", ") || "None"}`).join("\n\n")}\n\n## Exact checks\n\n${spec.checks.map((check) => `- ${check.id}: cwd (relative to iteration project): \`${check.cwd ?? "."}\`; command: \`${check.command}\``).join("\n")}\n\n## Batch plan — ${plan.mode === "single" ? "single agent" : plan.mode}\n\n${plan.batches.map((batch, index) => `${index + 1}. ${batch.id}: ${batch.itemIds.join(", ")}`).join("\n")}\n\n${plan.modeChange ? `Resolved batches retained, not scheduled: ${plan.modeChange.carriedResolutions.map((ref) => `${ref.batchId} (original receipt ${ref.receiptId})`).join("; ") || "None"}. Selected batch: ${plan.modeChange.batchId}.\n\n` : ""}${spec.lineage?.retiredItemIds.length ? `Retired item IDs: ${spec.lineage.retiredItemIds.join(", ")}\n\n` : ""}Prototype code must not be copied, patched, imported or merged into production. No automatic merge or worktree removal.`
 }
 
 /** Text-only generation: no design transcript, tools, inherited history or model writes. */
@@ -172,18 +173,48 @@ export async function runSpec(
     const corrected =
       correction && (await recordCorrection(store, state, correction, spec, saved.artifact, batches[0]!.id))
     if (corrected) state = corrected.state
+    // Discover at review time, not at activation: providers may be loaded/replaced later.
+    const modes = discoverModes(api)
+    let mode: NonNullable<ApprovalContext["mode"]> = "single"
+    if (modes.length > 1) {
+      const parallel = batches.some((batch) => batch.itemIds.length > 1)
+      const recommended = recommendMode(modes, batches)
+      ctx.print(
+        t(
+          `Recommended execution mode: ${recommended}. ${parallel ? "Multiple items can be split within a batch; collaborators must coordinate shared files." : batches.length > 1 ? "Ordered batches benefit from a scripted execution plan." : "One small batch needs only one implementation agent."} Mode selection is not approval; review the exact spec and plan next.`,
+          `推荐执行模式：${recommended}。${parallel ? "批次内有多个任务；协作者必须协调共享文件。" : batches.length > 1 ? "多个有序批次适合脚本化执行计划。" : "一个小批次只需一个实现代理。"} 选择模式不代表批准；接下来请审阅确切的规格和计划。`,
+          `推奨実行モード：${recommended}。${parallel ? "バッチ内に複数の項目があります。共有ファイルの編集は担当者間で調整してください。" : batches.length > 1 ? "順序付きの複数バッチにはスクリプトによる実行計画が適しています。" : "小さなバッチは実装エージェント1つで十分です。"} モードの選択は承認ではありません。次に仕様と計画を確認してください。`,
+        ),
+        "info",
+      )
+      const labels: string[] = modes.map((entry) =>
+        entry === "single"
+          ? t("Single agent", "单代理", "単一エージェント")
+          : entry === "workflow"
+            ? "Workflow"
+            : "Swarm",
+      )
+      const selected = await ctx.ui.select(
+        t("Choose execution mode", "选择执行模式", "実行モードを選択"),
+        labels,
+        { signal: ctx.signal, sessionId: ctx.session.info().id },
+      )
+      checkOrigin()
+      const index = labels.indexOf(selected ?? "")
+      if (index < 0) return state // Escape never approves a mode or launches work.
+      mode = modes[index]!
+    }
     const plan: BatchPlanArtifact = {
       kind: "batch-plan",
       specHash: saved.artifact.hash,
       specRevision: revision,
-      mode: "single",
+      mode,
       batches,
       ...(correction ? { preservedItems: preservedCorrectionEvidence(spec, correction) } : {}),
     }
     const planned = await store.saveArtifact(state.revision, plan)
     state = planned.state
     const rendered = renderSpec(spec, plan)
-    ctx.print(rendered, "info", { markdown: true, persist: true })
     if (correction) {
       const mapping = correctionArtifact(correction, spec, saved.artifact, batches[0]!.id)
       ctx.print(
@@ -192,11 +223,14 @@ export async function runSpec(
         { markdown: true, persist: true },
       )
     }
+    // Keep the exact plan adjacent to its approval, rather than burying it under
+    // a correction's potentially long change-pointer/impact report in fullscreen.
+    ctx.print(rendered, "info", { markdown: true, persist: true })
     const context: ApprovalContext = {
       spec: { artifactId: saved.artifact.id, revision, hash: saved.artifact.hash },
       batchPlan: { artifactId: planned.artifact.id, hash: planned.artifact.hash },
       batchId: plan.batches[0]!.id,
-      mode: "single",
+      mode,
       model: `${ctx.session.info().model.provider}/${ctx.session.info().model.model}`,
     }
     if (state.stage !== "implement" && ["ready", "confirmed"].includes(state.phase)) {
@@ -239,7 +273,7 @@ export async function runSpec(
         to: "implement",
         kind: state.stage === "implement" ? "reapprove" : "advance",
         summaryId: state.summaryId!,
-        suggestion: `Approve spec r${revision} (${saved.artifact.hash}), exact single-agent plan (${planned.artifact.hash}) and batch ${context.batchId}${state.stage === "design" ? "; skip prototype" : ""}`,
+        suggestion: `Approve spec r${revision} (${saved.artifact.hash}), exact ${mode} plan (${planned.artifact.hash}) and batch ${context.batchId}${state.stage === "design" ? "; skip prototype" : ""}`,
         skippedStages: state.stage === "design" ? ["prototype"] : [],
         context,
       },
@@ -265,7 +299,7 @@ export async function runSpec(
           revision: state.revision,
           subjectId: state.pending!.id,
           choice: "implement",
-          reason: "Approved rendered spec revision/hash and exact single-agent batch plan",
+          reason: `Approved rendered spec revision/hash and exact ${mode} batch plan`,
           context,
         },
       })

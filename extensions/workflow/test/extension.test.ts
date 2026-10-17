@@ -1194,6 +1194,75 @@ function resultOf(runner: WorkflowRunner, runId: string): Promise<BoundResult> {
   return new Promise((resolve) => runner.onResult(runId, resolve))
 }
 
+test("runner availability reports disabled settings without prompting or creating a bound group", async () => {
+  const t = setup({ settings: { enabled: "never" } })
+  const b = boundOwner()
+  const reason = "Workflows are turned off in settings (extensions.workflow.enabled: never)."
+  expect(t.runner.available()).toEqual({ reason })
+  expect(t.runner.available()).toEqual({ reason })
+  expect(t.confirms).toHaveLength(0)
+  expect(t.errors).toHaveLength(0)
+  expect(t.told).toHaveLength(0)
+  expect(b.groups).toHaveLength(0)
+  expect(t.groups).toHaveLength(0)
+  expect(await t.runner.startBound({ script: BOUND_SCRIPT, cwd: t.cwd, startedBy }, b.owner)).toEqual({
+    error: reason,
+  })
+  expect(t.confirms).toHaveLength(0)
+  expect(b.groups).toHaveLength(0)
+})
+
+test("runner availability follows settings immediately during a bound run and its original handle can still stop it", async () => {
+  const settings = { enabled: "always" }
+  const t = setup({ settings })
+  const runner = t.runner
+  const b = boundOwner(() => new Promise(() => {}))
+  const request = { script: BOUND_SCRIPT, cwd: t.cwd, startedBy }
+  expect(runner.available()).toBe(true)
+  const start = await runner.startBound(request, b.owner)
+  if ("error" in start) throw new Error(start.error)
+  await until(() => b.groups[0]!.spawned.length === 1)
+
+  settings.enabled = "never"
+  const reason = "Workflows are turned off in settings (extensions.workflow.enabled: never)."
+  expect(runner.available()).toEqual({ reason })
+  expect(runner.capabilities).toEqual({
+    cwd: true,
+    freshRun: true,
+    models: true,
+    ownedLifetime: true,
+    progress: true,
+  })
+  expect(runner.status(start.runId)).toMatchObject({ status: "running" })
+  expect(b.groups[0]!.endReason).toBeUndefined()
+  expect(await runner.startBound(request, b.owner)).toEqual({ error: reason })
+  expect(b.groups).toHaveLength(1)
+
+  settings.enabled = "always"
+  expect(runner.available()).toBe(true)
+  settings.enabled = "never"
+  expect(runner.available()).toEqual({ reason })
+  expect(runner.stop(start.runId)).toBe(true)
+  expect((await resultOf(runner, start.runId)).status).toBe("stopped")
+  expect(b.groups[0]!.endReason).toBeDefined()
+  expect(runner.stop(start.runId)).toBe(false)
+  expect(t.confirms).toHaveLength(0)
+})
+
+test("runner availability is a pure query for all start policies, including invalid settings", () => {
+  for (const enabled of [undefined, "mode", "ask", "always", "explicit", "invalid"]) {
+    const settings = { enabled, maxAgents: -1 }
+    const t = setup({ settings })
+    expect(t.runner.available()).toBe(true)
+    expect(t.runner.available()).toBe(true)
+    expect(settings).toEqual({ enabled, maxAgents: -1 })
+    expect(t.confirms).toHaveLength(0)
+    expect(t.errors).toHaveLength(0)
+    expect(t.told).toHaveLength(0)
+    expect(t.groups).toHaveLength(0)
+  }
+})
+
 test("bound runs resolve saved/nested source and roles at cwd, force fresh isolation none, and record effective execution", async () => {
   let gitCalls = 0
   const t = setup({
@@ -1328,6 +1397,8 @@ test("bound confirmation targets the owner session and owner cancellation preven
         }),
     })
     const b = boundOwner()
+    expect(t.runner.available()).toBe(true)
+    expect(t.confirms).toHaveLength(0)
     const pending = t.runner.startBound({ script: BOUND_SCRIPT, cwd: t.cwd, startedBy }, b.owner)
     await until(() => t.confirms.length === 1)
     expect(t.confirms[0]).toMatchObject({ sessionId: b.owner.sessionId })
@@ -1450,8 +1521,10 @@ test("bound stop and extension unload settle active runs and reject retained ser
     const start = await t.runner.startBound(request, b.owner)
     if ("error" in start) throw new Error(start.error)
     await until(() => b.groups[0]!.spawned.length === 1)
+    expect(t.runner.available()).toBe(true)
     if (unload) await t.dispose()
     else expect(t.runner.stop(start.runId)).toBe(true)
+    expect(t.runner.available()).toEqual(unload ? { reason: "The workflow extension was unloaded." } : true)
     expect((await resultOf(t.runner, start.runId)).status).toBe("stopped")
     expect(t.runner.stop(start.runId)).toBe(false)
     if (unload)

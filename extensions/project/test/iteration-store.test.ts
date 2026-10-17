@@ -505,3 +505,28 @@ for (const boundary of ["root", "ancestor"] as const) {
     )
   })
 }
+
+test("bounded journal prefetch validates every window and preserves edited evidence", async () => {
+  const f = await fixture()
+  let state = await f.store.read()
+  for (let revision = 0; revision < 18; revision++)
+    state = (await f.store.saveArtifact(state.revision, { ...summary, summary: `Window entry ${revision}` }))
+      .state
+  expect((await f.store.read()).revision).toBe(18)
+  const projection = await fs.readFile(path.join(f.directory, "state.json"), "utf8")
+  const journal = path.join(f.directory, ".state", "0000000000000017.json")
+  const original = await fs.readFile(journal, "utf8")
+  await fs.writeFile(journal, `${original} `)
+  await expect(f.store.read()).rejects.toThrow("hash chain")
+  expect(await fs.readFile(path.join(f.directory, "state.json"), "utf8")).toBe(projection)
+  expect(await fs.readFile(journal, "utf8")).toBe(`${original} `)
+  await fs.writeFile(journal, original)
+  const artifact = path.join(f.project.root, ...state.artifacts.at(-1)!.path.split("/"))
+  const content = await fs.readFile(artifact, "utf8")
+  await fs.writeFile(artifact, `${content} `)
+  await expect(f.store.read()).rejects.toThrow("artifact was edited")
+  expect(await fs.readFile(path.join(f.directory, "state.json"), "utf8")).toBe(projection)
+  expect(await fs.readFile(artifact, "utf8")).toBe(`${content} `)
+  await fs.writeFile(artifact, content)
+  expect(await f.store.read()).toEqual(state)
+}, 120_000)

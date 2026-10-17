@@ -36,12 +36,18 @@ export interface HumanReceipt {
   reason: string
   context?: ApprovalContext
 }
+export interface BatchResolutionRef {
+  batchId: string
+  receiptId: string
+}
 /** Membership copied by the store from an immutable, hash-checked plan. */
 export interface BatchManifest {
   batchPlan: NonNullable<ApprovalContext["batchPlan"]>
   spec: NonNullable<ApprovalContext["spec"]>
   mode: NonNullable<ApprovalContext["mode"]>
   batchIds: string[]
+  /** Original resolution owners remain unchanged across a mode-only replacement. */
+  carriedResolutions?: BatchResolutionRef[]
 }
 export interface BatchResolution {
   context: ApprovalContext
@@ -277,6 +283,7 @@ const manifestCheck = object({
   spec: object({ artifactId: text, revision: positive, hash: text }),
   mode: oneOf("single", "workflow", "swarm"),
   batchIds: list(text),
+  carriedResolutions: optional(list(object({ batchId: text, receiptId: text }))),
 })
 const trialCheck = object({
   status: oneOf("pending", "tried", "problem", "deferred"),
@@ -646,6 +653,18 @@ export function validateIteration(value: unknown): asserts value is IterationSta
     checkContext(state, manifest)
     require(manifest.batchIds.length > 0, "empty batch manifest")
     unique(manifest.batchIds, "manifest batches")
+    unique(
+      (manifest.carriedResolutions ?? []).map((ref) => ref.batchId),
+      "carried batches",
+    )
+    for (const ref of manifest.carriedResolutions ?? [])
+      require(!manifest.batchIds.includes(ref.batchId) &&
+        state.batchResolutions?.some(
+          (resolution) =>
+            resolution.batchId === ref.batchId &&
+            resolution.receiptId === ref.receiptId &&
+            canonical(resolution.context.spec) === canonical(manifest.spec),
+        ), "carried batch needs its original resolved receipt and exact spec")
   }
   unique(
     (state.batchManifests ?? []).map((entry) => entry.batchPlan.artifactId),
@@ -839,7 +858,13 @@ function samePlan(left?: ApprovalContext, right?: ApprovalContext): boolean {
 }
 export function batchProgress(state: IterationState, context = state.approvedContext) {
   const manifest = state.batchManifests?.find((entry) => samePlan(entry, context))
-  const resolutions = (state.batchResolutions ?? []).filter((entry) => samePlan(entry.context, context))
+  const resolutions = (state.batchResolutions ?? []).filter(
+    (entry) =>
+      samePlan(entry.context, context) ||
+      manifest?.carriedResolutions?.some(
+        (ref) => ref.batchId === entry.batchId && ref.receiptId === entry.receiptId,
+      ),
+  )
   const remaining =
     manifest?.batchIds.filter((id) => !resolutions.some((entry) => entry.batchId === id)) ?? []
   return { manifest, resolutions, remaining }

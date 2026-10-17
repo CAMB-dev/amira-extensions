@@ -396,6 +396,12 @@ export function createSwarmExtension(): Extension {
         })
       },
       (message) => api.reportError(message),
+      () => {
+        if (lifetime.signal.aborted) return { reason: "The swarm extension was unloaded." }
+        return settings().enabled === "never"
+          ? { reason: "Swarms are turned off in settings (extensions.swarm.enabled: never)." }
+          : true
+      },
     )
     runnerChanged = service.changed
     api.provideService?.("swarm.runner", service.runner)

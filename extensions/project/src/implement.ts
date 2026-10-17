@@ -7,6 +7,7 @@ import type {
   ToolDefinition,
 } from "@amira/api"
 import type { BatchPlanArtifact, BatchResultArtifact, SpecArtifact, WorktreeArtifact } from "./artifacts.ts"
+import { BoundRunError, boundRunner, runBound } from "./execution-modes.ts"
 import { ImplementationLifecycle } from "./implementation-lifecycle.ts"
 import {
   checkCwd,
@@ -39,6 +40,15 @@ export const IMPLEMENT_TOOLS = [
   "powershell",
   "ask_user",
 ]
+// Private tools supplied by swarm to its members still pass through the inherited
+// host callable-tool ceiling. These are names, not provider implementation imports.
+export const SWARM_COORDINATION_TOOLS = [
+  "send_message",
+  "list_agents",
+  "blackboard_read",
+  "blackboard_write",
+  "finish",
+]
 export const IMPLEMENT_SPAWN = "project_implement"
 interface Running {
   project: Project
@@ -47,15 +57,17 @@ interface Running {
   childIds: Set<string>
   lifecycle?: ImplementationLifecycle
   done?: Promise<void>
+  progress?: string
+  execution?: BatchResultArtifact["execution"]
 }
 export function implementationStatus(state: IterationState): string {
   const spec = state.artifacts.findLast((entry) => entry.kind === "spec")
   const worktree = state.artifacts.findLast((entry) => entry.kind === "iteration-worktree")
   const progress = batchProgress(state)
   const batch = progress.manifest
-    ? ` · batch ${state.approvedContext?.batchId ?? "—"} · resolved ${progress.resolutions.length}/${progress.manifest.batchIds.length}`
+    ? ` · batch ${state.approvedContext?.batchId ?? "—"} · resolved ${progress.resolutions.length}/${progress.manifest.batchIds.length + (progress.manifest.carriedResolutions?.length ?? 0)}`
     : ""
-  return `Spec: ${spec ? (state.approvedContext?.spec?.artifactId === spec.id ? "approved" : "review required") : "not generated"}${spec ? ` (${spec.hash.slice(0, 12)})` : ""}${batch}${worktree ? ` · worktree recorded` : ""}`
+  return `Spec: ${spec ? (state.approvedContext?.spec?.artifactId === spec.id ? "approved" : "review required") : "not generated"}${spec ? ` (${spec.hash.slice(0, 12)})` : ""}${batch}${state.approvedContext?.mode ? ` · mode ${state.approvedContext.mode}` : ""}${worktree ? ` · worktree recorded` : ""}`
 }
 
 export class Implementations {
@@ -84,6 +96,14 @@ export class Implementations {
     }
     api.intercept?.("context.build", (_value, context) => allowed(context.sessionId))
     api.intercept?.("tool.call.before", (_value, context) => allowed(context.sessionId))
+  }
+  progress(project: Project): string | undefined {
+    return [...this.running.values()].find(
+      (binding) =>
+        binding.project.marker.id === project.marker.id &&
+        binding.project.marker.currentIteration === project.marker.currentIteration &&
+        !binding.paused,
+    )?.progress
   }
   async quiesce(project: Project): Promise<void> {
     const bindings = [...this.running.values()].filter(
@@ -120,12 +140,29 @@ export class Implementations {
       state.status !== "idle" ||
       state.pending ||
       state.revisit ||
-      state.approvedContext?.mode !== "single"
+      !state.approvedContext?.mode
     )
       throw new Error(
-        "Review /project spec and approve the exact single-agent batch first. Interrupted/restarted work is never replayed; /project next offers explicit continuation.",
+        "Review /project spec and approve the exact spec, mode and batch first. Interrupted/restarted work is never replayed; /project next offers explicit continuation.",
       )
     const context = structuredClone(state.approvedContext)
+    if (context.mode !== "single") {
+      try {
+        boundRunner(this.api, context.mode!)
+      } catch (cause) {
+        const reason = `${String(cause)}. No mode or cwd was changed. Single-agent fallback is available: use /project mode, choose Single agent and approve the mode-only replacement before /project implement. Completed batches and the selected unresolved batch are retained; no spec regeneration.`
+        await store.saveArtifact(state.revision, {
+          kind: "stage-summary",
+          stage: "implement",
+          language,
+          summary: `Approved ${context.mode} execution blocked: ${reason}`,
+          outputs: [],
+          suggestion: "Review and approve single-agent fallback, or restore the approved provider.",
+        })
+        this.changed()
+        throw new Error(reason)
+      }
+    }
     const attemptId = randomUUID()
     // Prove all store/reducer launch gates before any Git mutation.
     reduceStage(state, { type: "start-work", expectedRevision: state.revision, attemptId })
@@ -227,6 +264,12 @@ export class Implementations {
           binding.childIds.add(child.id)
           models.add(`${child.model.provider}/${child.model.model}`)
           childResult = await child.result()
+          binding.execution = {
+            mode: "single",
+            runId: handle.id,
+            cwd: worktree.cwd,
+            sessionIds: [childResult.sessionId],
+          }
           return {
             content: [{ type: "text", text: childResult.text || childResult.error || childResult.status }],
             isError: childResult.status !== "done" || !!childResult.note,
@@ -245,8 +288,15 @@ export class Implementations {
         model: context.model,
         descendants: "inherit",
         writeRoots: [worktree.root],
-        callableTools: [...IMPLEMENT_TOOLS, IMPLEMENT_SPAWN],
-        systemPrompt: `You coordinate exactly one implementation child. Call ${IMPLEMENT_SPAWN} once with {}. It receives the approved task from the extension. Do not implement instead of the child. Do not merge, commit, push, remove worktrees or run acceptance. After the tool returns, summarize its result. Human-facing language: ${language}.`,
+        callableTools: [
+          ...IMPLEMENT_TOOLS,
+          IMPLEMENT_SPAWN,
+          ...(context.mode === "swarm" ? SWARM_COORDINATION_TOOLS : []),
+        ],
+        systemPrompt:
+          context.mode !== "single"
+            ? `You own the approved ${context.mode} batch. The extension starts its provider through your bound groups. Do not launch tools or implement independently. Human-facing language: ${language}.`
+            : `You coordinate exactly one implementation child. Call ${IMPLEMENT_SPAWN} once with {}. It receives the approved task from the extension. Do not implement instead of the child. Do not merge, commit, push, remove worktrees or run acceptance. After the tool returns, summarize its result. Human-facing language: ${language}.`,
       },
       { ...runtime, extraTools: [spawnTool] },
     )
@@ -290,6 +340,8 @@ export class Implementations {
         language,
         () => childResult,
         models,
+        seed,
+        items,
       )
     } catch (error) {
       await handle.stop("Implementation launch failed")
@@ -320,6 +372,8 @@ export class Implementations {
     language: string,
     child: () => SubagentResult | undefined,
     models: Set<string>,
+    seed: string,
+    items: SpecArtifact["items"],
   ): Promise<void> {
     const { handle } = binding
     const lifecycle = new ImplementationLifecycle(handle)
@@ -328,20 +382,60 @@ export class Implementations {
     try {
       const results: BatchResultArtifact["checks"] = []
       let error: string | undefined
+      let providerText: string | undefined
       let end = base
       let diffStat = ""
       let changedFiles: string[] = []
       let advisory = "Advisory: prototype-directory reference scan unavailable; inspect changes manually."
       try {
-        await handle.send(
-          `Start approved batch ${context.batchId}. Call ${IMPLEMENT_SPAWN} now.\nWorktree: ${worktree.cwd}`,
-          { signal: lifecycle.controller.signal },
-        )
+        if (context.mode === "single") {
+          await handle.send(
+            `Start approved batch ${context.batchId}. Call ${IMPLEMENT_SPAWN} now.\nWorktree: ${worktree.cwd}`,
+            { signal: lifecycle.controller.signal },
+          )
+          const outcome = child()
+          if (outcome?.status !== "done" || outcome.note)
+            throw new Error(outcome?.error || "The coordinator did not complete its one implementation child")
+        } else {
+          const outcome = await runBound({
+            api: this.api,
+            mode: context.mode!,
+            handle,
+            signal: lifecycle.controller.signal,
+            cwd: worktree.cwd,
+            model: context.model,
+            batchId: context.batchId!,
+            seed,
+            items,
+            onProgress: (progress) => {
+              for (const model of progress.models) models.add(model)
+              for (const child of progress.children)
+                if (child.sessionId) binding.childIds.add(child.sessionId)
+              binding.execution = {
+                mode: context.mode!,
+                runId: progress.runId,
+                ...(progress.cwd ? { cwd: progress.cwd } : {}),
+                sessionIds: [...binding.childIds],
+                ...(progress.groupId ? { groupId: progress.groupId } : {}),
+              }
+              binding.progress = `${context.mode} · ${progress.phase} · children ${progress.children.map((child) => `${child.label}: ${child.state}`).join(", ") || "pending"} · models ${[...models].join(", ") || "pending"}`
+              // Live progress is not a stage mutation. Refreshing durable evidence
+              // on every provider update can starve the fail-closed tool interceptors.
+              this.api.requestRender?.()
+            },
+          })
+          for (const model of outcome.models) models.add(model)
+          binding.execution = {
+            mode: context.mode!,
+            runId: outcome.runId,
+            cwd: outcome.cwd,
+            sessionIds: outcome.sessionIds,
+            ...(outcome.groupId ? { groupId: outcome.groupId } : {}),
+          }
+          providerText = outcome.text
+        }
         if (binding.paused) return
         lifecycle.check()
-        const outcome = child()
-        if (outcome?.status !== "done" || outcome.note)
-          throw new Error(outcome?.error || "The coordinator did not complete its one implementation child")
         // Drain descendants before independent exact checks and snapshotting.
         await lifecycle.drain()
         await verifyWorktree(tools, shell, worktree)
@@ -419,6 +513,23 @@ export class Implementations {
         )
       } catch (cause) {
         error = cause instanceof Error ? cause.message : String(cause)
+        if (context.mode !== "single") {
+          if (cause instanceof BoundRunError) {
+            for (const model of cause.models) models.add(model)
+            if (cause.runId)
+              binding.execution = {
+                mode: context.mode!,
+                runId: cause.runId,
+                ...(cause.cwd ? { cwd: cause.cwd } : {}),
+                sessionIds: cause.sessionIds,
+                ...(cause.groupId ? { groupId: cause.groupId } : {}),
+              }
+          }
+          error +=
+            ". No mode or cwd was changed. Single-agent fallback requires fresh approval: /project next to review continuation, then /project mode and choose Single agent. Completed batches and the selected unresolved batch are retained; no spec regeneration."
+          lifecycle.cancel(error)
+          await handle.stop("Provider execution stopped; retain iteration changes")
+        }
       }
       if (binding.paused) return
       // Cancellation does not turn an unrun command into success or omit an approved
@@ -452,7 +563,8 @@ export class Implementations {
           snapshot: end,
           diffStat,
           changedFiles,
-          summary: `${child()?.text || "Implementation did not finish"}\n\n${advisory}`,
+          summary: `${providerText || child()?.text || "Implementation did not finish"}\n\n${advisory}`,
+          ...(binding.execution ? { execution: binding.execution } : {}),
           implementerModels: [...models],
           checks: results,
           ...(error ? { error } : {}),
@@ -480,7 +592,7 @@ export class Implementations {
           kind: "stage-summary",
           stage: "implement",
           language,
-          summary: `${child()!.text}\n\n${advisory}\n\n${diffStat || "No file changes"}\n\n${results.map((check) => `${check.checkId}: ${check.status} (${check.cwd}) — ${check.command}`).join("\n")}`,
+          summary: `${providerText || child()?.text || "Implementation completed"}\n\n${advisory}\n\n${diffStat || "No file changes"}\n\n${results.map((check) => `${check.checkId}: ${check.status} (${check.cwd}) — ${check.command}`).join("\n")}`,
           outputs: [result.artifact.id],
           suggestion:
             "Implementation finished. Propose acceptance with /project next. Acceptance: /project next, then /project accept; no review or merge has run.",
@@ -537,7 +649,9 @@ export class Implementations {
         this.changed()
       }
     } finally {
+      binding.paused = true
       await lifecycle.close()
+      this.changed()
     }
   }
 }

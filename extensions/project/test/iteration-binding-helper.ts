@@ -56,7 +56,12 @@ export async function renewApproval(store: IterationStore, state: IterationState
   })
 }
 
-export async function bindingFixture(roots: string[], split = false, ui = false) {
+export async function bindingFixture(
+  roots: string[],
+  split = false,
+  ui = false,
+  mode: BatchPlanArtifact["mode"] = "single",
+) {
   const root = await mkdtemp(path.join(tmpdir(), "project-binding-"))
   roots.push(root)
   const project = await createProject(root, "Binding")
@@ -85,7 +90,7 @@ export async function bindingFixture(roots: string[], split = false, ui = false)
     kind: "batch-plan",
     specHash: savedSpec.artifact.hash,
     specRevision: 1,
-    mode: "single",
+    mode,
     batches: split
       ? ["S1", "S2"].map((id, index) => ({ id: `B${index + 1}`, itemIds: [id], decisionIds: [], files: [] }))
       : [{ id: "B1", itemIds: ["S1", "S2"], decisionIds: [], files: [] }],
@@ -95,7 +100,7 @@ export async function bindingFixture(roots: string[], split = false, ui = false)
     spec: { artifactId: savedSpec.artifact.id, revision: 1, hash: savedSpec.artifact.hash },
     batchPlan: { artifactId: savedPlan.artifact.id, hash: savedPlan.artifact.hash },
     batchId: "B1",
-    mode: "single" as const,
+    mode,
     model: "offline/coder",
     changes: ["diff:existing"],
   }

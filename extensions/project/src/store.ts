@@ -1560,6 +1560,11 @@ export class IterationStore {
     return value.artifact
   }
 
+  private async validateArtifacts(refs: IterationArtifactRef[]): Promise<void> {
+    for (let offset = 0; offset < refs.length; offset += 8)
+      await Promise.all(refs.slice(offset, offset + 8).map((ref) => this.artifact(ref)))
+  }
+
   /** Atomic no-clobber publication of a complete, flushed immutable record. */
   private async immutable(
     parts: string[],
@@ -1662,10 +1667,16 @@ export class IterationStore {
 
   private async auditPreserved(history: string[]): Promise<void> {
     const directory = await safePath(this.project.root, ...this.parts)
-    for (const name of await readdir(directory)) {
-      if (!/^\.state\.json\.[a-f0-9-]+\.preserved$/.test(name)) continue
-      const content = await readFile(await safePath(this.project.root, ...this.parts, name), "utf8")
-      if (!history.includes(content))
+    const names = (await readdir(directory)).filter((name) =>
+      /^\.state\.json\.[a-f0-9-]+\.preserved$/.test(name),
+    )
+    for (let offset = 0; offset < names.length; offset += 8) {
+      const contents = await Promise.all(
+        names
+          .slice(offset, offset + 8)
+          .map(async (name) => readFile(await safePath(this.project.root, ...this.parts, name), "utf8")),
+      )
+      if (contents.some((content) => !history.includes(content)))
         invalid("A retained iteration state was manually edited; edits were preserved")
     }
   }
@@ -1703,6 +1714,26 @@ export class IterationStore {
     await acknowledge()
   }
 
+  /** Prefetch only immutable bytes, in bounded windows. Validation still runs in
+   * journal order and every file keeps its independent safe-path check. Long
+   * iterations otherwise spend the tool-interceptor deadline on serial path I/O. */
+  private async *journalRecords(names: string[]) {
+    for (let offset = 0; offset < names.length; offset += 8) {
+      const records = await Promise.all(
+        names.slice(offset, offset + 8).map(async (name, index) => {
+          if (name !== `${String(offset + index).padStart(16, "0")}.json`)
+            invalid("Iteration journal is corrupt or has a missing revision")
+          const content = await readFile(
+            await safePath(this.project.root, ...this.parts, ".state", name),
+            "utf8",
+          )
+          return { name, content }
+        }),
+      )
+      yield* records
+    }
+  }
+
   private async load(): Promise<IterationHead> {
     await this.check()
     const directory = await safePath(this.project.root, ...this.parts, ".state")
@@ -1710,11 +1741,10 @@ export class IterationStore {
       .filter((name) => !name.endsWith(".tmp") && !/^\d{16}\.projected$/.test(name))
       .sort()
     let head: IterationHead | undefined
-    for (const name of names) {
+    for await (const { name, content } of this.journalRecords(names)) {
       const expectedRevision = head ? head.state.revision + 1 : 0
       if (name !== `${String(expectedRevision).padStart(16, "0")}.json`)
         invalid("Iteration journal is corrupt or has a missing revision")
-      const content = await readFile(await safePath(this.project.root, ...this.parts, ".state", name), "utf8")
       const value = this.parse(content)
       if (isObject(value)) checkSchema(value.schemaVersion, "iteration journal")
       if (
@@ -1754,7 +1784,7 @@ export class IterationStore {
     }
     // Recovery is a publication too: reject incompatible/missing evidence and false
     // plan metadata before touching state.json or creating a projection acknowledgement.
-    for (const ref of head.state.artifacts) await this.artifact(ref)
+    await this.validateArtifacts(head.state.artifacts)
     await this.batchMetadata(head.state, true)
     await this.projection(head, true)
     return head
@@ -1775,7 +1805,7 @@ export class IterationStore {
         )
           invalid("Iteration state was created concurrently; existing bytes were preserved")
         await this.check()
-        for (const ref of state.artifacts) await this.artifact(ref)
+        await this.validateArtifacts(state.artifacts)
         await this.batchMetadata(state)
       },
     )
@@ -2067,6 +2097,7 @@ export class IterationStore {
       spec: { artifactId: spec.id, hash: spec.hash, revision: plan.specRevision },
       mode: plan.mode,
       batchIds: plan.batches.map((batch) => batch.id),
+      ...(plan.modeChange ? { carriedResolutions: structuredClone(plan.modeChange.carriedResolutions) } : {}),
     }
   }
 
@@ -2234,7 +2265,15 @@ export class IterationStore {
       !plan.batches.some((batch) => batch.id === context.batchId)
     )
       invalid("Approval batch plan does not match the exact spec, batch and mode")
-    if (use === "active") await this.planCoverage(state, spec, plan)
+    if (use === "active") {
+      await this.planCoverage(state, spec, plan)
+      if (
+        plan.modeChange &&
+        context.model !==
+          state.receipts.find((receipt) => receipt.id === plan.modeChange!.sourceApprovalId)?.context?.model
+      )
+        invalid("Mode-only reapproval must retain the source implementation model")
+    }
     return plan
   }
 
@@ -2485,12 +2524,105 @@ export class IterationStore {
     return { spec, batch }
   }
 
+  /** Mode-only replacement keeps original receipt owners; it cannot turn a published
+   * verdict or a same-label batch from another spec into completed work. */
+  private async modeChangeCoverage(
+    state: IterationState,
+    spec: SpecArtifact,
+    plan: Extract<IterationArtifact, { kind: "batch-plan" }>,
+    beforePlanIndex: number,
+  ): Promise<void> {
+    const change = plan.modeChange!
+    const index = state.artifacts.findIndex(
+      (ref) =>
+        ref.kind === "batch-plan" &&
+        ref.id === change.previousPlan.artifactId &&
+        ref.hash === change.previousPlan.hash,
+    )
+    if (index < 0 || index >= beforePlanIndex)
+      invalid("Mode change requires an earlier immutable source plan")
+    const sourceRef = state.artifacts[index]!
+    const source = await this.artifact(sourceRef)
+    if (
+      source.kind !== "batch-plan" ||
+      source.specHash !== plan.specHash ||
+      source.specRevision !== plan.specRevision ||
+      source.mode === plan.mode
+    )
+      invalid("Mode change must keep the exact spec and change only the execution mode")
+    const approval = state.receipts.find((receipt) => receipt.id === change.sourceApprovalId)
+    const transition = state.transitions.find((entry) => entry.id === approval?.subjectId)
+    const attempt = state.attempts.find((entry) => entry.id === approval?.subjectId)
+    const approved = approval?.context
+    if (
+      approval?.provenance !== "human" ||
+      stable(approved?.batchPlan) !== stable(change.previousPlan) ||
+      approved?.spec?.hash !== plan.specHash ||
+      approved.spec.revision !== plan.specRevision ||
+      approved.batchId !== change.batchId ||
+      approved.mode !== source.mode ||
+      !approved.model ||
+      !(
+        (approval.choice === "implement" &&
+          transition?.to === "implement" &&
+          stable(transition.context) === stable(approved)) ||
+        (approval.choice === "resume" &&
+          attempt?.stage === "implement" &&
+          stable(attempt.context) === stable(approved))
+      )
+    )
+      invalid("Mode change requires its original human implementation approval and exact source context")
+    await this.planCoverage(state, spec, source, index)
+    const manifest = this.manifest(state, sourceRef, source)
+    const progress = batchProgress(state, manifest)
+    const expected = progress.resolutions.map(({ batchId, receiptId }) => ({ batchId, receiptId }))
+    if (
+      stable(change.carriedResolutions) !== stable(expected) ||
+      !progress.remaining.includes(change.batchId) ||
+      stable(plan.batches) !==
+        stable(source.batches.filter((batch) => progress.remaining.includes(batch.id))) ||
+      stable(plan.preservedItems ?? []) !== stable(source.preservedItems ?? [])
+    )
+      invalid(
+        "Mode change must preserve every resolved receipt and schedule only unchanged unresolved batches",
+      )
+    const covered = [
+      ...plan.batches.flatMap((batch) => batch.itemIds),
+      ...(plan.preservedItems ?? []).map((item) => item.itemId),
+    ]
+    for (const resolution of progress.resolutions) {
+      if (stable(resolution.context.spec) !== stable(manifest.spec))
+        invalid("Mode change cannot carry a resolution from another spec")
+      if (resolution.status === "accepted")
+        await this.confirmedAcceptedEvidence(state, {
+          batchId: resolution.batchId,
+          spec: resolution.context.spec!,
+          batchPlan: resolution.context.batchPlan!,
+          resolutionReceiptId: resolution.receiptId,
+          attemptId: resolution.attemptId!,
+        })
+      const original = await this.approvedPlan(state, resolution.context, "history")
+      covered.push(...original.batches.find((batch) => batch.id === resolution.batchId)!.itemIds)
+    }
+    if (
+      new Set(covered).size !== covered.length ||
+      covered.length !== spec.items.length ||
+      covered.some((id) => !spec.items.some((item) => item.id === id))
+    )
+      invalid("Mode change must retain complete, non-overlapping spec coverage")
+  }
+
   /** Publication/use policy, never historical schema validation or recovery. */
   private async planCoverage(
     state: IterationState,
     spec: SpecArtifact,
     plan: BatchPlanArtifact,
+    beforePlanIndex = Number.POSITIVE_INFINITY,
   ): Promise<void> {
+    if (plan.modeChange) {
+      await this.modeChangeCoverage(state, spec, plan, beforePlanIndex)
+      return
+    }
     const preserved = plan.preservedItems ?? []
     const covered = [
       ...plan.batches.flatMap((batch) => batch.itemIds),
@@ -2633,6 +2765,21 @@ export class IterationStore {
         saved.some((entry) => entry.artifact.kind === "batch-plan")
       )
         invalid("Cannot replace a batch plan while work is running or approval is proposed")
+      if (
+        artifact.modeChange &&
+        (state.stage !== "implement" ||
+          state.phase !== "confirmed" ||
+          state.status !== "idle" ||
+          state.activeAttemptId ||
+          state.pending ||
+          state.revisit ||
+          stable(state.approvedContext?.batchPlan) !== stable(artifact.modeChange.previousPlan) ||
+          state.approvedContext?.spec?.hash !== artifact.specHash ||
+          state.approvedContext?.batchId !== artifact.modeChange.batchId)
+      )
+        invalid(
+          "Mode change requires the current idle approved batch; review continuation first if interrupted",
+        )
       await this.planCoverage(state, spec, artifact)
       return
     }

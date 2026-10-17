@@ -1,0 +1,20 @@
+{
+  "name": "project-services",
+  "description": "Offline fullscreen mode choice and bound workflow progress. Use scripts/prepare-services-walk.ts; the mock workflow service uses real owned child sessions while local Git probes are fixture-adapted. No GUI, live provider or real home is used.",
+  "prompt": "Review two ordered offline result batches and explicitly select Workflow.",
+  "routes": {
+    "main": [
+      {
+        "text": "{\"spec\":{\"kind\":\"spec\",\"revision\":1,\"language\":\"en\",\"summary\":\"Two ordered local result batches; prototype code stays disposable.\",\"body\":\"Goal: expose local results. Constraints: offline only; no prototype imports.\",\"decisionIds\":[],\"items\":[{\"id\":\"S1\",\"description\":\"Expose the first approved local result\",\"constraints\":[\"Offline only\"],\"verification\":[\"Run C1\"],\"acceptanceCriteria\":[\"The first result is ready\"],\"decisionIds\":[],\"checkIds\":[\"C1\"],\"ui\":true},{\"id\":\"S2\",\"description\":\"Expose the second approved local result\",\"constraints\":[\"Offline only\"],\"verification\":[\"Run C1\"],\"acceptanceCriteria\":[\"The second result is ready\"],\"decisionIds\":[],\"checkIds\":[\"C1\"],\"ui\":false}],\"checks\":[{\"id\":\"C1\",\"command\":\"git --version\",\"cwd\":\".\"}]},\"batches\":[{\"id\":\"B1\",\"itemIds\":[\"S1\"],\"decisionIds\":[],\"files\":[\"result.txt\"]},{\"id\":\"B2\",\"itemIds\":[\"S2\"],\"decisionIds\":[],\"files\":[\"second.txt\"]}]}"
+      }
+    ],
+    "implementer": [
+      {
+        "text": "Implementing S1 from its exact approved spec in the isolated iteration checkout. The workflow owns this fresh child and reports effective cwd and actual model identity. Prototype code remains disposable; no design transcript or patch is inherited. ",
+        "repeat": 150,
+        "delayMs": 100,
+        "chunkSize": 8
+      }
+    ]
+  }
+}

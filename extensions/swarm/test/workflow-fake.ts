@@ -23,6 +23,7 @@ export function workflowRunner() {
   const listeners = new Map<string, Set<(result: Result) => void>>()
   let nextStart: ((request: Request, ctx: ToolContext) => Promise<Started>) | undefined
   let seq = 0
+  let availability: true | { reason: string } = true
   const finish = (runId: string, status = "done", value: unknown = "workflow output") => {
     const result: Result = {
       ...results.get(runId)!,
@@ -33,6 +34,7 @@ export function workflowRunner() {
     for (const listener of [...(listeners.get(runId) ?? [])]) listener(result)
   }
   const runner: WorkflowRunner = {
+    available: () => availability,
     async start(request, ctx) {
       starts.push({ request, ctx })
       const runId = `wf${++seq}`
@@ -69,6 +71,9 @@ export function workflowRunner() {
     results,
     listeners,
     finish,
+    setAvailable: (value: true | { reason: string }) => {
+      availability = value
+    },
     next: (start: (request: Request, ctx: ToolContext) => Promise<Started>) => {
       nextStart = start
     },

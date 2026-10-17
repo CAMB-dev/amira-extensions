@@ -1,7 +1,12 @@
 import { expect, test } from "bun:test"
 import type { ToolContext, ToolResult } from "@amira/api"
 import { readSettings } from "../src/limits.ts"
-import { type MemberWorkflowSettings, MemberWorkflows } from "../src/workflows.ts"
+import {
+  isWorkflowRunner,
+  type MemberWorkflowSettings,
+  MemberWorkflows,
+  supportsBoundWorkflow,
+} from "../src/workflows.ts"
 import { workflowRunner } from "./workflow-fake.ts"
 
 const textOf = (result: ToolResult) =>
@@ -281,4 +286,15 @@ test("cancelled tool contexts and stopping members cannot leak runs", async () =
   expect(h.stops).toEqual(["wf1"])
   expect((await h.start()).isError).toBe(true)
   expect(h.starts).toHaveLength(1)
+})
+
+test("legacy main-session integrations retain old runner support while bound starts require availability", async () => {
+  const h = harness()
+  Reflect.deleteProperty(h.runner, "available")
+  expect(isWorkflowRunner(h.runner)).toBe(true)
+  expect(supportsBoundWorkflow(h.runner)).toBe(false)
+  const result = await h.start()
+  expect(result.isError).not.toBe(true)
+  expect(h.starts).toHaveLength(1)
+  await h.workflows.stop()
 })

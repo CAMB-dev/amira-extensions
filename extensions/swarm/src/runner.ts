@@ -41,6 +41,8 @@ export interface SwarmRunReport extends SwarmReport {
 
 export interface SwarmRunner {
   capabilities: RunnerCapabilities
+  /** Live policy query only; does not confirm or start work. */
+  available(): true | { reason: string }
   startBound(request: SwarmStartRequest, owner: RunnerOwner): Promise<{ runId: string } | { error: string }>
   status(runId: string): SwarmRunSnapshot | undefined
   stop(runId: string): boolean
@@ -53,6 +55,7 @@ export interface SwarmRunner {
 export function createSwarmRunner(
   launch: (request: SwarmStartRequest, owner: RunnerOwner) => Promise<Swarm | string>,
   reportError: (message: string) => void,
+  available: SwarmRunner["available"],
 ) {
   const runs = new Map<
     string,
@@ -74,6 +77,7 @@ export function createSwarmRunner(
   }
   const runner: SwarmRunner = {
     capabilities: RUNNER_CAPABILITIES,
+    available,
     async startBound(request, owner) {
       if (!request || !Array.isArray(request.members) || !request.startedBy)
         return { error: "A bound swarm requires members and startedBy attribution." }

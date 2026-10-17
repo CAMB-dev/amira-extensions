@@ -201,9 +201,9 @@ interface Launch {
 export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
   return (api: ExtensionAPI) => {
     const reported = new Set<string>()
-    const settings = (): WorkflowSettings =>
+    const settings = (report = true): WorkflowSettings =>
       readSettings(api.settings.extensions?.workflow, (error) => {
-        if (reported.has(error)) return
+        if (!report || reported.has(error)) return
         reported.add(error)
         api.reportError(error)
       })
@@ -545,6 +545,12 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
 
     const runner: WorkflowRunner = {
       capabilities: { cwd: true, freshRun: true, models: true, ownedLifetime: true, progress: true },
+      available() {
+        if (lifetime.signal.aborted) return { reason: "The workflow extension was unloaded." }
+        if (settings(false).enabled === "never")
+          return { reason: "Workflows are turned off in settings (extensions.workflow.enabled: never)." }
+        return true
+      },
       async startBound(request, owner) {
         if (!owner || typeof owner.createGroup !== "function" || !owner.signal?.addEventListener)
           return { error: "Workflows need an owner with a signal and createGroup." }

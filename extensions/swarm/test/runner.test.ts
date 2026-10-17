@@ -246,6 +246,10 @@ async function harness(
     setFailSpawn: (value: number | undefined) => {
       failSpawn = value
     },
+    setEnabled: (value: string) => {
+      const swarm = api.settings.extensions!.swarm as { enabled: string }
+      swarm.enabled = value
+    },
     confirmations,
     questions,
     memberTool,
@@ -290,6 +294,50 @@ async function idOf(result: Awaited<ReturnType<SwarmRunner["startBound"]>>) {
   if ("error" in result) throw new Error(result.error)
   return result.runId
 }
+
+test("disabled availability explains current settings without confirming or launching", async () => {
+  const h = await harness({ enabled: "never" })
+  expect(h.runner.available()).toEqual({
+    reason: "Swarms are turned off in settings (extensions.swarm.enabled: never).",
+  })
+  expect(h.confirmations).toHaveLength(0)
+  expect(h.questions).toHaveLength(0)
+  expect(h.groups).toHaveLength(0)
+  expect(h.spawns).toHaveLength(0)
+  expect(await h.start()).toHaveProperty("error")
+  expect(h.groups).toHaveLength(0)
+})
+
+test("availability follows live settings during a bound run and consumers can still stop the original runner", async () => {
+  const h = await harness({ enabled: "ask", holdGroup: true })
+  const original = h.runner
+  expect(original.available()).toBe(true)
+  expect(h.confirmations).toHaveLength(0)
+  const id = await idOf(await h.start())
+  expect(h.confirmations).toHaveLength(1)
+  h.setEnabled("never")
+  expect(original.available()).toEqual({
+    reason: "Swarms are turned off in settings (extensions.swarm.enabled: never).",
+  })
+  expect(original.status(id)?.state).toBe("running")
+  h.setEnabled("always")
+  expect(original.available()).toBe(true)
+  h.setEnabled("never")
+  expect(original.stop(id)).toBe(true)
+  await tick()
+  expect(original.status(id)?.state).toBe("ending")
+  h.groups[0]!.release()
+  expect((await h.report(id)).reason).toBe("stopped by swarm.runner")
+  expect(h.groups[0]!.drained).toBe(true)
+  expect(h.groups[0]!.activeChildren).toBe(0)
+  expect(h.groups[0]!.activeEvents).toBe(0)
+  expect(await h.start()).toHaveProperty(
+    "error",
+    "Swarms are turned off in settings (extensions.swarm.enabled: never).",
+  )
+  expect(h.groups).toHaveLength(1)
+  expect(h.confirmations).toHaveLength(1)
+})
 
 test("bound service advertises all capabilities and spawns fresh members with explicit cwd, models and caller groups", async () => {
   const h = await harness()
@@ -436,6 +484,7 @@ test("provider unload stops established runs and later launches remain unavailab
   const h = await harness()
   const id = await idOf(await h.start())
   h.unload()
+  expect(h.runner.available()).toEqual({ reason: "The swarm extension was unloaded." })
   expect((await h.report(id)).reason).toBe("swarm extension unloaded")
   expect(await h.start()).toHaveProperty("error")
 })
@@ -511,10 +560,40 @@ test("bound member workflows propagate cwd, owner, attribution and cancellation,
   expect(service.stops).toEqual(["wf1"])
 })
 
+for (const duringStart of [false, true]) {
+  test(`bound workflow availability blocks ${duringStart ? "a racing start and stops the original run" : "new starts"} without legacy fallback`, async () => {
+    const service = workflowRunner()
+    const pending = duringStart ? service.pending() : undefined
+    const runner: WorkflowRunner = {
+      ...service.runner,
+      capabilities: RUNNER_CAPABILITIES,
+      onProgress: () => () => {},
+      start: async () => {
+        throw new Error("legacy fallback")
+      },
+      startBound: (request, owner) => service.runner.start(request, { signal: owner.signal } as ToolContext),
+    }
+    const h = await harness({ workflow: runner })
+    await h.start()
+    if (!duringStart) service.setAvailable({ reason: "Workflows are turned off in settings." })
+    const started = h.memberTool("start_workflow", { name: "check" })
+    if (duringStart) {
+      service.setAvailable({ reason: "Workflows are turned off in settings." })
+      pending!.resolve({ runId: "wf1" })
+    }
+    const result = await started
+    expect(result.isError).toBe(true)
+    expect(textOf(result)).toContain("Workflows are turned off in settings.")
+    expect(service.starts).toHaveLength(duringStart ? 1 : 0)
+    expect(service.stops).toEqual(duringStart ? ["wf1"] : [])
+  })
+}
+
 for (const kind of [
   "absent",
   "legacy",
   "missing flag",
+  "missing availability",
   "missing progress",
   "replaced",
   "unloaded",
@@ -534,9 +613,11 @@ for (const kind of [
           ? service.runner
           : kind === "missing flag"
             ? { ...full, capabilities: { ...RUNNER_CAPABILITIES, ownedLifetime: false } }
-            : kind === "missing progress"
-              ? { ...full, onProgress: undefined }
-              : full
+            : kind === "missing availability"
+              ? { ...full, available: undefined }
+              : kind === "missing progress"
+                ? { ...full, onProgress: undefined }
+                : full
     const h = await harness({ workflow: candidate })
     await h.start()
     if (kind === "replaced") h.setWorkflow({ ...full })

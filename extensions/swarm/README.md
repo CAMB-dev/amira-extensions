@@ -236,8 +236,9 @@ The swarm's total token count includes descendants; per-member totals do not.
 
 Since **0.3.0**, `api.useService("swarm.runner")` provides execution without the dashboard
 or a fabricated `ToolContext`. Treat the value as `unknown`: check its methods and **all
-five** capability flags at recommendation time and again at launch. Installed packages,
-`swarm.dashboardSource`, or a legacy runner without the flags do not establish compatibility.
+five** capability flags plus the required `available()` query at recommendation time, at
+launch and while polling a run. Installed packages, `swarm.dashboardSource`, or a legacy
+runner without this contract do not establish compatibility.
 These are provider/consumer-local structural contracts, not new `@amira/api` exports:
 
 ```ts
@@ -262,6 +263,7 @@ interface MemberSpec {
 }
 interface SwarmRunner {
   capabilities: RunnerCapabilities
+  available(): true | { reason: string }
   startBound(request: {
     goal: string
     members: MemberSpec[]
@@ -275,6 +277,15 @@ interface SwarmRunner {
   onResult(runId: string, listener: (report: SwarmRunReport) => void): () => void
 }
 ```
+
+Added in **0.3.1**, `available()` is a synchronous, live policy query: it opens no dialogs, calls no models
+and makes no network requests. It returns `{ reason }` when current settings contain
+`extensions.swarm.enabled: never` or this provider has unloaded; otherwise it returns
+`true`, including while a run is active. It does not reserve a slot or authorize a start.
+Settings changes are visible on the next query, not cached at registration. If availability
+is lost during a run, consumers must stop and drain that run through the **original**
+runner reference, even if service discovery now returns a replacement or nothing. Status,
+stop and result subscriptions remain usable on the original runner for this cleanup.
 
 `SpawnGroupOptions` and `SpawnGroup` are public API types. Bind `createGroup` to the
 caller's owned handle (for example, `options => owned.createGroup(options)`), not
@@ -308,13 +319,16 @@ available in memory for this provider instance; consumers must persist their own
 
 Member workflows of a bound swarm use `workflow.runner.startBound` with the **same cwd and
 owner**, member attribution, and a signal combining owner, tool and swarm cancellation.
-The workflow service must structurally provide `start`, `startBound`, `status`, `stop`,
-`onProgress`, `onResult` and all five true capability flags. Its `startBound` request adds
-`cwd` to `{ script?, name?, args?, startedBy }`, takes the same `RunnerOwner`, and returns
+The workflow service must structurally provide `available(): true | { reason: string }`,
+`start`, `startBound`, `status`, `stop`, `onProgress`, `onResult` and all five true capability
+flags. Availability is checked before and after each bound start; a disabled provider's
+reason is included in the error, and a run returned after availability is lost is stopped
+and drained through the original runner. Its `startBound` request adds `cwd` to
+`{ script?, name?, args?, startedBy }`, takes the same `RunnerOwner`, and returns
 `{ runId } | { error }`. A missing method/flag, service replacement or unload disables new
 member workflow starts with a clear reason; **legacy `start` is never a fallback** for a
 bound run. Explicit `memberWorkflows.enabled: false` removes the tools. Legacy main-session
-swarms keep their existing workflow integration.
+swarms keep their existing workflow integration, including older services with only `start`, `status`, `stop` and `onResult`; the settings-aware availability query is mandatory for **bound** execution, not a new requirement for that legacy unbound path.
 
 Consumers must handle start errors and recheck service identity/capabilities, never silently
 switch an approved mode or cwd. If the provider is absent, disabled, old or unloaded, block

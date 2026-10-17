@@ -52,6 +52,8 @@ export interface RunSnapshot extends RunnerResult {
 
 export interface WorkflowRunner {
   capabilities: { cwd: true; freshRun: true; models: true; ownedLifetime: true; progress: true }
+  /** Pure, current start availability; does not confirm or affect existing runs. */
+  available(): true | { reason: string }
   start(request: RunnerRequest, ctx: ToolContext): Promise<{ runId: string } | { error: string }>
   startBound(
     request: RunnerRequest & { cwd: string },

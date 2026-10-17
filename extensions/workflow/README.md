@@ -302,16 +302,26 @@ interface RunSnapshot extends RunnerResult {
   }[]
 }
 interface WorkflowRunner {
+  capabilities: { cwd: true; freshRun: true; models: true; ownedLifetime: true; progress: true }
+  available(): true | { reason: string }
   start(request: StartRequest, ctx: ToolContext): Promise<StartResult>
+  startBound(request: StartRequest & { cwd: string }, owner: RunnerOwner): Promise<StartResult>
   status(runId: string): RunnerResult | undefined
   stop(runId: string): boolean
+  onProgress(runId: string, listener: (snapshot: RunSnapshot) => void): () => void
   onResult(runId: string, listener: (result: RunnerResult) => void): () => void
-  // Optional when mirroring older providers:
-  capabilities?: { cwd: true; freshRun: true; models: true; ownedLifetime: true; progress: true }
-  startBound?(request: StartRequest & { cwd: string }, owner: RunnerOwner): Promise<StartResult>
-  onProgress?(runId: string, listener: (snapshot: RunSnapshot) => void): () => void
 }
 ```
+
+Added in **0.3.1**, `available()` is a required, synchronous, pure query of current start availability: it
+opens no dialogs, reports no settings errors, and makes no model or network calls. It
+returns `{ reason }` when `extensions.workflow.enabled` is `"never"` (with
+`extensions.workflow.enabled: never` in the reason), or when the provider is unloaded or
+disposed; otherwise it returns `true`. Setting changes are visible on the next call,
+including during a bound run. `true` does not bypass settings or confirmation at start.
+The five capability flags describe supported execution semantics, not current availability,
+and remain true when starts are disabled. Disabling starts does not stop existing runs:
+keep their original runner handle to inspect, subscribe to, or stop them.
 
 Bind `createGroup` to the owned handle, for example `createGroup: (o) => owned.createGroup(o)`,
 and supply its session ID and abort signal. `startedBy` attributes the requester (which may
@@ -349,8 +359,9 @@ and cancellation signal; this structural service is not an authentication or san
 boundary. The original `start` remains caller-group/main-session compatible and retains
 its previous confirmation and result behavior, without duplicate root notices.
 
-Discover the service when recommending a mode **and again at launch**. If it is absent,
-unloaded, disabled, or has no `startBound`/`onProgress` or any of the five true capability
+Discover the service when recommending a mode **and again at launch**, and require
+`available() === true` each time. If it is absent, has no `available` query, reports an
+unavailable reason, or has no `startBound`/`onProgress` or any of the five true capability
 flags, do not treat it as a bound runner. Old providers can still serve old `start` callers,
 but an injected cwd or fabricated ToolContext does not make them compatible. Keep the
 approved mode blocked and ask for fresh approval before any single-agent/other-provider

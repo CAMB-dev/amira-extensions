@@ -1,5 +1,5 @@
 import path from "node:path"
-import type { AcceptedBatchRef, ArtifactKind } from "./stage.ts"
+import type { AcceptedBatchRef, ArtifactKind, BatchResolutionRef } from "./stage.ts"
 
 export interface PrototypeManifestArtifact {
   kind: "prototype-manifest"
@@ -69,6 +69,14 @@ export interface BatchPlanArtifact extends SpecBinding {
   kind: "batch-plan"
   mode: "single" | "workflow" | "swarm"
   batches: { id: string; itemIds: string[]; decisionIds: string[]; files: string[] }[]
+  /** Mode-only replacement of the same immutable spec. Carried receipt owners are never rewritten. */
+  modeChange?: {
+    previousPlan: { artifactId: string; hash: string }
+    /** Durable source context for cancelled/interrupted mode-review drafts, not launch authorization. */
+    sourceApprovalId: string
+    batchId: string
+    carriedResolutions: BatchResolutionRef[]
+  }
   /** Correction-only coverage, qualified by the original human-confirmed acceptance. */
   preservedItems?: { itemId: string; acceptedBatch: AcceptedBatchRef }[]
 }
@@ -148,6 +156,15 @@ export interface BatchResultArtifact {
   changedFiles?: string[]
   summary: string
   implementerModels: string[]
+  /** Provider-independent execution evidence. Older results remain readable. */
+  execution?: {
+    mode: "single" | "workflow" | "swarm"
+    runId: string
+    /** Missing only when execution failed before the provider reported a cwd. */
+    cwd?: string
+    groupId?: string
+    sessionIds: string[]
+  }
   checks: AcceptanceArtifact["checks"]
   error?: string
 }
@@ -305,6 +322,7 @@ export function validateArtifact(value: unknown): asserts value is IterationArti
         "changedFiles",
         "summary",
         "implementerModels",
+        "execution",
         "checks",
         "error",
       ])
@@ -312,6 +330,19 @@ export function validateArtifact(value: unknown): asserts value is IterationArti
       if (typeof a.diffStat !== "string") fail("invalid diff stat")
       if (a.changedFiles !== undefined) files(a.changedFiles)
       texts(a.implementerModels)
+      if (a.execution !== undefined) {
+        const execution = object(a.execution, ["mode", "runId", "cwd", "groupId", "sessionIds"])
+        oneOf(execution.mode, ["single", "workflow", "swarm"])
+        text(execution.runId)
+        if (execution.cwd !== undefined) {
+          text(execution.cwd)
+          if (!path.isAbsolute(String(execution.cwd))) fail("execution cwd must be absolute")
+        }
+        if (execution.groupId !== undefined) text(execution.groupId)
+        texts(execution.sessionIds)
+        if (execution.mode !== (a.context as { mode?: unknown })?.mode)
+          fail("execution mode differs from approval")
+      }
       const context = object(a.context, ["spec", "batchPlan", "batchId", "mode", "model", "changes"])
       text(context.batchId)
       if (!Array.isArray(a.checks)) fail("invalid check results")
@@ -366,6 +397,7 @@ export function validateArtifact(value: unknown): asserts value is IterationArti
     "mode",
     "batches",
     "preservedItems",
+    "modeChange",
     "batchId",
     ...reviewBindings,
     "reviewerModel",
@@ -512,7 +544,7 @@ export function validateArtifact(value: unknown): asserts value is IterationArti
       break
     }
     case "batch-plan": {
-      const a = object(value, ["kind", ...bindings, "mode", "batches", "preservedItems"])
+      const a = object(value, ["kind", ...bindings, "mode", "batches", "preservedItems", "modeChange"])
       binding(a)
       oneOf(a.mode, ["single", "workflow", "swarm"])
       const batches = list(a.batches).map((entry) => {
@@ -525,6 +557,30 @@ export function validateArtifact(value: unknown): asserts value is IterationArti
       })
       if (!batches.length) fail("plan requires batches")
       unique(batches)
+      if (a.modeChange !== undefined) {
+        const change = object(a.modeChange, [
+          "previousPlan",
+          "sourceApprovalId",
+          "batchId",
+          "carriedResolutions",
+        ])
+        text(change.sourceApprovalId)
+        const previous = object(change.previousPlan, ["artifactId", "hash"])
+        text(previous.artifactId)
+        digest(previous.hash)
+        ids([change.batchId], true)
+        if (!batches.includes(String(change.batchId)))
+          fail("mode change must keep the selected batch scheduled")
+        unique(
+          list(change.carriedResolutions).map((entry) => {
+            const ref = object(entry, ["batchId", "receiptId"])
+            ids([ref.batchId], true)
+            text(ref.receiptId)
+            if (batches.includes(String(ref.batchId))) fail("carried batches cannot be scheduled again")
+            return ref.batchId
+          }),
+        )
+      }
       if (a.preservedItems !== undefined) {
         unique(
           list(a.preservedItems).map((entry) => {

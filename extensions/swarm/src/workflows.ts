@@ -23,6 +23,7 @@ export function isWorkflowRunner(value: unknown): value is WorkflowRunner {
 
 export function supportsBoundWorkflow(value: unknown): value is WorkflowRunner & {
   startBound: NonNullable<WorkflowRunner["startBound"]>
+  available: NonNullable<WorkflowRunner["available"]>
 } {
   if (!isWorkflowRunner(value)) return false
   return (
@@ -30,15 +31,18 @@ export function supportsBoundWorkflow(value: unknown): value is WorkflowRunner &
       (key) => value.capabilities?.[key as keyof RunnerCapabilities] === true,
     ) &&
     typeof value.startBound === "function" &&
+    typeof value.available === "function" &&
     typeof value.onProgress === "function"
   )
 }
 
 export const BOUND_WORKFLOW_UNAVAILABLE =
-  "Member workflows are disabled for this bound swarm: workflow.runner must be available with startBound, onProgress and cwd/freshRun/models/ownedLifetime/progress capabilities. No legacy workflow start will be used."
+  "Member workflows are disabled for this bound swarm: workflow.runner must be available with available, startBound, onProgress and cwd/freshRun/models/ownedLifetime/progress capabilities. No legacy workflow start will be used."
 
 /** Structural contract of the optional workflow.runner service; no package dependency. */
 export interface WorkflowRunner {
+  /** Optional only for legacy unbound integration; bound calls require the live query. */
+  available?(): true | { reason: string }
   capabilities?: RunnerCapabilities
   start(request: WorkflowStartRequest, ctx: ToolContext): Promise<{ runId: string } | { error: string }>
   startBound?(
@@ -217,6 +221,9 @@ export class MemberWorkflows {
     const runner = this.runner
     if (!runner || (this.bound && (!supportsBoundWorkflow(runner) || this.bound.current() !== runner)))
       return textResult(BOUND_WORKFLOW_UNAVAILABLE, true)
+    const availability = this.bound ? runner.available!() : true
+    if (availability !== true)
+      return textResult(`${BOUND_WORKFLOW_UNAVAILABLE}\n${availability.reason}`, true)
     if (!ctx.session) return textResult("A member session is required to start a workflow.", true)
     const running = this.#runs.filter((run) => run.running)
     const own = running.filter((run) => run.owner === owner)
@@ -254,6 +261,12 @@ export class MemberWorkflows {
         run.running = false
         await this.#stopRun(runner, run.runId)
         return textResult(BOUND_WORKFLOW_UNAVAILABLE, true)
+      }
+      const available = this.bound ? runner.available!() : true
+      if (available !== true) {
+        run.running = false
+        await this.#stopRun(runner, run.runId)
+        return textResult(`${BOUND_WORKFLOW_UNAVAILABLE}\n${available.reason}`, true)
       }
       run.name = runner.status(run.runId)?.name ?? run.name
       this.#publish()
