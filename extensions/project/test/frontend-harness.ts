@@ -6,6 +6,7 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import type { SessionControl, TerminalApi } from "@amira/api"
 import { frontendSuite, requireFrontendHost, waitFor } from "./frontend-host.ts"
+import { fixtureShell } from "./implement-fixture.ts"
 
 export { frontendSuite, waitFor }
 export const ESC = "\x1b[27u"
@@ -45,6 +46,7 @@ export async function frontend(
   const tools = new ToolRegistry()
   tools.register(writeTool, "builtin-tools")
   tools.register(applyPatchTool, "builtin-tools")
+  if (!extraTools.some((tool) => tool.name === "bash")) tools.register(fixtureShell, "offline-fixture")
   for (const tool of extraTools) tools.register(tool, "offline-fixture")
   const interceptors = new InterceptorRegistry()
   const mock = createMockDialect([])
@@ -89,7 +91,7 @@ export async function frontend(
     }),
     data: agent.data,
     messages: () => agent.messages,
-    models: () => ["mock/frontend"],
+    models: () => ["mock/frontend", "mock/reviewer"],
     replies: () => [],
     subagents: () => [],
   } as unknown as SessionControl
@@ -159,7 +161,7 @@ export async function frontend(
       throw new Error(`${String(error)}\n${live()}`)
     }
   }
-  const dialog = async (title: string, timeoutMs = 20_000) => {
+  const dialog = async (title: string, timeoutMs = 60_000) => {
     try {
       await waitFor(
         () => host.ui.pending[0]?.title === title && live().includes(`╭ ${title}`),
@@ -172,7 +174,7 @@ export async function frontend(
     expect(host.ui.pending).toHaveLength(1)
   }
   const idle = () =>
-    waitFor(() => !commandRunning && !live().includes("esc cancel command"), "command completed", 20_000)
+    waitFor(() => !commandRunning && !live().includes("esc cancel command"), "command completed", 60_000)
   const dismissed = async () => {
     await waitFor(() => host.ui.pending.length === 0, "dialog dismissed", 20_000)
     await idle()

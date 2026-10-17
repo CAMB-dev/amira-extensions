@@ -148,7 +148,8 @@ test("single-agent batch has exact coordinator policy, fresh child seed, metadat
   const state = await f.store.read()
   expect(state.phase, f.notifications.join("\n")).toBe("proposed")
   expect(state.pending?.to).toBe("accept")
-  expect(state.pending?.suggestion).toContain("coming next")
+  expect(state.pending?.suggestion).toContain("/project accept")
+  expect(state.pending?.suggestion).not.toContain("coming next")
   const coordinator = f.specs.at(-1)!
   expect(coordinator.key).toMatch(new RegExp(`^${f.project.marker.id}/iteration/1/batch/B1/implement/`))
   expect(coordinator.descendants).toBe("inherit")

@@ -14,7 +14,14 @@ import { link, lstat, mkdir, open, readdir, readFile, realpath, rename, unlink }
 import path from "node:path"
 import type { AskAnswer, AskQuestion } from "@amira/api"
 import { validateAskAnswers } from "./answers.ts"
-import { type IterationArtifact, type PrototypeManifestArtifact, validateArtifact } from "./artifacts.ts"
+import {
+  type BatchPlanArtifact,
+  type IterationArtifact,
+  type PrototypeManifestArtifact,
+  type SpecArtifact,
+  sameSpecItem,
+  validateArtifact,
+} from "./artifacts.ts"
 import { localize } from "./language.ts"
 import { validateAskQuestions } from "./questions.ts"
 import { requiredChecks, validateSpecIdentity } from "./spec-integrity.ts"
@@ -2183,6 +2190,19 @@ export class IterationStore {
     this.validateState(state)
   }
 
+  /** Active policy only: immutable historical specs remain readable after supersession. */
+  async assertCurrentSpecDecisions(spec: SpecArtifact): Promise<void> {
+    if (!spec.decisionIds.length) return
+    const decisions = await new DecisionStore(this.project).records()
+    const obsolete = spec.decisionIds.filter(
+      (id) => !decisions.some((entry) => entry.id === id && !entry.supersededBy.length),
+    )
+    if (obsolete.length)
+      invalid(
+        `Spec references missing or superseded decisions: ${obsolete.join(", ")}. Revisit design/prototype, generate a correction spec and approve it before continuing.`,
+      )
+  }
+
   /** Historical binding proofs remain schema-only. Every new approval/execution
    * must explicitly opt into the current spec-use policy, never recovery/load. */
   private async approvedPlan(
@@ -2198,7 +2218,10 @@ export class IterationStore {
     const spec = await this.artifact(specRef)
     if (spec.kind !== "spec" || spec.revision !== context.spec.revision)
       invalid("Approval must bind the exact saved spec revision and hash")
-    if (use === "active") requiredChecks(spec)
+    if (use === "active") {
+      requiredChecks(spec)
+      await this.assertCurrentSpecDecisions(spec)
+    }
     const planRef = state.artifacts.find((ref) => ref.id === context.batchPlan!.artifactId)
     if (!planRef || planRef.hash !== context.batchPlan.hash)
       invalid("Approval must bind the exact saved batch plan")
@@ -2211,6 +2234,7 @@ export class IterationStore {
       !plan.batches.some((batch) => batch.id === context.batchId)
     )
       invalid("Approval batch plan does not match the exact spec, batch and mode")
+    if (use === "active") await this.planCoverage(state, spec, plan)
     return plan
   }
 
@@ -2372,7 +2396,7 @@ export class IterationStore {
   }
 
   /** A correction points at the original acceptance owner, not its new target spec/plan. */
-  private async confirmedAcceptedEvidence(state: IterationState, ref: AcceptedBatchRef): Promise<void> {
+  private async confirmedAcceptedEvidence(state: IterationState, ref: AcceptedBatchRef) {
     const resolution = state.batchResolutions?.find(
       (entry) =>
         entry.status === "accepted" &&
@@ -2437,7 +2461,7 @@ export class IterationStore {
       invalid("Correction accepted evidence must retain its UI trial requirement")
     const trial = resolution.manualTrial ?? attempt.manualTrial
     if (trialRequired && !trial) invalid("Correction accepted evidence requires a resolved manual trial")
-    if (!trial) return
+    if (!trial) return { spec, batch }
     const trialRef = state.artifacts.find((entry) => entry.id === trial.artifactId)
     const payload = trialRef && (await this.artifact(trialRef))
     const trialReceipt = state.receipts.find((entry) => entry.id === trial.receiptId)
@@ -2458,6 +2482,58 @@ export class IterationStore {
       payload.specRevision !== evidence.specRevision
     )
       invalid("Correction accepted evidence requires its exact resolved trial and human receipt")
+    return { spec, batch }
+  }
+
+  /** Publication/use policy, never historical schema validation or recovery. */
+  private async planCoverage(
+    state: IterationState,
+    spec: SpecArtifact,
+    plan: BatchPlanArtifact,
+  ): Promise<void> {
+    const preserved = plan.preservedItems ?? []
+    const covered = [
+      ...plan.batches.flatMap((batch) => batch.itemIds),
+      ...preserved.map((entry) => entry.itemId),
+    ]
+    const itemIds = spec.items.map((item) => item.id)
+    if (
+      new Set(covered).size !== covered.length ||
+      covered.length !== itemIds.length ||
+      covered.some((id) => !itemIds.includes(id))
+    )
+      invalid(
+        "Batch plan must cover every spec item exactly once through scheduled or qualified preserved items",
+      )
+    for (const batch of plan.batches) {
+      if (batch.decisionIds.some((id) => !spec.decisionIds.includes(id)))
+        invalid("Batch references unknown spec decision IDs")
+    }
+    if (!preserved.length) return
+    const corrections = []
+    for (const record of state.corrections) {
+      const ref = state.artifacts.find((entry) => entry.id === record.artifactId)
+      const payload = ref && (await this.artifact(ref))
+      if (
+        payload?.kind === "correction" &&
+        payload.specHash === plan.specHash &&
+        payload.specRevision === plan.specRevision
+      )
+        corrections.push(payload)
+    }
+    if (!corrections.length)
+      invalid("Preserved items require a recorded correction for the exact revised spec")
+    for (const entry of preserved) {
+      if (
+        corrections.some((correction) =>
+          correction.mappings.some((mapping) => mapping.itemIds.includes(entry.itemId)),
+        )
+      )
+        invalid("Affected correction items cannot be preserved as unchanged accepted work")
+      const { spec: original, batch } = await this.confirmedAcceptedEvidence(state, entry.acceptedBatch)
+      if (!batch.itemIds.includes(entry.itemId) || !sameSpecItem(original, spec, entry.itemId))
+        invalid("Preserved item must retain its accepted stable identity, semantics and exact checks")
+    }
   }
 
   private async validateBinding(
@@ -2491,6 +2567,7 @@ export class IterationStore {
     }
     if (artifact.kind === "spec") {
       requiredChecks(artifact)
+      await this.assertCurrentSpecDecisions(artifact)
       if (
         saved.some((entry) => entry.artifact.kind === "spec" && entry.artifact.revision >= artifact.revision)
       )
@@ -2556,14 +2633,7 @@ export class IterationStore {
         saved.some((entry) => entry.artifact.kind === "batch-plan")
       )
         invalid("Cannot replace a batch plan while work is running or approval is proposed")
-      const covered = artifact.batches.flatMap((batch) => batch.itemIds)
-      knownItems(covered)
-      if (new Set(covered).size !== covered.length || itemIds.some((id) => !covered.includes(id)))
-        invalid("Batch plan must cover every spec item exactly once")
-      for (const batch of artifact.batches) {
-        if (batch.decisionIds.some((id) => !spec.decisionIds.includes(id)))
-          invalid("Batch references unknown spec decision IDs")
-      }
+      await this.planCoverage(state, spec, artifact)
       return
     }
     if (artifact.kind === "correction") {
@@ -2585,7 +2655,13 @@ export class IterationStore {
     )
       invalid("Acceptance/manual trial must bind the active review attempt ID, ordinal and code snapshot")
     const context = active.context
-    const plan = await this.approvedPlan(state, context, "active")
+    // Stale/blocked failure evidence is still worth preserving after decisions
+    // change. It authorizes no work or pass; execution/continuation stays active-policy gated.
+    const plan = await this.approvedPlan(
+      state,
+      context,
+      artifact.kind === "acceptance" && artifact.outcome !== "pass" ? "history" : "active",
+    )
     if (
       artifact.specHash !== context!.spec!.hash ||
       artifact.specRevision !== context!.spec!.revision ||

@@ -134,7 +134,7 @@ test("declining a pending-trial revisit and explicitly continuing does not resur
     artifact: pending.artifact,
     status: "pending",
   })
-  f.setSelect((_title, options) => options.find((option) => option === "Explicitly defer trial"))
+  f.setSelect((_title, options) => options.find((option) => option.startsWith("Explicitly defer trial")))
   state = await f.run("next")
   expect(state.manualTrial?.status).toBe("deferred")
   const artifact = await f.store.readArtifact(
@@ -159,7 +159,7 @@ test("a queued revisit does not force the pending trial and returns at the finis
     artifact: verdict.artifact,
     acceptance: { verdict: "pass", failingItemIds: [], artifactId: verdict.artifact.id },
   })
-  expect(stageStatus(state, "en")).toContain("Batch B1 accepted, manual trial pending")
+  expect(stageStatus(state, "en")).toContain("Batch B1 automated pass, manual trial pending")
   expect(stageStatus(state, "en")).not.toContain("\nAccepted, manual trial pending")
   expect(nextSuggestion(state, "en")).toContain("request to revisit design")
   expect(nextSuggestion(state, "en")).not.toContain("trial prompt")

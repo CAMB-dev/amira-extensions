@@ -69,6 +69,8 @@ export interface BatchPlanArtifact extends SpecBinding {
   kind: "batch-plan"
   mode: "single" | "workflow" | "swarm"
   batches: { id: string; itemIds: string[]; decisionIds: string[]; files: string[] }[]
+  /** Correction-only coverage, qualified by the original human-confirmed acceptance. */
+  preservedItems?: { itemId: string; acceptedBatch: AcceptedBatchRef }[]
 }
 interface ReviewBinding extends SpecBinding {
   batchPlan: { artifactId: string; hash: string }
@@ -142,6 +144,8 @@ export interface BatchResultArtifact {
   base: string
   snapshot: string
   diffStat: string
+  /** Exact repository-relative paths from Git, not parsed/abbreviated --stat output. */
+  changedFiles?: string[]
   summary: string
   implementerModels: string[]
   checks: AcceptanceArtifact["checks"]
@@ -224,6 +228,45 @@ function reviewBinding(value: Record<string, unknown>): void {
   digest(value.codeHash)
 }
 
+function acceptedBatch(value: unknown): asserts value is AcceptedBatchRef {
+  const ref = object(value, ["batchId", "spec", "batchPlan", "resolutionReceiptId", "attemptId"])
+  ids([ref.batchId], true)
+  const spec = object(ref.spec, ["artifactId", "revision", "hash"])
+  text(spec.artifactId)
+  integer(spec.revision)
+  digest(spec.hash)
+  const plan = object(ref.batchPlan, ["artifactId", "hash"])
+  text(plan.artifactId)
+  digest(plan.hash)
+  text(ref.resolutionReceiptId)
+  text(ref.attemptId)
+}
+
+/** Stable identity and all item semantics, including exact referenced check definitions.
+ * Set ordering is irrelevant; command text and cwd are not normalized. */
+export function sameSpecItem(left: SpecArtifact, right: SpecArtifact, id: string): boolean {
+  const fingerprint = (spec: SpecArtifact) => {
+    const item = spec.items.find((entry) => entry.id === id)
+    if (!item) return null
+    return JSON.stringify([
+      item.id,
+      item.description,
+      [...item.constraints].sort(),
+      [...item.verification].sort(),
+      [...item.acceptanceCriteria].sort(),
+      [...item.decisionIds].sort(),
+      [...item.checkIds].sort(),
+      item.ui,
+      [...item.checkIds].sort().map((checkId) => {
+        const check = spec.checks.find((entry) => entry.id === checkId)
+        return check ? [check.id, check.command, check.cwd ?? "."] : null
+      }),
+    ])
+  }
+  const original = fingerprint(left)
+  return original !== null && original === fingerprint(right)
+}
+
 /** Historical payload schema only. Current spec-use policy is checked separately at
  * publication, approval and execution; it must not make valid old history unreadable.
  * Identity, filenames and hashes are store-owned. */
@@ -259,6 +302,7 @@ export function validateArtifact(value: unknown): asserts value is IterationArti
         "base",
         "snapshot",
         "diffStat",
+        "changedFiles",
         "summary",
         "implementerModels",
         "checks",
@@ -266,6 +310,7 @@ export function validateArtifact(value: unknown): asserts value is IterationArti
       ])
       for (const key of ["attemptId", "worktree", "base", "snapshot", "summary"]) text(a[key])
       if (typeof a.diffStat !== "string") fail("invalid diff stat")
+      if (a.changedFiles !== undefined) files(a.changedFiles)
       texts(a.implementerModels)
       const context = object(a.context, ["spec", "batchPlan", "batchId", "mode", "model", "changes"])
       text(context.batchId)
@@ -320,6 +365,7 @@ export function validateArtifact(value: unknown): asserts value is IterationArti
     ...bindings,
     "mode",
     "batches",
+    "preservedItems",
     "batchId",
     ...reviewBindings,
     "reviewerModel",
@@ -466,7 +512,7 @@ export function validateArtifact(value: unknown): asserts value is IterationArti
       break
     }
     case "batch-plan": {
-      const a = object(value, ["kind", ...bindings, "mode", "batches"])
+      const a = object(value, ["kind", ...bindings, "mode", "batches", "preservedItems"])
       binding(a)
       oneOf(a.mode, ["single", "workflow", "swarm"])
       const batches = list(a.batches).map((entry) => {
@@ -479,6 +525,16 @@ export function validateArtifact(value: unknown): asserts value is IterationArti
       })
       if (!batches.length) fail("plan requires batches")
       unique(batches)
+      if (a.preservedItems !== undefined) {
+        unique(
+          list(a.preservedItems).map((entry) => {
+            const preserved = object(entry, ["itemId", "acceptedBatch"])
+            ids([preserved.itemId], true)
+            acceptedBatch(preserved.acceptedBatch)
+            return preserved.itemId
+          }),
+        )
+      }
       break
     }
     case "acceptance": {
@@ -606,18 +662,8 @@ export function validateArtifact(value: unknown): asserts value is IterationArti
         ids(edge.itemIds, true)
         files(edge.changedFiles)
         const accepted = list(edge.acceptedBatches).map((entry) => {
-          const ref = object(entry, ["batchId", "spec", "batchPlan", "resolutionReceiptId", "attemptId"])
-          ids([ref.batchId], true)
-          const spec = object(ref.spec, ["artifactId", "revision", "hash"])
-          text(spec.artifactId)
-          integer(spec.revision)
-          digest(spec.hash)
-          const plan = object(ref.batchPlan, ["artifactId", "hash"])
-          text(plan.artifactId)
-          digest(plan.hash)
-          text(ref.resolutionReceiptId)
-          text(ref.attemptId)
-          return JSON.stringify([plan.artifactId, ref.batchId])
+          acceptedBatch(entry)
+          return JSON.stringify([entry.batchPlan.artifactId, entry.batchId])
         })
         unique(accepted)
         mappedOld.push(edge.oldDecisionId)

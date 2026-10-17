@@ -95,6 +95,13 @@ frontendSuite("frontend-spec-implementation", () => {
           "F6 returns from implementation coordinator",
           20_000,
         )
+        const beforePrematureAcceptance = await f.store.read()
+        await expect(f.command("accept", "Running implementation was not stopped.", 60_000)).rejects.toThrow(
+          "Running implementation was not stopped.",
+        )
+        await f.idle()
+        expect(await f.store.read()).toEqual(beforePrematureAcceptance)
+        expect(f.mock.requests).toHaveLength(3)
         release()
         await waitFor(
           () => f.mock.requests.length === 5,
@@ -120,7 +127,7 @@ frontendSuite("frontend-spec-implementation", () => {
         })
         expect(await readFile(path.join(coordinator.cwd, "result.txt"), "utf8")).toBe("ready\n")
         expect(await Bun.file(path.join(f.cwd, "result.txt")).exists()).toBe(false)
-        await f.command("status", ["Spec: approved", "Worktree:", "Acceptance: coming next"])
+        await f.command("status", ["Spec: approved", "Worktree:", "/project accept"])
         const beforeDismissal = await f.store.read()
         const modelCalls = f.mock.requests.length
         f.send("next")

@@ -1,0 +1,61 @@
+{
+  "name": "project-acceptance",
+  "description": "Offline acceptance progress, verdict and human manual trial at 120x36. Prepare with scripts/prepare-accept-walk.ts; load its printed temporary extension directory with ui-walk --extension. Git runTool and fixed orchestration/record tool names are fixture-adapted; frontend-accept.test.ts covers the unadapted production path. Use /project new Acceptance --language en, /walk-prepare, /project spec (approve), /project implement (confirm base), F6, /project next (approve acceptance), /project accept; capture progress, then F6 and /project status for the verdict, /project next for the manual trial. No merge, ship or trial is automatic.",
+  "prompt": "Review the approved local result independently, then inspect the human-only UI trial prompt.",
+  "routes": {
+    "main": [
+      {
+        "text": "{\"spec\":{\"kind\":\"spec\",\"revision\":1,\"language\":\"en\",\"summary\":\"Expose a local result from confirmed decisions without promoting prototype code.\",\"body\":\"Goal: expose the approved local result. Constraints: offline only; no prototype imports.\",\"decisionIds\":[],\"items\":[{\"id\":\"S1\",\"description\":\"Expose the approved local result\",\"constraints\":[\"Offline only\",\"No prototype imports\"],\"verification\":[\"Run C1\"],\"acceptanceCriteria\":[\"The local result is ready\"],\"decisionIds\":[],\"checkIds\":[\"C1\"],\"ui\":true}],\"checks\":[{\"id\":\"C1\",\"command\":\"git --version\",\"cwd\":\".\"}]},\"batches\":[{\"id\":\"B1\",\"itemIds\":[\"S1\"],\"decisionIds\":[],\"files\":[\"result.txt\"]}]}"
+      }
+    ],
+    "coordinator": [
+      {
+        "text": "Starting one fresh implementation child for the approved B1 scope.",
+        "toolCalls": [
+          {
+            "id": "walk-accept-implementation",
+            "name": "agent",
+            "args": { "tasks": [{ "isolation": "none", "model": "ui-walk/main" }] }
+          }
+        ]
+      },
+      {
+        "text": "The implementation child finished. Independent acceptance still requires human stage approval. Nothing was merged."
+      }
+    ],
+    "implementer": [
+      {
+        "text": "S1 is ready for independent review in this offline screenshot fixture. No prototype source or design transcript was inherited."
+      }
+    ],
+    "reviewer": [
+      {
+        "text": "Independently reviewing B1, attempt 1, against the pinned spec. I am checking S1 evidence in the isolated iteration checkout. Required command C1 is executed independently by the extension after this read-only review; an automated pass does not count as a human UI trial. ",
+        "delayMs": 500,
+        "chunkSize": 6,
+        "toolCalls": [
+          {
+            "id": "walk-record-acceptance",
+            "name": "agent",
+            "args": {
+              "tasks": [],
+              "items": [
+                {
+                  "itemId": "S1",
+                  "status": "pass",
+                  "evidence": [
+                    "The offline fixture demonstrates the approved local result; independent check C1 is recorded separately."
+                  ],
+                  "reason": "The approved S1 behavior is represented by this offline screenshot fixture."
+                }
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "text": "Per-item review recorded. Independent checks and a human manual UI trial remain separate evidence. No merge or ship has run."
+      }
+    ]
+  }
+}

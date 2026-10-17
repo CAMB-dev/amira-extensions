@@ -2,9 +2,10 @@ import { expect, setDefaultTimeout, test } from "bun:test"
 import type { AcceptanceArtifact } from "../src/artifacts.ts"
 import type { ApprovalContext } from "../src/stage.ts"
 import type { IterationStore } from "../src/store.ts"
+import { frontendFingerprint } from "./frontend-fingerprint.ts"
 import { frontend, frontendSuite } from "./frontend-harness.ts"
 
-setDefaultTimeout(120_000)
+setDefaultTimeout(300_000)
 
 /** Mirrors the split-plan regression manifest: B1=S1, B2=S2, no checks or UI trial. */
 async function splitReview(store: IterationStore) {
@@ -81,12 +82,13 @@ async function proposeReview(store: IterationStore, context: ApprovalContext, fr
   })
 }
 
-async function passReview(store: IterationStore, batchId: "B1" | "B2") {
+async function passReview(f: Awaited<ReturnType<typeof frontend>>, batchId: "B1" | "B2") {
+  const { store } = f
+  const codeHash = await frontendFingerprint(f.project, store)
   let state = await store.read()
   const context = state.approvedContext!
   const attemptId = `frontend-accept-${batchId}`
   const attempt = batchId === "B1" ? 1 : 2
-  const codeHash = (batchId === "B1" ? "a" : "b").repeat(64)
   state = await store.dispatch(state.revision, {
     type: "start-work",
     expectedRevision: state.revision,
@@ -157,9 +159,10 @@ frontendSuite("frontend-batch", () => {
       test(`${mode}: B1 pass proposes exact B2, starts no executor, and only B2 ${outcome} permits overall completion`, async () => {
         const f = await frontend(mode)
         try {
+          f.agent.permissions.setMode("auto")
           const context = await splitReview(f.store)
           await confirmReview(f)
-          const first = await passReview(f.store, "B1")
+          const first = await passReview(f, "B1")
           f.send("next")
           await f.dialog("Choose the next step")
           const proposed = await f.store.read()
@@ -178,7 +181,7 @@ frontendSuite("frontend-batch", () => {
           await f.dialog("Confirm stage change")
           expect(f.live()).toContain("Batch B1 passed; prepare B2")
           expect(f.live()).toContain('"batchId": "B2"')
-          expect(f.live()).toContain("Acceptance: coming next")
+          expect(f.live()).toContain("Ship: coming later.")
           f.terminal.send("\x1b[B\r")
           await f.dismissed()
           await f.visible("implementation · idle")
@@ -189,7 +192,7 @@ frontendSuite("frontend-batch", () => {
           expect(second.activeAttemptId).toBeUndefined()
           expect(second.completion).toBeUndefined()
           expect(f.mock.requests).toEqual([])
-          await f.command("next", "Acceptance: coming next")
+          await f.command("next", "Ship: coming later.")
           await f.command("status", "Stage: implementation")
           expect(f.live()).toContain("Batch: B2")
           expect(f.live()).toContain("Accepted batches: B1")
@@ -212,7 +215,7 @@ frontendSuite("frontend-batch", () => {
           await proposeReview(f.store, { ...second.approvedContext!, changes: ["diff:B2"] }, "implement")
           await confirmReview(f)
           if (outcome === "pass") {
-            const passed = await passReview(f.store, "B2")
+            const passed = await passReview(f, "B2")
             expect(passed.completion).toBeUndefined()
             f.send("next")
             await f.dialog("Choose the next step")

@@ -7,6 +7,7 @@ import type { ArtifactRef } from "../src/stage.ts"
 import {
   type AcceptanceArtifact,
   createProject,
+  DecisionStore,
   IterationStore,
   ProjectStorageError,
   readProject,
@@ -30,6 +31,20 @@ async function fixture(iteration = 1) {
     project.marker.currentIteration = iteration
     await fs.writeFile(path.join(project.root, ".amira", "project.json"), JSON.stringify(project.marker))
   }
+  await new DecisionStore(project).record(
+    [
+      {
+        question: "Which feature?",
+        header: "Feature",
+        options: [
+          { label: "Approved", description: "Fixture requirement" },
+          { label: "Other", description: "Alternative" },
+        ],
+      },
+    ],
+    [{ selected: ["Approved"] }],
+    { sessionId: "fixture", askId: "D1-fixture", language: "en" },
+  )
   const store = new IterationStore(project)
   return {
     project,

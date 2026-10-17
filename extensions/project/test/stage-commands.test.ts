@@ -14,8 +14,8 @@ import { createProjectExtension, restoreAttachment } from "../src/index.ts"
 import { createProject, IterationStore, readProject, writeDocument } from "../src/store.ts"
 
 // These are durable filesystem/command tests, not latency benchmarks. Full Windows
-// runs can outlive 30s while flushing journals; keep the stale-approval assertions intact.
-setDefaultTimeout(60_000)
+// repeated-revisit cases can outlive 60s while flushing journals; keep the stale-approval assertions intact.
+setDefaultTimeout(120_000)
 const roots: string[] = []
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })

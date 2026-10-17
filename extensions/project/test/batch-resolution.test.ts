@@ -7,7 +7,8 @@ import { commandHarness, consume, implement, startReview, summarize, trial } fro
 import { bindingFixture, human, renewApproval } from "./iteration-binding-helper.ts"
 import { legacyJournal } from "./legacy-batch-helper.ts"
 
-setDefaultTimeout(120_000)
+// Multi-batch durability cases publish 50+ revisions; allow Windows filesystem flushes.
+setDefaultTimeout(240_000)
 const roots: string[] = []
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })

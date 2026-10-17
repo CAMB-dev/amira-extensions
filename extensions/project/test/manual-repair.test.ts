@@ -17,7 +17,8 @@ for (const beforeSummary of [false, true]) {
     let state = await consume(f.store, review.state, review.verdict, true)
     if (!beforeSummary) state = await summarize(f.store, state)
     await trial(f.store, state, review.verdict, "pending")
-    h.control.pick = async (_title, options) => options.find((option) => option === "Record a problem")
+    h.control.pick = async (_title, options) =>
+      options.find((option) => option.startsWith("Record a problem"))
     state = await h.run()
     expect(state.manualTrial?.status).toBe("problem")
     const original = structuredClone(state.attempts.at(-1))

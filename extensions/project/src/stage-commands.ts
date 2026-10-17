@@ -71,7 +71,7 @@ export function stageStatus(state: IterationState, language: string): string {
         : state.stage === "accept" && automatedPass && trial === "pending"
           ? localize(
               language,
-              `Batch ${state.approvedContext?.batchId ?? "—"} accepted, manual trial pending`,
+              `Batch ${state.approvedContext?.batchId ?? "—"} automated pass, manual trial pending`,
               `批次 ${state.approvedContext?.batchId ?? "—"} 已通过自动验收，等待手动试用`,
               `バッチ ${state.approvedContext?.batchId ?? "—"} は自動確認済み、手動試用待ち`,
             )
@@ -84,6 +84,9 @@ export function stageStatus(state: IterationState, language: string): string {
       `段階：${stageName(state.stage, language)}\n状態：${statusName(state.status, language)}（r${state.revision}）\n承認待ち：${pending}\n手動試用：${trialText}`,
     ) +
     (completion ? `\n${completion}` : "") +
+    (state.attempts.find((entry) => entry.id === state.activeAttemptId)?.staleReason
+      ? `\nAcceptance stale: ${state.attempts.find((entry) => entry.id === state.activeAttemptId)!.staleReason}`
+      : "") +
     (batchProgress(state).manifest ? tBatchStatus(state, language) : "") +
     (state.revisit
       ? localize(
@@ -127,6 +130,8 @@ export async function runStageCommand(
   quiesce: () => Promise<void>,
   changed: (state: IterationState) => void = () => {},
   generateSpec?: () => Promise<void>,
+  startAcceptance?: () => Promise<void>,
+  verifyAcceptance?: () => Promise<{ stale: boolean; reason: string | null }>,
 ): Promise<IterationState> {
   const store = new IterationStore(project)
   let state = normalizeIteration(await store.read())
@@ -174,6 +179,23 @@ export async function runStageCommand(
         ctx.print(renderSpec(spec, plan), "info", { markdown: true })
     }
   }
+  const freshReview = async () => {
+    if (!verifyAcceptance) return true
+    const result = await verifyAcceptance()
+    checkOrigin()
+    if (!result.stale) return true
+    const attempt = state.attempts.find((entry) => entry.id === state.activeAttemptId)
+    if (attempt?.acceptance && attempt.status === "finished" && state.phase !== "complete")
+      state = await store.dispatch(state.revision, {
+        type: "invalidate-review",
+        expectedRevision: state.revision,
+        attemptId: attempt.id,
+        reason: result.reason ?? "Acceptance inputs changed; run a fresh review.",
+      })
+    ctx.print(`Acceptance stale: ${result.reason ?? "Fresh review required"}`, "warning")
+    changed(state)
+    return false
+  }
   const approve = async () => {
     const pending = state.pending!
     if (
@@ -181,6 +203,12 @@ export async function runStageCommand(
         t("Confirm stage change", "确认阶段变更", "段階の変更を確認"),
         `${pending.suggestion}${pending.context ? `\n\n${JSON.stringify(pending.context, null, 2)}` : ""}\n\n${executionUnavailable(language)}`,
       ))
+    )
+      return
+    if (
+      state.stage === "accept" &&
+      ["complete", "next-batch"].includes(pending.kind) &&
+      !(await freshReview())
     )
       return
     checkOrigin()
@@ -412,13 +440,28 @@ export async function runStageCommand(
     )
     if (!selected || !options.includes(selected)) return state
     if (state.status !== "working" && selected === options[1]) return state
-    const attempt = state.attempts.find((a) => a.id === state.activeAttemptId)
+    const stage = state.stage
+    let attempt = state.attempts.find((a) => a.id === state.activeAttemptId && a.stage === stage)
     let changes = attempt?.changes ?? []
     if (selected === options[0]) {
       await quiesce()
       checkOrigin()
+      state = normalizeIteration(await store.read())
+      const currentAttempt = state.attempts.find(
+        (entry) => entry.id === state.activeAttemptId && entry.stage === state.stage,
+      )
+      if (state.stage !== stage || currentAttempt?.id !== attempt?.id)
+        throw new ProjectCommandError(
+          t(
+            "Stage or active attempt changed while stopping work. Run /project revisit again.",
+            "停止工作期间阶段或当前工作记录已改变。请重新运行 /project revisit。",
+            "停止中に段階または現在の作業記録が変わりました。/project revisit を再実行してください。",
+          ),
+        )
+      attempt = currentAttempt
+      changes = attempt?.changes ?? []
       const worktreeRef = state.artifacts.findLast((entry) => entry.kind === "iteration-worktree")
-      if (worktreeRef && state.stage === "implement") {
+      if (attempt && worktreeRef && state.stage === "implement") {
         const worktree = await store.readArtifact(worktreeRef)
         if (worktree.kind === "iteration-worktree") changes = [...new Set([...changes, worktree.root])]
       }
@@ -493,6 +536,10 @@ export async function runStageCommand(
         attempt.context,
       ),
     })
+    if (state.stage === "accept") {
+      ctx.print(`${stageStatus(state, language)}\n${nextSuggestion(state, language)}`)
+      return state
+    }
   }
   const recordManualTrial = async () => {
     const review = state.attempts.find((attempt) => attempt.id === state.activeAttemptId)
@@ -529,16 +576,18 @@ export async function runStageCommand(
     }
     ctx.print(`${prior.instructions}\n${prior.observe.join("\n")}`)
     const choices = [
-      t("Record tried", "记录已试用", "試用済みとして記録"),
-      t("Record a problem", "记录发现问题", "問題を記録"),
-      t("Explicitly defer trial", "明确推迟试用", "試用を明示的に延期"),
+      t("Record tried, OK", "记录已试用且正常", "試用して問題なしと記録"),
+      t("Record a problem (tried, problem)", "记录已试用但有问题", "試用して問題ありと記録"),
+      t(
+        "Explicitly defer trial (skip for now, not tried)",
+        "明确暂缓试用（未试用）",
+        "試用を明示的に延期（未試用）",
+      ),
     ]
     const selected = await ask(t("Record manual UI trial", "记录手动界面试用", "手動 UI 試用を記録"), choices)
     const index = selected ? choices.indexOf(selected) : -1
     if (index < 0) return state
     const status = (["tried", "problem", "deferred"] as const)[index]!
-    const saved = await store.saveArtifact(state.revision, { ...prior, status, result: selected! })
-    state = saved.state
     if (
       !(await confirm(
         t("Confirm manual trial record", "确认手动试用记录", "手動試用の記録を確認"),
@@ -546,6 +595,9 @@ export async function runStageCommand(
       ))
     )
       return state
+    if (!(await freshReview())) return state
+    const saved = await store.saveArtifact(state.revision, { ...prior, status, result: selected! })
+    state = saved.state
     state = await store.dispatch(state.revision, {
       type: "record-manual-trial",
       expectedRevision: state.revision,
@@ -814,7 +866,19 @@ export async function runStageCommand(
     })
     await showSummary()
     // Persist the proposal first, then offer confirmation / alternative / skip on this same command.
-    return runStageCommand("next", [], project, ctx, language, checkOrigin, quiesce, changed, generateSpec)
+    return runStageCommand(
+      "next",
+      [],
+      project,
+      ctx,
+      language,
+      checkOrigin,
+      quiesce,
+      changed,
+      generateSpec,
+      startAcceptance,
+      verifyAcceptance,
+    )
   }
   if (state.phase === "summarized" && state.summaryId && state.stage !== "design") {
     const attempt = state.attempts.find((a) => a.id === state.activeAttemptId)
@@ -877,7 +941,31 @@ export async function runStageCommand(
       return state
     }
     await propose(proposal)
-    return runStageCommand("next", [], project, ctx, language, checkOrigin, quiesce, changed, generateSpec)
+    return runStageCommand(
+      "next",
+      [],
+      project,
+      ctx,
+      language,
+      checkOrigin,
+      quiesce,
+      changed,
+      generateSpec,
+      startAcceptance,
+      verifyAcceptance,
+    )
+  }
+  if (startAcceptance && state.stage === "accept" && state.phase === "confirmed" && !state.revisit) {
+    const actions = {
+      start: t("Start acceptance review", "开始验收审查", "受け入れ確認を開始"),
+      keep: t("Keep current stage", "保持当前阶段", "現在の段階を保持"),
+    }
+    const selected = await ask(
+      t("Review this batch", "验收当前批次", "このバッチを確認"),
+      Object.values(actions),
+    )
+    if (selected === actions.start) await startAcceptance()
+    return store.read()
   }
   const suggestion = nextSuggestion(state, language)
   const unavailable = executionUnavailable(language)

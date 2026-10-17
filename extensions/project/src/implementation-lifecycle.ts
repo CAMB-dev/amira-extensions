@@ -9,7 +9,10 @@ export class ImplementationLifecycle {
   private readonly iterator: AsyncIterator<import("@amira/api").AnyEvent>
   private readonly observing: Promise<void>
 
-  constructor(private readonly handle: OwnedConversation) {
+  constructor(
+    private readonly handle: OwnedConversation,
+    private readonly label = "Implementation",
+  ) {
     this.iterator = handle.events[Symbol.asyncIterator]()
     this.observing = this.observe()
     this.tools = new Proxy(handle, {
@@ -23,7 +26,7 @@ export class ImplementationLifecycle {
               : this.controller.signal
             const result = await target.runTool(name, args, { signal })
             if ((result.details as { aborted?: boolean } | undefined)?.aborted)
-              this.cancel("Implementation tool was stopped")
+              this.cancel(`${this.label} tool was stopped`)
             this.check()
             return result
           }
@@ -38,12 +41,12 @@ export class ImplementationLifecycle {
   }
   check(): void {
     if (!this.drained && this.handle.status().state === "stopped")
-      this.cancel("Implementation coordinator was stopped")
+      this.cancel(`${this.label} coordinator was stopped`)
     this.controller.signal.throwIfAborted()
   }
   async drain(): Promise<void> {
     this.check()
-    await this.handle.stop("Implementation finished; drain before checks")
+    await this.handle.stop(`${this.label} finished; drain before checks`)
     // This one extension-initiated stop is not native cancellation. The first
     // subsequent tool consumes it; all later stopped states remain terminal.
     this.drained = true
@@ -61,17 +64,17 @@ export class ImplementationLifecycle {
         const event = next.value
         if (event.sessionId !== this.handle.id) continue
         if (event.type === "turn.end" && event.data.reason === "aborted")
-          this.cancel("Implementation coordinator was stopped")
+          this.cancel(`${this.label} coordinator was stopped`)
         if (
           event.type === "tool.execute.end" &&
           (event.data.rejected === "aborted" ||
             (event.data.result.details as { aborted?: boolean } | undefined)?.aborted)
         )
-          this.cancel("Implementation tool was stopped")
-        if (event.type === "session.end") this.cancel("Implementation conversation ended")
+          this.cancel(`${this.label} tool was stopped`)
+        if (event.type === "session.end") this.cancel(`${this.label} conversation ended`)
       }
     } catch (error) {
-      this.cancel(`Implementation event stream failed: ${String(error)}`)
+      this.cancel(`${this.label} event stream failed: ${String(error)}`)
     }
   }
 }

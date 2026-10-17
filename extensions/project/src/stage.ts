@@ -59,6 +59,8 @@ export interface StageAttempt {
   context?: ApprovalContext
   manualTrial?: IterationState["manualTrial"]
   review?: { attempt: number; codeHash: string }
+  /** Why the immutable verdict can no longer authorize acceptance. */
+  staleReason?: string
   acceptance?: {
     verdict: "pass" | "fail" | "blocked"
     failingItemIds: string[]
@@ -191,6 +193,7 @@ export type StageEvent = AtRevision &
         artifact: ArtifactRef
         receipt?: HumanReceipt
       }
+    | { type: "invalidate-review"; attemptId: string; reason: string }
     | { type: "interrupt-work"; attemptId: string; changes: string[] }
     /** Cancellation of an implementation lifecycle, including unapproved finalization. */
     | { type: "interrupt-batch"; attemptId: string; changes: string[] }
@@ -335,6 +338,7 @@ const stateCheck = object({
       context: optional(contextCheck),
       acceptance: optional(acceptanceCheck),
       review: optional(reviewCheck),
+      staleReason: optional(text),
       manualTrial: optional(trialCheck),
     }),
   ),
@@ -429,6 +433,7 @@ const eventChecks: Record<StageEvent["type"], Record<string, Check>> = {
   "interrupt-work": { attemptId: text, changes: list(text) },
   "interrupt-batch": { attemptId: text, changes: list(text) },
   "confirm-continuation": { receipt: receiptCheck },
+  "invalidate-review": { attemptId: text, reason: text },
 }
 
 // Object property order is not part of an exact approval context; array order is.
@@ -461,7 +466,9 @@ function checkPlan(state: IterationState, context?: ApprovalContext): void {
 }
 function checkAcceptance(state: IterationState, attempt: StageAttempt): void {
   if (!attempt.acceptance) return
-  require(attempt.stage === "accept" && attempt.status === "finished", "acceptance attempt")
+  require(attempt.stage === "accept" &&
+    (attempt.status === "finished" ||
+      (attempt.status === "interrupted" && !!attempt.staleReason)), "acceptance attempt")
   artifact(state, attempt.acceptance.artifactId, "acceptance")
   unique(attempt.acceptance.failingItemIds, "failing spec items")
   require(attempt.acceptance.verdict === "fail"
@@ -1319,17 +1326,22 @@ const handlers: Handlers = {
     }
   },
   "record-correction": (state, event) => {
-    const reopened = state.revisitHistory!.some((visit) => visit.transitionId && visit.target === state.stage)
     const visit = state.revisitHistory!.findLast(
       (visit) =>
-        visit.target === state.stage &&
         !!visit.transitionId &&
-        (!event.revisitReceiptId || visit.receiptId === event.revisitReceiptId),
+        (event.revisitReceiptId ? visit.receiptId === event.revisitReceiptId : visit.target === state.stage),
     )
-    require(reopened && visit, "no reopened stage")
-    require(["running", "finished", "summarized"].includes(
-      state.phase,
-    ), "correction not at writable boundary")
+    const obligation = state.correctionObligations!.find((entry) => entry.receiptId === visit?.receiptId)
+    require(visit && (visit.target === state.stage || obligation), "no reopened stage")
+    const planning =
+      state.status === "idle" &&
+      !state.pending &&
+      !state.revisit &&
+      ["design", "prototype", "implement"].includes(state.stage) &&
+      ["ready", "confirmed", "finished", "summarized"].includes(state.phase)
+    const stageWork =
+      visit!.target === state.stage && ["running", "finished", "summarized"].includes(state.phase)
+    require(planning || stageWork, "correction not at writable boundary")
     addArtifact(state, event.artifact, "correction", true)
     require(event.correction.artifactId === event.artifact.id, "correction artifact reference")
     require(!state.corrections.some((c) => c.id === event.correction.id), "duplicate correction")
@@ -1346,7 +1358,6 @@ const handlers: Handlers = {
     }
     state.corrections.push(event.correction)
     visit!.correctionId = event.correction.id
-    const obligation = state.correctionObligations!.find((o) => o.receiptId === visit!.receiptId)
     if (obligation) obligation.correctionId = event.correction.id
   },
   "record-manual-trial": (state, event) => {
@@ -1381,6 +1392,23 @@ const handlers: Handlers = {
     attempt!.changes = [...new Set([...attempt!.changes, ...event.changes])]
     state.status = "interrupted"
     state.phase = "finished"
+    delete state.pending
+    delete state.summaryId
+  },
+  "invalidate-review": (state, event) => {
+    const attempt = state.attempts.find((entry) => entry.id === event.attemptId)
+    require(state.stage === "accept" &&
+      state.activeAttemptId === event.attemptId &&
+      attempt?.status === "finished" &&
+      attempt.acceptance &&
+      state.phase !== "complete", "only an unconsumed finished review can become stale")
+    require(!(state.batchResolutions ?? []).some(
+      (entry) => entry.attemptId === event.attemptId,
+    ), "accepted history must remain intact")
+    attempt!.staleReason = event.reason
+    attempt!.status = "interrupted"
+    state.phase = "finished"
+    state.status = "interrupted"
     delete state.pending
     delete state.summaryId
   },

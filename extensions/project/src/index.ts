@@ -1,5 +1,7 @@
 import path from "node:path"
 import type { CommandContext, Extension, PanelRenderOptions, SessionData, ToolLine } from "@amira/api"
+import { Acceptances, checkAcceptanceFreshness } from "./accept.ts"
+import { type AcceptanceView, acceptancePanelText, acceptanceView } from "./accept-view.ts"
 import type { PrototypeManifestArtifact } from "./artifacts.ts"
 import { DesignSessions } from "./design.ts"
 import { ProjectCommandError, projectError } from "./diagnostics.ts"
@@ -51,6 +53,7 @@ export function panelLines(
   iterationState?: IterationState,
   prototype?: PrototypeManifestArtifact,
   worktree?: string,
+  acceptance?: AcceptanceView,
 ): ToolLine[] {
   const lang = language ?? project?.marker.settings.language ?? "en"
   if (error)
@@ -97,6 +100,12 @@ export function panelLines(
       text: `${implementationStatus(state)}${worktree ? ` · ${worktree}` : ""}`,
       wrap: true,
     })
+  if (acceptance)
+    lines.push({
+      kind: acceptance.stale ? "warning" : "muted",
+      text: acceptancePanelText(acceptance, lang),
+      wrap: true,
+    })
   if (prototype)
     lines.push({
       kind: "muted",
@@ -114,19 +123,20 @@ const HELP = `/project [list] — choose a known project or the nearest discover
 /project prototype [<variant>|choose|run <variant>]
 /project spec
 /project implement
+/project accept
 /project next
 /project skip batch|design|prototype|implement|accept
 /project revisit design|prototype
 Attachment does not change the main session's working directory.
 Prototype file tools are variant-scoped; shell uses current permissions. This is not a sandbox.
-Spec review: /project spec. Single-agent batch execution: /project implement. Acceptance, ship and archive: coming later.`
+Spec review: /project spec. Single-agent batch execution: /project implement. Acceptance: /project next, then /project accept. Ship and archive: coming later.`
 
 function help(language: string): string {
   return localize(
     language,
     HELP,
-    `/project [list] — 选择已知项目或最近识别的项目\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 查看项目阶段和状态\n/project design — 打开设计会话\n/project prototype [<variant>|choose|run <variant>] — 查看原型变体、选择结论或显示运行命令\n/project next — 查看总结并确认下一步\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n关联项目不会改变主会话工作目录。原型文件工具仅能写入各自目录，Shell 遵循当前权限模式；这不是沙箱。规格审阅：/project spec；单个子代理实现：/project implement。验收执行、发布和归档将在后续版本提供。`,
-    `/project [list] — 登録済みまたは最寄りのプロジェクトを選択\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 段階と状態を確認\n/project design — 設計会話を開く\n/project prototype [<variant>|choose|run <variant>] — 案の表示・選択・実行コマンドの確認\n/project next — 要約を確認して次の手順を承認\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n関連付けてもメインの作業ディレクトリは変わりません。試作のファイルツールは各案のディレクトリ内だけに書き込みます。シェルは現在の権限モードに従い、サンドボックスではありません。仕様確認：/project spec、単一サブエージェント実装：/project implement。受け入れ確認・リリース・アーカイブは今後対応予定です。`,
+    `/project [list] — 选择已知项目或最近识别的项目\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 查看项目阶段和状态\n/project design — 打开设计会话\n/project prototype [<variant>|choose|run <variant>] — 查看原型变体、选择结论或显示运行命令\n/project next — 查看总结并确认下一步\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n关联项目不会改变主会话工作目录。原型文件工具仅能写入各自目录，Shell 遵循当前权限模式；这不是沙箱。规格审阅：/project spec；单个子代理实现：/project implement。验收：/project next 确认后用 /project accept。发布和归档将在后续版本提供。`,
+    `/project [list] — 登録済みまたは最寄りのプロジェクトを選択\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 段階と状態を確認\n/project design — 設計会話を開く\n/project prototype [<variant>|choose|run <variant>] — 案の表示・選択・実行コマンドの確認\n/project next — 要約を確認して次の手順を承認\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n関連付けてもメインの作業ディレクトリは変わりません。試作のファイルツールは各案のディレクトリ内だけに書き込みます。シェルは現在の権限モードに従い、サンドボックスではありません。仕様確認：/project spec、単一サブエージェント実装：/project implement。受け入れ確認：/project next で承認後 /project accept。リリース・アーカイブは今後対応予定です。`,
   )
 }
 
@@ -156,6 +166,14 @@ export function createProjectExtension(): Extension {
     const settings = api.settings.declare({
       fields: [
         {
+          key: "reviewerModel",
+          label: "Reviewer model",
+          type: "text",
+          default: "",
+          description:
+            "Configured provider/model must differ from every model that changed code in this batch. Empty uses a disclosed same-model fresh-session review.",
+        },
+        {
           key: "language",
           label: "Document language",
           type: "text",
@@ -173,19 +191,36 @@ export function createProjectExtension(): Extension {
       for (const state of states.values()) state.refreshedAt = undefined
       api.requestRender()
     })
+    const acceptances = new Acceptances(api, () => {
+      for (const state of states.values()) state.refreshedAt = undefined
+      api.requestRender()
+    })
+    const acceptancePanels = new Map<string, AcceptanceView>()
     const worktreePanels = new Map<string, string>()
+    const panelArtifactRefs = new Map<string, { worktree?: string; prototype?: string }>()
     const prototypePanels = new Map<string, PrototypeManifestArtifact>()
     async function refreshPrototypePanel(project: Project, iteration?: IterationState) {
       const store = new IterationStore(project)
       const current = iteration ?? (await store.read())
+      const view = await acceptanceView(store, current, acceptancePanels.get(designKey(project)))
+      if (view) acceptancePanels.set(designKey(project), view)
+      else acceptancePanels.delete(designKey(project))
+      const key = designKey(project)
+      const cached = panelArtifactRefs.get(key) ?? {}
       const worktreeRef = current.artifacts.findLast((entry) => entry.kind === "iteration-worktree")
-      if (worktreeRef) {
+      if (worktreeRef && cached.worktree !== worktreeRef.id) {
         const worktree = await store.readArtifact(worktreeRef)
         if (worktree.kind === "iteration-worktree")
-          worktreePanels.set(designKey(project), `${worktree.status}: ${worktree.cwd}`)
+          worktreePanels.set(key, `${worktree.status}: ${worktree.cwd}`)
+        cached.worktree = worktreeRef.id
       }
-      const saved = await latestPrototypeManifest(store, current)
-      if (saved) prototypePanels.set(designKey(project), saved.manifest)
+      const prototypeRef = current.artifacts.findLast((entry) => entry.kind === "prototype-manifest")
+      if (prototypeRef && cached.prototype !== prototypeRef.id) {
+        const saved = await latestPrototypeManifest(store, current)
+        if (saved) prototypePanels.set(key, saved.manifest)
+        cached.prototype = prototypeRef.id
+      }
+      panelArtifactRefs.set(key, cached)
     }
     const states = new Map<string, PanelState>()
     const memoryAttachments = new Map<string, Attachment>()
@@ -529,6 +564,7 @@ export function createProjectExtension(): Extension {
         state.iteration,
         state.project && prototypePanels.get(designKey(state.project)),
         state.project && worktreePanels.get(designKey(state.project)),
+        state.project && acceptancePanels.get(designKey(state.project)),
       )
     }
     api.registerPanel({ id: "project", order: 10, render })
@@ -551,7 +587,7 @@ export function createProjectExtension(): Extension {
       name: "project",
       description: "Attach a project, inspect its status, or open its saved design conversation",
       args: {
-        hint: "[list|new|switch|status|design|prototype|spec|implement|next|skip|revisit]",
+        hint: "[list|new|switch|status|design|prototype|spec|implement|accept|next|skip|revisit]",
         complete: (prefix) =>
           [
             "list",
@@ -562,6 +598,7 @@ export function createProjectExtension(): Extension {
             "prototype",
             "spec",
             "implement",
+            "accept",
             "next",
             "skip",
             "revisit",
@@ -639,7 +676,7 @@ export function createProjectExtension(): Extension {
               commitDocuments,
             })
             await attach(project, ctx, origin)
-          } else if (verb === "spec" || verb === "implement") {
+          } else if (verb === "spec" || verb === "implement" || verb === "accept") {
             if (tokens.length) throw new Error(HELP)
             const project = await attached(ctx, origin)
             const checkOrigin = () => {
@@ -658,7 +695,24 @@ export function createProjectExtension(): Extension {
                   await designs.quiesce(project)
                   await prototypes.sessions.quiesce(project)
                 })
-              else await implementations.run(project, ctx, displayLanguage(project), checkOrigin)
+              else if (verb === "implement")
+                await implementations.run(project, ctx, displayLanguage(project), checkOrigin)
+              else {
+                const current = await new IterationStore(project).read()
+                if (current.stage !== "accept")
+                  throw new Error(
+                    "Confirm acceptance with /project next first. Running implementation was not stopped.",
+                  )
+                await implementations.quiesce(project)
+                checkOrigin()
+                await acceptances.run(
+                  project,
+                  ctx,
+                  displayLanguage(project),
+                  checkOrigin,
+                  settings.get().reviewerModel.trim() || undefined,
+                )
+              }
             } finally {
               if (active(origin)) await attached(ctx, origin)
               api.requestRender()
@@ -761,6 +815,7 @@ export function createProjectExtension(): Extension {
                     await designs.quiesce(project)
                     await prototypes.sessions.quiesce(project)
                     await implementations.quiesce(project)
+                    await acceptances.quiesce(project)
                   })
                 return
               }
@@ -796,6 +851,7 @@ export function createProjectExtension(): Extension {
                   await designs.quiesce(project)
                   await prototypes.sessions.quiesce(project)
                   await implementations.quiesce(project)
+                  await acceptances.quiesce(project)
                 },
                 (iteration) => {
                   states.set(origin, {
@@ -810,6 +866,24 @@ export function createProjectExtension(): Extension {
                     await designs.quiesce(project)
                     await prototypes.sessions.quiesce(project)
                   })
+                },
+                async () => {
+                  await implementations.quiesce(project)
+                  checkOrigin()
+                  await acceptances.run(
+                    project,
+                    ctx,
+                    displayLanguage(project),
+                    checkOrigin,
+                    settings.get().reviewerModel.trim() || undefined,
+                  )
+                },
+                async () => {
+                  const freshness = await checkAcceptanceFreshness(api, project, ctx)
+                  const view = acceptancePanels.get(designKey(project))
+                  if (view)
+                    acceptancePanels.set(designKey(project), { ...view, ...freshness, verified: true })
+                  return freshness
                 },
               )
             } finally {
@@ -873,6 +947,11 @@ export function createProjectExtension(): Extension {
                 await prototypes.refresh(project, ctx, lang)
               const iteration = await new IterationStore(project).read()
               await refreshPrototypePanel(project, iteration)
+              const view = acceptancePanels.get(designKey(project))
+              if (view?.outcome && !view.running) {
+                const freshness = await checkAcceptanceFreshness(api, project, ctx)
+                acceptancePanels.set(designKey(project), { ...view, ...freshness, verified: true })
+              }
               states.set(origin, {
                 fingerprint: JSON.stringify(attachmentFor(origin, ctx.session.data)),
                 project,
@@ -886,14 +965,17 @@ export function createProjectExtension(): Extension {
                   `${project.marker.name}\nディレクトリ：${project.root}\nイテレーション：${project.marker.currentIteration}`,
                 ) +
                   `\n${stageStatus(iteration, lang)}\n${implementationStatus(iteration)}${worktreePanels.has(designKey(project)) ? `\nWorktree: ${worktreePanels.get(designKey(project))}` : ""}\n${nextSuggestion(iteration, lang, availableDesigns.has(designKey(project)))}` +
+                  (acceptancePanels.has(designKey(project))
+                    ? `\n${acceptancePanelText(acceptancePanels.get(designKey(project))!, lang)}`
+                    : "") +
                   (prototypePanels.has(designKey(project))
                     ? `\n${prototypePanelText(prototypePanels.get(designKey(project))!, lang, !!iteration.prototypeChoice)}`
                     : "") +
                   localize(
                     lang,
-                    "\nAcceptance, ship and archive: coming later.",
-                    "\n验收、发布和归档：后续版本提供。",
-                    "\n受け入れ確認、リリース、アーカイブは今後対応予定です。",
+                    "\nAcceptance: /project next, then /project accept. Ship and archive: coming later.",
+                    "\n验收：/project next 确认后用 /project accept。发布和归档：后续版本提供。",
+                    "\n受け入れ確認：/project next で承認後 /project accept。リリースとアーカイブは今後対応予定です。",
                   ),
               )
               api.requestRender()

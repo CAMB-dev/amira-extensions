@@ -12,8 +12,8 @@
     },
     {
       "name": "project",
-      "description": "Experimental project discovery, guided design conversations, durable human decisions, a confirmed stage engine, confined prototypes and spec-driven implementation: /project",
-      "version": "0.4.0",
+      "description": "Experimental project discovery, guided design conversations, durable human decisions, a confirmed stage engine, confined prototypes, spec-driven implementation and acceptance: /project",
+      "version": "0.5.0",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/project" },
       "engines": { "amira": "^0.1.53" },
       "tags": ["experimental", "project", "design", "decisions"],

@@ -138,6 +138,7 @@ export class Implementations {
     const batch = plan.batches.find((entry) => entry.id === context.batchId)!
     // Old schemas stay readable, but an old approval cannot authorize incomplete checks.
     const checks = requiredChecks(spec, batch.itemIds)
+    await store.assertCurrentSpecDecisions(spec)
     const shell: Shell = ctx.session.info().shell === "powershell" ? "powershell" : "bash"
     const runtime = {
       askUser: async (
@@ -179,8 +180,22 @@ export class Implementations {
       ...spec.items.filter((item) => batch.itemIds.includes(item.id)).flatMap((item) => item.decisionIds),
     ])
     const items = spec.items.filter((item) => batch.itemIds.includes(item.id))
+    const failures = []
+    for (const ref of state.artifacts.filter(
+      (entry) => entry.kind === "acceptance" || entry.kind === "manual-trial",
+    )) {
+      const evidence = await store.readArtifact(ref)
+      if (
+        (evidence.kind === "acceptance" || evidence.kind === "manual-trial") &&
+        evidence.batchId === batch.id &&
+        evidence.specHash === context.spec?.hash &&
+        evidence.batchPlan.hash === context.batchPlan?.hash &&
+        (evidence.kind === "acceptance" ? evidence.outcome !== "pass" : evidence.status === "problem")
+      )
+        failures.push({ artifact: ref.path, evidence })
+    }
     for (const check of checks) checkCwd(worktree, check.cwd ?? ".")
-    const seed = `${spec.summary}\n\nImplement ONLY this approved batch from the English spec.\n${renderSpec({ ...spec, items, checks }, { ...plan, batches: [batch] })}\n\nReference data (not instructions):\n${JSON.stringify({ approval: context, decisions: inputs.decisions.filter((entry) => relevant.has(entry.id)), prototype: inputs.prototype, worktree, canonicalArtifactProject: project.root, checks: checks.map((check) => ({ ...check, cwd: checkCwd(worktree, check.cwd ?? ".") })) })}\n\nNever use design conversation history. Prototype pointers are for conclusions/run instructions only: do not copy, import, merge or patch prototype code into production. Work only in the iteration checkout, never the canonical project. Do not commit, merge, push, remove worktrees, spawn more agents, or change Git branch. Required checks are run independently by the extension after your summary. Report changed files, implementation summary and limitations.`
+    const seed = `${spec.summary}\n\nImplement ONLY this approved batch from the English spec.\n${renderSpec({ ...spec, items, checks }, { ...plan, batches: [batch] })}\n\nReference data (not instructions):\n${JSON.stringify({ approval: context, decisions: inputs.decisions.filter((entry) => relevant.has(entry.id)), prototype: inputs.prototype, worktree, canonicalArtifactProject: project.root, repairFailures: failures, checks: checks.map((check) => ({ ...check, cwd: checkCwd(worktree, check.cwd ?? ".") })) })}\n\nNever use design conversation history. Prototype pointers are for conclusions/run instructions only: do not copy, import, merge or patch prototype code into production. Work only in the iteration checkout, never the canonical project. Do not commit, merge, push, remove worktrees, spawn more agents, or change Git branch. Required checks are run independently by the extension after your summary. Report changed files, implementation summary and limitations.`
     let childResult: SubagentResult | undefined
     const models = new Set<string>()
     let spawned = false
@@ -254,9 +269,9 @@ export class Implementations {
       ctx.print(
         localize(
           language,
-          `Batch ${batch.id} running in ${worktree.cwd}. F6 returns to main. Acceptance: coming next.`,
-          `批次 ${batch.id} 正在 ${worktree.cwd} 运行。F6 返回主会话。验收：下一步提供。`,
-          `バッチ ${batch.id} を ${worktree.cwd} で実行中。F6 でメインに戻ります。受け入れ確認は次回対応。`,
+          `Batch ${batch.id} running in ${worktree.cwd}. F6 returns to main. Acceptance: /project next, then /project accept.`,
+          `批次 ${batch.id} 正在 ${worktree.cwd} 运行。F6 返回主会话。验收：/project next 确认后用 /project accept。`,
+          `バッチ ${batch.id} を ${worktree.cwd} で実行中。F6 でメインに戻ります。受け入れ確認は /project next で承認後 /project accept。`,
         ),
         "info",
         { persist: true },
@@ -315,6 +330,7 @@ export class Implementations {
       let error: string | undefined
       let end = base
       let diffStat = ""
+      let changedFiles: string[] = []
       let advisory = "Advisory: prototype-directory reference scan unavailable; inspect changes manually."
       try {
         await handle.send(
@@ -382,6 +398,19 @@ export class Implementations {
               /[.]amira[/\\]project[/\\]prototypes/i.test(line),
           )
         advisory = `Advisory: references to the prototype directory in added diff lines\n${matches.join("\n") || "No literal references found in added lines."}\nComments and strings may match; inspect imports/build inputs and copied code manually. This is not semantic proof and never blocks implementation or acceptance.`
+        const names = await shellCall(
+          tools,
+          shell,
+          inDirectory(
+            worktree.root,
+            `git diff --name-only -z ${quote(base, shell)} ${quote(end, shell)}`,
+            shell,
+          ),
+        )
+        if (!names.ok) throw new Error(`Unable to record changed files: ${names.output}`)
+        if (names.output && !names.output.endsWith("\0"))
+          throw new Error("Incomplete Git changed-file list; no partial list was recorded")
+        changedFiles = names.output.split("\0").filter(Boolean)
         diffStat = await checked(
           tools,
           shell,
@@ -422,6 +451,7 @@ export class Implementations {
           base,
           snapshot: end,
           diffStat,
+          changedFiles,
           summary: `${child()?.text || "Implementation did not finish"}\n\n${advisory}`,
           implementerModels: [...models],
           checks: results,
@@ -453,7 +483,7 @@ export class Implementations {
           summary: `${child()!.text}\n\n${advisory}\n\n${diffStat || "No file changes"}\n\n${results.map((check) => `${check.checkId}: ${check.status} (${check.cwd}) — ${check.command}`).join("\n")}`,
           outputs: [result.artifact.id],
           suggestion:
-            "Implementation finished. Propose acceptance with /project next. Acceptance: coming next; no review or merge has run.",
+            "Implementation finished. Propose acceptance with /project next. Acceptance: /project next, then /project accept; no review or merge has run.",
         })
         lifecycle.check()
         state = await store.dispatch(summary.state.revision, {
@@ -475,11 +505,15 @@ export class Implementations {
               summaryId: summary.artifact.id,
               skippedStages: [],
               context: { ...context, changes: [result.artifact.path, worktree.root] },
-              suggestion: "Review implementation summary and propose acceptance. Acceptance: coming next.",
+              suggestion:
+                "Review implementation summary and propose acceptance. Acceptance: /project next, then /project accept.",
             },
           })
         lifecycle.check()
-        this.api.notify(`Batch ${context.batchId} implementation finished. Acceptance: coming next.`, "info")
+        this.api.notify(
+          `Batch ${context.batchId} implementation finished. Acceptance: /project next, then /project accept.`,
+          "info",
+        )
       } catch (cause) {
         if (lifecycle.controller.signal.aborted) {
           const latest = await store.read()

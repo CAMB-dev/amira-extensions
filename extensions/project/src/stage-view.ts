@@ -25,9 +25,9 @@ export function statusName(status: IterationState["status"], language: string): 
 export function executionUnavailable(language: string): string {
   return localize(
     language,
-    "Acceptance: coming next. Review /project spec, then explicitly start an approved batch with /project implement. No work was started.",
-    "验收：下一步提供。请用 /project spec 审阅规格，再用 /project implement 明确开始已批准的批次。未启动任何工作。",
-    "受け入れ確認は次回対応。/project spec で仕様を確認し、/project implement で承認済みバッチを明示的に開始します。作業は開始していません。",
+    "Start an approved batch with /project implement or its approved review with /project accept. No work was started. Ship: coming later.",
+    "用 /project implement 开始已批准的实现批次，或用 /project accept 开始已批准的验收。未启动任何工作。发布：稍后提供。",
+    "承認済みバッチは /project implement、承認済みの確認は /project accept で開始します。作業は開始していません。リリースは今後対応。",
   )
 }
 
@@ -74,7 +74,7 @@ export function nextSuggestion(state: IterationState, language: string, designAv
   if (state.stage === "accept" && automatedPass && trial === "pending")
     return localize(
       language,
-      `Batch ${state.approvedContext?.batchId ?? "—"} accepted, manual trial pending · /project next reviews the trial prompt`,
+      `Batch ${state.approvedContext?.batchId ?? "—"} automated pass, manual trial pending · /project next reviews the trial prompt`,
       `批次 ${state.approvedContext?.batchId ?? "—"} 已通过自动验收，等待手动试用 · /project next 查看试用提示`,
       `バッチ ${state.approvedContext?.batchId ?? "—"} は自動確認済み、手動試用待ち · /project next で試用手順を確認`,
     )
@@ -92,12 +92,28 @@ export function nextSuggestion(state: IterationState, language: string, designAv
       "工作进行中。/project revisit design|prototype 可中断当前工作或排队回访。",
       "作業中です。/project revisit design|prototype で中断または再検討を予約できます。",
     )
+  if (state.stage === "accept" && state.phase === "complete")
+    return localize(
+      language,
+      "Iteration complete · ship: coming later",
+      "迭代已完成 · 发布：稍后提供",
+      "イテレーション完了 · リリースは今後対応",
+    )
+  if (state.stage === "accept" && state.phase === "confirmed")
+    return localize(
+      language,
+      "Start approved review: /project accept · F6 returns to main",
+      "开始已批准的验收：/project accept · F6 返回主会话",
+      "承認済み確認を開始：/project accept · F6 でメインへ",
+    )
   if (state.stage === "implement")
     return localize(
       language,
       state.phase === "confirmed" && state.approvedContext?.spec
         ? "Start approved batch: /project implement · F6 returns to main"
-        : "Review implementation spec: /project spec",
+        : state.phase === "summarized"
+          ? "Implementation finished · propose acceptance: /project next"
+          : "Review implementation spec: /project spec",
       state.phase === "confirmed" && state.approvedContext?.spec
         ? "开始已批准的批次：/project implement · F6 返回主会话"
         : "审阅实现规格：/project spec",

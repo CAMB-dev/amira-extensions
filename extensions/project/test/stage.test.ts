@@ -660,6 +660,29 @@ describe("revisit lifecycle regressions", () => {
       expect(state.transitions.slice(0, -1)).toEqual(evidence.transitions)
     })
   }
+  test("an outstanding confirmed revisit can be mapped at idle implementation planning after both earlier stages are skipped", () => {
+    let state = request(finish(start(ready("implement"))), "design")
+    state = summary(state)
+    state = confirm(propose(state, proposal(state, "design", "revisit")))
+    const visit = state.revisitHistory!.at(-1)!.receiptId
+    state = summary(state)
+    state = confirm(propose(state, proposal(state, "prototype", "skip")))
+    state = summary(state)
+    state = confirm(propose(state, { ...proposal(state, "implement", "skip"), preparationOnly: true }))
+    expect(state).toMatchObject({ stage: "implement", phase: "confirmed", status: "idle" })
+    expect(state.activeAttemptId).toBeUndefined()
+    const attempts = structuredClone(state.attempts)
+    expect(() => mapped(state, "mapped")).toThrow("reopened stage")
+    expect(() => mapped(state, "mapped", "wrong-receipt")).toThrow("reopened stage")
+    state = mapped(state, "mapped", visit)
+    expect(state.attempts).toEqual(attempts)
+    expect(state.correctionObligations![0]!.correctionId).toBe(state.corrections.at(-1)!.id)
+    state = apply(state, { type: "record-artifact", artifact: ref("spec") })
+    state = summary(state)
+    state = confirm(propose(state, proposal(state, "implement", "reapprove", context(state))))
+    const running = start(state)
+    expect(() => mapped(running, "mapped", visit)).toThrow("writable boundary")
+  })
   test("later mapped revisit cannot bypass an earlier unmapped impact", () => {
     let state = request(start(ready("implement")), "prototype")
     state = summary(state)
@@ -703,8 +726,9 @@ describe("revisit lifecycle regressions", () => {
           impact: "mapped",
         },
       },
-      "reopened stage",
+      "correction artifact reference",
     )
+    // An explicit earlier receipt is now valid here, but still needs exact artifact evidence.
     state = confirm(propose(state, proposal(state, "prototype")))
     state = select(finish(start(state)))
     state = mapped(state, "mapped", first)
@@ -1335,6 +1359,11 @@ describe("illegal event/phase matrix", () => {
       status: "pending",
       artifact: ref("manual-trial"),
     }),
+    "invalidate-review": (s) => ({
+      type: "invalidate-review",
+      attemptId: s.activeAttemptId ?? "absent",
+      reason: "Code changed",
+    }),
     "interrupt-work": (s) => ({
       type: "interrupt-work",
       attemptId: s.activeAttemptId ?? "absent",
@@ -1365,6 +1394,7 @@ describe("illegal event/phase matrix", () => {
     "request-revisit": ["blocked"],
     "record-correction": [],
     "record-manual-trial": ["blocked"],
+    "invalidate-review": ["blocked"],
     "interrupt-work": ["running"],
     "interrupt-batch": [],
     "confirm-continuation": ["interrupted", "blocked"],

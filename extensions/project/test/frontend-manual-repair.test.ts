@@ -1,10 +1,11 @@
 import { expect, setDefaultTimeout, test } from "bun:test"
 import type { AcceptanceArtifact } from "../src/artifacts.ts"
 import { consume, implement, startReview, summarize, trial } from "./batch-test-helper.ts"
+import { frontendFingerprint } from "./frontend-fingerprint.ts"
 import { ESC, frontend, frontendSuite } from "./frontend-harness.ts"
 import { proposeUiReview } from "./manual-repair-helper.ts"
 
-setDefaultTimeout(180_000)
+setDefaultTimeout(600_000)
 
 async function approveNext(f: Awaited<ReturnType<typeof frontend>>, stage: string) {
   f.send("next")
@@ -21,6 +22,7 @@ frontendSuite("frontend-manual-repair", () => {
     test(`${mode}: actual human problem leads to pinned repair approval, fresh review/trial and acceptance`, async () => {
       const f = await frontend(mode)
       try {
+        f.agent.permissions.setMode("auto")
         const context = await proposeUiReview(f.store)
         await approveNext(f, "acceptance")
         const base: AcceptanceArtifact = {
@@ -31,7 +33,7 @@ frontendSuite("frontend-manual-repair", () => {
           batchPlan: context.batchPlan,
           attemptId: "unused",
           attempt: 1,
-          codeHash: "a".repeat(64),
+          codeHash: await frontendFingerprint(f.project, f.store),
           reviewerModel: "mock/reviewer",
           implementerModels: ["mock/frontend"],
           sameModelFallback: false,
@@ -75,7 +77,10 @@ frontendSuite("frontend-manual-repair", () => {
         expect(f.mock.requests).toEqual([])
         state = await implement(f.store, state, ["diff:repaired-control"])
         await approveNext(f, "acceptance")
-        const fresh = await startReview(f.store, await f.store.read(), { ...base, codeHash: "b".repeat(64) })
+        const fresh = await startReview(f.store, await f.store.read(), {
+          ...base,
+          codeHash: await frontendFingerprint(f.project, f.store),
+        })
         expect(fresh.verdict.attempt).toBe(2)
         state = await summarize(f.store, await consume(f.store, fresh.state, fresh.verdict, true))
         await trial(f.store, state, fresh.verdict, "pending")

@@ -174,7 +174,7 @@ frontendSuite("frontend", () => {
         expect(cancelled.pending).toBeUndefined()
         expect(cancelled.revisit).toBeUndefined()
         const revision = cancelled.revision
-        await f.command("next", "Acceptance: coming next")
+        await f.command("next", "Ship: coming later.")
         expect((await f.store.read()).revision).toBe(revision)
         expect(f.host.ui.pending).toEqual([])
         f.send("revisit design")
@@ -286,6 +286,7 @@ frontendSuite("frontend", () => {
       test(`${mode}: revisit design from ${completion} completion preserves evidence and allows another revisit`, async () => {
         const f = await frontend(mode)
         try {
+          f.agent.permissions.setMode("auto")
           const before = await completed(f.store, completion)
           expect(before.completion).toBe(completion)
           await f.command("status", "Stage: acceptance")
