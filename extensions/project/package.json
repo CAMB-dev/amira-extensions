@@ -1,7 +1,7 @@
 {
   "name": "project",
   "license": "Apache-2.0",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Experimental project discovery, guided design conversations and durable human decisions: /project",
   "type": "module",
   "scripts": {
@@ -11,6 +11,8 @@
     "lint": "biome check ."
   },
   "amira": {
+    "status": "wip",
+    "statusMessage": "Design is still in flux; ship, spend caps, dashboard and archive are paused.",
     "engines": {
       "amira": "^0.1.53"
     },

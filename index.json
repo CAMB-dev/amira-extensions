@@ -4,7 +4,8 @@
     {
       "name": "review",
       "description": "Experimental bounded independent static code review with saved findings: /code-review",
-      "version": "0.1.0",
+      "version": "0.1.1",
+      "status": "experimental",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/review" },
       "engines": { "amira": "^0.1.56" },
       "tags": ["experimental", "review", "git", "security"],
@@ -13,7 +14,9 @@
     {
       "name": "project",
       "description": "Experimental project discovery, guided design conversations, durable human decisions, a confirmed stage engine, confined prototypes, spec-driven implementation, acceptance and workflow/swarm execution modes: /project",
-      "version": "0.6.0",
+      "version": "0.6.1",
+      "status": "wip",
+      "statusMessage": "Design is still in flux; ship, spend caps, dashboard and archive are paused.",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/project" },
       "engines": { "amira": "^0.1.53" },
       "tags": ["experimental", "project", "design", "decisions"],
@@ -22,7 +25,8 @@
     {
       "name": "computer-use-uia",
       "description": "Experimental any-window Windows desktop control: screenshot-first observations with a UIA tree, coordinate actions and an emergency stop; off by default",
-      "version": "0.1.0",
+      "version": "0.1.1",
+      "status": "experimental",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/computer-use-uia" },
       "engines": { "amira": "^0.1.28" },
       "tags": ["experimental", "windows", "desktop", "uia", "automation"],
@@ -31,7 +35,8 @@
     {
       "name": "dashboard",
       "description": "Experimental default dashboard: live sub-agent timeline, agent detail pages and trace replay statistics: /dashboard",
-      "version": "0.4.0",
+      "version": "0.4.1",
+      "status": "experimental",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/dashboard" },
       "engines": { "amira": "^0.1.49" },
       "tags": ["dashboard", "agents", "orchestration", "trace", "statistics"],
@@ -40,7 +45,8 @@
     {
       "name": "agent-bridge",
       "description": "Experimental: a persistent local Amira session for external agents through short-lived CLI calls: amira agent",
-      "version": "0.0.1",
+      "version": "0.0.2",
+      "status": "experimental",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/agent-bridge" },
       "engines": { "amira": "^0.1.27" },
       "tags": ["experimental", "agents", "integration", "delegation", "rpc"],
@@ -49,7 +55,8 @@
     {
       "name": "memory",
       "description": "Experimental local persistent memories with global and project scopes: /memory",
-      "version": "0.0.2",
+      "version": "0.0.3",
+      "status": "experimental",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/memory" },
       "engines": { "amira": "^0.1.28" },
       "tags": ["experimental", "memory", "context"],

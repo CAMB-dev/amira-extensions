@@ -1,7 +1,7 @@
 {
   "name": "memory",
   "license": "Apache-2.0",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Experimental local persistent memories with global and project scopes",
   "type": "module",
   "scripts": {
@@ -12,6 +12,7 @@
     "demo": "bun scripts/offline-demo.ts"
   },
   "amira": {
+    "status": "experimental",
     "engines": {
       "amira": "^0.1.28"
     },

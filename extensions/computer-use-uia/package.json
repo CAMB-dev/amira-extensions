@@ -1,7 +1,7 @@
 {
   "name": "computer-use-uia",
   "license": "Apache-2.0",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Experimental any-window Windows UI Automation with emergency stop; off by default",
   "type": "module",
   "scripts": {
@@ -12,6 +12,7 @@
     "eval:desktop": "bun scripts/eval-desktop.ts"
   },
   "amira": {
+    "status": "experimental",
     "engines": {
       "amira": "^0.1.28"
     },
