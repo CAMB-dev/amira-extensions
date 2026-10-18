@@ -2,14 +2,17 @@ export interface UiaSettings {
   enabled: boolean
   overlay: boolean
   stopHotkey: string
+  screenshot: boolean
+  screenshotMaxEdge: number
+  treeDensityThreshold: number
 }
 
 export function readSettings(value: unknown): UiaSettings {
-  if (value === undefined) return { enabled: false, overlay: true, stopHotkey: "ctrl+alt+q" }
+  if (value === undefined) value = {}
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new Error("computer-use-uia settings must be an object")
   const section = value as Record<string, unknown>
-  for (const name of ["enabled", "overlay"])
+  for (const name of ["enabled", "overlay", "screenshot"])
     if (section[name] !== undefined && typeof section[name] !== "boolean")
       throw new Error(`computer-use-uia.${name} must be a boolean`)
   const rawHotkey = section.stopHotkey ?? "ctrl+alt+q"
@@ -33,5 +36,15 @@ export function readSettings(value: unknown): UiaSettings {
     enabled: section.enabled === true,
     overlay: section.overlay !== false,
     stopHotkey,
+    screenshot: section.screenshot !== false,
+    screenshotMaxEdge: integerSetting(section.screenshotMaxEdge, 1280, 128, 4096, "screenshotMaxEdge"),
+    treeDensityThreshold: integerSetting(section.treeDensityThreshold, 12, 0, 1000, "treeDensityThreshold"),
   }
+}
+
+function integerSetting(value: unknown, fallback: number, min: number, max: number, name: string) {
+  if (value === undefined) return fallback
+  if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max)
+    throw new Error(`computer-use-uia.${name} must be an integer from ${min} to ${max}`)
+  return value
 }

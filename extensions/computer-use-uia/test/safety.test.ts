@@ -52,8 +52,8 @@ test("headless stop checks exact handle identity and job membership, not image n
     "IsProcessInJob(handle, job",
     "EnumWindows",
     "IsWindowVisible",
-    "HeadlessAncestors(pid, started",
-    "parentStarted >= started",
+    "ShouldStopMember(pid, belongs, member.HasExited, Visible)",
+    "owner == pid && ProtectorWindow(window)",
     "DwmGetWindowAttribute(window, 14",
     "(cloaked & ~2u) != 0",
     "bool iconic = IsIconic(window);",
@@ -61,7 +61,6 @@ test("headless stop checks exact handle identity and job membership, not image n
     "GetSystemMetrics(76)",
     "GetLayeredWindowAttributes(window",
     "alpha == 0",
-    "parentStarted != rootStarted",
     "rootStarted < 30000000L",
     "still starting",
     "member.Kill()",
@@ -70,66 +69,58 @@ test("headless stop checks exact handle identity and job membership, not image n
   expect(helper + watchdog + launch).not.toMatch(/taskkill|Stop-Process\s+-Name/)
 })
 
-test("broken ancestor chains cannot protect an owned member; protectors are strictly older", () => {
-  const ancestors = launch.slice(
-    launch.indexOf("bool HeadlessAncestors"),
-    launch.indexOf("public void StopHeadless"),
+test("only a member's own windows protect it; foreign and exited processes are never eligible", () => {
+  const classifier = launch.slice(
+    launch.indexOf("public static bool ShouldStopMember"),
+    launch.indexOf("sealed class HeadlessMember"),
   )
-  expect(ancestors).toContain("parentStarted >= started")
-  expect(ancestors).toContain("if (pid == rootPid && started == rootStarted) return true;")
-  expect(ancestors).toContain("if (!parents.TryGetValue(pid, out parentPid) || parentPid <= 0) return true;")
-  expect(ancestors).not.toContain("return false;\n                }")
-})
-
-test("ancestor access/API failures cannot become permission to kill", () => {
-  const ancestors = launch.slice(
-    launch.indexOf("bool HeadlessAncestors"),
-    launch.indexOf("public void StopHeadless"),
+  expect(classifier).toContain("return belongs && !exited && !visible(pid);")
+  const visible = launch.slice(
+    launch.indexOf("bool Visible(int pid)"),
+    launch.indexOf("public static bool ShouldStopMember"),
   )
-  expect(ancestors).not.toContain("catch (ArgumentException)")
-  expect(ancestors).not.toContain("catch (InvalidOperationException)")
-  expect(ancestors).not.toContain("catch (Win32Exception) { return true; }")
-  expect(ancestors).toContain("if (!IsProcessInJob(handle, job, out belongs)) throw new Win32Exception();")
-  expect(ancestors).toContain("OpenProcess(0x1000u, false, (uint)parentPid)")
-  expect(ancestors).not.toContain("parent.Handle")
-  expect(ancestors).not.toContain("Process.GetProcessById(parentPid)")
-  expect(ancestors).toContain("if (error == 87) return true;")
-  expect(ancestors).toContain("GetProcessId(handle) != (uint)parentPid")
-  expect(ancestors).toContain("OpenProcess(0x101000u, false, (uint)parentPid)")
-  expect(ancestors).toContain("if (error == 5)")
-  expect(ancestors.indexOf("if (error == 5)")).toBeLessThan(ancestors.indexOf("OpenProcess(0x1000u"))
-  expect(ancestors).toContain("if (exited == null) return false;")
-  expect(ancestors.indexOf("if (!belongs) return true;")).toBeLessThan(
-    ancestors.indexOf("if (exited == null)"),
-  )
-  expect(ancestors.indexOf("parentStarted >= started")).toBeLessThan(ancestors.indexOf("if (exited == null)"))
-  expect(ancestors.indexOf("parentPid == rootPid && parentStarted != rootStarted")).toBeLessThan(
-    ancestors.indexOf("if (exited == null)"),
-  )
-  expect(ancestors).toContain("HasExited(handle, synchronize)")
-  const exited = launch.slice(launch.indexOf("static bool? HasExited"), launch.indexOf("IntPtr job, process"))
-  expect(exited).toContain("WaitForSingleObject(handle, 0)")
-  expect(exited).toContain("if (status == 0) return true;")
-  expect(exited).toContain("if (status == 258) return false;")
-  expect(exited).not.toContain("GetProcessTimes")
-  expect(exited).toContain("if (!synchronize)")
-  expect(exited).toContain("if (code == 259u) return null;")
-  expect(exited).toContain("if (status == 0xffffffffu) throw new Win32Exception();")
-  expect(ancestors).toContain("CreationTime(handle)")
-  expect(ancestors).toContain("finally { CloseHandle(handle); }")
+  expect(visible).toContain("owner == pid && ProtectorWindow(window)")
+  expect(launch).not.toContain("HeadlessAncestors")
+  expect(launch).not.toContain("Dictionary<int, int> Parents()")
   const stop = launch.slice(
     launch.indexOf("public void StopHeadless"),
     launch.indexOf("public int[] Members"),
   )
+  expect(stop.match(/ShouldStopMember\(pid, belongs, member.HasExited, Visible\)/g)).toHaveLength(2)
+  expect(stop).not.toContain("parentPid")
+  expect(stop).not.toContain("Parents()")
+})
+
+test("a member's own access/API failures cannot become permission to kill or skip other candidates", () => {
+  const visible = launch.slice(
+    launch.indexOf("bool Visible(int pid)"),
+    launch.indexOf("public static bool ShouldStopMember"),
+  )
+  expect(visible).toContain("IntPtr.Zero)) throw new Win32Exception();")
+  const stop = launch.slice(
+    launch.indexOf("public void StopHeadless"),
+    launch.indexOf("public int[] Members"),
+  )
+  expect(stop.match(/IntPtr handle = member.Handle;/g)).toHaveLength(2)
+  expect(stop.match(/long started = CreationTime\(handle\);/g)).toHaveLength(2)
+  expect(
+    stop.match(/if \(!IsProcessInJob\(handle, job, out belongs\)\) \{ failed = true; continue; \}/g),
+  ).toHaveLength(2)
+  expect(stop).toContain("started != candidate.Started")
+  expect(stop).toContain("!member.HasExited && CreationTime(handle) == started")
   expect(stop.match(/catch \(InvalidOperationException\) \{ \}/g)).toHaveLength(2)
   expect(stop.match(/catch \(Win32Exception\) \{ failed = true; \}/g)).toHaveLength(2)
+  expect(stop).toContain(
+    'if (failed) throw new InvalidOperationException("Headless member cleanup incomplete.")',
+  )
+  expect(stop).not.toContain("catch (Win32Exception) { return true; }")
 })
 
 test("minimized protectors need non-empty placement, but only restored windows need on-screen bounds", () => {
   const protector = launch.slice(launch.indexOf("bool ProtectorWindow"), launch.indexOf("bool Visible"))
   expect(protector).toContain("GetWindowPlacement(window, ref placement)")
   expect(protector).toContain("rect = placement.NormalPosition;")
-  expect(protector).toContain("(styles & 0x80) != 0")
+  expect(protector).not.toContain("(styles & 0x80) != 0")
   expect(protector).not.toContain("MonitorFromWindow")
   expect(launch).not.toContain("MONITORINFO")
   expect(launch).not.toContain("GetMonitorInfo")

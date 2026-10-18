@@ -364,7 +364,8 @@ test("launch parent and job membership are assigned together before suspended cr
   expect(guard).toContain("guard.ParentPid = owner.Id")
   ordered(
     guard,
-    "Process.GetCurrentProcess()",
+    "Process.GetProcessById(custodyPid)",
+    "CreationTime(owner.Handle) != custodyStarted",
     "owner.Handle, target, out parentDuplicate",
     "guard.ParentHandle = parentDuplicate.ToInt64()",
   )

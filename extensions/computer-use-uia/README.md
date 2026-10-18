@@ -1,12 +1,24 @@
 # computer-use-uia
 
-> **Experimental 0.0.2 — Windows only, off by default.** This extension can read and control
+> **Experimental 0.1.0 — Windows only, off by default.** This extension can read and control
 > **any window**, including apps you already have open. It is not an application sandbox.
 > Interfaces and safety limits may change. Do not enable it unless you accept the risks below.
 
-Uses Windows PowerShell 5.1 and the built-in .NET UI Automation client (UIA2), with no
-screenshots, OCR, native npm modules or shipped compiled binaries. P/Invoke and the WinForms
-pointer use small in-memory C# shims. Requires **Amira ^0.1.28**.
+**D113: screenshot-first perception, Windows only.** Every successful target observation
+(`ui_tree`) returns a bounded PNG screenshot by default. Dense UIA trees also supply a text
+summary with element IDs; sparse trees are omitted automatically. `ui_windows` is metadata-only
+target discovery, not an observation, and never captures the desktop. Screenshots can be
+explicitly disabled for tree-only operation.
+
+Uses Windows PowerShell 5.1, the built-in .NET UI Automation client (UIA2), and
+System.Drawing/Graphics.CopyFromScreen. No OCR, native npm modules or shipped compiled binaries.
+P/Invoke, capture and the WinForms pointer use small in-memory C# shims. Requires **Amira ^0.1.28**.
+
+> **Screenshot privacy warning:** password-field hiding applies only to UIA text. Images are
+> **not redacted** and can reveal passwords, revealed-password widgets, recovery codes, private
+> documents, and anything else visible in the target window—even when the tree hides it.
+> Screenshots are sent to the model provider and may persist in session history. Disable
+> `screenshot` before observing sensitive apps; there is no automatic image redaction.
 
 **D112 supersedes D109:** there is no launch allowlist or launched-window-only read/action rule.
 The old `apps` setting is removed. Reading or controlling a window does **not** make its process
@@ -58,6 +70,9 @@ Install with `amira ext install computer-use-uia`, then opt in in **`~/.amira/se
 | `enabled` | `false` | Register desktop tools on Windows |
 | `overlay` | `true` | Run the virtual pointer, action banner and emergency-stop monitor; `false` disables all three |
 | `stopHotkey` | `ctrl+alt+q` | Emergency stop; ctrl/alt/shift modifiers plus a letter, digit or F1–F12 |
+| `screenshot` | `true` | Include a target-window PNG with every successful `ui_tree`; `false` retains trees even when sparse |
+| `screenshotMaxEdge` | `1280` | Maximum PNG edge in pixels; integer 128–4096; never upscale |
+| `treeDensityThreshold` | `12` | Include tree text when at least this many readable, on-screen UIA descendants are observed; integer 0–1000; 0 always includes it |
 
 Settings come **only from the explicit user layer** of `api.settings.layers("extensions")`.
 Project, project-local and flag layers cannot enable desktop access or change the stop monitor.
@@ -109,23 +124,37 @@ physically held user keys. The hidden release-only monitor can retain hooks for 
 seconds during idle/interruption cleanup to retry
 transient failures. If releases still fail (for example across a secure-desktop transition), Amira
 reports incomplete input cleanup; release any held keys/buttons manually before resuming.
-Inspect the target app before resuming. Emergency stop kills the exact helper and only launched
-job members with **no windowed protector of their own and no live, older windowed ancestor within
-that job**, following PID/creation-time ancestry up to the launch root. Job membership proves
-ownership; an exited ancestor, a broken chain, an ancestor outside the job, or a reused PID that
-is not strictly older grants no protection. Ancestor access/API failures are not proof of a broken
-chain: that candidate is skipped and cleanup is reported incomplete; other candidates are still checked.
-A .NET process-already-exited exception is treated as an exit, not an access failure. Ancestors are
-opened with limited query access plus `SYNCHRONIZE`, never all-access rights. A zero-time wait
-checks exit independently of the process's exit code. If synchronize access is denied, the watchdog
-retries with query-only access: a reused PID or an ancestor outside the job still grants no protection,
-and an exit code other than `259` proves exit. For an older same-job ancestor, query-only code `259`
-cannot distinguish running from exited; that candidate is conservatively preserved, without claiming
-a verified live ancestor chain or reporting a false cleanup failure. Genuine query/wait API failures
-still report incomplete cleanup.
+Inspect the target app before resuming. **D113 emergency stop kills the exact helper and only
+windowless members of process trees the extension itself launched.** A process's own visible
+window protects that process, including when minimized; a windowed parent does **not** protect
+its windowless children. Consequently Chromium/Electron/WebView2 renderers, GPU and utility
+workers without their own visible windows may be terminated even though the app window stays
+open. Stop is not a promise that the surviving app remains usable.
+
+Emergency-stop cleanup goes to the current watchdog **and** the independent custody owner,
+which checks all retained watchdog generations. Old windowless workers are not exempt after a
+watchdog replacement; old windowed/minimized processes still get the same per-member protection.
+Exact-helper retirement starts immediately. Custody's completion pass runs **after** that
+retirement is confirmed and after the current watchdog's drain/exit checkpoint. Unconfirmed
+retirement, custody failure or overdue confirmation reports explicit incomplete cleanup.
+A stop arriving while a pass is pending queues another post-retirement pass; the stopped latch
+never suppresses a later retry. Reads/restarts follow the live cleanup gates, including queued
+passes, rather than just one captured acknowledgement promise.
+
+Only retained launch-job handles grant ownership. Each candidate's PID/creation-time identity,
+job membership and own windows are checked again before termination; foreign processes are
+never eligible. Candidate API failures preserve that candidate and report incomplete cleanup,
+without protecting its children or preventing other candidates from being checked.
+Each job gets up to three termination passes followed by a read-only completion scan, with a
+cooperative three-second budget. Follow-up scans catch workers created during another worker's
+termination and repeat the same identity/job/own-window checks. Persisting eligible members,
+API failures or budget exhaustion report **incomplete** cleanup; there is no whole-job
+termination fallback or ongoing monitor for later worker creation. Individual native calls may
+still exceed the cooperative budget.
+A .NET process-already-exited exception is treated as an exit, not an access failure.
 “Windowed” means a visible top-level window with non-zero bounds intersecting the virtual screen.
-A **minimized window protects** if it is not a tool window and its saved normal placement is non-empty,
-even when that placement is off the virtual screen (for example, after unplugging a monitor). Only
+A **minimized window protects** when visible with non-empty saved normal placement, including
+`WS_EX_TOOLWINDOW` windows and placement off the virtual screen (for example, after unplugging a monitor). Only
 restored windows require an on-screen intersection; minimized placement needs no coordinate conversion.
 Apps that minimize to the tray hide their window and are **not protected** by that hidden window or tray icon. DWM shell-only cloaking (including windows on another
 virtual desktop) is allowed;
@@ -135,13 +164,58 @@ that you can see or use the app:
 per-pixel transparency, occlusion and unusual window styles may still fool it.
 Launch roots younger than **three seconds** (and their members) are skipped and reported as
 **“still starting (3 s grace)”**; stop does not schedule a later kill. **“Launch root registration
-pending”** is reported separately and means the job's members were preserved; failed/pre-commit
-or completed rootless launches are drained and discarded.
-This preserves windowed apps and their
-Chromium/Electron/WebView2 GPU, renderer and utility children. Windowed apps remain open until
-you close them or end the session. Session cleanup terminates the entire launched tree and can
+pending”** is reported separately and preserves genuinely pending jobs. For a retained rootless
+job, custody confirms abandonment only when **both exact original producer handles** report
+exit. It then applies the same bounded per-member cleanup instead of exempting the suspended
+process forever. Live/missing producer references preserve the pending job; unverifiable exit
+checks preserve it and report incomplete cleanup. No journal PID lookup or whole-job emergency
+termination is used. Normal failed/pre-commit cancellation still drains the current watchdog's
+uncommitted launches.
+Windowed processes remain open until you close them or end the session; their windowless
+workers are not protected. Session cleanup terminates the entire launched tree and can
 lose unsaved changes. Apps that were already open, including unrelated handoff targets, are
 never terminated just because the extension read or acted on them.
+
+## Target screenshots and coordinates
+
+Capture uses only the chosen top-level window's physical DWM extended-frame bounds, validated
+inside `GetWindowRect` (excluding invisible resize borders on maximized windows), never an
+implicit whole-desktop capture. This extension does not offer whole-desktop capture.
+Observations do not focus or restore windows. Hidden, minimized, cloaked, layered/transparent,
+partly offscreen (including monitor gaps), excessively large, or occluded targets are refused;
+make the intended window fully visible yourself or explicitly disable screenshots. A failed
+capture is an error, not a silent tree-only observation. Intermediate captures are bounded to
+64 megapixels and 32,768 pixels per dimension. The extension's own overlay hides and acknowledges
+before capture while its stop monitor remains active. A failed/timed-out hide handshake retires
+that exact overlay without changing the stop latch, **even when already stopped**; the next
+observation starts a fresh overlay and retries. Read recovery never resumes desktop actions.
+
+CopyFromScreen is not a private offscreen renderer: overlapping windows can expose unrelated
+pixels. Conservative pre/post visibility, occlusion and geometry checks reduce that risk, but
+cannot eliminate races while another app moves. Custom nonrectangular window regions are
+refused; four conservative 16-logical-pixel corner squares are blacked out before downscaling,
+using the highest physical monitor scale intersected by the frame (not the app's potentially
+virtualized DPI), to avoid exporting pixels behind DWM-rounded corners. Unusual glass/composited transparency
+may still expose underlying content: this is not a private renderer. Never observe a sensitive
+window assuming password flags or target bounds guarantee redaction or isolation.
+
+PNG output never upscales and has a configurable maximum edge. Width and height round down
+independently, so the response reports actual `scaleX = imageWidth / physicalWidth` and
+`scaleY = imageHeight / physicalHeight`, plus bounds and effective monitor DPI (the highest
+intersected monitor scale × 96, which need not equal a DPI-unaware app's reported 96 DPI). For example a 1920×1080
+window at physical origin (−1920, 100), downscaled to 1280×720, maps screenshot (640, 360)
+to physical (−960, 640): `origin + floor(imageCoordinate / axisScale)`. **Do not apply another
+DPI multiplier**. Pass image pixels and the screenshot ID to `ui_click`/`ui_scroll`; the helper
+maps them and repeats foreground, target identity, hit-test, held-modifier and actual-cursor
+checks. Moved/resized/DPI-changed/minimized targets or stale IDs are refused; observe again.
+No coordinate input is available with screenshots disabled.
+
+Density is the count of readable non-Window UIA rows not flagged offscreen in the bounded
+snapshot; unknown visibility counts. It is a heuristic, not screen-area coverage or proof of
+complete accessibility. At the threshold, the summary is included; below it, no tree refs are
+exposed or accepted. Traversal limits can underestimate density. Dense summaries retain bounded
+names, IDs, flags and values with the existing password-value protections. Refresh observations
+after UI changes; the image is captured before tree traversal, not atomically with the tree.
 
 ## Virtual pointer
 
@@ -167,9 +241,10 @@ operations never reposition your real cursor.
 | Tool | Arguments | Result |
 | --- | --- | --- |
 | `ui_windows` | optional `filter` | Up to 200 visible top-level `windows`: native handle (`window`), title (120 characters), process name, PID, class, physical bounds, minimized/foreground state. Case-insensitive substring across these identifiers; a `cut` flag/note reports truncated output. |
-| `ui_tree` | `window`, optional `depth` (8, 0–30), `maxNodes` (300, 1–1000) | Any target window's UIA tree, unique snapshot refs, names, flags, bounded values/text, password flags, and timing/size footer |
+| `ui_tree` | `window`, optional `depth` (8, 0–30), `maxNodes` (300, 1–1000) | Target PNG ImageBlock, screenshot ID, physical bounds, image size, DPI and axis scales; dense UIA summary with unique element refs, password flags, and timing/size footer |
 | `ui_launch` | `command`, optional string-array `args`, `cwd` | New PID plus an unambiguous new window, or a PID and instruction to use `ui_windows` |
-| `ui_click` | `window`, `ref` | Invoke/Toggle/SelectionItem/ExpandCollapse pattern, otherwise guarded clickable-point input; reports path |
+| `ui_click` | `window`, either `ref` or `screenshot`, `x`, `y` | UIA pattern/clickable-point input for refs, or guarded screenshot-space click; reports path |
+| `ui_scroll` | `window`, `screenshot`, `x`, `y`, `delta` | Guarded wheel at screenshot-space point; integer nonzero delta −10…10 notches, positive up, negative down |
 | `ui_type` | `window`, `text`, optional `ref` | ValuePattern.SetValue or guarded focused Unicode input; reports path |
 | `ui_key` | `window`, `keys` | Single chord such as `ctrl+s`, `enter`, `shift+tab`; refuses desktop-switching chords and `alt+f4` |
 | `ui_focus` | `window` | Restore a minimized window and bring it to the foreground; refuses focus failure |
@@ -198,7 +273,7 @@ launched by this extension. Exact PID/creation-time kills of still-running launc
 reserved for **session cleanup** and the headless-member emergency-stop rule above.
 There are no image-name kills.
 
-`ui_close`, `ui_focus`, `ui_click`, `ui_type` and `ui_key` refuse desktop/taskbar shell classes
+`ui_close`, `ui_focus`, `ui_click`, `ui_scroll`, `ui_type` and `ui_key` refuse desktop/taskbar shell classes
 (`Progman`, `WorkerW`, `Shell_TrayWnd`, `Shell_SecondaryTrayWnd`), the overlay's own native window,
 and identifiable Amira console/terminal windows (Amira PID/ancestor identities and console HWND).
 Reads can still list and inspect them. Terminal-host identification is best effort; native window
@@ -207,13 +282,16 @@ ownership varies between console hosts.
 ## Lifecycle
 
 The helper and overlay start lazily through `api.openPipe`. A headless extension-owned lifetime
-sentinel bridges host unload, and a separate headless watchdog can clean up while UIA is blocked.
+sentinel bridges host unload. A separate headless watchdog can clean up while UIA is blocked;
+an **independent session-lifetime custody owner** retains cleanup-capable job duplicates across
+watchdog crashes and replacements.
 Exact launch PID/start-time records, the helper identity and opaque job IDs are atomically
 journaled in `%TEMP%/amira-uia-<UUID>.json` (`OwnershipVersion=3`), with no titles, screen text
 or action history. Every write carries an HMAC-SHA256 over the exact serialized content, including
 a per-session nonce and the state path. A new random 32-byte key and nonce are generated with
 each client session's state path; helper replacements reuse that session's credentials. Replacing
-a lost watchdog starts a fresh state path/key/nonce generation, never adopting its lost jobs. The key
+a lost watchdog starts a fresh state path/key/nonce generation, never adopting old jobs from the
+journal; the independent custody owner keeps its already-retained kernel duplicates. The key
 stays in memory and reaches the helper/watchdog only over stdin, never argv, environment or
 files. Readers verify the MAC, nonce and path before trusting any identity. Untrusted records
 are ignored with **“untrusted launch journal; cleanup refused”** and grant no cleanup authority;
@@ -221,16 +299,33 @@ they cannot block later launches. No other clients' journals are scanned. Readin
 clicking, or executable-matching a window never adds a launch record.
 
 The watchdog creates an **unnamed, non-breakaway Windows job** before launch and transfers a
-assignment-only job handle and a limited parent-process handle only to the verified helper PID/start-time identity.
+assignment-only job handle and a limited custody-owner parent-process handle only to the verified
+helper PID/start-time identity.
 The helper closes both duplicated handles when a requested transfer acknowledgement arrives late
 or is rejected. Acknowledgements for job IDs this helper never requested are ignored without closing
 any echoed handle numbers.
-The helper validates the parent's PID/creation time and assigns **both the job and the watchdog
-as OS parent atomically** during suspended creation. Launched apps are children of the session
-watchdog, not the transient helper, so even a host-level helper tree kill cannot reach them.
-No public job names or journal-supplied handles are opened. Closing job handles does not implicitly kill apps: termination requires explicit cleanup
-by the watchdog holding those exact handles. After the helper journals the suspended root, the
-watchdog verifies its exact identity and primary-thread ownership, then registers and resumes it
+
+**Before launch handles are released or a root can run**, the watchdog pins a distinct cleanup
+handle and offers it through the client's private pipes. Offers and acknowledgements bind the
+custody session nonce, one-use transfer ID, job ID, source PID/creation time, pinned source handle,
+and helper writer identity. The independent owner verifies those exact process identities and
+pulls a new local `QUERY | TERMINATE` duplicate; it validates job/query rights before acknowledging.
+Only an exact acknowledgement releases the source pin and permits launch. Unknown, mismatched,
+replayed, or late transfers cannot grant launch authority or close arbitrary echoed handle numbers.
+The custody protocol and native duplicates stay in memory/private stdin/stdout; journal PIDs or
+handle numbers are never recovery authority.
+
+The helper validates the parent's PID/creation time and assigns **both the job and the independent
+custody owner as OS parent atomically** during suspended creation. Launched apps are children of
+that session owner, not the transient helper or watchdog, so retiring either transient process
+does not cascade a tree kill into apps. The session owner's tree remains attached to host shutdown.
+No public job names or journal-supplied handles are opened. Closing job handles does not implicitly
+kill apps: there is **no blanket kill-on-close**. Termination requires explicit cleanup through
+retained handles in the watchdog or independent custody owner. After the helper journals the
+suspended root, custody verifies its PID/creation time and membership through the retained job
+handle and acknowledges its immutable root/grace metadata **before** the watchdog may resume it.
+This preserves the three-second grace across watchdog loss without trusting journal PIDs.
+The watchdog then verifies the exact identity and primary-thread ownership, registers and resumes it
 before acknowledging the launch. Helper death cannot leave a registered root indefinitely suspended;
 a lost acknowledgement does not authorize killing a launch the watchdog already committed.
 Failure to retain/assign the job (including unsupported
@@ -240,25 +335,34 @@ launcher exits. This does **not** track processes created by external brokers: W
 `Win32_Process.Create`, `schtasks`/scheduled tasks, DCOM or explorer-mediated ShellExecute,
 COM/ShellExecute to an existing instance, or services. Discovery never turns these into owned
 processes. Emergency stop checks exact UTC FILETIME creation identities, job membership,
-visible-window ancestors and the three-second root-start grace described above. Session end
+each member's own visible windows and the three-second root-start grace described above. Session end
 terminates the whole job, polls for exit for two seconds, and retries once if incomplete.
 
 Helper EOF, request timeout and helper restart **do not clean up launched apps**. Helpers are
 retired through PID/creation-time-checked, non-tree termination; their pipe is closed only after
 confirmed exit. If the watchdog dies, a headless exact-helper reaper is used, never a tree kill.
 Retirement failure or a ten-second retirement timeout refuses replacement and reports the error
-instead of hanging requests; session teardown still drains the watchdog and its retained jobs.
+instead of hanging requests; session teardown still drains the watchdog and independent custody
+owner, including trees retained before watchdog replacement.
 After that exact old helper's native exit is confirmed, `/uia resume` followed by a tool request
 (or the next read/start) can retry the retirement gate. Until exit is confirmed, replacement stays
 refused; resume alone does not permit overlapping helpers.
 The watchdog holds jobs across helper replacement; restarted helpers read only their own client's authenticated
-journal and invalidate old window refs. Session end, host exit/unload, watchdog EOF,
-**`/jobs stop` on the computer-use-uia lifetime job**, and **extension reload** end the launched
-apps, including windowed apps with unsaved changes. **Extension reload does not call the client's
-`stop()` method**: cleanup relies on the extension-owned sentinel dying and the watchdog's
-**three-second grace** before terminating its retained jobs. Stopping the lifetime sentinel signals the
-watchdog to terminate its retained jobs; a watchdog tree kill at session end also reaches the
-launched trees by design. The watchdog pins the current helper identity over its private
+journal and invalidate old window refs. Session end, host exit/unload,
+**`/jobs stop` on the computer-use-uia lifetime job**, and **extension reload** end all launched
+apps, including windowed apps with unsaved changes. Watchdog EOF drains that watchdog's retained
+jobs; it does not discard the independent owner's authority over earlier generations. **Extension reload does not call the client's
+`stop()` method**: cleanup relies on the extension-owned sentinel dying and the owners'
+**three-second grace** before terminating retained jobs. The custody owner is not a descendant
+of the transient watchdog, and watches the same exact sentinel identity plus its private-pipe EOF
+or authenticated end request. On session end it retires the authenticated launch producers before draining **all** original
+and replacement-generation jobs, preventing an in-flight launch from entering an apparently
+empty job after cleanup. Stopping the lifetime sentinel signals both owners; the custody owner's
+process tree also reaches its launches at host shutdown, while retained job handles cover
+surviving descendants whose launcher has already exited. Failed producer retirement or a job-drain
+failure keeps custody alive with its native handles and retries; a bounded client cleanup timeout
+reports the failure without force-closing that owner. Replacement stays blocked until confirmed
+cleanup. The watchdog pins the current helper identity over its private
 client pipe, once per helper generation, checks the spawned child's PID and native creation time,
 and acknowledges that identity before the helper's first journal write. Cleanup retires that exact
 helper before verifying the final snapshot. Missing, stale or untrusted journals **never prevent
@@ -266,15 +370,18 @@ cleanup of jobs the watchdog itself retained**; journal-supplied identities gran
 A complete session cleanup removes the journal and `.tmp`; unverifiable/incomplete cleanup retains
 the journal and reports the failure. Existing windows are not closed during teardown.
 Rotated journals are deleted after the old generation's cleanup finishes or its watchdog is
-confirmed gone, when lost unnamed job handles make further cleanup impossible; they are kept
-only while they can provide evidence for active cleanup. A missing journal before the first write,
+confirmed gone; cleanup authority remains in the independent owner's native duplicates, not
+those files. Journals are kept only while they can provide evidence for active cleanup. A missing journal before the first write,
 or a retired writer's snapshot before replacement writes, is not reported as incomplete when
 all retained jobs were drained. On a non-force emergency stop, windowed members deliberately
 preserved during a journal gap do not count as incomplete cleanup.
 The overlay watches the exact helper and sentinel identities and exits on pipe EOF.
-**Hard-killing only the watchdog process does not clean up launched apps.** Job handles have no
-kill-on-close behavior, and the journal cannot recover lost kernel job handles. Killing the
-**watchdog's entire process tree**, in contrast, also kills its launched apps.
+**Hard-killing only the watchdog does not immediately kill windowed apps.** Desktop actions
+latch stopped, while the independent custody owner keeps the original jobs for session-end
+cleanup. A replacement watchdog owns new launches without dropping those old duplicates.
+Killing a transient watchdog's entire process tree does not end the independent custody owner
+or its launched apps. If the independent custody owner itself is lost, the extension refuses further
+launches and reports cleanup authority unavailable; it never guesses kernel objects or recovers ownership from PIDs.
 
 Invoke/Toggle/SelectionItem/ExpandCollapse/SetValue, WindowPattern.Close and element SetFocus run
 on background threads with a **five-second wait**. If a click/type provider remains busy, the
@@ -284,6 +391,43 @@ preflight, so it cannot dispatch later; it cannot cancel or roll back a UIA call
 A focus timeout refuses subsequent input. A bounded number of busy pattern calls is allowed;
 additional calls are refused until one finishes.
 
+### Emergency-stop asynchronous ordering audit
+
+The relevant asynchronous boundaries, from interrupted launch through session end, are:
+
+| Boundary | Completion/evidence and ordering rule |
+| --- | --- |
+| In-flight launch ownership/root handoff | Private custody-transfer, root-metadata and commit acknowledgements are bound to their session/job/helper generation. Late replies cannot resume a retired helper. A suspended member may exist before root metadata arrives. |
+| Watchdog physical death → exit notification | The host notification may arrive before or after a stop/read/end request. It latches control, fails the interrupted tool request and starts exact-helper retirement. Retained native job handles do not depend on notification delivery. |
+| Retirement dispatch | A live watchdog receives the exact helper identity; after watchdog loss a separate exact-identity reaper is dispatched. Dispatch is immediate, not delayed behind custody classification. |
+| Exact helper exit and reaper/retire acknowledgement | These notifications may arrive in either order. Successful retirement requires the identity-bound exit evidence; failed attempts may recover only after the same exact exit is confirmed. Otherwise cleanup reports incomplete. |
+| Overlay abort/input-release/exit, if enabled | Runs alongside retirement and is included in the retirement barrier. Replacement cannot overlap a retiring monitor; existing fake monitor-release/startup regressions cover this optional branch. |
+| Watchdog's own stop drain acknowledgement or exit | Bound to the originating pipe, even if session end has already cleared the active watchdog. Custody waits for this checkpoint as well as helper retirement; an old exit cannot complete a replacement watchdog's stop. |
+| Post-retirement custody request → scans → acknowledgement | Only after the preceding barriers does custody inspect all retained jobs using the unchanged cached-producer and identity/job/own-window checks. Incomplete results and unavailable/overdue confirmations are reported. Late acknowledgements remain usable. |
+| A second stop during any wait/acknowledgement | Starts retirement immediately again and coalesces a burst into an additional pass. A request arriving during promise settlement is not dropped. Reads keep following queued passes until the live gates are clear. |
+| Replacement request → watchdog readiness → helper identity/writer handshake → overlay readiness | A queued read first waits for retirement and all cleanup passes. Each subsequent startup checkpoint revalidates the generation/session-end state. A stop/end during readiness cannot launch an old queued action. |
+| Session-end request | Can preempt any preceding boundary: retire the helper, close the watchdog input, signal custody end and stop the exact lifetime sentinel. An interrupted emergency pass must not claim success on unavailable evidence. |
+| Custody producer retirement → whole-session job drain/retry → drained reply → owner exit | The independent owner ends all original/replacement job trees, including windowed members. Unconfirmed drainage retains authority and reports incomplete; client teardown waits for confirmations without force-closing the last owner. |
+
+The fake table in `unit.test.ts` covers **4,320 scenarios**: all **240 causal orderings** of
+watchdog-exit delivery, exact-helper exit, reaper reply, stop request, replacement request and
+session-end request, crossed with reaper success/failure, immediate/either-delayed cleanup
+acknowledgement, and ready/watchdog-blocked/helper-identity-blocked replacement startup. The
+fallback reaper's exit/reply follow watchdog notification; all other caller/event orders are
+permuted, including stop before watchdog-exit delivery. Internal handshakes keep the causal
+ordering listed above rather than being independently reorderable.
+
+Crucially, session-end drainage is held back in every row: **before** releasing it, every
+custody pass must observe retired original producers, the eligible suspended member must be
+gone **or an explicit incomplete-cleanup report must exist**, and the minimized member must
+still be alive. Then session drainage must remove both. This prevents session teardown from
+masking an emergency-stop survivor. Separate regressions cover immediate stop without yielding,
+retry after failed retirement without a read, and a second stop/read while the first custody
+acknowledgement is held. Pending/grace-protected jobs and windowed members remain intentionally
+ineligible for emergency termination under the rules above.
+
+These are fake/static checks, not proof of native Windows scheduling or process teardown.
+
 ## Limitations
 
 - Requires Windows 10 version 1607 or later, and an active, connected, unlocked interactive desktop. Secure desktops,
@@ -291,8 +435,8 @@ additional calls are refused until one finishes.
 - **Elevated windows are inaccessible from a non-elevated helper.** Do not use this to operate
   UAC/security prompts. UIA/input may fail across integrity levels.
 - Electron apps often need **`--force-renderer-accessibility`** in their launch arguments.
-- Games, canvas apps and custom-drawn controls often expose sparse or empty UIA trees. There
-  is no screenshot/OCR fallback. Providers can be stale, expensive or hang.
+- Games, canvas apps and custom-drawn controls often expose sparse or empty UIA trees. These
+  use screenshot-space input; no OCR is provided. Providers can be stale, expensive or hang.
 - UIA2 behavior varies by provider. Some editors expose TextPattern rather than writable
   ValuePattern; these use guarded Unicode input, not a pretend SetValue success.
 - A UIA tree can expose cross-process children/popups. Reads may include these, but an action
@@ -306,9 +450,9 @@ additional calls are refused until one finishes.
 Safe fake-only checks (no desktop/helper/hotkey processes):
 
 ```sh
-bunx tsc --noEmit
-bunx biome check src test scripts package.json tsconfig.json biome.json
-bun test ./test/unit.test.ts ./test/helper.test.ts ./test/safety.test.ts
+bun run typecheck
+bun run lint
+bun run test
 ```
 
 `unit.test.ts` uses fake host/jobs/pipes for settings, tool traits, arbitrary handles/launches,
@@ -316,8 +460,71 @@ window-local refs, emergency-stop latching/explicit resume, startup-stop races, 
 untrusted-result framing, model-facing stop notices and overlay protocol/lifecycle. `helper.test.ts`
 reads source files only: these contracts are **not PowerShell runtime or provider tests**.
 
-Desktop tests are **explicitly opt-in**. Do not run them while anyone is using the machine.
-Importing/skipping `desktop.test.ts` starts no probes or processes. On a dedicated idle Windows
+The test script lists only fake/static suites explicitly, including density/omission,
+ImageBlock shape, PNG scaling and coordinate/DPI math, settings validation, stop classification,
+session teardown, and evaluation opt-in/metrics. It never imports the live desktop suite.
+Source contracts do **not** prove C#/PowerShell execution, capture privacy, or native behavior.
+
+Development setup: run `bun install --offline` (fall back to `bun install` on cache miss),
+then `bun run link-amira D:/dev/Amira` (or your checkout's absolute path). Linking supplies host
+packages, TypeScript and Biome; no host changes or settings edits are needed.
+
+## Manual D113 regression evaluation
+
+**Never run this on an in-use desktop.** `eval:desktop` is separate from `test` and CI. It refuses
+to run before importing desktop services or launching anything unless `--allow-desktop` or
+`AMIRA_UIA_EVAL=1` is explicit; it also refuses CI and non-Windows hosts. The bundled WinForms
+fixture has its own opt-in gate. No user settings/auth files are read or written: evaluation
+uses in-memory settings and a temporary directory, never `~/.amira`.
+
+On an idle, unlocked dedicated Windows machine, configure a vision/tool-capable model through
+explicit environment variables and run (PowerShell example):
+
+```powershell
+$env:AMIRA_UIA_EVAL_MODEL = 'your-model-id'
+$env:AMIRA_UIA_EVAL_BASE_URL = 'https://your-provider.example/v1'
+$env:AMIRA_UIA_EVAL_API_KEY = 'your-api-key'
+bun run eval:desktop --allow-desktop
+```
+
+The bundled runner uses `@amira/ai` with explicit provider configuration, fresh history per
+trial and the same model in both modes. `AMIRA_UIA_EVAL_MODEL` is the endpoint-native model ID,
+not an Amira provider/model reference. Optional `AMIRA_UIA_EVAL_DIALECT` defaults to
+`openai-chat`; `AMIRA_UIA_EVAL_MAX_TURNS` defaults to 40. For an intentionally unauthenticated
+endpoint, set `AMIRA_UIA_EVAL_KEYLESS=1` and omit the API key (do not set both).
+The runner offers only fixture-scoped extension tools and forwards complete image blocks. For another provider/session integration, pass
+`--runner ./your-runner.ts`; that trusted module exports `createRunner(): EvalRunner`
+(see `scripts/eval-desktop.ts`). Return `{ usage, error? }`: actual provider token counters or
+`usage: null`, with an optional failure message. Never return text-length estimates or throw
+away already measured usage when returning a failed outcome. Runner modules are trusted code,
+not a security sandbox.
+
+Six fixed tasks cover profile fields, Unicode text, checkboxes, priority choice, a two-click
+counter and a gated release. Each gets a fresh uniquely titled owned form in both modes
+(12 trials), with counterbalanced order. The form's own validation handler supplies an independent
+success label. Tree-only uses `screenshot: false`; screenshot+tree uses `screenshot: true`;
+both set `treeDensityThreshold: 0`, so the comparison isolates the addition of images. Defaults
+are 40 attempted tool calls and 120 seconds per trial. Escape/hotkey stop remains enabled;
+an emergency stop aborts the suite without automatic resume.
+
+JSON stdout reports success rate, attempted tool-call steps (reads included), actual
+input/output/cache token counters, and solver wall time per trial and mode. Setup, scoring and
+teardown are excluded from solver time. Unknown token counts stay `null`, with measured-trial
+coverage and a known subtotal; no invented token metric. Failed model trials retain counters
+already measured when consumption is fully known; an interrupted/unreported request keeps total
+usage unknown rather than presenting a partial count as complete. Verification exceptions become
+failed/unscorable trial records, preserving completed trials and the affected trial's steps, usage
+and solver time. Emergency stop still prevents any subsequent fixture launch.
+No images or unrelated window titles
+are saved by the harness. The model provider still receives fixture images/text. Results are
+synthetic regression evidence, not a claim about arbitrary apps. This implementation has not
+been live-evaluated; the maintainer must produce and review the first baseline by hand.
+
+## Existing manual desktop tests
+
+Desktop tests are **explicitly opt-in**. They explicitly disable screenshots to retain legacy
+UIA/provider/input coverage; run the D113 evaluation and screenshot checklist separately.
+Do not run them while anyone is using the machine. Importing/skipping `desktop.test.ts` starts no probes or processes. On a dedicated idle Windows
 machine, set `AMIRA_UIA_DESKTOP_TESTS=1` and run `bun test ./test/desktop.test.ts` (or the explicit
 `scripts/smoke.ts` wrapper). Tests use only their uniquely titled bundled test window and their
 own overlay/helper processes, filter `ui_windows` before acting, and never log other windows'
@@ -334,7 +541,44 @@ hotkey; input-release hooks observe the test helper's tagged input only during a
 post-action window. Desktop coverage also checks idle hook removal, explicit overlay opt-out,
 polite close of an IgnoreClose fixture, delayed acknowledgements, protected test-owned targets,
 title truncation, modal dialogs, windowed-app survival on stop, and headless descendant cleanup.
-Simultaneous loss of helper and watchdog can leave a launched tree running; no replacement
-reopens an unverified kernel object, and rotation removes the unrecoverable old journal.
+Loss of the helper and watchdog does not erase the independent owner's retained job authority:
+session end still drains original and replacement trees. Native custody transfer, watchdog-loss
+recovery and producer/drain races require manual Windows checks; fake tests do not prove them.
 Do not use blanket `bun test` as a
 substitute for the explicit fake-only paths on a live desktop.
+
+### Maintainer acceptance checks (manual only)
+
+Use disposable, uniquely titled test-owned windows on an idle Windows desktop. These checks
+have **not** been run by the coding agent:
+
+- Check stop classification with a visible parent, a visible/minimized `WS_EX_TOOLWINDOW` child,
+  and a windowless sibling: keep both windowed processes, terminate only the windowless owned
+  worker, leave a foreign test process alone, then end the session and verify the entire owned tree exits.
+- After a launch is acknowledged, crash only its exact watchdog, resume into a replacement and
+  launch another fixture. Emergency-stop first: windowless workers in **both generations** must
+  exit while old/new windowed and minimized members survive. Then end the session and confirm
+  all remaining owned processes exit, including descendants whose launcher already exited. Repeat through lifetime-sentinel stop/reload;
+  custody acknowledgement failure must refuse a launch, not run an untracked process.
+  Also interrupt before root registration and stop immediately, without yielding to exact-helper
+  retirement. Cleanup must wait for confirmed retirement and then clean the abandoned member,
+  or explicitly report incomplete. Repeat a stop before/after acknowledgement and after a failed
+  retirement's late exact-exit confirmation; no intervening read should be needed to retry.
+  A genuinely pending launch stays protected.
+  Inject a worker during another worker's termination: follow-up scans must find it, while a
+  continuously spawning chain must produce an incomplete result rather than false success.
+- Simulate/delay the overlay's screenshot-hide acknowledgement. The observation must fail without
+  a stop latch; the old overlay must exit and a new observation must recover with a fresh overlay.
+  Repeat with the latch already set: recovery must work without clearing it or allowing actions.
+  Actual hotkey/Escape stops must still latch normally.
+- Run `eval:desktop` with its explicit opt-in and cause one scoring read to fail. Earlier trials
+  and the affected trial's usage/steps/time must remain in the report. Emergency stop, including
+  during cleanup, must return a partial aborted report without starting another fixture.
+- Set a small model-turn budget and inspect failed-trial token counters. Also compare timeout
+  during a measured-response tool call against timeout during an unreported model request:
+  retain complete measured usage in the former; leave unknown total usage `null` in the latter.
+- Run the opt-in desktop suite with a temporary directory containing an apostrophe and spaces;
+  its windowed-child wrapper must pass the exact paths without PowerShell source interpolation.
+- Retest screenshot density/omission, image-space click/scroll, moved/stale/obscured targets,
+  maximized frames and rounded corners on mixed-DPI/negative-coordinate monitors, including
+  a DPI-unaware target at 300% scaling. Use dummy secrets only; images are not password-redacted.

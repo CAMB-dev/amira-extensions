@@ -22,7 +22,7 @@ export class StopState {
 export type OverlayReply =
   | { event: "ready"; class?: string; pid?: number }
   | { event: "stop" }
-  | { event: "glided" | "armed"; id: number }
+  | { event: "glided" | "armed" | "hidden"; id: number }
   | { event: "error"; error: string }
 
 export function overlayReply(line: string): OverlayReply {
@@ -34,8 +34,8 @@ export function overlayReply(line: string): OverlayReply {
       ...(Number.isInteger(value.pid) && value.pid! > 0 ? { pid: value.pid } : {}),
     }
   if (value?.event === "stop") return { event: "stop" }
-  if (["glided", "armed"].includes(value?.event) && "id" in value && Number.isInteger(value.id))
-    return { event: value.event as "glided" | "armed", id: value.id }
+  if (["glided", "armed", "hidden"].includes(value?.event) && "id" in value && Number.isInteger(value.id))
+    return { event: value.event as "glided" | "armed" | "hidden", id: value.id }
   if (value?.event === "error" && typeof value.error === "string") return value
   throw new Error("Invalid overlay protocol response")
 }

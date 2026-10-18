@@ -109,8 +109,8 @@ function Assert-Lifetime {
     }
 }
 
-# The watchdog, not a transient helper, owns session cleanup. Restart only reloads
-# this client's authenticated records; it never kills apps or scans other journals.
+# The watchdog and independent custody owner, not a transient helper, own session cleanup.
+# Restart only reloads this client's authenticated records; it never kills apps or scans other journals.
 function Save-OwnedState {
     if ([string]::IsNullOrEmpty($StatePath)) { return }
     $records = @($script:processes.Values | ForEach-Object {
@@ -177,7 +177,8 @@ try {
     Add-Type -AssemblyName UIAutomationClient | Out-Null
     Add-Type -AssemblyName UIAutomationTypes | Out-Null
     Add-Type -AssemblyName UIAutomationClientsideProviders | Out-Null
-    Add-Type -ReferencedAssemblies @('System.dll', [System.Windows.Automation.AutomationElement].Assembly.Location, [System.Windows.Automation.AutomationProperty].Assembly.Location) -TypeDefinition @'
+    Add-Type -AssemblyName System.Drawing | Out-Null
+    Add-Type -ReferencedAssemblies @('System.dll', 'System.Drawing.dll', [System.Windows.Automation.AutomationElement].Assembly.Location, [System.Windows.Automation.AutomationProperty].Assembly.Location) -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
@@ -422,6 +423,181 @@ namespace OwnedUia {
         [DllImport("user32.dll")]
         public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
 
+        [DllImport("user32.dll")]
+        public static extern uint GetDpiForWindow(IntPtr window);
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetThreadDpiAwarenessContext();
+        [DllImport("user32.dll")]
+        private static extern bool AreDpiAwarenessContextsEqual(IntPtr first, IntPtr second);
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetWindow(IntPtr window, uint command);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
+        private static extern int GetWindowLong(IntPtr window, int index);
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmGetWindowAttribute(IntPtr window, uint attribute, out uint value, uint size);
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmGetWindowAttribute(IntPtr window, uint attribute, out RECT value, uint size);
+        [DllImport("user32.dll")]
+        private static extern int GetWindowRgn(IntPtr window, IntPtr region);
+        [DllImport("gdi32.dll")]
+        private static extern IntPtr CreateRectRgn(int left, int top, int right, int bottom);
+        [DllImport("gdi32.dll")]
+        private static extern int GetRgnBox(IntPtr region, out RECT bounds);
+        [DllImport("gdi32.dll")]
+        private static extern bool DeleteObject(IntPtr value);
+        private delegate bool MonitorProc(IntPtr monitor, IntPtr dc, ref RECT rect, IntPtr data);
+        [DllImport("user32.dll")]
+        private static extern bool EnumDisplayMonitors(IntPtr dc, IntPtr clip, MonitorProc callback, IntPtr data);
+        [DllImport("shcore.dll")]
+        private static extern int GetScaleFactorForMonitor(IntPtr monitor, out int scalePercent);
+
+        public sealed class CaptureBounds {
+            public int X, Y, Width, Height, ScalePercent;
+            public uint Dpi;
+        }
+        public sealed class CapturedImage {
+            public CaptureBounds Bounds;
+            public int Width, Height;
+            public string Data;
+        }
+        static InvalidOperationException CaptureError(string reason) {
+            return new InvalidOperationException("UIA_SAFE: " + reason + "; request a new screenshot of a fully visible window.");
+        }
+        public static CaptureBounds GetCaptureBounds(IntPtr window) {
+            if (!AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), new IntPtr(-4)))
+                throw CaptureError("Physical-pixel DPI awareness is unavailable");
+            if (!InteractiveDesktop() || !IsWindow(window) || !IsWindowVisible(window) || IsIconic(window))
+                throw CaptureError("Screenshot target is hidden, minimized or unavailable");
+            // Layered/transparent targets can expose unrelated windows beneath their own bounds.
+            if ((GetWindowLong(window, -20) & (0x80000 | 0x20)) != 0)
+                throw CaptureError("Screenshot target is layered or transparent");
+            uint cloaked;
+            if (DwmGetWindowAttribute(window, 14, out cloaked, 4) != 0 || cloaked != 0)
+                throw CaptureError("Screenshot target is cloaked or cannot be verified");
+            RECT nativeRect, rect;
+            uint dpi = GetDpiForWindow(window);
+            // Extended frame excludes invisible resize borders (notably negative maximized bounds).
+            if (!GetWindowRect(window, out nativeRect) || dpi == 0 ||
+                DwmGetWindowAttribute(window, 9, out rect, 16) != 0 ||
+                rect.Right <= rect.Left || rect.Bottom <= rect.Top ||
+                rect.Left < nativeRect.Left || rect.Top < nativeRect.Top ||
+                rect.Right > nativeRect.Right || rect.Bottom > nativeRect.Bottom)
+                throw CaptureError("Screenshot target bounds or DPI are unavailable");
+            // A nonlayered HWND can still have holes via SetWindowRgn. Never export those pixels.
+            IntPtr region = CreateRectRgn(0, 0, 0, 0);
+            if (region == IntPtr.Zero) throw CaptureError("Window shape cannot be verified");
+            try {
+                int shape = GetWindowRgn(window, region);
+                // ERROR (0) also means no custom region, the normal rectangular HWND case.
+                if (shape == 1 || shape == 3) throw CaptureError("Nonrectangular screenshot target");
+                if (shape == 2) {
+                    RECT area;
+                    if (GetRgnBox(region, out area) != 2 ||
+                        area.Left > rect.Left - nativeRect.Left || area.Top > rect.Top - nativeRect.Top ||
+                        area.Right < rect.Right - nativeRect.Left || area.Bottom < rect.Bottom - nativeRect.Top)
+                        throw CaptureError("Screenshot frame extends beyond the window region");
+                }
+            } finally { DeleteObject(region); }
+            long width = (long)rect.Right - rect.Left, height = (long)rect.Bottom - rect.Top;
+            // Bound the intermediate physical bitmap, not just its downscaled output.
+            if (width > 32768 || height > 32768 || width * height > 67108864)
+                throw CaptureError("Screenshot target is too large");
+            var bounds = new System.Drawing.Rectangle(rect.Left, rect.Top, (int)width, (int)height);
+            int maxScale = 0;
+            using (var uncovered = new System.Drawing.Region(bounds))
+            using (var probe = new System.Drawing.Bitmap(1, 1))
+            using (var graphics = System.Drawing.Graphics.FromImage(probe)) {
+                MonitorProc callback = delegate(IntPtr monitor, IntPtr dc, ref RECT area, IntPtr data) {
+                    var monitorBounds = System.Drawing.Rectangle.FromLTRB(area.Left, area.Top, area.Right, area.Bottom);
+                    if (monitorBounds.IntersectsWith(bounds)) {
+                        // GetDpiForWindow is virtualized to 96 for DPI-unaware targets.
+                        // Shell monitor scale is independent of the target app's awareness.
+                        int monitorScale;
+                        if (GetScaleFactorForMonitor(monitor, out monitorScale) != 0 ||
+                            monitorScale < 100 || monitorScale > 1000) return false;
+                        maxScale = Math.Max(maxScale, monitorScale);
+                    }
+                    uncovered.Exclude(monitorBounds);
+                    return true;
+                };
+                if (!EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, callback, IntPtr.Zero) || !uncovered.IsEmpty(graphics))
+                    throw CaptureError("Screenshot target is partly offscreen or monitor scale is unavailable");
+                GC.KeepAlive(callback);
+            }
+            if (maxScale == 0) throw CaptureError("Physical monitor scale cannot be verified");
+            return new CaptureBounds { X = rect.Left, Y = rect.Top, Width = (int)width, Height = (int)height,
+                ScalePercent = maxScale, Dpi = (uint)Math.Ceiling(96.0 * maxScale / 100.0) };
+        }
+        static void AssertCaptureClear(IntPtr window, System.Drawing.Rectangle bounds) {
+            // Conservatively refuse intersecting top-level windows above the target,
+            // even transparent/tool windows: hit tests alone miss click-through occluders.
+            IntPtr above = GetWindow(window, 3); // GW_HWNDPREV: walk toward top of Z order.
+            int visited = 0;
+            while (above != IntPtr.Zero) {
+                if (++visited > 10000) throw CaptureError("Window stacking cannot be verified");
+                if (IsWindowVisible(above) && !IsIconic(above)) {
+                    uint cloaked;
+                    if (DwmGetWindowAttribute(above, 14, out cloaked, 4) != 0)
+                        throw CaptureError("Window occlusion cannot be verified");
+                    if (cloaked == 0) {
+                        RECT rect;
+                        if (!GetWindowRect(above, out rect)) throw CaptureError("Window occlusion cannot be verified");
+                        if (System.Drawing.Rectangle.FromLTRB(rect.Left, rect.Top, rect.Right, rect.Bottom).IntersectsWith(bounds))
+                            throw CaptureError("Screenshot target is occluded");
+                    }
+                }
+                above = GetWindow(above, 3);
+            }
+        }
+        static bool SameBounds(CaptureBounds first, CaptureBounds second) {
+            return first.X == second.X && first.Y == second.Y && first.Width == second.Width &&
+                first.Height == second.Height && first.Dpi == second.Dpi && first.ScalePercent == second.ScalePercent;
+        }
+        public static CapturedImage Capture(IntPtr window, int maxEdge) {
+            if (maxEdge < 128 || maxEdge > 4096) throw CaptureError("Invalid screenshotMaxEdge");
+            var before = GetCaptureBounds(window);
+            var bounds = new System.Drawing.Rectangle(before.X, before.Y, before.Width, before.Height);
+            AssertCaptureClear(window, bounds);
+            double scale = Math.Min(1.0, (double)maxEdge / Math.Max(bounds.Width, bounds.Height));
+            int width = Math.Max(1, (int)Math.Floor(bounds.Width * scale));
+            int height = Math.Max(1, (int)Math.Floor(bounds.Height * scale));
+            // Copy only target bounds, never the virtual desktop. Cannot perfectly prevent races:
+            // another window can move over these pixels between checks and CopyFromScreen.
+            using (var bitmap = new System.Drawing.Bitmap(bounds.Width, bounds.Height)) {
+                using (var graphics = System.Drawing.Graphics.FromImage(bitmap)) {
+                    graphics.CopyFromScreen(bounds.X, bounds.Y, 0, 0, bitmap.Size, System.Drawing.CopyPixelOperation.SourceCopy);
+                }
+                AssertCaptureClear(window, bounds);
+                if (!SameBounds(before, GetCaptureBounds(window))) throw CaptureError("Screenshot target moved or changed DPI");
+                // DWM may round an otherwise rectangular HWND. Conservatively mask corner
+                // squares before export so underlying apps at those corners are never included.
+                int corner = (int)Math.Ceiling(16.0 * before.ScalePercent / 100.0);
+                using (var mask = System.Drawing.Graphics.FromImage(bitmap)) {
+                    mask.FillRectangle(System.Drawing.Brushes.Black, 0, 0, corner, corner);
+                    mask.FillRectangle(System.Drawing.Brushes.Black, bounds.Width - corner, 0, corner, corner);
+                    mask.FillRectangle(System.Drawing.Brushes.Black, 0, bounds.Height - corner, corner, corner);
+                    mask.FillRectangle(System.Drawing.Brushes.Black, bounds.Width - corner, bounds.Height - corner, corner, corner);
+                }
+                using (var scaled = new System.Drawing.Bitmap(width, height))
+                using (var graphics = System.Drawing.Graphics.FromImage(scaled))
+                using (var stream = new System.IO.MemoryStream()) {
+                    graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                    graphics.DrawImage(bitmap, new System.Drawing.Rectangle(0, 0, width, height));
+                    scaled.Save(stream, System.Drawing.Imaging.ImageFormat.Png);
+                    return new CapturedImage { Bounds = before, Width = width, Height = height,
+                        Data = Convert.ToBase64String(stream.ToArray()) };
+                }
+            }
+        }
+        public static bool Wheel(int delta) {
+            if (delta == 0 || delta < -10 || delta > 10) return false;
+            var input = new INPUT();
+            input.Data.Mouse.Flags = 0x0800; // MOUSEEVENTF_WHEEL, signed WHEEL_DELTA notches.
+            input.Data.Mouse.Data = unchecked((uint)(delta * 120));
+            input.Data.Mouse.Extra = InputTag;
+            return SendInput(1, new INPUT[] { input }, Marshal.SizeOf(typeof(INPUT))) == 1;
+        }
+
         // Enumeration itself is metadata only; ui_windows reads titles after enumeration.
         public static Window[] Windows() {
             var windows = new List<Window>();
@@ -642,7 +818,7 @@ namespace OwnedUia {
         }
         $window = [pscustomobject]@{
             Ref = $ref; Handle = $handle; Identity = $identity
-            Root = $root; Refs = @{}
+            Root = $root; Refs = @{}; Screenshot = $null
         }
         Assert-Window $window
         $script:windows[$ref] = $window
@@ -696,11 +872,12 @@ namespace OwnedUia {
         return $result
     }
 
-    function Show-Action($window, $element, [string] $kind, [string] $label) {
+    function Show-Action($window, $element, [string] $kind, [string] $label, $ExplicitPoint = $null) {
         if ($null -ne $window) { Assert-ActionWindow $window }
         if ($Overlay -eq 'false') { return }
         $point = @{ X = 32; Y = 64 }
-        if ($null -ne $window) {
+        if ($null -ne $ExplicitPoint) { $point = $ExplicitPoint }
+        elseif ($null -ne $window) {
             Assert-ActionWindow $window
             if ($null -eq $element) { $element = $window.Root }
             Assert-Element $window $element
@@ -792,10 +969,11 @@ namespace OwnedUia {
         Assert-Foreground $window
     }
 
-    function Focus-Window($window) {
+    function Focus-Window($window, [switch] $NoRestore) {
         Assert-ActionWindow $window
         if (-not [OwnedUia.Native]::InteractiveDesktop()) { Deny 'No interactive input desktop is available.' }
         if ([OwnedUia.Native]::IsIconic($window.Handle)) {
+            if ($NoRestore) { Deny 'Screenshot target is minimized; request a new screenshot.' }
             $null = [OwnedUia.Native]::ShowWindowAsync($window.Handle, 9)
         }
         $null = [OwnedUia.Native]::SetForegroundWindow($window.Handle)
@@ -1041,13 +1219,74 @@ namespace OwnedUia {
         return [int]$value
     }
 
+    function Get-TargetScreenshot($window, [int] $maxEdge) {
+        Assert-Window $window
+        $capture = [OwnedUia.Native]::Capture($window.Handle, $maxEdge)
+        Assert-Window $window
+        $bounds = $capture.Bounds
+        $screenshot = @{
+            id = [Guid]::NewGuid().ToString('N')
+            data = $capture.Data; mimeType = 'image/png'
+            width = $capture.Width; height = $capture.Height
+            bounds = @{ x = $bounds.X; y = $bounds.Y; width = $bounds.Width; height = $bounds.Height }
+            scaleX = $capture.Width / [double]$bounds.Width
+            scaleY = $capture.Height / [double]$bounds.Height
+            dpi = $bounds.Dpi
+        }
+        # Retain only geometry/token, not the potentially large PNG, on this exact root.
+        $window.Screenshot = @{
+            id = $screenshot.id; width = $screenshot.width; height = $screenshot.height
+            bounds = $screenshot.bounds; scaleX = $screenshot.scaleX; scaleY = $screenshot.scaleY; dpi = $screenshot.dpi
+        }
+        return $screenshot
+    }
+
+    function Assert-Screenshot($window, $parameters) {
+        Assert-Window $window
+        $id = Get-Argument $parameters 'screenshot'
+        $shot = $window.Screenshot
+        if ($id -isnot [string] -or $null -eq $shot -or $id -cne $shot.id) {
+            Deny 'Unknown screenshot token for this window; request a new screenshot.'
+        }
+        try {
+            $current = [OwnedUia.Native]::GetCaptureBounds($window.Handle)
+            if ($current.X -ne $shot.bounds.x -or $current.Y -ne $shot.bounds.y -or
+                $current.Width -ne $shot.bounds.width -or $current.Height -ne $shot.bounds.height -or
+                $current.Dpi -ne $shot.dpi) {
+                Deny 'Screenshot target moved, resized or changed DPI; request a new screenshot.'
+            }
+        } catch {
+            $window.Screenshot = $null
+            throw
+        }
+        return $shot
+    }
+
+    function Get-ScreenshotPoint($window, $parameters) {
+        $shot = Assert-Screenshot $window $parameters
+        $x = Get-Integer $parameters 'x' -1 0 ($shot.width - 1)
+        $y = Get-Integer $parameters 'y' -1 0 ($shot.height - 1)
+        # Screenshot pixels -> physical desktop pixels. Use separate rounded-axis scales:
+        # bounds.x + floor(x / scaleX), bounds.y + floor(y / scaleY).
+        return [OwnedUia.Native+POINT]::new(
+            ($shot.bounds.x + [int][Math]::Floor($x / $shot.scaleX)),
+            ($shot.bounds.y + [int][Math]::Floor($y / $shot.scaleY)))
+    }
+
     # tree: bounded snapshot with unique refs, cheap state/text and traversal metrics.
     function Get-OwnedTree($parameters) {
         $window = Get-Window $parameters
+        # Invalidate refs and coordinates even if validation/capture/traversal fails.
+        $window.Refs = @{}
+        $window.Screenshot = $null
         $depth = Get-Integer $parameters 'depth' 8 0 30
         $maxNodes = Get-Integer $parameters 'maxNodes' 300 1 1000
-        # Invalidate refs even if the subsequent snapshot fails.
-        $window.Refs = @{}
+        $includeScreenshot = Get-Argument $parameters 'screenshot' $false
+        if ($includeScreenshot -isnot [bool]) { Deny 'screenshot must be a boolean.' }
+        $maxEdge = Get-Integer $parameters 'screenshotMaxEdge' 1280 128 4096
+        $screenshot = $null
+        # Capture before slow UIA provider traversal; reads must never focus/restore.
+        if ($includeScreenshot) { $screenshot = Get-TargetScreenshot $window $maxEdge }
         $clock = [Diagnostics.Stopwatch]::StartNew()
         $lines = New-Object System.Collections.Generic.List[string]
         $stack = New-Object System.Collections.Generic.Stack[object]
@@ -1151,10 +1390,13 @@ namespace OwnedUia {
             $nodes = $lines.Count
             if ($cut) { $lines.Add('[cut: node/character/time limit or unreadable node]') }
             $text = [string]::Join("`n", $lines.ToArray())
-            return @{ text = $text; nodes = $nodes; chars = $text.Length;
+            $result = @{ text = $text; nodes = $nodes; chars = $text.Length;
                 ms = $clock.ElapsedMilliseconds; cut = $cut }
+            if ($includeScreenshot) { $result.screenshot = $screenshot }
+            return $result
         } catch {
             $window.Refs = @{}
+            $window.Screenshot = $null
             throw
         }
     }
@@ -1175,10 +1417,56 @@ namespace OwnedUia {
         return $result
     }
 
+    function Invoke-CoordinateInput($window, $parameters, [string] $kind) {
+        Assert-ActionWindow $window
+        if ($null -ne (Get-Argument $parameters 'ref')) { Deny 'Use ref or screenshot coordinates, not both.' }
+        $delta = 0
+        if ($kind -eq 'scroll') {
+            $delta = Get-Integer $parameters 'delta' 0 -10 10
+            if ($delta -eq 0) { Deny 'Scroll delta must be nonzero wheel notches.' }
+        }
+        $nativePoint = Get-ScreenshotPoint $window $parameters
+        Show-Action $window $window.Root $kind $kind $nativePoint
+        # Animation can take seconds. Revalidate before focusing; never restore stale pixels.
+        $null = Assert-Screenshot $window $parameters
+        Focus-Window $window -NoRestore
+        $null = Assert-Screenshot $window $parameters
+        Assert-NoHeldModifiers
+        Assert-ClickPoint $window $nativePoint
+        if (-not [OwnedUia.Native]::SetCursorPos($nativePoint.X, $nativePoint.Y)) {
+            Deny 'Pointer could not be positioned.'
+        }
+        $null = Assert-Screenshot $window $parameters
+        $actualPoint = [OwnedUia.Native+POINT]::new(0, 0)
+        if (-not [OwnedUia.Native]::GetCursorPos([ref]$actualPoint) -or
+            $actualPoint.X -ne $nativePoint.X -or $actualPoint.Y -ne $nativePoint.Y) {
+            Deny 'Pointer moved before input; coordinate action refused.'
+        }
+        Assert-ClickPoint $window $actualPoint
+        Assert-NoHeldModifiers
+        if (([int][OwnedUia.Native]::GetAsyncKeyState(0x01) -band 0x8000) -ne 0) { Deny 'Release the mouse button before sending input.' }
+        if ($kind -eq 'scroll') {
+            if (-not [OwnedUia.Native]::Wheel($delta)) { Deny 'Wheel input was refused.' }
+        } else {
+            if (-not [OwnedUia.Native]::Click()) { Deny 'Pointer input was refused.' }
+        }
+        return @{ path = 'SendInput'; screenshot = (Get-Argument $parameters 'screenshot') }
+    }
+
+    function Invoke-OwnedScroll($parameters) {
+        $window = Get-Window $parameters
+        Assert-ActionWindow $window
+        return Invoke-CoordinateInput $window $parameters 'scroll'
+    }
+
     # click: prefer UIA patterns; fallback requires a verified target-window clickable point.
     function Invoke-OwnedClick($parameters) {
         $window = Get-Window $parameters
         Assert-ActionWindow $window
+        if ($null -ne (Get-Argument $parameters 'screenshot') -or
+            $null -ne (Get-Argument $parameters 'x') -or $null -ne (Get-Argument $parameters 'y')) {
+            return Invoke-CoordinateInput $window $parameters 'click'
+        }
         $element = Get-Element $window $parameters
         Show-Action $window $element 'click' 'Click'
         $pattern = Get-Pattern $window $element ([System.Windows.Automation.InvokePattern]::Pattern)
@@ -1412,6 +1700,8 @@ namespace OwnedUia {
         if ($null -eq $line) { break }
         $id = $null
         $method = ''
+        $parameters = $null
+        $targetRef = $null
         try {
             $request = $line | ConvertFrom-Json
             if ($null -eq $request -or $request -isnot [pscustomobject]) { Deny 'Request must be a JSON object.' }
@@ -1430,7 +1720,13 @@ namespace OwnedUia {
                 ($null -ne $parameters -and $parameters -isnot [pscustomobject])) {
                 Deny 'Invalid method or params.'
             }
-            if ($method -in @('launch', 'click', 'type', 'key', 'focus', 'close')) {
+            $targetRef = Get-Argument $parameters 'window'
+            if ($method -ceq 'tree' -and $targetRef -is [string] -and $script:windows.ContainsKey($targetRef)) {
+                # Clear before Get-Window too: failed root/identity validation cannot retain tokens.
+                $script:windows[$targetRef].Screenshot = $null
+                $script:windows[$targetRef].Refs = @{}
+            }
+            if ($method -in @('launch', 'click', 'scroll', 'type', 'key', 'focus', 'close')) {
                 $script:overlayClass = [string](Get-Argument $parameters 'overlayClass' '')
                 $script:overlayPid = [int](Get-Argument $parameters 'overlayPid' 0)
             }
@@ -1439,6 +1735,7 @@ namespace OwnedUia {
                 'launch' { Start-OwnedApp $parameters; break }
                 'tree' { Get-OwnedTree $parameters; break }
                 'click' { Invoke-OwnedClick $parameters; break }
+                'scroll' { Invoke-OwnedScroll $parameters; break }
                 'type' { Set-OwnedText $parameters; break }
                 'key' { Send-OwnedKey $parameters; break }
                 'focus' {
@@ -1454,6 +1751,9 @@ namespace OwnedUia {
             }
             $reply = @{ id = $id; result = $result }
         } catch {
+            if ($targetRef -is [string] -and $script:windows.ContainsKey($targetRef)) {
+                $script:windows[$targetRef].Screenshot = $null
+            }
             $message = 'Operation failed or target could not be verified.'
             $exception = $_.Exception
             while ($exception -is [System.Management.Automation.MethodInvocationException] -and
@@ -1465,7 +1765,7 @@ namespace OwnedUia {
             }
             $reply = @{ id = $id; error = $message }
         }
-        if ($method -in @('launch', 'click', 'type', 'key', 'focus', 'close')) {
+        if ($method -in @('launch', 'click', 'scroll', 'type', 'key', 'focus', 'close')) {
             $writer.WriteLine((@{ event = 'done' } | ConvertTo-Json -Compress))
         }
         $writer.WriteLine(($reply | ConvertTo-Json -Depth 8 -Compress))

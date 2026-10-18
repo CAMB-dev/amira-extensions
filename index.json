@@ -21,8 +21,8 @@
     },
     {
       "name": "computer-use-uia",
-      "description": "Experimental any-window Windows desktop UI Automation with emergency stop; off by default",
-      "version": "0.0.2",
+      "description": "Experimental any-window Windows desktop control: screenshot-first observations with a UIA tree, coordinate actions and an emergency stop; off by default",
+      "version": "0.1.0",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/computer-use-uia" },
       "engines": { "amira": "^0.1.28" },
       "tags": ["experimental", "windows", "desktop", "uia", "automation"],

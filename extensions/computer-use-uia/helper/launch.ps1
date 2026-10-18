@@ -1,6 +1,6 @@
-# Session-owned unnamed jobs: the watchdog creates/retains the kernel object BEFORE
-# creation. Only a duplicated handle enters the verified helper; no public job name
-# or journal-supplied handle can be rebound to an unrelated process tree.
+# Session-owned unnamed jobs: the watchdog creates each kernel object and independent
+# custody retains a cleanup duplicate BEFORE creation. Only an ASSIGN duplicate enters
+# the verified helper; public job names/journal records never grant cleanup authority.
 Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
@@ -59,9 +59,7 @@ namespace OwnedUia {
             out IntPtr target, uint access, bool inherit, uint options);
         [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
         [DllImport("kernel32.dll", SetLastError = true)] static extern uint GetProcessId(IntPtr process);
-        [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
         [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetExitCodeProcess(IntPtr process, out uint code);
-        [DllImport("kernel32.dll", SetLastError = true)] static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr data, uint size, out uint returned);
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -84,41 +82,82 @@ namespace OwnedUia {
         [DllImport("user32.dll")] static extern bool GetLayeredWindowAttributes(IntPtr window, out uint key, out byte alpha, out uint flags);
         [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr window, int attribute, out uint value, int size);
         [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
-        [DllImport("kernel32.dll", SetLastError = true)]
-        static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-        static extern bool Process32First(IntPtr snapshot, ref PROCESSENTRY32 entry);
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-        static extern bool Process32Next(IntPtr snapshot, ref PROCESSENTRY32 entry);
-        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-        struct PROCESSENTRY32 {
-            public uint Size, Usage, Pid; public UIntPtr Heap;
-            public uint Module, Threads, ParentPid; public int Priority; public uint Flags;
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string Exe;
-        }
         public static long CreationTime(IntPtr handle) {
             long created, exited, kernel, user;
             if (!GetProcessTimes(handle, out created, out exited, out kernel, out user)) throw new Win32Exception();
             return created; // UTC FILETIME, never local StartTime -> UTC (ambiguous across DST).
         }
-        static bool? HasExited(IntPtr handle, bool synchronize) {
-            if (!synchronize) {
-                uint code;
-                if (!GetExitCodeProcess(handle, out code)) throw new Win32Exception();
-                // Query-only access cannot distinguish STILL_ACTIVE from an exit code of 259.
-                if (code == 259u) return null;
-                return true;
-            }
-            uint status = WaitForSingleObject(handle, 0);
-            if (status == 0) return true; // WAIT_OBJECT_0
-            if (status == 258) return false; // WAIT_TIMEOUT
-            if (status == 0xffffffffu) throw new Win32Exception(); // WAIT_FAILED
-            throw new Win32Exception("Unexpected process wait result.");
+        IntPtr job, process, thread, parent, custodyPin;
+        Process custodySource, custodyWriter;
+        bool custodied;
+        public long CleanupHandle { get { return custodyPin.ToInt64(); } }
+        public void ConfirmCustody() {
+            if (custodied || custodyPin == IntPtr.Zero) throw new InvalidOperationException("Invalid custody acknowledgement.");
+            custodied = true;
+            CloseHandle(custodyPin); custodyPin = IntPtr.Zero;
         }
-        IntPtr job, process, thread, parent;
+        public static LaunchGuard RetainForCleanup(string id, int sourcePid, long sourceStarted, long handle,
+            int writerPid, long writerStarted) {
+            var guard = new LaunchGuard { Name = id };
+            try {
+                var source = Process.GetProcessById(sourcePid);
+                guard.custodySource = source;
+                if (source.HasExited || CreationTime(source.Handle) != sourceStarted)
+                    throw new InvalidOperationException("Custody source identity changed.");
+                var writer = Process.GetProcessById(writerPid);
+                guard.custodyWriter = writer;
+                if (writer.HasExited || CreationTime(writer.Handle) != writerStarted)
+                    throw new InvalidOperationException("Custody writer identity changed.");
+                // Pull a NEW local QUERY | TERMINATE duplicate. Never close a received
+                // numeric handle: rejected/replayed input cannot close an unrelated local object.
+                if (!DuplicateHandle(source.Handle, new IntPtr(handle), GetCurrentProcess(), out guard.job,
+                    0x000Cu, false, 0)) throw new Win32Exception();
+                guard.Members(); // Validate job type/query rights before custody acknowledgement.
+                return guard;
+            } catch { guard.Dispose(); throw; }
+        }
+        bool OriginalProducersExited() {
+            // These handles were cached and creation-time verified during retention.
+            // Never reopen a producer PID: it may now name an unrelated process.
+            if (custodyWriter == null || custodySource == null) return false;
+            return custodyWriter.WaitForExit(0) && custodySource.WaitForExit(0);
+        }
+        public void RetireProducers() {
+            // Cached, creation-time-verified handles came ONLY from the private offer.
+            // End both launch producers before draining, so even suspended/in-flight
+            // creation cannot add a member after an apparently empty job was checked.
+            bool failed = false;
+            foreach (var producer in new Process[] { custodyWriter, custodySource }) {
+                if (producer == null) continue;
+                try {
+                    if (!producer.HasExited) producer.Kill();
+                    if (!producer.WaitForExit(1000)) failed = true;
+                } catch (InvalidOperationException) {
+                    try { if (!producer.HasExited) failed = true; } catch { failed = true; }
+                } catch (Win32Exception) { failed = true; }
+            }
+            if (failed) throw new InvalidOperationException("Custody producer retirement incomplete.");
+        }
         int rootPid;
         long rootStarted;
+        public void RememberRoot(int pid, long started) {
+            if (rootPid != 0) {
+                if (rootPid == pid && rootStarted == started) return;
+                throw new InvalidOperationException("Custody root identity changed.");
+            }
+            using (var root = Process.GetProcessById(pid)) {
+                IntPtr handle = root.Handle;
+                bool belongs;
+                if (root.HasExited || CreationTime(handle) != started ||
+                    !IsProcessInJob(handle, job, out belongs) || !belongs)
+                    throw new InvalidOperationException("Custody root is not an exact owned job member.");
+            }
+            // Retain commit/grace metadata while the root is still suspended. No PID-based
+            // recovery authority: only this already-retained native job can authorize a stop.
+            rootPid = pid; rootStarted = started;
+        }
         public void SetRoot(int pid, long started, uint tid) {
+            if (!custodied) throw new InvalidOperationException("Independent launch custody is unavailable.");
             if (rootPid != 0) throw new InvalidOperationException("Launch root already registered.");
             using (var root = Process.GetProcessById(pid)) {
                 bool belongs;
@@ -153,7 +192,8 @@ namespace OwnedUia {
             // DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS: roll back only our own duplicate.
             if (DuplicateHandle(target, handle, GetCurrentProcess(), out local, 0, false, 3)) CloseHandle(local);
         }
-        public static LaunchGuard CreateFor(string id, int helperPid, long helperStarted) {
+        public static LaunchGuard CreateFor(string id, int helperPid, long helperStarted,
+            int custodyPid, long custodyStarted) {
             var guard = new LaunchGuard();
             try {
                 guard.Name = id; // Opaque protocol ID only; the kernel job is UNNAMED.
@@ -165,12 +205,14 @@ namespace OwnedUia {
                     if (helper.HasExited || CreationTime(target) != helperStarted)
                         throw new InvalidOperationException("Helper identity changed.");
                     IntPtr duplicate;
-                    // ASSIGN only; cleanup/query authority stays with the watchdog. Never inherit.
+                    // ASSIGN only; cleanup/query authority stays with session owners. Never inherit.
                     if (!DuplicateHandle(GetCurrentProcess(), guard.job, target, out duplicate,
                         0x0001u, false, 0)) throw new Win32Exception();
                     guard.HelperHandle = duplicate.ToInt64();
                     try {
-                        using (var owner = Process.GetCurrentProcess()) {
+                        using (var owner = Process.GetProcessById(custodyPid)) {
+                            if (owner.HasExited || CreationTime(owner.Handle) != custodyStarted)
+                                throw new InvalidOperationException("Custody owner identity changed.");
                             guard.ParentPid = owner.Id;
                             guard.ParentStarted = CreationTime(owner.Handle);
                             IntPtr parentDuplicate;
@@ -184,6 +226,11 @@ namespace OwnedUia {
                         throw;
                     }
                 }
+                // Pin the offered source slot until an authenticated duplicate ack.
+                // On timeout/rejection, keep it until this process exits (Dispose must
+                // not recycle it under a delayed custody pull). No launch may run yet.
+                if (!DuplicateHandle(GetCurrentProcess(), guard.job, GetCurrentProcess(), out guard.custodyPin,
+                    0x000Cu, false, 0)) throw new Win32Exception();
                 return guard;
             } catch { guard.Dispose(); throw; }
         }
@@ -203,19 +250,21 @@ namespace OwnedUia {
         bool ProtectorWindow(IntPtr window) {
             uint cloaked;
             // SHELL (2) alone includes windows on another virtual desktop; APP (1),
-            // INHERITED (4), and unknown cloak flags cannot protect a subtree.
-            if (!IsWindowVisible(window) || DwmGetWindowAttribute(window, 14, out cloaked, 4) != 0 ||
-                (cloaked & ~2u) != 0) return false;
+            // INHERITED (4), and unknown cloak flags cannot protect the owning process.
+            if (!IsWindowVisible(window)) return false;
+            // Unverifiable is not windowless: preserve this candidate on native-query failure.
+            if (DwmGetWindowAttribute(window, 14, out cloaked, 4) != 0) throw new Win32Exception();
+            if ((cloaked & ~2u) != 0) return false;
             int styles = GetWindowLong(window, -20);
             RECT rect;
             bool iconic = IsIconic(window);
             if (!iconic) {
-                if (!GetWindowRect(window, out rect)) return false;
+                if (!GetWindowRect(window, out rect)) throw new Win32Exception();
             } else {
-                // Ignore iconic bounds; a taskbar-restorable app still protects after monitor removal.
-                if ((styles & 0x80) != 0) return false; // WS_EX_TOOLWINDOW
+                // Ignore iconic bounds; visible minimized windows protect even with WS_EX_TOOLWINDOW
+                // or saved placement on a removed monitor.
                 var placement = new WINDOWPLACEMENT(); placement.Length = Marshal.SizeOf(typeof(WINDOWPLACEMENT));
-                if (!GetWindowPlacement(window, ref placement)) return false;
+                if (!GetWindowPlacement(window, ref placement)) throw new Win32Exception();
                 rect = placement.NormalPosition;
             }
             if (rect.Right <= rect.Left || rect.Bottom <= rect.Top) return false;
@@ -241,115 +290,76 @@ namespace OwnedUia {
             }, IntPtr.Zero)) throw new Win32Exception();
             return visible;
         }
-        Dictionary<int, int> Parents() {
-            var parents = new Dictionary<int, int>();
-            IntPtr snapshot = CreateToolhelp32Snapshot(2, 0);
-            if (snapshot == new IntPtr(-1)) throw new Win32Exception();
-            try {
-                var entry = new PROCESSENTRY32(); entry.Size = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
-                if (!Process32First(snapshot, ref entry)) throw new Win32Exception();
-                do { parents[(int)entry.Pid] = (int)entry.ParentPid; }
-                while (Process32Next(snapshot, ref entry));
-            } finally { CloseHandle(snapshot); }
-            return parents;
+        // D113: only this member's own windows protect it. The injectable observation
+        // keeps classification pure; native failures propagate and preserve the candidate.
+        public static bool ShouldStopMember(int pid, bool belongs, bool exited, Func<int, bool> visible) {
+            return belongs && !exited && !visible(pid);
         }
-        // Job membership already proves ownership. Ancestry only finds a live,
-        // strictly older, same-job windowed protector; a broken chain grants none.
-        // Access/API failures are not broken chains: propagate and skip that candidate.
-        sealed class HeadlessMember { public int Pid, Depth; public long Started; }
-        bool HeadlessAncestors(int pid, long started, Dictionary<int, int> parents, out int depth) {
-            depth = 0;
-            var seen = new HashSet<int>();
-            if (Visible(pid)) return false;
-            while (seen.Add(pid)) {
-                if (pid == rootPid && started == rootStarted) return true;
-                int parentPid;
-                if (!parents.TryGetValue(pid, out parentPid) || parentPid <= 0) return true;
-                // Limited query + SYNCHRONIZE, never Process.Handle (ALL_ACCESS).
-                bool synchronize = true;
-                IntPtr handle = OpenProcess(0x101000u, false, (uint)parentPid);
-                if (handle == IntPtr.Zero) {
-                    int error = Marshal.GetLastWin32Error();
-                    if (error == 5) { // ERROR_ACCESS_DENIED: retry without SYNCHRONIZE.
-                        synchronize = false;
-                        handle = OpenProcess(0x1000u, false, (uint)parentPid);
-                        error = handle == IntPtr.Zero ? Marshal.GetLastWin32Error() : 0;
-                    }
-                    if (handle == IntPtr.Zero) {
-                        if (error == 87) return true; // ERROR_INVALID_PARAMETER: PID gone.
-                        throw new Win32Exception(error);
-                    }
-                }
-                try {
-                    if (GetProcessId(handle) != (uint)parentPid) throw new Win32Exception();
-                    bool? exited = HasExited(handle, synchronize);
-                    if (exited == true) return true;
-                    long parentStarted = CreationTime(handle);
-                    bool belongs;
-                    if (HasExited(handle, synchronize) == true || parentStarted >= started) return true;
-                    if (!IsProcessInJob(handle, job, out belongs)) throw new Win32Exception();
-                    if (!belongs) return true;
-                    if (parentPid == rootPid && parentStarted != rootStarted) return true;
-                    // An ambiguous query-only ancestor is not proof of a traversable live
-                    // chain. Preserve this candidate, without pretending cleanup failed.
-                    if (exited == null) return false;
-                    if (Visible(parentPid) && HasExited(handle, synchronize) == false && CreationTime(handle) == parentStarted) return false;
-                    pid = parentPid; started = parentStarted; depth++;
-                } finally { CloseHandle(handle); }
-            }
-            return true;
-        }
-        // Capture identity through the SAME cached handle used to kill, recheck job
-        // membership and each live ancestor, and stop at the exact registered launch root.
+        const int HeadlessScanLimit = 4; // Three kill passes, then a read-only completion scan.
+        const int HeadlessBudgetMs = 3000; // Cooperative bound; native calls themselves may block.
+        sealed class HeadlessMember { public int Pid; public long Started; }
+        // Capture identity through the SAME cached handle used to kill and recheck
+        // retained-job membership and this member's own windows immediately before killing.
         public void StopHeadless() {
             if (rootPid == 0) {
-                Console.Error.WriteLine("Launch root registration pending; emergency stop preserved its members.");
-                return;
-            }
-            if (DateTime.UtcNow.ToFileTimeUtc() - rootStarted < 30000000L) {
+                if (!OriginalProducersExited()) {
+                    Console.Error.WriteLine("Launch root registration pending; emergency stop preserved its members.");
+                    return;
+                }
+                // Both exact producers exited without recording a root. This retained job
+                // is abandoned, not a pending launch. Apply the same per-member checks;
+                // even here, never substitute whole-job termination for window classification.
+            } else if (DateTime.UtcNow.ToFileTimeUtc() - rootStarted < 30000000L) {
                 Console.Error.WriteLine("Launch job still starting (3 s grace); emergency stop preserved its members.");
                 return;
             }
             bool failed = false;
-            var parents = Parents();
-            var eligible = new List<HeadlessMember>();
-            // Snapshot eligibility before any kills: never erase a parent needed by a child.
-            foreach (int pid in Members()) {
-                try {
-                    using (var member = Process.GetProcessById(pid)) {
-                        IntPtr handle = member.Handle;
-                        long started = CreationTime(handle);
-                        bool belongs;
-                        if (!IsProcessInJob(handle, job, out belongs)) { failed = true; continue; }
-                        int depth;
-                        if (belongs && !member.HasExited && HeadlessAncestors(pid, started, parents, out depth))
-                            eligible.Add(new HeadlessMember { Pid = pid, Started = started, Depth = depth });
-                    }
-                } catch (ArgumentException) { }
-                catch (InvalidOperationException) { } // Process already exited; nothing to kill.
-                catch (Win32Exception) { failed = true; }
-            }
-            // Children first; exited ancestors never exempt surviving owned descendants.
-            eligible.Sort(delegate(HeadlessMember a, HeadlessMember b) { return b.Depth.CompareTo(a.Depth); });
-            foreach (var candidate in eligible) {
-                int pid = candidate.Pid;
-                try {
-                    using (var member = Process.GetProcessById(pid)) {
-                        IntPtr handle = member.Handle;
-                        long started = CreationTime(handle);
-                        bool belongs;
-                        if (!IsProcessInJob(handle, job, out belongs)) { failed = true; continue; }
-                        int depth;
-                        if (!belongs || member.HasExited || started != candidate.Started ||
-                            !HeadlessAncestors(pid, started, Parents(), out depth)) continue;
-                        if (!member.HasExited && CreationTime(handle) == started) {
-                            member.Kill();
-                            if (!member.WaitForExit(1000)) throw new Win32Exception();
+            var clock = Stopwatch.StartNew();
+            for (int scan = 0; scan < HeadlessScanLimit; scan++) {
+                var eligible = new List<HeadlessMember>();
+                // Re-enumerate after termination: a worker may have created another job member.
+                // Each scan snapshots identities, then repeats membership/window checks before killing.
+                foreach (int pid in Members()) {
+                    if (clock.ElapsedMilliseconds >= HeadlessBudgetMs) { failed = true; break; }
+                    try {
+                        using (var member = Process.GetProcessById(pid)) {
+                            IntPtr handle = member.Handle;
+                            long started = CreationTime(handle);
+                            bool belongs;
+                            if (!IsProcessInJob(handle, job, out belongs)) { failed = true; continue; }
+                            if (ShouldStopMember(pid, belongs, member.HasExited, Visible))
+                                eligible.Add(new HeadlessMember { Pid = pid, Started = started });
                         }
-                    }
-                } catch (ArgumentException) { }
-                catch (InvalidOperationException) { } // Process already exited; nothing to kill.
-                catch (Win32Exception) { failed = true; }
+                    } catch (ArgumentException) { }
+                    catch (InvalidOperationException) { } // Process already exited; nothing to kill.
+                    catch (Win32Exception) { failed = true; }
+                }
+                if (eligible.Count == 0) break;
+                // The final scan verifies quiescence without an unverified last kill batch.
+                if (scan == HeadlessScanLimit - 1 || clock.ElapsedMilliseconds >= HeadlessBudgetMs) {
+                    failed = true;
+                    break;
+                }
+                foreach (var candidate in eligible) {
+                    if (clock.ElapsedMilliseconds >= HeadlessBudgetMs) { failed = true; break; }
+                    int pid = candidate.Pid;
+                    try {
+                        using (var member = Process.GetProcessById(pid)) {
+                            IntPtr handle = member.Handle;
+                            long started = CreationTime(handle);
+                            bool belongs;
+                            if (!IsProcessInJob(handle, job, out belongs)) { failed = true; continue; }
+                            if (started != candidate.Started ||
+                                !ShouldStopMember(pid, belongs, member.HasExited, Visible)) continue;
+                            if (!member.HasExited && CreationTime(handle) == started) {
+                                member.Kill();
+                                if (!member.WaitForExit(1000)) throw new Win32Exception();
+                            }
+                        }
+                    } catch (ArgumentException) { }
+                    catch (InvalidOperationException) { } // Process already exited; nothing to kill.
+                    catch (Win32Exception) { failed = true; }
+                }
             }
             if (failed) throw new InvalidOperationException("Headless member cleanup incomplete.");
         }
@@ -378,8 +388,8 @@ namespace OwnedUia {
         public long Started { get; private set; }
         void Limits() {
             var limits = new EXTENDED_LIMIT();
-            // No breakaway and NO implicit kill on handle close. The watchdog owns
-            // the job before creation; its retained handle authorizes explicit cleanup.
+            // No breakaway and NO implicit kill on handle close. Both the watchdog
+            // and independent session custody hold explicit cleanup authority before creation.
             limits.Basic.Flags = 0u;
             if (!SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf(typeof(EXTENDED_LIMIT))))
                 throw new Win32Exception();
@@ -402,8 +412,9 @@ namespace OwnedUia {
                     new IntPtr(IntPtr.Size), IntPtr.Zero, IntPtr.Zero)) throw new Win32Exception();
                 parentValue = Marshal.AllocHGlobal(IntPtr.Size);
                 Marshal.WriteIntPtr(parentValue, guard.parent);
-                // PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: the session owner, NOT the helper,
-                // is the OS parent. Helper/overlay tree retirement cannot reach launched apps.
+                // PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: independent session custody,
+                // NOT a helper/watchdog generation, is the OS parent. Provider/monitor
+                // retirement cannot reach apps; host exit can still tree-close custody.
                 if (!UpdateProcThreadAttribute(attributes, 0, new IntPtr(0x20000), parentValue,
                     new IntPtr(IntPtr.Size), IntPtr.Zero, IntPtr.Zero)) throw new Win32Exception();
                 guard.CheckParent();
@@ -435,6 +446,10 @@ namespace OwnedUia {
             if (thread != IntPtr.Zero) { CloseHandle(thread); thread = IntPtr.Zero; }
             if (process != IntPtr.Zero) { CloseHandle(process); process = IntPtr.Zero; }
             if (parent != IntPtr.Zero) { CloseHandle(parent); parent = IntPtr.Zero; }
+            if (custodySource != null) { custodySource.Dispose(); custodySource = null; }
+            if (custodyWriter != null) { custodyWriter.Dispose(); custodyWriter = null; }
+            // An unacknowledged custodyPin deliberately lives until process exit.
+            // Recycling its source slot could turn a delayed transfer into foreign authority.
         }
     }
 }

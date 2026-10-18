@@ -53,6 +53,7 @@ namespace AmiraPointer {
         [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern int GetClassName(IntPtr hwnd, StringBuilder name, int size);
         [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT point);
+        [DllImport("dwmapi.dll")] static extern int DwmFlush();
         [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
         [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT point);
         [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
@@ -307,6 +308,14 @@ namespace AmiraPointer {
                             active = gliding = false; idleAt = clock.ElapsedMilliseconds;
                             if (kind == "click") rippleAt = idleAt;
                         }
+                    } else if (ev == "observe") {
+                        // A target-only capture must not include our full-screen overlay.
+                        // Hide rendering only; retain hotkey/hooks and their normal idle expiry.
+                        if (active) throw new InvalidOperationException("Cannot observe during an action.");
+                        gliding = false;
+                        Hide();
+                        if (DwmFlush() != 0) throw new InvalidOperationException("Overlay hide could not be synchronized.");
+                        Reply(new { @event = "hidden", id = Convert.ToInt32(value["id"]) });
                     } else if (ev == "inspect" && testMode) {
                         POINT cursor; GetCursorPos(out cursor);
                         Reply(new { @event = "inspection", styles = CreateParams.ExStyle,

@@ -35,7 +35,8 @@ async function rejection(call: Promise<unknown>): Promise<string> {
 }
 
 function host(overlay = true) {
-  const settings = { enabled: true, overlay }
+  // Legacy UIA/provider coverage stays tree-only; D113 images are exercised by eval:desktop.
+  const settings = { enabled: true, overlay, screenshot: false }
   return new ExtensionHost({
     bus: new EventBus(),
     tools: new ToolRegistry(),
@@ -684,7 +685,7 @@ test.skipIf(!enabled)(
 )
 
 test.skipIf(!enabled)(
-  "stop preserves a windowed launch's headless child; session end removes the tree and journal",
+  "stop removes a windowed launch's headless child; session end removes the windowed root and journal",
   async () => {
     const instance = host(false)
     let client: UiaClient | undefined
@@ -706,24 +707,41 @@ test.skipIf(!enabled)(
       const child = scriptFile(
         `[IO.File]::WriteAllText('${pidPath.replaceAll("'", "''")}', [string]$PID); Start-Sleep -Seconds 600`,
       )
-      const fixturePath = `${import.meta.dir}/../helper/test-window.ps1`.replaceAll("'", "''")
+      const fixturePath = `${import.meta.dir}/../helper/test-window.ps1`
       const script = scriptFile(
-        `Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File "${child}"'; & '${fixturePath}' -Title '${title}'`,
+        `param([string] $ChildScript, [string] $FixturePath, [string] $FixtureTitle)
+Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $ChildScript + '"'))
+& $FixturePath -Title $FixtureTitle`,
       )
       const launched = (await client!.call("launch", {
         command: "powershell.exe",
-        args: ["-NoProfile", "-STA", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-File", script],
+        args: [
+          "-NoProfile",
+          "-STA",
+          "-WindowStyle",
+          "Hidden",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          script,
+          "-ChildScript",
+          child,
+          "-FixturePath",
+          fixturePath,
+          "-FixtureTitle",
+          title,
+        ],
       })) as LaunchResult
       rootPid = launched.pid
       await until(() => existsSync(pidPath))
       childPid = Number(readFileSync(pidPath, "utf8"))
       expect(childPid).toBeGreaterThan(0)
-      // Past the launch grace: survival must be due to the visible-window ancestor.
+      // Past the launch grace: a visible-window ancestor no longer protects a headless child.
       await Bun.sleep(3100)
       client!.emergencyStop()
       await client!.call("windows", { filter: title }) // Wait for stop cleanup acknowledgement.
       expect(alive(rootPid)).toBe(true)
-      expect(alive(childPid)).toBe(true)
+      await until(() => !alive(childPid))
       await client!.stop()
       await until(() => !alive(rootPid) && !alive(childPid))
       await until(() => !existsSync(statePath) && !existsSync(`${statePath}.tmp`))

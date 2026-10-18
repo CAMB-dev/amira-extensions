@@ -1,5 +1,5 @@
 # Headless session owner. Helper death/restart never means session end.
-# This watchdog holds every authenticated launch job before the child may execute.
+# This watchdog may release a launch only after independent session custody acks it.
 param(
     [switch] $Sentinel,
     [string] $StatePath,
@@ -78,6 +78,12 @@ if ($null -eq $verified) { exit 1 }
 $sentinelProcess = $verified
 $jobs = @{}
 $completedJobs = @{}
+$custodyPending = @{}
+$custodySession = $null
+$custodyIdentity = $null
+$self = [Diagnostics.Process]::GetCurrentProcess()
+try { $selfStarted = [OwnedUia.LaunchGuard]::CreationTime($self.Handle).ToString() }
+finally { $self.Dispose() }
 $cleanupIncomplete = $false
 $endingSince = $null
 $stopRequested = $false
@@ -146,6 +152,7 @@ function Stop-RetainedJobs([bool] $force, $state) {
     if (-not $force) {
         $failed = $false
         foreach ($job in @($jobs.Values)) {
+            # D113: each owned member needs its own window; ancestors do not protect workers.
             try { $job.StopHeadless() }
             catch { $failed = $true; [Console]::Error.WriteLine('Launch job cleanup incomplete; continuing other jobs.') }
         }
@@ -188,7 +195,14 @@ try {
             else {
                 try {
                     $message = $line | ConvertFrom-Json
-                    if ($message.event -ceq 'helper-spawned') {
+                    if ($message.event -ceq 'custody-session') {
+                        if ($null -ne $custodySession -or [string]$message.session -cnotmatch '^[0-9a-f-]{36}$') { throw 'Invalid custody session.' }
+                        $custodyIdentity = @{ Pid = [int]$message.pid; Started = [string]$message.started }
+                        $verified = Get-ExactProcess $custodyIdentity
+                        if ($null -eq $verified) { throw 'Custody owner identity changed.' }
+                        $verified.Dispose()
+                        $custodySession = [string]$message.session
+                    } elseif ($message.event -ceq 'helper-spawned') {
                         if ([int]$message.pid -le 0 -or [int]$message.generation -le $helperGeneration) { throw 'Invalid helper generation.' }
                         $expectedHelperPid = [int]$message.pid
                         $helperGeneration = [int]$message.generation
@@ -226,16 +240,40 @@ try {
                             -not $jobs.ContainsKey([string]$message.job)) { throw 'Invalid launch root request.' }
                         $jobs[$message.job].SetRoot([int]$message.pid, [long]$message.started, [uint32]$message.threadId)
                         [Console]::WriteLine((@{ event = 'root-registered'; job = $message.job } | ConvertTo-Json -Compress))
+                    } elseif ($message.event -ceq 'custody-accepted') {
+                        $name = [string]$message.job
+                        if (-not $custodyPending.ContainsKey($name)) { throw 'Unknown custody acknowledgement.' }
+                        $offer = $custodyPending[$name]
+                        foreach ($field in @('session', 'transfer', 'job', 'pid', 'started', 'handle', 'writerPid', 'writerStarted')) {
+                            if ([string]$message.$field -cne [string]$offer.$field) { throw 'Mismatched custody acknowledgement.' }
+                        }
+                        $custodyPending.Remove($name)
+                        if (-not $jobs.ContainsKey($name) -or -not $writerAccepted -or
+                            [int]$offer.writerPid -ne $script:writerIdentity.Pid -or
+                            [string]$offer.writerStarted -cne $script:writerIdentity.Started) { continue }
+                        $job = $jobs[$name]
+                        $job.ConfirmCustody()
+                        [Console]::WriteLine((@{ event = 'job-created'; job = $name; handle = $job.HelperHandle;
+                            parentHandle = $job.ParentHandle; parentPid = $job.ParentPid; parentStarted = $job.ParentStarted.ToString() } | ConvertTo-Json -Compress))
+                    } elseif ($message.event -ceq 'custody-rejected') {
+                        # Keep any unacknowledged source slot pinned until process exit:
+                        # a queued pull must never duplicate a recycled/foreign handle.
+                        if ($custodyPending.ContainsKey([string]$message.job)) { Remove-LaunchJob ([string]$message.job) }
                     } elseif ($message.event -ceq 'create-job') {
                         if (-not $writerAccepted) { throw 'Current helper writer is unavailable; launch refused.' }
+                        if ($null -eq $custodySession) { throw 'Independent launch custody is unavailable.' }
                         # Fresh jobs are bound to our accepted private writer, not file
                         # records. Unknown journal job names can never block or authorize creation.
                         if ($message.job -isnot [string] -or $message.job -cnotmatch '^amira-uia-job-[0-9a-f-]{36}$' -or
                             ($jobs.ContainsKey($message.job) -or $completedJobs.ContainsKey($message.job))) { throw 'Invalid launch job request.' }
-                        $job = [OwnedUia.LaunchGuard]::CreateFor($message.job, [int]$script:writerIdentity.Pid, [long]$script:writerIdentity.Started)
+                        $job = [OwnedUia.LaunchGuard]::CreateFor($message.job, [int]$script:writerIdentity.Pid, [long]$script:writerIdentity.Started,
+                            [int]$custodyIdentity.Pid, [long]$custodyIdentity.Started)
                         $jobs[$message.job] = $job
-                        [Console]::WriteLine((@{ event = 'job-created'; job = $message.job; handle = $job.HelperHandle;
-                            parentHandle = $job.ParentHandle; parentPid = $job.ParentPid; parentStarted = $job.ParentStarted.ToString() } | ConvertTo-Json -Compress))
+                        $offer = @{ event = 'job-custody'; session = $custodySession; transfer = [Guid]::NewGuid().ToString();
+                            job = $message.job; pid = $PID; started = $selfStarted; handle = $job.CleanupHandle;
+                            writerPid = $script:writerIdentity.Pid; writerStarted = $script:writerIdentity.Started }
+                        $custodyPending[$message.job] = $offer
+                        [Console]::WriteLine(($offer | ConvertTo-Json -Compress))
                     } elseif ($message.event -ceq 'stop') { $stopRequested = $true }
                 } catch { [Console]::Error.WriteLine($_.Exception.Message) }
                 $inputLine = $reader.ReadLineAsync()

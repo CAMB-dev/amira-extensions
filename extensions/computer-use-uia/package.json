@@ -1,13 +1,15 @@
 {
   "name": "computer-use-uia",
   "license": "Apache-2.0",
-  "version": "0.0.2",
+  "version": "0.1.0",
   "description": "Experimental any-window Windows UI Automation with emergency stop; off by default",
   "type": "module",
   "scripts": {
     "link-amira": "bun scripts/link-amira.ts",
     "typecheck": "bunx tsc --noEmit",
-    "test": "bun test ./test/unit.test.ts ./test/helper.test.ts ./test/safety.test.ts"
+    "lint": "bunx biome check src test scripts package.json tsconfig.json biome.json",
+    "test": "bun test ./test/unit.test.ts ./test/helper.test.ts ./test/safety.test.ts ./test/perception.test.ts ./test/perception-helper.test.ts ./test/stop-rule.test.ts ./test/eval.test.ts ./test/eval-runner.test.ts ./test/desktop-script.test.ts ./test/custody.test.ts",
+    "eval:desktop": "bun scripts/eval-desktop.ts"
   },
   "amira": {
     "engines": {
