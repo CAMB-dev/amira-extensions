@@ -3,8 +3,8 @@
   "extensions": [
     {
       "name": "review",
-      "description": "Experimental bounded independent static code review with saved findings: /code-review",
-      "version": "0.1.1",
+      "description": "Experimental bounded independent static code review with saved findings, workflow-backed --deep and GitHub PR diffs: /code-review",
+      "version": "0.2.0",
       "status": "experimental",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/review" },
       "engines": { "amira": "^0.1.56" },

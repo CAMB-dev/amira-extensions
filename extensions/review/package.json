@@ -1,7 +1,7 @@
 {
   "name": "review",
   "license": "Apache-2.0",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Experimental bounded independent code review: /code-review",
   "type": "module",
   "scripts": {

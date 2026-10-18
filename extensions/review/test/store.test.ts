@@ -362,3 +362,13 @@ describe("ReportStore", () => {
     expect(repoKey("D:/dev/project")).not.toBe(repoKey("D:/dev/other-worktree"))
   })
 })
+
+test("deep reports persist admitted guidance beyond the normal 64-path ceiling", async () => {
+  const { store, report } = await fixture()
+  report.scope.deep = true
+  report.included = Array.from({ length: 65 }, (_, index) => `dir${index}/file.ts`)
+  report.guidance = Array.from({ length: 65 }, (_, index) => `dir${index}/AGENTS.md`)
+  report.snapshotHashes = Object.fromEntries(report.guidance.map((name) => [name, "e".repeat(64)]))
+  await store.save(report)
+  expect((await store.last(report.repoKey))?.guidance).toHaveLength(65)
+})

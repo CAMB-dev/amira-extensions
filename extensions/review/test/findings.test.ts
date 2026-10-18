@@ -1,14 +1,17 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { ReviewContext } from "../src/context.ts"
+import { DEEP_CANDIDATES } from "../src/deep.ts"
 import {
   assess,
   type Candidate,
   candidateSchema,
   changeExcerpt,
   dedupe,
+  deepAssessmentLimits,
   reviewerSchema,
   validateReview,
   verifierSchema,
+  verifierSchemaFor,
 } from "../src/findings.ts"
 import { bundle, cleanup, file, temporary } from "./review-fixture.ts"
 
@@ -318,4 +321,43 @@ describe("independent static assessments", () => {
     assess(untouched, { assessments: [], limitations: [], extra: true })
     expect(untouched[0]!.assessment).toBe("unchecked")
   })
+})
+
+test("one deep assessor batch covers more than twelve merged findings without changing normal limits", () => {
+  const findings = Array.from({ length: DEEP_CANDIDATES }, (_, index) => ({
+    ...finding(),
+    id: `F${String(index + 1).padStart(3, "0")}`,
+  }))
+  const value = {
+    assessments: findings.map((finding) => ({
+      id: finding.id,
+      assessment: "supported",
+      rationale: "Static evidence supports it.",
+    })),
+    limitations: [],
+  }
+  expect(assess(findings, value)).toHaveLength(1)
+  expect(findings.every((finding) => finding.assessment === "unchecked")).toBe(true)
+  expect(assess(findings, value, DEEP_CANDIDATES)).toEqual([])
+  expect(findings.every((finding) => finding.assessment === "supported")).toBe(true)
+})
+
+test("deep assessor schema and prompt allowances keep every admitted batch inside 32 KiB", () => {
+  for (let count = 1; count <= DEEP_CANDIDATES; count++) {
+    const limits = deepAssessmentLimits(count)
+    const schema = JSON.parse(JSON.stringify(verifierSchemaFor(count, limits)))
+    expect(schema.properties.assessments.maxItems).toBe(count)
+    expect(schema.properties.assessments.items.properties.rationale.maxLength).toBe(limits.rationale)
+    const value = {
+      assessments: Array.from({ length: count }, (_, index) => ({
+        id: `F${String(index + 1).padStart(3, "0")}`,
+        assessment: "uncertain",
+        rationale: "\u0001".repeat(limits.rationale),
+        duplicateOf: "F001",
+      })),
+      limitations: Array.from({ length: limits.limitations }, () => "\u0001".repeat(limits.limitation)),
+    }
+    expect(Buffer.byteLength(JSON.stringify(value))).toBeLessThanOrEqual(32 * 1024)
+  }
+  expect(deepAssessmentLimits(30).rationale).toBeLessThan(1100)
 })

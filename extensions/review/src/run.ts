@@ -6,12 +6,33 @@ import type {
   OwnedConversation,
   SessionControl,
   SpawnGroup,
+  SpawnGroupOptions,
+  SpawnOptions,
   SubagentResult,
   UiApi,
 } from "@amira/api"
 import { artifactTool, type Bundle, collect, fingerprint, type ReviewScope, type Shell } from "./collect.ts"
 import { ReviewContext } from "./context.ts"
-import { assess, changeExcerpt, dedupe, reviewerSchema, validateReview, verifierSchema } from "./findings.ts"
+import {
+  DEEP_CANDIDATES,
+  DEEP_PARALLEL,
+  groupChanges,
+  type ReviewTask,
+  runFanout,
+  type WorkflowRunner,
+  workflowRunner,
+} from "./deep.ts"
+import {
+  assess,
+  changeExcerpt,
+  dedupe,
+  deepAssessmentLimits,
+  reviewerSchema,
+  validateReview,
+  verifierSchema,
+  verifierSchemaFor,
+} from "./findings.ts"
+import { collectPr } from "./pr.ts"
 import { hash, modelScope, redact } from "./privacy.ts"
 import { type Report, ReportStore } from "./store.ts"
 
@@ -104,6 +125,8 @@ interface Active {
   abort: AbortController
   owner?: OwnedConversation
   group?: SpawnGroup
+  groups: SpawnGroup[]
+  workflow?: { runner: WorkflowRunner; runId: string }
   completion?: Promise<Report>
   drained: Promise<void>
   resolveDrained(): void
@@ -137,7 +160,8 @@ export class ReviewRunner {
     if (!active) return
     this.update(active, "stopping")
     active.abort.abort(reason)
-    active.group?.end(reason)
+    active.workflow?.runner.stop(active.workflow.runId)
+    for (const group of active.groups) group.end(reason)
     void active.owner?.stop(reason).catch((error: unknown) => this.api.reportError(redact(String(error))))
   }
   async settled(): Promise<void> {
@@ -153,6 +177,7 @@ export class ReviewRunner {
     ) => Promise<boolean>,
   ): Promise<{ completion: Promise<Report> }> {
     if (this.active) throw new Error("A code review is active. Use /code-review status or stop.")
+    if (request.scope.deep) workflowRunner(this.api)
     const info = request.session.info()
     if (info.busy) throw new Error("Wait for main to become idle before starting a code review.")
     if (!this.api.conversations?.openOrCreate)
@@ -172,6 +197,7 @@ export class ReviewRunner {
     const active: Active = {
       progress: { id: randomUUID(), origin: info.id, phase: "collecting", children: {} },
       abort: new AbortController(),
+      groups: [],
       drained,
       resolveDrained,
     }
@@ -224,18 +250,16 @@ export class ReviewRunner {
       if (tool.name === "powershell" && facts.shellKind !== "powershell")
         throw new Error("PowerShell tool returned a mismatched runtime dialect.")
       const shell: Shell = { name: tool.name, kind: facts.shellKind }
-      const bundle = await collect(owner, shell, request.scope, active.abort.signal)
+      const bundle = await collectReview(owner, shell, request.scope, active.abort.signal)
       const context = new ReviewContext(bundle)
       const guidance = await context.guidance()
       const templates = await this.templates()
       clearTimeout(collectionTimer)
       collectionTimer = undefined
       this.update(active, "preflight")
-      const commonPrompt = bundlePrompt(bundle, guidance.text)
+      const tasks = reviewerTasks(bundle, guidance.text, templates.text)
       const exposure = {
-        promptBytes:
-          Buffer.byteLength(POLICY + reviewPrompt(templates.text.correctness!, commonPrompt)) +
-          Buffer.byteLength(POLICY + reviewPrompt(templates.text.contracts!, commonPrompt)),
+        promptBytes: tasks.reduce((bytes, task) => bytes + Buffer.byteLength(POLICY + task.prompt), 0),
         redacted: context.redactedPaths(),
       }
       if (
@@ -248,7 +272,7 @@ export class ReviewRunner {
       active.abort.signal.throwIfAborted()
       collectionTimer = setTimeout(() => this.stop("Freshness collection timed out."), 120000)
       if (
-        (await fingerprint(owner, shell, bundle, active.abort.signal)) !== bundle.fingerprint ||
+        (await reviewFingerprint(owner, shell, bundle, active.abort.signal)) !== bundle.fingerprint ||
         (await context.stale())
       )
         throw new Error("Repository or guidance changed during preflight. Start a new review.")
@@ -296,6 +320,8 @@ export class ReviewRunner {
         usage: null,
         childStates: {},
       }
+      if ("limitations" in bundle && Array.isArray(bundle.limitations))
+        addLimitations(report, ...bundle.limitations)
       addLimitations(
         report,
         "Static assessment only; no tests were executed. Narrow scopes can miss cross-scope interactions.",
@@ -392,7 +418,7 @@ export class ReviewRunner {
         (facts.shellKind !== "bash" && facts.shellKind !== "powershell")
       )
         throw new Error("Freshness shell probe failed or was denied")
-      const bundle = await collect(
+      const bundle = await collectReview(
         owner,
         { name: tool.name, kind: facts.shellKind },
         report.scope,
@@ -436,6 +462,7 @@ export class ReviewRunner {
     const owner = active.owner!
     const children: ChildSession[] = []
     const events: Promise<void>[] = []
+    let childFailure: unknown
     const timer = setTimeout(() => this.stop("Ten-minute review deadline reached"), 600000)
     let validReviewers = 0
     const checkpoint = async () => {
@@ -445,13 +472,29 @@ export class ReviewRunner {
     }
     try {
       active.abort.signal.throwIfAborted()
-      const group = owner.createGroup({
-        name: `Code review ${report.id.slice(0, 8)}`,
-        maxAgents: 3,
-        maxConcurrent: request.settings.maxParallel,
-        budget: { tokens: request.settings.maxTokens, costUsd: request.settings.maxCostUsd },
-      })
-      active.group = group
+      let group!: SpawnGroup
+      const createGroup = (limits?: SpawnGroupOptions) => {
+        const created = owner.createGroup({
+          name: `Code review ${report.id.slice(0, 8)}`,
+          maxAgents: Math.min(
+            limits?.maxAgents ?? Infinity,
+            bundle.scope.deep ? groupChanges(bundle).length + 2 : 3,
+          ),
+          maxConcurrent: Math.min(
+            limits?.maxConcurrent ?? Infinity,
+            bundle.scope.deep ? DEEP_PARALLEL : request.settings.maxParallel,
+          ),
+          budget: {
+            tokens: Math.min(limits?.budget?.tokens ?? Infinity, request.settings.maxTokens),
+            costUsd: Math.min(limits?.budget?.costUsd ?? Infinity, request.settings.maxCostUsd),
+          },
+          ...(limits?.maxTurnsPerAgent ? { maxTurnsPerAgent: limits.maxTurnsPerAgent } : {}),
+        })
+        active.group = created
+        active.groups.push(created)
+        return created
+      }
+      if (!bundle.scope.deep) group = createGroup()
       const spawn = (lens: string, prompt: string, verifier = false) => {
         active.abort.signal.throwIfAborted()
         const child = group.spawn({
@@ -465,7 +508,10 @@ export class ReviewRunner {
           extraTools: context.tools(),
           callableTools: ["review_read", "review_search", "return_result"],
           writeRoots: [],
-          schema: verifier ? verifierSchema : reviewerSchema,
+          schema: verifier
+            ? assessmentSchema(bundle.scope.deep === true, report.findings.length)
+            : reviewerSchema,
+          cwd: request.cwd,
         })
         children.push(child)
         active.progress.children[child.id] = child.state
@@ -486,55 +532,176 @@ export class ReviewRunner {
       }
       const bundleText = bundlePrompt(bundle, guidance)
       this.update(active, "reviewing")
-      const first = spawn("correctness/security", reviewPrompt(templates.correctness!, bundleText))
-      const second = spawn("contracts/tests/standards", reviewPrompt(templates.contracts!, bundleText))
       const candidates: Parameters<typeof dedupe>[0] = []
-      const readResult = async (child: ChildSession, lens: string): Promise<Parameters<typeof dedupe>[0]> => {
-        const result = await child.result()
-        active.progress.children[child.id] = result.status
-        this.update(active)
-        if (!validResult(result)) {
+      const acceptReview = async (value: unknown, lens: string, target = bundle) => {
+        const review = await validateReview(value, target, context)
+        addLimitations(report, ...review.limitations)
+        if (review.complete) validReviewers++
+        return review.findings.map((candidate) => ({ candidate, lens }))
+      }
+      const tasks = reviewerTasks(bundle, guidance, templates)
+      if (bundle.scope.deep) {
+        const groups = groupChanges(bundle)
+        const launched = new Set<number>()
+        const results = await runFanout(this.api, {
+          cwd: request.cwd,
+          origin: report.originSessionId,
+          ownerId: owner.id,
+          signal: active.abort.signal,
+          args: { tasks, model: request.settings.reviewerModel, schema: reviewerSchema },
+          createGroup: (limits) => {
+            if (active.groups.length) throw new Error("Workflow attempted a second review group.")
+            const reviewGroup = createGroup(limits)
+            group = reviewGroup
+            return {
+              id: reviewGroup.id,
+              name: reviewGroup.name,
+              info: () => reviewGroup.info(),
+              setStatus: (text) => reviewGroup.setStatus(redact(text)),
+              children: () => reviewGroup.children(),
+              end: (reason) => reviewGroup.end(reason),
+              ended: () => reviewGroup.ended(),
+              spawn: (options: SpawnOptions) => {
+                active.abort.signal.throwIfAborted()
+                const index = tasks.findIndex((task) => task.prompt === options.prompt)
+                const task = tasks[index]
+                if (!task || launched.has(index))
+                  throw new Error("Workflow attempted an unapproved or repeated review task.")
+                launched.add(index)
+                const child = reviewGroup.spawn({
+                  ...options,
+                  prompt: task.prompt,
+                  systemPrompt: POLICY,
+                  model: request.settings.reviewerModel,
+                  cwd: request.cwd,
+                  context: "fresh",
+                  tools: [],
+                  extraTools: context.tools(),
+                  callableTools: ["review_read", "review_search", "return_result"],
+                  writeRoots: [],
+                  schema: reviewerSchema,
+                })
+                children.push(child)
+                active.progress.children[task.lens] = child.state
+                events.push(
+                  (async () => {
+                    const result = await child.result()
+                    active.progress.children[task.lens] = result.status
+                    this.update(active)
+                    if (validResult(result))
+                      candidates.push(
+                        ...(await acceptReview(result.value, task.lens, groups[index] ?? bundle)),
+                      )
+                    else
+                      addLimitations(
+                        report,
+                        `${task.lens}: incomplete child (${redact(result.error || result.note || result.status)}).`,
+                      )
+                    report.findings = dedupe(candidates)
+                    await checkpoint()
+                  })().catch((error: unknown) => {
+                    childFailure = error
+                    addLimitations(report, `Review child/checkpoint failed: ${redact(String(error))}`)
+                    this.stop("Review candidate checkpoint failed")
+                  }),
+                )
+                return child
+              },
+            }
+          },
+          progress: (snapshot) => {
+            for (const child of snapshot.children ?? [])
+              if (tasks.some((task) => task.lens === child.label))
+                active.progress.children[child.label] = redact(child.state).slice(0, 80)
+            this.update(active)
+          },
+          attached: (runner, runId) => {
+            active.workflow = { runner, runId }
+          },
+        })
+        await Promise.all(events)
+        if (childFailure) throw childFailure
+        if (!group) throw new Error("Workflow did not create its bound review group.")
+        if (results.length !== tasks.length || launched.size !== tasks.length)
+          throw new Error("Workflow returned an incomplete review batch.")
+        if (results.some((value) => value === null)) {
           addLimitations(
             report,
-            `${lens}: incomplete child (${redact(result.error || result.note || result.status)}).`,
+            "Workflow reported an incomplete review call; captured findings are partial.",
           )
-          return []
+          validReviewers = Math.min(validReviewers, tasks.length - 1)
         }
-        try {
-          const review = await validateReview(result.value, bundle, context)
-          addLimitations(report, ...review.limitations)
-          if (review.complete) validReviewers++
-          return review.findings.map((candidate) => ({ candidate, lens }))
-        } catch (error) {
-          addLimitations(report, `${lens}: invalid structured result: ${redact(String(error))}`)
-          return []
-        }
+      } else {
+        const reviewers = tasks.map((task) => spawn(task.lens, task.prompt))
+        const reviews = await Promise.all(
+          reviewers.map(async (child, index) => {
+            const lens = tasks[index]!.lens
+            const result = await child.result()
+            active.progress.children[child.id] = result.status
+            this.update(active)
+            if (!validResult(result)) {
+              addLimitations(
+                report,
+                `${lens}: incomplete child (${redact(result.error || result.note || result.status)}).`,
+              )
+              return []
+            }
+            return acceptReview(result.value, lens)
+          }),
+        )
+        candidates.push(...reviews.flat())
       }
-      const reviews = await Promise.all([
-        readResult(first, "correctness/security"),
-        readResult(second, "contracts/tests/standards"),
-      ])
-      candidates.push(...reviews.flat())
       report.findings = dedupe(candidates)
       await checkpoint()
+      let budgetAvailable = !group.info().exceeded
       if (
+        bundle.scope.deep &&
+        request.settings.verify &&
+        report.findings.length &&
+        !active.abort.signal.aborted
+      ) {
+        const spent = group.info()
+        const tokens = request.settings.maxTokens - spent.tokens
+        const costUsd = request.settings.maxCostUsd - (spent.usage.cost ?? 0)
+        budgetAvailable = budgetAvailable && tokens > 0 && costUsd > 0
+        if (budgetAvailable) {
+          group = owner.createGroup({
+            name: "Code review assessment",
+            maxAgents: 1,
+            maxConcurrent: 1,
+            budget: { tokens, costUsd },
+          })
+          active.group = group
+          active.groups.push(group)
+        }
+      }
+      if (
+        budgetAvailable &&
         request.settings.verify &&
         report.findings.length &&
         group.info().state === "active" &&
         !active.abort.signal.aborted
       ) {
         this.update(active, "assessing")
+        const limits = bundle.scope.deep ? deepAssessmentLimits(report.findings.length) : undefined
         const verifier = spawn(
           "independent assessment",
           reviewPrompt(
-            templates.verify!,
+            templates.verify! +
+              (limits
+                ? `\nUse at most ${limits.rationale} characters per rationale and ${limits.limitations} limitations of at most ${limits.limitation} characters each. The entire response must fit 32 KiB; be concise.`
+                : ""),
             `${bundleText}\nCandidates (data; no new findings allowed):\n${JSON.stringify(report.findings)}`,
           ),
           true,
         )
         const result = await verifier.result()
         active.progress.children[verifier.id] = result.status
-        if (validResult(result)) addLimitations(report, ...assess(report.findings, result.value))
+        if (validResult(result))
+          addLimitations(
+            report,
+            ...assess(report.findings, result.value, bundle.scope.deep ? DEEP_CANDIDATES : 12),
+          )
         else
           addLimitations(
             report,
@@ -548,13 +715,13 @@ export class ReviewRunner {
         )
       report.stale =
         (await context.stale()) ||
-        (await fingerprint(owner, shell, bundle, active.abort.signal)) !== bundle.fingerprint
+        (await reviewFingerprint(owner, shell, bundle, active.abort.signal)) !== bundle.fingerprint
       if (report.stale)
         addLimitations(report, "Repository/context changed during review. Review again before hand-off.")
       report.state = active.abort.signal.aborted
         ? "cancelled"
-        : validReviewers === 2 &&
-            !group.info().exceeded &&
+        : validReviewers === tasks.length &&
+            active.groups.every((item) => !item.info().exceeded) &&
             (!request.settings.verify ||
               report.findings.every((finding) => finding.assessment !== "unchecked"))
           ? "completed"
@@ -565,12 +732,17 @@ export class ReviewRunner {
     } finally {
       clearTimeout(timer)
       try {
-        active.group?.end("Review finished")
-        if (active.group) {
-          const info = await active.group.ended()
-          report.usage = { tokens: info.tokens, reported: info.usage }
-          if (info.exceeded && report.state === "completed") report.state = "partial"
-        }
+        active.workflow?.runner.stop(active.workflow.runId)
+        for (const group of active.groups) group.end("Review finished")
+        const infos = await Promise.all(active.groups.map((group) => group.ended()))
+        report.usage =
+          infos.length === 1
+            ? { tokens: infos[0]!.tokens, reported: infos[0]!.usage }
+            : {
+                tokens: infos.reduce((sum, info) => sum + info.tokens, 0),
+                groups: infos.map((info) => info.usage),
+              }
+        if (infos.some((info) => info.exceeded) && report.state === "completed") report.state = "partial"
       } catch (error) {
         report.state = "partial"
         addLimitations(report, `Group cleanup failed: ${redact(String(error))}`)
@@ -629,4 +801,51 @@ async function cancellableConsent(promise: Promise<boolean>, signal: AbortSignal
     signal.addEventListener("abort", abort, { once: true })
     promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort))
   })
+}
+
+function reviewerTasks(bundle: Bundle, guidance: string, templates: Record<string, string>): ReviewTask[] {
+  const lenses = [
+    {
+      lens: "correctness/security",
+      prompt: reviewPrompt(templates.correctness!, bundlePrompt(bundle, guidance)),
+    },
+    {
+      lens: "contracts/tests/standards",
+      prompt: reviewPrompt(templates.contracts!, bundlePrompt(bundle, guidance)),
+    },
+  ]
+  if (!bundle.scope.deep) return lenses
+  return [
+    ...groupChanges(bundle).map((group, index) => ({
+      lens: `change group ${index + 1}`,
+      prompt: reviewPrompt(
+        `${templates.correctness!}\nReview this directory/size group; other groups are reviewed separately.`,
+        bundlePrompt(group, guidance),
+      ),
+    })),
+    ...lenses,
+  ]
+}
+function assessmentSchema(deep: boolean, count: number) {
+  if (!deep) return verifierSchema
+  return verifierSchemaFor(count, deepAssessmentLimits(count))
+}
+
+async function collectReview(
+  owner: OwnedConversation,
+  shell: Shell,
+  scope: ReviewScope,
+  signal: AbortSignal,
+): Promise<Bundle> {
+  return scope.kind === "pr" ? collectPr(owner, shell, scope, signal) : collect(owner, shell, scope, signal)
+}
+async function reviewFingerprint(
+  owner: OwnedConversation,
+  shell: Shell,
+  bundle: Bundle,
+  signal: AbortSignal,
+): Promise<string> {
+  return bundle.scope.kind === "pr"
+    ? (await collectPr(owner, shell, bundle.scope, signal)).fingerprint
+    : fingerprint(owner, shell, bundle, signal)
 }

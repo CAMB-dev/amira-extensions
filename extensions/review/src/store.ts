@@ -3,6 +3,7 @@ import { constants } from "node:fs"
 import { lstat, mkdir, open, readdir, rename, unlink } from "node:fs/promises"
 import path from "node:path"
 import type { ReviewScope } from "./collect.ts"
+import { DEEP_CANDIDATES, MAX_GROUPS } from "./deep.ts"
 import type { Finding } from "./findings.ts"
 import { redact, safePath } from "./privacy.ts"
 
@@ -150,7 +151,7 @@ function finding(value: unknown): boolean {
     !text(value.summary, 160) ||
     !text(value.scenario, 1200) ||
     !text(value.suggestedFix, 1200) ||
-    !strings(value.sources, 3, 160) ||
+    !strings(value.sources, MAX_GROUPS + 2, 160) ||
     typeof value.ignored !== "boolean" ||
     !["supported", "uncertain", "refuted", "unchecked"].includes(String(value.assessment))
   )
@@ -237,10 +238,11 @@ function valid(value: unknown): value is Report {
     return false
   if (
     !object(value.scope) ||
-    !exact(value.scope, ["kind", "paths", "includeUntracked"], ["ref"]) ||
+    !exact(value.scope, ["kind", "paths", "includeUntracked"], ["ref", "deep"]) ||
     !paths(value.scope.paths) ||
-    !["worktree", "since"].includes(String(value.scope.kind)) ||
+    !["worktree", "since", "pr"].includes(String(value.scope.kind)) ||
     typeof value.scope.includeUntracked !== "boolean" ||
+    (value.scope.deep !== undefined && typeof value.scope.deep !== "boolean") ||
     (value.scope.ref !== undefined &&
       (!text(value.scope.ref, 1024) ||
         !value.scope.ref ||
@@ -248,7 +250,11 @@ function valid(value: unknown): value is Report {
         value.scope.ref.split("").some((char) => char.charCodeAt(0) <= 32 || char.charCodeAt(0) === 127)))
   )
     return false
-  if (value.scope.kind === "since" && (!value.scope.ref || value.scope.includeUntracked)) return false
+  if (
+    (value.scope.kind === "since" || value.scope.kind === "pr") &&
+    (!value.scope.ref || value.scope.includeUntracked)
+  )
+    return false
   if (
     ![value.base, value.head].every((v) => text(v, 64) && /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(v)) ||
     !text(value.fingerprint) ||
@@ -256,16 +262,20 @@ function valid(value: unknown): value is Report {
   )
     return false
   if (
-    !record(value.snapshotHashes, 64, (v, key) => relative(key) && text(v) && HASH.test(v)) ||
+    !record(
+      value.snapshotHashes,
+      value.scope.deep ? 528 : 64,
+      (v, key) => relative(key) && text(v) && HASH.test(v),
+    ) ||
     !record(value.promptHashes, 16, (v) => text(v) && HASH.test(v)) ||
-    !record(value.childStates, 3, (v) => text(v, 80))
+    !record(value.childStates, value.scope.deep ? MAX_GROUPS + 3 : 3, (v) => text(v, 80))
   )
     return false
   if (
-    !paths(value.included, 32) ||
+    !paths(value.included, value.scope.deep ? 128 : 32) ||
     !paths(value.untracked, 10000) ||
-    !paths(value.redacted) ||
-    !paths(value.guidance) ||
+    !paths(value.redacted, value.scope.deep ? 656 : 64) ||
+    !paths(value.guidance, value.scope.deep ? 512 : 64) ||
     !Array.isArray(value.excluded) ||
     value.excluded.length > 10000 ||
     !value.excluded.every(
@@ -290,7 +300,7 @@ function valid(value: unknown): value is Report {
     return false
   if (
     !Array.isArray(value.findings) ||
-    value.findings.length > 12 ||
+    value.findings.length > (value.scope.deep ? DEEP_CANDIDATES : 12) ||
     !value.findings.every(finding) ||
     !strings(value.limitations, 128, 4096) ||
     !(value.usage === null || object(value.usage)) ||

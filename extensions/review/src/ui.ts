@@ -1,7 +1,9 @@
 import type { CommandContext, SelectSection, ViewDefinition, ViewLine } from "@amira/api"
-import type { Bundle } from "./collect.ts"
+import { type Bundle, reviewCaps } from "./collect.ts"
+import { DEEP_PARALLEL, groupChanges } from "./deep.ts"
 import type { Finding } from "./findings.ts"
 import { modelScope, redact } from "./privacy.ts"
+import type { Progress } from "./run.ts"
 import type { Report, ReviewSettings } from "./store.ts"
 
 const VIEW = "review-detail"
@@ -18,7 +20,7 @@ const list = (values: string[]) =>
   values.length ? values.map((value) => `- ${md(value)}`).join("\n") : "- None"
 
 function scopeText(scope: Report["scope"], base: string): string {
-  return `${scope.kind === "worktree" ? "Worktree (net HEAD to working tree)" : "Committed changes since an explicit ancestor"}; ${JSON.stringify(modelScope(scope, base))}`
+  return `${scope.kind === "worktree" ? "Worktree (net HEAD to working tree)" : scope.kind === "pr" ? `GitHub PR ${scope.ref}` : "Committed changes since an explicit ancestor"}; ${JSON.stringify(modelScope(scope, base))}`
 }
 
 export function consentSummary(
@@ -32,7 +34,7 @@ export function consentSummary(
   return [
     `Scope: ${scope.kind}${scope.base ? `; resolved base: ${scope.base}` : ""}; literal filters: ${scope.paths.join(", ") || "repository"}.`,
     `Reviewer: ${settings.reviewerModel}; assessor: ${settings.verifierModel}.`,
-    `Plan: 2 fresh reviewers${settings.verify ? " + at most 1 independent assessor" : "; assessment disabled"}.`,
+    `Plan: ${reviewerPlan(bundle)}${settings.verify ? " + at most 1 independent assessor" : "; assessment disabled"}.`,
     `Selected: ${bundle.changes.length} files; +${bundle.added}/-${bundle.removed} lines; ${Buffer.byteLength(bundle.patch)} sanitized patch bytes.`,
     `Prepared reviewer prompts: ${promptBytes ?? "unknown"} bytes before host schema/envelope; source reads add exposure.`,
     `Untracked admitted: ${admitted} (${bundle.scope.includeUntracked ? "explicitly enabled" : "off"}); excluded: ${bundle.excluded.length}.`,
@@ -43,9 +45,11 @@ export function consentSummary(
         .join(", ") || "none"
     }${bundle.changes.length > 4 ? "; see full manifest for remaining paths" : ""}.`,
     `Guidance: ${guidance.join(", ") || "none"}.`,
-    `Budget: ${settings.maxParallel} parallel; ${settings.maxTokens} group tokens; USD ${settings.maxCostUsd} reported cost; 10 minutes.`,
-    "Caps: 32 files / 2,000 lines / 64 KiB patch; 16 KiB guidance; source snapshots: 16 files / 256 KiB.",
-    "Privacy collection requires complete old/new sources: 64 KiB each / 256 KiB total, or stops.",
+    `Budget: ${bundle.scope.deep ? DEEP_PARALLEL : settings.maxParallel} parallel; ${settings.maxTokens} group tokens; USD ${settings.maxCostUsd} reported cost; 10 minutes.`,
+    `Caps: ${reviewCaps(bundle.scope).files} files / ${reviewCaps(bundle.scope).lines.toLocaleString("en-US")} lines / ${reviewCaps(bundle.scope).patchBytes / 1024} KiB patch; 16 KiB guidance; source snapshots: 16 files / 256 KiB.`,
+    bundle.scope.kind === "pr"
+      ? "PR diff only: no remote full-source snapshots or local checkout context; secrets outside the diff cannot be inspected."
+      : "Privacy collection requires complete old/new sources: 64 KiB each / 256 KiB total, or stops.",
     "Private reads/search only: no shell, tests, network, writes or delegation in children.",
     "Static assessment is not reproduction. Narrowed scope can miss cross-scope defects.",
     "Secret detection is best effort. Host/provider transcripts persist independently of reports.",
@@ -91,10 +95,12 @@ export function preflight(
     "## Guidance paths",
     list(guidance),
     `Reviewer model: ${md(settings.reviewerModel)}; verifier model: ${md(settings.verifierModel)}.`,
-    `Planned agents: 2 fresh reviewers${settings.verify ? " + at most 1 independent assessor when findings exist" : "; independent assessment disabled (findings remain unchecked)"}.`,
-    `Run caps: ${settings.maxParallel} parallel children; ${settings.maxTokens} group tokens; USD ${settings.maxCostUsd} reported-cost budget; 10-minute deadline. Budgets are observed, not reservations: in-flight work can overrun and unknown pricing is not zero.`,
-    "Admission caps: 32 changed files; 2,000 added + removed lines; 64 KiB combined complete patch / 32 KiB per file; 16 KiB guidance; 10,000 context paths / 1 MiB inventory; 16 extra source files / 64 KiB each / 256 KiB total; 24 bounded read/search calls per child (200 lines / 8 KiB per response).",
-    "Complete old/new privacy sources: 64 KiB each / 256 KiB total. Missing, oversized or mismatched source refuses the run before spawning; PEM spans are sanitized before projection onto hunks.",
+    `Planned agents: ${reviewerPlan(bundle)}${settings.verify ? " + at most 1 independent assessor when findings exist" : "; independent assessment disabled (findings remain unchecked)"}.`,
+    `Run caps: ${bundle.scope.deep ? DEEP_PARALLEL : settings.maxParallel} parallel children; ${settings.maxTokens} group tokens; USD ${settings.maxCostUsd} reported-cost budget; 10-minute deadline. Budgets are observed, not reservations: in-flight work can overrun and unknown pricing is not zero.`,
+    `Admission caps: ${reviewCaps(bundle.scope).files} changed files; ${reviewCaps(bundle.scope).lines.toLocaleString("en-US")} added + removed lines; ${reviewCaps(bundle.scope).patchBytes / 1024} KiB combined complete patch / 32 KiB per file; 16 KiB guidance; 10,000 context paths / 1 MiB inventory; 16 extra source files / 64 KiB each / 256 KiB total; 24 bounded read/search calls per child (200 lines / 8 KiB per response).`,
+    bundle.scope.kind === "pr"
+      ? "PR diff only: remote full-source snapshots and guidance are unavailable. Local files are not PR context; secrets outside the diff cannot be inspected."
+      : "Complete old/new privacy sources: 64 KiB each / 256 KiB total. Missing, oversized or mismatched source refuses the run before spawning; PEM spans are sanitized before projection onto hunks.",
     "Reviewers can use only bounded private review_read and literal review_search over approved scope, plus return_result. No shell, network, tests, delegation or writes.",
     STATIC,
     PRIVACY,
@@ -307,5 +313,42 @@ export async function browse(
       // Callers can persist using a cloned report. Update the local browser only after success.
       finding.ignored = !previous
     } else if (action === "Hand off to main") await actions.fix(finding.id)
+  }
+}
+
+function reviewerPlan(bundle: Bundle): string {
+  return bundle.scope.deep
+    ? `${groupChanges(bundle).length} group reviewers + 2 full-bundle lenses via workflow.runner`
+    : "2 fresh reviewers"
+}
+
+/** Host-scrolled live progress. Closing the view never changes execution. */
+export function progressView(snapshot: () => Progress | undefined): ViewDefinition {
+  return {
+    kind: "review-progress",
+    follow: false,
+    title: () => "Code review progress",
+    render: () => {
+      const progress = snapshot()
+      if (!progress)
+        return [
+          { kind: "text", text: "Review settled. Open /code-review last for saved findings.", wrap: true },
+        ]
+      return [
+        { kind: "accent", text: `${inline(progress.id.slice(0, 8))}: ${inline(progress.phase)}`, wrap: true },
+        ...Object.entries(progress.children).map(
+          ([label, state]): ViewLine => ({
+            kind: "text",
+            text: `${inline(label)}: ${inline(state)}`,
+            wrap: true,
+          }),
+        ),
+        {
+          kind: "text",
+          text: "Closing this view leaves the review running. Use /code-review stop to cancel and drain.",
+          wrap: true,
+        },
+      ]
+    },
   }
 }

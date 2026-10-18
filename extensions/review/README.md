@@ -1,9 +1,11 @@
-# Review — experimental 0.1.0
+# Review — experimental 0.2.0
 
-Bounded independent **static** code review with `/code-review`. Two fresh schema reviewers inspect
-the same sanitized change bundle: correctness/security and contracts/tests/documented standards.
-One optional fresh agent assesses the combined candidate list. No test execution or automatic edits.
-`/review` remains share's command; this package neither overrides nor imports share.
+Bounded independent **static** code review with `/code-review`. Normal review uses two fresh schema
+reviewers over the same sanitized change bundle: correctness/security and contracts/tests/documented
+standards. Optional `--deep` adds directory/size groups through workflow's owner-bound runner while
+retaining both full-bundle lenses. At most one fresh verifier assesses the merged, validated,
+deduplicated findings. No test execution or automatic edits. `/review` remains share's command;
+this package neither overrides nor imports share.
 
 ## Installation and compatibility
 
@@ -16,14 +18,17 @@ permission-checked `runTool`, group/schema, private tool, artifact, settings and
 used here. Runtime capability checks remain fail-closed. The host's owned-interface source still
 contains a publication-bump caveat: test against the 0.1.56 checkout and reconcile that host release
 before publishing. This extension does not change the host version. Unknown configured models fail
-before children start. No dependencies on other optional extensions.
+before children start. Normal review has no dependency on another optional extension. `--deep`
+requires the optional structural **`workflow.runner` 0.3.1** contract described below; review does not
+import workflow implementation code.
 
 ## Commands and exact scopes
 
 ```text
-/code-review
-/code-review worktree [--path P ...] [--include-untracked] [--no-verify] [--yes]
-/code-review since REF [--path P ...] [--no-verify] [--yes]
+/code-review [--deep]
+/code-review worktree [--deep] [--path P ...] [--include-untracked] [--no-verify] [--yes]
+/code-review since REF [--deep] [--path P ...] [--no-verify] [--yes]
+/code-review pr NUMBER_OR_URL [--deep] [--path P ...] [--no-verify] [--yes]
 /code-review status
 /code-review stop
 /code-review last
@@ -41,10 +46,18 @@ before children start. No dependencies on other optional extensions.
   Tracked index/worktree must be clean. No merge-base substitution or working-change ingestion.
   Untracked files are never included in this scope. Detached HEAD is supported; unborn HEAD and an
   unmerged index are explicitly unsupported.
+- **PR NUMBER_OR_URL:** accepts a positive PR number (resolved by `gh` from the local repository) or
+  a canonical `https://github.com/OWNER/REPO/pull/NUMBER` URL, without a query, fragment or trailing
+  slash. Requires an accessible local Git repository and an already-installed, authenticated GitHub
+  CLI. The collector uses owned, permission-checked `gh pr view REF --json
+  number,url,headRefOid,baseRefOid` and `gh pr diff URL --color=never`, checking metadata before and
+  after collection. No checkout, fetching, worktree creation, posting or `--post` option. Authentication
+  setup happens outside review; the extension does not sign in for you.
 - **Path filters:** repeat repository-relative literal file/directory filters, e.g. `--path src`.
   Quote spaces or apostrophes using the other quote style. No glob, regex, arbitrary Git pathspec,
-  absolute/traversing paths, leading options or line breaks. No automatic default branch discovery,
-  arbitrary ranges/historical targets, PR APIs, fetching or worktree creation.
+  absolute/traversing paths, leading options or line breaks. No automatic default branch discovery or
+  arbitrary ranges/historical targets. For PRs the complete remote diff must fit the raw patch cap
+  **before** path filtering, so `--path` cannot admit an oversized remote diff.
 
 Examples:
 
@@ -55,6 +68,11 @@ Examples:
 /code-review worktree --include-untracked --path src
 # Committed changes only; clean tracked checkout required
 /code-review since HEAD~1 --path src --path test
+# Optional workflow-backed fan-out over a larger admitted local change set
+/code-review worktree --deep --path src
+# Remote PR diff only; no unrelated local source context or posting
+/code-review pr 123 --deep --path src --no-verify
+/code-review pr https://github.com/OWNER/REPO/pull/123 --yes
 # Print-mode command (passed using the host's normal print input mechanism)
 /code-review worktree --path src --yes
 ```
@@ -65,13 +83,61 @@ consents to the documented model exposure; it never grants shell permissions or 
 TUI/RPC runs preflight in the command, then returns while admitted model work runs. No queue; one run
 per loaded extension. `last`/`show` reopen saved data without a model call or Git collection.
 
+## Deep review and optional workflow service
+
+Use `--deep` with `worktree`, `since REF` or `pr NUMBER_OR_URL`. Interactive `/code-review --deep`
+opens the scope chooser and retains deep mode; print mode requires an explicit scope.
+Review discovers `api.useService("workflow.runner")` structurally: all five capabilities **`cwd`, `freshRun`, `models`,
+`ownedLifetime`, `progress` must equal `true`**, and all six methods **`available`, `startBound`,
+`status`, `stop`, `onProgress`, `onResult` must be functions**. It requires **`available() === true`**
+at mode admission and again at launch, and rechecks availability/service identity during the run.
+A version string alone is not admission. The provider's availability query is pure and does not
+bypass workflow settings, start confirmation or budgets.
+
+If the runner is absent, incompatible or unavailable before starting, interactive use offers
+**Review normally** or **Cancel**. Normal review requires that explicit fallback approval and its
+usual exposure consent (or an already-supplied `--yes`); it retains normal admission caps. Print mode
+starts nothing and tells you to retry manually **without `--deep`**, retaining your scope and other
+options. There is never a silent downgrade. A launch failure, replacement, disable or unload during
+deep work fails/stops that run rather than substituting normal review.
+
+Deep packing sorts by directory and path, then uses size-bounded first fit, preferring a fitting
+group containing the same directory. Each group has at most **32 files, 2,000 added + removed lines,
+64 KiB combined patch**, with a **32 KiB single-file patch** cap. It refuses an indivisible file or
+more than **12 groups**; it does not truncate. One reviewer per group plus **two independent
+full-bundle lenses** produces at most 14 review tasks, six findings each: **84 candidates** before
+validation/deduplication. At most **one existing batched verifier**, outside the fan-out script,
+assesses the merged, validated, deduplicated list when enabled and budget remains. `--no-verify`
+disables it; no verifier per group is added. The deep assessor schema sizes its rationale allowance
+against the merged candidate count to keep the whole response within **32 KiB**, including JSON
+escaping and up to four 200-character limitations. Large batches require brief rationales; oversized
+or missing assessments still remain unchecked.
+
+Review supplies a wrapped owned group to `startBound` and overrides every workflow group spawn:
+only approved task prompts, the captured reviewer model/cwd, fresh context, fixed policy/schema,
+empty ordinary tools and write roots, and child-only `review_read`, `review_search`, `return_result`
+are allowed. Workflow's script sandbox or a reviewer role alone is **not** this privacy boundary.
+Deep execution is capped at **six concurrent reviewers**, further constrained by workflow admission,
+host tree limits and review token/cost budgets; the normal `maxParallel` setting remains 1–2.
+The verifier uses only the remaining review budget. The ten-minute execution deadline still applies.
+
+Service **`onProgress`** snapshots feed review child states/status and the host-scrolled deep
+progress view. Interactive deep runs open it when the frontend supports views; closing it leaves
+execution running. `/code-review status` remains the text fallback. Cancellation calls runner
+**`stop(runId)`** and stops owned work. A terminal `status` or progress
+snapshot is not settlement: review waits for **`onResult`** before accepting the batch, then drains
+its groups/children and releases its owner. No resume/replay is offered by review.
+
 ## Preflight, privacy and coverage
 
 Every Git operation (including probes/freshness) runs through an inert extension-owned conversation's
 permission-checked shell tool. The owner never receives a model turn. Collection disables pager,
 external diff/textconv, rename detection, fsmonitor, lazy fetching and transports; it has a two-minute
 wall deadline (including unanswered approvals) and 30-second Git-call timeouts. A cancelled/denied
-approval is not a model-exposure yes and is not retried through raw process APIs.
+approval is not a model-exposure yes and is not retried through raw process APIs. PR collection
+likewise uses the owned host shell tool: **the extension makes no direct network requests**, but the
+user-approved host tool may run `gh`, which contacts GitHub. Permission approval and model-exposure
+consent are separate. Development and verification remain offline; they do not contact GitHub.
 
 Before children start, preflight lists selected/excluded/redacted paths, scope, guidance, prompt size,
 models, agents and budgets. Reviewer/assessor scope metadata uses the resolved base OID, not the supplied
@@ -92,6 +158,12 @@ or mismatched complete source stops the run before any reviewer starts; even a s
 therefore require narrowing or deferral. Host Git evidence can retain the raw complete source locally.
 **Detection is best effort, not a guarantee that arbitrary source contains no secrets.**
 
+The PR collector has a narrower context boundary: only the sanitized **remote diff**, not complete
+remote source or unrelated local checkout snapshots. Its approved inventory is empty, so local
+`review_read`/`review_search` context and repository guidance are unavailable. Redaction works over
+old/new projections of the remote diff; secrets outside that diff cannot be inspected. Local editable
+templates still apply. Do not interpret PR commit IDs as proof that the local checkout matches.
+
 Children have no shell, network, generic read/grep/glob, delegation or writes. Child-only
 `review_read({path, offset?, limit?})` serves approved bounded sanitized immutable snapshots.
 `review_search({query, path?, maxResults?})` performs **literal, case-sensitive substring** search in
@@ -104,9 +176,10 @@ The allowlist is an application boundary, not an OS sandbox.
 
 | Resource | Maximum |
 |---|---|
-| Selected changed files (tracked + admitted untracked) | 32 |
-| Added + removed lines | 2,000 |
-| Complete combined / single-file UTF-8 patch | 64 KiB / 32 KiB |
+| Selected changed files (tracked + admitted untracked for local scopes) | Normal: 32; deep total: 128 |
+| Added + removed lines | Normal: 2,000; deep total: 8,000 |
+| Complete combined / single-file UTF-8 patch | Normal: 64 KiB / 32 KiB; deep total: 256 KiB / 32 KiB |
+| Deep group | 32 files / 2,000 added + removed lines / 64 KiB patch; at most 12 groups |
 | Repository guidance / local editable templates | 16 KiB each total |
 | Approved path inventory | 10,000 paths or 1 MiB |
 | Complete old/new source for privacy collection | 64 KiB per side, 256 KiB total |
@@ -114,13 +187,18 @@ The allowlist is an application boundary, not an OS sandbox.
 | Reader response | 200 lines / 8 KiB, explicit continuation |
 | Reader calls per child | 24, including repeated reads and search calls |
 | Search per child / per call | 8 calls / 50 results |
-| Findings per reviewer / total candidates | 6 / 12 |
+| Findings per reviewer / total candidates | 6 / normal: 12; deep: 84 |
 | Child result domain size | 32 KiB |
-| Run | 2 reviewers + at most 1 batched assessor; concurrency 1–2; ten minutes |
+| Normal run | 2 reviewers + at most 1 batched assessor; concurrency 1–2; ten minutes |
+| Deep run | At most 12 group reviewers + 2 full-bundle lenses + 1 batched assessor; concurrency at most 6; ten minutes |
 | Terminal reports per repository | 20 |
 
-Large/historical changes are not split or fanned out. Shell capture of extreme metadata output is a
-host/process limitation, not a hard memory guarantee. Budgets stop on observed usage, not provider
+Deep raises the combined file/changed-line/patch caps and matching report metadata limits, **not the privacy-source cap**: complete
+local old/new privacy sources remain **64 KiB per side, 256 KiB total for the entire run**, not per
+group. The additional snapshot pool also stays shared at 16 files / 256 KiB total. A small patch over
+large complete sources can still fail admission. Normal review never automatically splits large
+changes; deep grouping does not admit arbitrary historical ranges. Shell capture of extreme metadata
+output is a host/process limitation, not a hard memory guarantee. Budgets stop on observed usage, not provider
 reservations; an in-flight request may overrun. Prompt bytes are not exact tokens or a dollar quote.
 Unknown/missing reported cost stays unknown, not zero. Reported group usage is counted once.
 
@@ -133,7 +211,7 @@ Flat fields in the host's extension settings UI; captured at run start (later ed
 | `reviewerModel` | empty | Capture main model; otherwise enabled `provider/model` |
 | `verifierModel` | empty | Independently capture main model; explicit override allowed |
 | `verify` | true | One batched independent static refutation pass; `--no-verify` disables |
-| `maxParallel` | 2 | Integer 1–2, also subject to host tree admission |
+| `maxParallel` | 2 | Normal review: integer 1–2, subject to host tree admission; deep uses a fixed upper bound of 6, subject also to workflow limits |
 | `maxTokens` | 120000 | Positive integer, at most 240000 group tokens |
 | `maxCostUsd` | 2 | Positive reported-cost budget, at most USD 10 |
 
@@ -163,7 +241,9 @@ before sending to the idle current main session. It requires the same canonical 
 scope/context fingerprint, then rechecks identity/busy state immediately before one `send`. Main is
 asked to reassess, make the smallest justified fix, run relevant checks and not commit. This starts a
 model turn, not a composer draft. The extension does not edit code or declare a finding fixed. There
-is no fix-all, auto-fix, editor/clipboard integration or public runner service.
+is no fix-all, auto-fix, editor/clipboard integration or public review runner service. **PR findings
+cannot be handed off to an unverified local checkout**: `fix` is blocked for PR reports. Review a
+matching local change set first; the extension does not fetch/check out a PR or infer checkout identity.
 
 ## Guidance, storage and retention
 
@@ -186,6 +266,10 @@ locally before sanitization. Owned sessions and submitted child transcripts foll
 provider retention policies. Releasing owners or pruning extension reports does not delete those
 host-managed histories. This package never reaches into home to remove them or promises zero retention.
 
+**Deep mode and workflow:** `--deep` runs through the workflow extension, which keeps its own run
+arguments and journals (including the sanitized group prompts) under its data directory. Pruning
+review reports does not remove those; manage them with the workflow extension.
+
 ## Offline development and verification
 
 Use an already-prepared host checkout and local toolchain (no dependency downloads needed for tests):
@@ -194,8 +278,14 @@ Use an already-prepared host checkout and local toolchain (no dependency downloa
 bun run link-amira <path-to-your-Amira-checkout>
 bun run typecheck
 bun run lint
-bun test
+# From extensions/review, use a fresh Bun process for each test file:
+for file in test/*.test.ts; do bun test "$file" || exit; done
 ```
+
+Do not combine all files into one `bun test` process: host/module mocks and disposable home state
+must not leak between files. The loop above is Bash syntax; in PowerShell, use a fresh `bun test`
+invocation for each file and stop on a nonzero exit code. These are maintainer instructions, not
+commands executed as part of this documentation update.
 
 Tests use fake hosts, scripted schema children/dialects and temporary local Git repositories, with
 only disposable `AMIRA_HOME`. No live API calls, network, GUI, installed user state or project commits.

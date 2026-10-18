@@ -2,6 +2,8 @@ import { lstat, realpath } from "node:fs/promises"
 import path from "node:path"
 import type { CommandContext, ExtensionAPI } from "@amira/api"
 import type { ReviewScope } from "./collect.ts"
+import { workflowRunner } from "./deep.ts"
+import { prReference } from "./pr.ts"
 import { redact, safePath } from "./privacy.ts"
 import { type ReviewRunner, type ReviewSettings, settingsSnapshot } from "./run.ts"
 import { type Report, repoKey } from "./store.ts"
@@ -9,7 +11,7 @@ import { browse, consentSummary, details, markdown, preflight } from "./ui.ts"
 
 export type Parsed =
   | { action: "start"; scope: ReviewScope; noVerify: boolean; yes: boolean }
-  | { action: "choose" }
+  | { action: "choose"; deep?: boolean }
   | { action: "status" | "stop" | "last" }
   | { action: "show" | "ignore" | "fix"; id: string }
 
@@ -45,8 +47,19 @@ export function words(input: string): string[] {
 }
 export function parse(input: string): Parsed {
   const args = words(input)
+  let deep = false
+  for (let index = args.length - 1; index >= 0; index--) {
+    if (args[index] === "--deep") {
+      deep = true
+      args.splice(index, 1)
+    }
+  }
   const action = args.shift()
-  if (!action) return { action: "choose" }
+  if (!action) {
+    return { action: "choose", ...(deep ? { deep: true } : {}) }
+  }
+  if (deep && !["worktree", "since", "pr"].includes(action))
+    throw new Error("--deep requires a review scope.")
   if (action === "status" || action === "stop" || action === "last") {
     if (args.length) throw new Error(`/${"code-review"} ${action} takes no arguments.`)
     return { action }
@@ -55,11 +68,16 @@ export function parse(input: string): Parsed {
     if (args.length !== 1 || !/^F\d{3}$/.test(args[0]!)) throw new Error(`Use /code-review ${action} F001.`)
     return { action, id: args[0]! }
   }
-  if (action !== "worktree" && action !== "since")
+  if (action !== "worktree" && action !== "since" && action !== "pr")
     throw new Error(
-      "Use worktree, since REF, status, stop, last, show, ignore or fix. Arbitrary ranges are not supported.",
+      "Use worktree, since REF, pr NUMBER or URL, status, stop, last, show, ignore or fix. Arbitrary ranges are not supported.",
     )
-  const scope: ReviewScope = { kind: action, paths: [], includeUntracked: false }
+  const scope: ReviewScope = {
+    kind: action,
+    paths: [],
+    includeUntracked: false,
+    ...(deep ? { deep: true } : {}),
+  }
   if (action === "since") {
     const ref = args.shift()
     if (
@@ -71,6 +89,7 @@ export function parse(input: string): Parsed {
       throw new Error("Since needs one explicit local ancestor ref, not an option or range.")
     scope.ref = ref
   }
+  if (action === "pr") scope.ref = prReference(args.shift())
   let noVerify = false,
     yes = false
   while (args.length) {
@@ -112,6 +131,12 @@ export function fixPrompt(finding: Report["findings"][number], report: Report): 
   )
 }
 
+const FINISHED = new Set(["done", "error", "aborted", "failed", "stopped"])
+
+/** Children in a terminal state; workflow progress reports failed/stopped, the runner error/aborted. */
+export function completedChildren(children: Record<string, string>): number {
+  return Object.values(children).filter((state) => FINISHED.has(state)).length
+}
 export class ReviewCommands {
   constructor(
     private api: ExtensionAPI,
@@ -137,15 +162,16 @@ export class ReviewCommands {
     if (ctx.session.info().id !== origin) throw new Error("Main session changed; command cancelled.")
     if (parsed.action === "status") {
       const progress = this.runner.snapshot()
-      if (progress)
+      if (progress) {
+        if (ctx.frontend !== "print") ctx.openView?.({ kind: "review-progress", data: {} })
         ctx.print(
-          `Code review ${progress.id.slice(0, 8)}: ${progress.phase}; ${Object.values(progress.children).filter((state) => ["done", "error", "aborted"].includes(state)).length}/${Object.keys(progress.children).length} children complete.\n${Object.entries(
+          `Code review ${progress.id.slice(0, 8)}: ${progress.phase}; ${completedChildren(progress.children)}/${Object.keys(progress.children).length} children complete.\n${Object.entries(
             progress.children,
           )
             .map(([id, state]) => `${id}: ${state}`)
             .join("\n")}\nUse /code-review stop to cancel.`,
         )
-      else {
+      } else {
         const key = await repositoryKey(ctx.cwd)
         const interrupted = await this.runner.store.interrupted(key)
         ctx.print(
@@ -164,19 +190,26 @@ export class ReviewCommands {
     if (parsed.action === "choose") {
       if (ctx.frontend === "print")
         throw new Error("Print mode needs an explicit worktree or since REF scope and --yes.")
-      const choice = await ctx.ui.choose("Code review scope", ["Worktree", "Since a ref"], {
+      const choice = await ctx.ui.choose("Code review scope", ["Worktree", "Since a ref", "GitHub PR"], {
         sections: [{ at: 0, choose: "continue" }],
         descriptions: [
           "Net tracked HEAD → working tree; untracked files excluded by default",
           "Committed ancestor → HEAD; tracked checkout must be clean",
+          "GitHub PR diff via permission-checked gh; no local checkout changes",
         ],
         signal: ctx.signal,
       })
       if (!choice) return
-      if (choice.option === "Worktree") return this.execute(parse("worktree"), ctx, origin)
+      if (choice.option === "Worktree")
+        return this.execute(parse(`worktree${parsed.deep ? " --deep" : ""}`), ctx, origin)
+      if (choice.option === "GitHub PR") {
+        const ref = await ctx.ui.input("GitHub PR number or URL", { placeholder: "123", signal: ctx.signal })
+        if (ref === undefined || ctx.signal.aborted) return
+        return this.execute(parse(`pr ${prReference(ref)}${parsed.deep ? " --deep" : ""}`), ctx, origin)
+      }
       const ref = await ctx.ui.input("Local ancestor ref", { placeholder: "HEAD~1", signal: ctx.signal })
       if (ref === undefined) return
-      const selected = parse("since HEAD")
+      const selected = parse(`since HEAD${parsed.deep ? " --deep" : ""}`)
       if (selected.action !== "start") return
       selected.scope.ref = ref
       return this.execute(selected, ctx, origin)
@@ -186,6 +219,22 @@ export class ReviewCommands {
         throw new Error(
           "Print mode requires --yes to consent to model exposure; shell permissions still apply.",
         )
+      if (parsed.scope.deep) {
+        try {
+          workflowRunner(this.api)
+        } catch (error) {
+          const message = redact(error instanceof Error ? error.message : String(error))
+          ctx.print(`${message} No review started. You can run the normal review without --deep.`, "warning")
+          if (ctx.frontend === "print") return
+          const choice = await ctx.ui.choose("Deep review unavailable", ["Review normally", "Cancel"], {
+            sections: [{ at: 0, choose: "continue" }],
+            signal: ctx.signal,
+          })
+          if (choice?.option !== "Review normally" || ctx.signal.aborted) return
+          const { deep: _deep, ...scope } = parsed.scope
+          return this.execute({ ...parsed, scope }, ctx, origin)
+        }
+      }
       const settings: ReviewSettings = settingsSnapshot(this.values(), ctx.session, parsed.noVerify)
       const { completion } = await this.runner.start(
         {
@@ -221,6 +270,7 @@ export class ReviewCommands {
             { details: markdown(report), markdown: true, persist: true },
           )
       }
+      if (ctx.frontend !== "print" && parsed.scope.deep) ctx.openView?.({ kind: "review-progress", data: {} })
       if (ctx.frontend === "print") publish(await completion)
       else {
         ctx.print("Code review started. Use /code-review status or stop.")
@@ -260,6 +310,10 @@ export class ReviewCommands {
   private async fix(report: Report, id: string, ctx: CommandContext, origin: string) {
     const finding = report.findings.find((entry) => entry.id === id)
     if (!finding) throw new Error("Unknown finding")
+    if (report.scope.kind === "pr")
+      throw new Error(
+        "PR findings cannot be handed off to an unverified local checkout. Review a matching local change set first.",
+      )
     if (report.stale || report.state !== "completed")
       throw new Error("Hand-off requires a completed, fresh report. Start a new review.")
     const checkMain = () => {

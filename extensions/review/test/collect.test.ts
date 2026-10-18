@@ -660,3 +660,18 @@ describe("owned Git collection", () => {
     120_000,
   )
 })
+
+test("deep collection raises only combined admission caps, preserving fingerprints and single-file/privacy bounds", async () => {
+  const files = Object.fromEntries(Array.from({ length: 33 }, (_, index) => [`src/f${index}.ts`, "before\n"]))
+  const root = await repo(files)
+  for (const name of Object.keys(files)) await put(root, name, "after\n")
+  const f = owned(root)
+  await expect(collect(f.owner, bash, worktree(), signal())).rejects.toThrow("32 files")
+  const scope = { ...worktree(), deep: true }
+  const result = await collect(f.owner, bash, scope, signal())
+  expect(result.changes).toHaveLength(33)
+  expect(result.scope.deep).toBe(true)
+  expect(await fingerprint(f.owner, bash, result, signal())).toBe(result.fingerprint)
+  await put(root, "src/f0.ts", "x".repeat(33 * 1024))
+  await expect(collect(f.owner, bash, scope, signal())).rejects.toThrow("32 KiB")
+}, 120000)

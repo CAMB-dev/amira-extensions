@@ -3,7 +3,7 @@ import type { CommandContext, SelectChoice, SelectSection } from "@amira/api"
 import type { Bundle } from "../src/collect.ts"
 import type { Finding } from "../src/findings.ts"
 import type { Report } from "../src/store.ts"
-import { browse, details, detailView, markdown, preflight } from "../src/ui.ts"
+import { browse, details, detailView, markdown, preflight, progressView } from "../src/ui.ts"
 
 function finding(id = "F001", assessment: Finding["assessment"] = "supported"): Finding {
   return {
@@ -338,4 +338,25 @@ describe("review UI", () => {
         .every((line) => "wrap" in line && line.wrap),
     ).toBe(true)
   })
+})
+
+test("live progress renders workflow children and settlement without closing or cancelling work", () => {
+  let active = true
+  const view = progressView(() =>
+    active
+      ? {
+          id: "review-id",
+          origin: "main",
+          phase: "reviewing",
+          children: { "change group 1": "working", "correctness/security": "done" },
+        }
+      : undefined,
+  )
+  const rows = view.render!({}, { width: 80 } as never)
+  expect(JSON.stringify(rows)).toContain("change group 1: working")
+  expect(JSON.stringify(rows)).toContain("/code-review stop")
+  expect(view.keys).toBeUndefined()
+  expect(view.onClose).toBeUndefined() // Native Escape only closes the read-only view.
+  active = false
+  expect(JSON.stringify(view.render!({}, { width: 80 } as never))).toContain("Review settled")
 })

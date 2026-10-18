@@ -78,29 +78,45 @@ export const reviewerSchema: JSONSchema = {
     limitations: { type: "array", maxItems: 12, items: text(500) },
   },
 }
-export const verifierSchema: JSONSchema = {
-  type: "object",
-  additionalProperties: false,
-  required: ["assessments", "limitations"],
-  properties: {
-    assessments: {
-      type: "array",
-      maxItems: 12,
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["id", "assessment", "rationale"],
-        properties: {
-          id: { type: "string", pattern: "^F[0-9]{3}$" },
-          assessment: { type: "string", enum: ["supported", "uncertain", "refuted"] },
-          rationale: text(1200),
-          duplicateOf: { type: "string", pattern: "^F[0-9]{3}$" },
+export function deepAssessmentLimits(count: number) {
+  // Reserve JSON/ID/disposition overhead plus four 200-character limitations.
+  // Six bytes per character also covers worst-case JSON escaping, not just ASCII.
+  if (!Number.isInteger(count) || count < 1 || count > 84) throw new Error("Invalid deep assessor batch size")
+  return {
+    rationale: Math.min(1200, Math.floor((32 * 1024 - 8192 - count * 110) / (count * 6))),
+    limitations: 4,
+    limitation: 200,
+  }
+}
+export function verifierSchemaFor(
+  maxItems = 12,
+  limits = { rationale: 1200, limitations: 12, limitation: 500 },
+): JSONSchema {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["assessments", "limitations"],
+    properties: {
+      assessments: {
+        type: "array",
+        maxItems,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["id", "assessment", "rationale"],
+          properties: {
+            id: { type: "string", pattern: "^F[0-9]{3}$" },
+            assessment: { type: "string", enum: ["supported", "uncertain", "refuted"] },
+            rationale: text(limits.rationale),
+            duplicateOf: { type: "string", pattern: "^F[0-9]{3}$" },
+          },
         },
       },
+      limitations: { type: "array", maxItems: limits.limitations, items: text(limits.limitation) },
     },
-    limitations: { type: "array", maxItems: 12, items: text(500) },
-  },
+  }
 }
+export const verifierSchema = verifierSchemaFor()
 
 type ObjectValue = Record<string, unknown>
 const object = (value: unknown): value is ObjectValue =>
@@ -225,7 +241,7 @@ async function sourceAvailable(
 ): Promise<boolean> {
   approved(name)
   if (bundle.excluded.some((entry) => entry.path === name)) return false
-  if (selected === "old") {
+  if (selected === "old" || bundle.scope.kind === "pr") {
     const change = changedFile(bundle, name, selected)
     if (
       !change ||
@@ -235,7 +251,7 @@ async function sourceAvailable(
       return false
     approved(change.path)
     if (change.oldPath) approved(change.oldPath)
-    return patchLines(change, "old").has(line)
+    return patchLines(change, selected).has(line)
   }
   // New-side evidence must have a real, approved source snapshot, not just a plausible hunk number.
   try {
@@ -398,7 +414,7 @@ export function dedupe(candidates: { candidate: Candidate; lens: string }[]): Fi
   return findings
 }
 
-export function assess(findings: Finding[], value: unknown): string[] {
+export function assess(findings: Finding[], value: unknown, maxCandidates = 12): string[] {
   for (const finding of findings) {
     finding.assessment = "unchecked"
     delete finding.rationale
@@ -409,7 +425,7 @@ export function assess(findings: Finding[], value: unknown): string[] {
     !object(value) ||
     !keys(value, ["assessments", "limitations"]) ||
     !Array.isArray(value.assessments) ||
-    value.assessments.length > 12 ||
+    value.assessments.length > maxCandidates ||
     !limitationsShape(value.limitations)
   ) {
     return [

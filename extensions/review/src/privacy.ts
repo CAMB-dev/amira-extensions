@@ -115,7 +115,8 @@ export function redact(text: string): string {
 /** Public exposure metadata is separate from the operational ref used by Git/fingerprints. */
 export function modelScope(
   scope: {
-    readonly kind: "worktree" | "since"
+    readonly kind: "worktree" | "since" | "pr"
+    readonly deep?: boolean
     readonly paths: readonly string[]
     readonly includeUntracked: boolean
   },
@@ -125,7 +126,8 @@ export function modelScope(
     kind: redact(scope.kind),
     paths: scope.paths.map(redact),
     includeUntracked: scope.includeUntracked,
-    ...(scope.kind === "since" ? { base: redact(base) } : {}),
+    ...(scope.kind !== "worktree" ? { base: redact(base) } : {}),
+    ...(scope.deep ? { deep: true } : {}),
   }
 }
 

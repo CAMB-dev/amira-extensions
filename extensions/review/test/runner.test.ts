@@ -22,6 +22,7 @@ import { hash } from "../src/privacy.ts"
 import { ReviewRunner, settingFields, settingsSnapshot } from "../src/run.ts"
 import { ReportStore, repoKey } from "../src/store.ts"
 import { consentSummary, preflight } from "../src/ui.ts"
+import { fakeWorkflow } from "./deep-fixture.ts"
 
 setDefaultTimeout(60000)
 const roots: string[] = []
@@ -789,10 +790,10 @@ describe("command contracts", () => {
   })
   test("packaging public-only imports, version/index, templates and usage-only skill", async () => {
     const manifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"))
-    expect(manifest.version).toBe("0.1.0")
+    expect(manifest.version).toBe("0.2.0")
     expect(manifest.amira.engines.amira).toBe("^0.1.56")
     const index = JSON.parse(await readFile(new URL("../../../index.json", import.meta.url), "utf8"))
-    expect(index.extensions.find((entry: { name: string }) => entry.name === "review").version).toBe("0.1.0")
+    expect(index.extensions.find((entry: { name: string }) => entry.name === "review").version).toBe("0.1.1")
     const skill = await readFile(new URL("../skills/code-review/SKILL.md", import.meta.url), "utf8")
     expect(skill).toContain("documentation only")
     expect(hash(skill)).toHaveLength(64)
@@ -850,5 +851,168 @@ describe("command contracts", () => {
       expect(f.counters().released).toBe(1)
       expect(f.counters().ownerSends).toBe(0)
     }
+  })
+})
+
+describe("deep owner-bound workflow reviews", () => {
+  test("parallel launch has original owner/cwd, strict tools, redacted prompts, merged dedup and one verifier", async () => {
+    const review = done({ findings: [candidate], limitations: [] })
+    const f = await fixture(
+      [
+        review,
+        review,
+        review,
+        done({
+          assessments: [{ id: "F001", assessment: "supported", rationale: "Static evidence agrees." }],
+          limitations: [],
+        }),
+      ],
+      { held: true },
+    )
+    const fake = fakeWorkflow({ maxConcurrent: 2 })
+    f.api.useService = (() => fake.runner) as ExtensionAPI["useService"]
+    await writeFile(
+      path.join(f.repo, "file.ts"),
+      "export const answer = 2 // token ghp_abcdefghijklmnopqrstuvwxyz1234567890\n",
+    )
+    let bytes = 0
+    const { completion } = await f.runner.start(
+      { ...f.request, scope: { ...f.request.scope, deep: true } },
+      async (_bundle, _guidance, _signal, exposure) => {
+        bytes = exposure.promptBytes
+        return true
+      },
+    )
+    await fake.started
+    expect(f.spawns).toHaveLength(3) // All launches precede any held result.
+    const start = fake.starts[0]!
+    expect(start.request.cwd).toBe(f.request.cwd)
+    expect(start.request.startedBy.sessionId).toBe("main")
+    expect(start.owner.sessionId).toBe("owner")
+    expect(start.owner.signal.aborted).toBe(false)
+    expect(start.request.script).toContain("parallel(")
+    expect(f.runner.snapshot()!.phase).toBe("reviewing")
+    expect(Object.keys(f.runner.snapshot()!.children)).toHaveLength(3)
+    for (const spawn of f.spawns) {
+      expect(spawn.cwd).toBe(f.request.cwd)
+      expect(spawn.context).toBe("fresh")
+      expect(spawn.tools).toEqual([])
+      expect(spawn.writeRoots).toEqual([])
+      expect(spawn.callableTools).toEqual(["review_read", "review_search", "return_result"])
+      expect(spawn.extraTools!.map((tool) => tool.name)).toEqual(["review_read", "review_search"])
+      expect(spawn.prompt).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz1234567890")
+    }
+    expect(bytes).toBe(
+      f.spawns.reduce((sum, child) => sum + Buffer.byteLength((child.systemPrompt ?? "") + child.prompt), 0),
+    )
+    expect(f.specs[1]).toMatchObject({
+      maxAgents: 3,
+      maxConcurrent: 2,
+      budget: { tokens: 120000, costUsd: 2 },
+    })
+    f.release()
+    const report = await completion
+    expect(report.state).toBe("completed")
+    expect(report.findings).toHaveLength(1)
+    expect(report.findings[0]!.sources).toEqual([
+      "change group 1",
+      "correctness/security",
+      "contracts/tests/standards",
+    ])
+    expect(report.findings[0]!.assessment).toBe("supported")
+    expect(f.spawns).toHaveLength(4)
+    expect(f.specs[2]).toMatchObject({
+      maxAgents: 1,
+      maxConcurrent: 1,
+      budget: { tokens: 119990, costUsd: 2 },
+    })
+    expect(await f.store.last(report.repoKey)).toMatchObject({ scope: { deep: true }, state: "completed" })
+    expect(f.counters().ownerSends).toBe(0)
+  })
+  test("stop reaches original workflow runner, drains owner, and retains validated partial findings", async () => {
+    const f = await fixture([done({ findings: [candidate], limitations: [] }), empty(), empty()], {
+      held: true,
+    })
+    const fake = fakeWorkflow()
+    f.api.useService = (() => fake.runner) as ExtensionAPI["useService"]
+    const { completion } = await f.runner.start(
+      { ...f.request, scope: { ...f.request.scope, deep: true } },
+      async () => true,
+    )
+    await fake.started
+    f.runner.stop()
+    const report = await completion
+    expect(report.state).toBe("cancelled")
+    expect(report.findings).toHaveLength(1)
+    expect(fake.stops()).toBeGreaterThan(0)
+    expect(fake.starts[0]!.owner.signal.aborted).toBe(true)
+    expect(f.counters().released).toBe(1)
+    expect(f.runner.snapshot()).toBeUndefined()
+  })
+  test("disabled provider during a run stops its original handle without normal fallback", async () => {
+    const f = await fixture([], { held: true })
+    const fake = fakeWorkflow()
+    f.api.useService = (() => fake.runner) as ExtensionAPI["useService"]
+    const { completion } = await f.runner.start(
+      { ...f.request, scope: { ...f.request.scope, deep: true } },
+      async () => true,
+    )
+    await fake.started
+    fake.disable()
+    const report = await completion
+    expect(report.state).not.toBe("completed")
+    expect(report.limitations.join("\n")).toContain("extensions.workflow.enabled: never")
+    expect(fake.stops()).toBeGreaterThan(0)
+    expect(f.spawns).toHaveLength(3)
+  })
+  test("availability is checked again at launch after exposure approval", async () => {
+    const f = await fixture()
+    const fake = fakeWorkflow()
+    f.api.useService = (() => fake.runner) as ExtensionAPI["useService"]
+    const { completion } = await f.runner.start(
+      { ...f.request, scope: { ...f.request.scope, deep: true } },
+      async () => {
+        fake.disable()
+        return true
+      },
+    )
+    const report = await completion
+    expect(report.state).toBe("failed")
+    expect(fake.starts).toHaveLength(0)
+    expect(f.spawns).toHaveLength(0)
+  })
+  test("unavailable mode offers an explicit normal review; Escape and print are inert", async () => {
+    const f = await fixture()
+    const commands = new ReviewCommands(f.api, f.runner, () => defaults)
+    let choices = 0
+    f.ctx.ui.choose = async () => {
+      choices++
+      return undefined
+    }
+    await commands.run("worktree --deep --yes", f.ctx)
+    expect(choices).toBe(1)
+    expect(f.spawns).toHaveLength(0)
+    expect(f.calls).toHaveLength(0)
+    expect(f.outputs.join("\n")).toContain("normal review without --deep")
+    await commands.run("worktree --deep --yes", { ...f.ctx, frontend: "print" })
+    expect(choices).toBe(1)
+    expect(f.spawns).toHaveLength(0)
+    f.ctx.ui.choose = async () => ({ option: "Review normally" })
+    await commands.run("worktree --deep --yes", f.ctx)
+    await f.runner.settled()
+    expect(f.spawns).toHaveLength(2)
+  })
+  test("Escape on deep scope picker and PR input starts nothing", async () => {
+    const f = await fixture()
+    const commands = new ReviewCommands(f.api, f.runner, () => defaults)
+    await commands.run("--deep", f.ctx)
+    f.ctx.ui.choose = async () => ({ option: "GitHub PR" })
+    f.ctx.ui.input = async () => undefined
+    await commands.run("--deep", f.ctx)
+    f.ctx.ui.input = async () => "123 --yes"
+    await commands.run("--deep", f.ctx)
+    expect(f.outputs.join("\n")).toContain("canonical")
+    expect(f.calls).toHaveLength(0)
+    expect(f.spawns).toHaveLength(0)
   })
 })

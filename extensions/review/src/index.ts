@@ -1,7 +1,7 @@
 import type { Extension } from "@amira/api"
 import { ReviewCommands } from "./command.ts"
 import { ReviewRunner, settingFields } from "./run.ts"
-import { detailView } from "./ui.ts"
+import { detailView, progressView } from "./ui.ts"
 
 const extension: Extension = (api) => {
   const settings = api.settings.declare({ fields: settingFields })
@@ -10,10 +10,13 @@ const extension: Extension = (api) => {
   api.registerCommand({
     name: "code-review",
     description: "Experimental bounded independent static code review",
-    args: { hint: "[worktree | since REF | status | stop | last | show | ignore | fix]" },
+    args: {
+      hint: "[worktree | since REF | pr NUMBER/URL | --deep | status | stop | last | show | ignore | fix]",
+    },
     run: (args, ctx) => commands.run(args, ctx),
   })
   api.registerView(detailView())
+  api.registerView(progressView(() => runner.snapshot()))
   api.registerStatusItem({
     id: "review-status",
     priority: 20,

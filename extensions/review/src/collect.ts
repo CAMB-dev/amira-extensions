@@ -5,7 +5,8 @@ import type { OwnedConversation, ToolDefinition, ToolResult } from "@amira/api"
 import { exclusion, hash, redact, safePath } from "./privacy.ts"
 
 export type ReviewScope = {
-  kind: "worktree" | "since"
+  kind: "worktree" | "since" | "pr"
+  deep?: boolean
   ref?: string
   paths: string[]
   includeUntracked: boolean
@@ -37,9 +38,9 @@ export type Bundle = {
   removed: number
 }
 
-const FILES = 32
-const LINES = 2_000
-const PATCH_BYTES = 64 * 1024
+export const NORMAL_CAPS = { files: 32, lines: 2_000, patchBytes: 64 * 1024 }
+export const DEEP_CAPS = { files: 128, lines: 8_000, patchBytes: 256 * 1024 }
+export const reviewCaps = (scope: ReviewScope) => (scope.deep ? DEEP_CAPS : NORMAL_CAPS)
 const FILE_BYTES = 32 * 1024
 const INVENTORY_BYTES = 1024 * 1024
 const OUTPUT_BYTES = 2 * 1024 * 1024
@@ -381,6 +382,7 @@ function normalizedScope(scope: ReviewScope): ReviewScope {
     ...(scope.kind === "since" ? { ref: scope.ref } : {}),
     paths: [...new Set(scope.paths.map(safePath))].sort(),
     includeUntracked: scope.includeUntracked,
+    ...(scope.deep ? { deep: true } : {}),
   }
 }
 
@@ -756,6 +758,7 @@ async function snapshot(
   base: string,
   signal: AbortSignal,
 ): Promise<Snapshot> {
+  const { files: FILES, lines: LINES } = reviewCaps(scope)
   const at = ["-C", root]
   const head = singleLine((await git([...at, "rev-parse", "--verify", "HEAD^{commit}"])).raw)
   if (!oid.test(head)) throw new Error("Unborn or unsupported HEAD")
@@ -810,9 +813,10 @@ async function snapshot(
   const selected = metadata(raw, counts).filter((entry) => !metadataReason(entry))
   const pending = scope.includeUntracked ? others.filter((path) => !allowedPath(path)) : []
   // Candidate admission precedes source/guidance work and covers tracked + opted-in untracked files.
-  if (selected.length + pending.length > FILES) throw new Error("Review exceeds 32 files; narrow --path")
+  if (selected.length + pending.length > FILES)
+    throw new Error(`Review exceeds ${FILES} files; narrow --path`)
   if (selected.reduce((sum, entry) => sum + entry.added + entry.removed, 0) > LINES)
-    throw new Error("Review exceeds 2,000 changed lines; narrow --path")
+    throw new Error(`Review exceeds ${LINES.toLocaleString("en-US")} changed lines; narrow --path`)
   const guidance = await trackedGuidance(git, at, [...selected.map((entry) => entry.path), ...pending])
   inventory = [...new Set([...inventory, ...guidance.names])]
   if (
@@ -927,6 +931,7 @@ export async function collect(
   signal: AbortSignal,
 ): Promise<Bundle> {
   const scope = normalizedScope(requested)
+  const { files: FILES, lines: LINES, patchBytes: PATCH_BYTES } = reviewCaps(scope)
   const clock = deadline(signal)
   try {
     const git = runner(owner, shell, clock.signal)
@@ -982,7 +987,9 @@ export async function collect(
     let added = admitted.reduce((sum, entry) => sum + entry.added, 0)
     const removed = admitted.reduce((sum, entry) => sum + entry.removed, 0)
     if (admitted.length > FILES || added + removed > LINES)
-      throw new Error("Review exceeds 32 files / 2,000 changed lines; narrow --path")
+      throw new Error(
+        `Review exceeds ${FILES} files / ${LINES.toLocaleString("en-US")} changed lines; narrow --path`,
+      )
     const changes: Change[] = []
     let privacyBytes = 0
     let rawPatchBytes = 0
@@ -1005,7 +1012,7 @@ export async function collect(
       if (!output.raw.endsWith("\n")) throw new Error("Incomplete file patch")
       rawPatchBytes += Buffer.byteLength(output.raw)
       if (rawPatchBytes > PATCH_BYTES)
-        throw new Error("Combined patch exceeds 64 KiB before redaction; narrow --path")
+        throw new Error(`Combined patch exceeds ${PATCH_BYTES / 1024} KiB before redaction; narrow --path`)
       const sources =
         entry.added + entry.removed
           ? await patchSources(git, root, base, head, scope, entry, clock.signal)
@@ -1024,7 +1031,7 @@ export async function collect(
         metadataOnly: parsed.hunks.length === 0,
       })
       if (Buffer.byteLength(changes.map((change) => change.patch).join("")) > PATCH_BYTES)
-        throw new Error("Combined patch exceeds 64 KiB; narrow --path")
+        throw new Error(`Combined patch exceeds ${PATCH_BYTES / 1024} KiB; narrow --path`)
     }
     for (const path of before.others) {
       const reason = allowedPath(path)
@@ -1036,7 +1043,7 @@ export async function collect(
         exclude(path, "untracked (not included)")
         continue
       }
-      if (changes.length >= FILES) throw new Error("Review exceeds 32 files; narrow --path")
+      if (changes.length >= FILES) throw new Error(`Review exceeds ${FILES} files; narrow --path`)
       let text: string
       try {
         text = await untrackedText(root, path, clock.signal)
@@ -1049,7 +1056,8 @@ export async function collect(
       const lines = text ? text.split("\n") : []
       if (text.endsWith("\n")) lines.pop()
       added += lines.length
-      if (added + removed > LINES) throw new Error("Review exceeds 2,000 changed lines; narrow --path")
+      if (added + removed > LINES)
+        throw new Error(`Review exceeds ${LINES.toLocaleString("en-US")} changed lines; narrow --path`)
       const prefix = `diff --git ${gitPath(`a/${path}`)} ${gitPath(`b/${path}`)}\nnew file mode 100644\n`
       const patch =
         prefix +
@@ -1058,7 +1066,7 @@ export async function collect(
           : "")
       rawPatchBytes += Buffer.byteLength(patch)
       if (rawPatchBytes > PATCH_BYTES)
-        throw new Error("Combined patch exceeds 64 KiB before redaction; narrow --path")
+        throw new Error(`Combined patch exceeds ${PATCH_BYTES / 1024} KiB before redaction; narrow --path`)
       privacyBytes += Buffer.byteLength(text)
       if (privacyBytes > PRIVACY_TOTAL_BYTES)
         throw new Error("Complete privacy sources exceed 256 KiB cap; narrow --path")
@@ -1088,7 +1096,7 @@ export async function collect(
     }
     const patch = changes.map((change) => change.patch).join("")
     if (Buffer.byteLength(patch) > PATCH_BYTES)
-      throw new Error("Combined patch exceeds 64 KiB; narrow --path")
+      throw new Error(`Combined patch exceeds ${PATCH_BYTES / 1024} KiB; narrow --path`)
     const after = await snapshot(git, root, scope, base, clock.signal)
     if (before.value !== after.value)
       throw new Error("Repository changed during collection; start a new review")
