@@ -45,7 +45,7 @@ const questions: AskQuestion[] = [
 const answers: AskAnswer[] = [{ selected: ["Local"] }]
 const meta = { sessionId: "design-session", askId: "ask-1", language: "en" }
 
-test("creation has only batch-one layout and preserves gitignore bytes and marker identity", async () => {
+test("creation initializes cost coverage and preserves gitignore bytes and marker identity", async () => {
   const root = await directory()
   await writeFile(path.join(root, ".gitignore"), "# existing\r\nnode_modules/", "utf8")
   const project = await createProject(root, "New project")
@@ -53,12 +53,18 @@ test("creation has only batch-one layout and preserves gitignore bytes and marke
     "# existing\r\nnode_modules/\r\n.amira/project/\r\n",
   )
   expect((await readdir(location(project, ""))).sort()).toEqual([
+    "costs.json",
     "decisions.md",
     "design.md",
     "iterations",
     "research",
     "suggestions.md",
   ])
+  expect(JSON.parse(await readFile(location(project, "costs.json"), "utf8"))).toMatchObject({
+    projectId: project.marker.id,
+    coverage: { legacyIncomplete: false, policyInitialized: false },
+    owners: [],
+  })
   expect(await readdir(location(project, "iterations"))).toEqual(["1"])
   expect(await readdir(location(project, "iterations/1"))).toEqual([])
   expect(await readProject(root)).toEqual(project)

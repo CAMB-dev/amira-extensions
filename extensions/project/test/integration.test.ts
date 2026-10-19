@@ -20,6 +20,7 @@ import {
   textResult,
 } from "@amira/api"
 import { Agent, AgentTree, InterceptorRegistry, OwnedConversationManager, ToolRegistry } from "@amira/core"
+import { disposeAccounting } from "../src/accounting.ts"
 import { type RecordDecisionDetails, recordDecisionPresenter } from "../src/design.ts"
 import { createProjectExtension, restoreAttachment } from "../src/index.ts"
 import { DecisionStore, IterationStore, readDocument, readProject } from "../src/store.ts"
@@ -158,7 +159,10 @@ async function fixture(builtins: HostAskUserModule, steps: MockStep[] = []) {
   })
   function makeManager() {
     const manager = new OwnedConversationManager({ ai, tools, tree: main.tree!, home, agent: () => main })
-    cleanups.push(() => manager.drain())
+    cleanups.push(async () => {
+      await disposeAccounting(api)
+      await manager.drain()
+    })
     return manager
   }
   let manager = makeManager()
@@ -279,6 +283,7 @@ async function fixture(builtins: HostAskUserModule, steps: MockStep[] = []) {
       data = sessionData()
     },
     async reconstruct() {
+      await disposeAccounting(api)
       await manager.drain()
       for (const dispose of interceptDisposers.splice(0)) dispose()
       manager = makeManager()
@@ -484,7 +489,7 @@ test("releasing and reconstructing the host manager reopens the same saved desig
   expect(reopened.id).toBe(first.id)
   expect(reopened.history()).toEqual(history)
   expect(f.mock.requests).toHaveLength(1)
-  await expect(first.send("Stale writer")).rejects.toThrow("released")
+  await expect(first.send("Stale writer")).rejects.toThrow("unloaded")
   await reopened.send("Continue explicitly")
   expect(f.mock.requests).toHaveLength(2)
   expect(JSON.stringify(reopened.history())).toContain("Explicit continuation only")
@@ -590,7 +595,7 @@ for (const entry of answerCases) {
   })
 }
 
-test("stopping real builtin ask_user during the evidence queue declines without a late decision", async (builtins) => {
+test("stopping real builtin ask_user behind an evidence writer declines without a late decision", async (builtins) => {
   const f = await fixture(builtins, [
     { toolCalls: [{ id: "queued-ask", name: "ask_user", args: { questions: offered } }] },
     { text: "Must not continue after stop" },
@@ -600,7 +605,20 @@ test("stopping real builtin ask_user during the evidence queue declines without 
   const gate = Promise.withResolvers<void>()
   const blocking = Promise.withResolvers<void>()
   const queued = Promise.withResolvers<void>()
-  cleanups.push(async () => gate.resolve())
+  const shown = Promise.withResolvers<void>()
+  const answer = Promise.withResolvers<AskAnswer[]>()
+  cleanups.push(async () => {
+    gate.resolve()
+    answer.resolve(confirmed)
+  })
+  f.setAskHandler(() => {
+    shown.resolve()
+    return answer.promise
+  })
+  // Present the question before taking the project-wide writer claim. Otherwise
+  // its initial state read queues behind the seed and it cannot reach publication.
+  const turn = f.handle().send("Ask while another confirmation is being persisted")
+  await shown.promise
   const seed = new DecisionStore(project, {
     afterEvidenceSync: async () => {
       blocking.resolve()
@@ -608,27 +626,44 @@ test("stopping real builtin ask_user during the evidence queue declines without 
     },
   }).record(offered, confirmed, { sessionId: "seed", askId: "seed", language: "en" })
   await blocking.promise
-  const original = DecisionStore.prototype.record
-  let pending: Promise<unknown> | undefined
-  const spy = spyOn(DecisionStore.prototype, "record").mockImplementation(function (
+  const original = IterationStore.prototype.read
+  const publication = Promise.withResolvers<unknown>()
+  const record = DecisionStore.prototype.record
+  const recordSpy = spyOn(DecisionStore.prototype, "record").mockImplementation(function (
     this: DecisionStore,
     ...args
   ) {
-    const result = original.apply(this, args)
-    pending = result.catch(() => {})
+    const result = record.apply(this, args)
+    publication.resolve(result.catch(() => {}))
+    return result
+  })
+  const spy = spyOn(IterationStore.prototype, "read").mockImplementation(function (this: IterationStore) {
+    // The answered question's revision recheck shares the evidence writer's claim.
+    const result = original.call(this)
     queued.resolve()
     return result
   })
-  cleanups.push(async () => spy.mockRestore())
-  const turn = f.handle().send("Ask while another confirmation is being persisted")
+  cleanups.push(async () => {
+    spy.mockRestore()
+    recordSpy.mockRestore()
+  })
+  answer.resolve(confirmed)
   await queued.promise
-  await f.handle().stop("Cancel queued human confirmation")
-  await turn
-  const result = toolResults(f.handle()).find((message) => message.toolCallId === "queued-ask")!
-  expect(result.details).toMatchObject({ questions: offered, outcome: { declined: true } })
+  const signal = f.asks[0]!.options.signal
+  const aborted = new Promise<void>((resolve) =>
+    signal.addEventListener("abort", () => resolve(), { once: true }),
+  )
+  const stopped = f.handle().stop("Cancel queued human confirmation")
+  await aborted
+  // Accounting teardown also uses the claim; allow it to flush only after the
+  // host has synchronously cancelled the queued human answer.
   gate.resolve()
   await seed
-  await pending
+  await stopped
+  await turn
+  await publication.promise
+  const result = toolResults(f.handle()).find((message) => message.toolCallId === "queued-ask")!
+  expect(result.details).toMatchObject({ questions: offered, outcome: { declined: true } })
   // records() bypasses the write queue; no sleeps or scheduler timing can hide a late publication.
   expect((await new DecisionStore(project).records()).map((record) => record.id)).toEqual(["D1"])
   const evidence = readFileSync(path.join(project.root, ".amira/project/decisions.evidence.jsonl"), "utf8")

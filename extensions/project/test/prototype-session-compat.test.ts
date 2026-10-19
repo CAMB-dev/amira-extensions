@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:f
 import { tmpdir } from "node:os"
 import path from "node:path"
 import type { CommandContext, ExtensionAPI, OwnedConversation } from "@amira/api"
+import { disposeAccounting } from "../src/accounting.ts"
 import { PrototypeSessions, validatePrototypeReport } from "../src/prototype-sessions.ts"
 import { createProject, IterationStore } from "../src/store.ts"
 import { hostDescribe, loadHostModule, requireHostModule } from "./amira-source.ts"
@@ -186,6 +187,7 @@ async function hostFixture() {
     conversations,
     intercept: (point, handler, options) => interceptors.add(point, handler, options, "project"),
   } as ExtensionAPI
+  cleanups.push(() => disposeAccounting(api))
   const output: string[] = []
   const ctx = {
     print: (text: string) => output.push(text),

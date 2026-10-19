@@ -14,7 +14,7 @@
     {
       "name": "project",
       "description": "Experimental project discovery, guided design conversations, durable human decisions, a confirmed stage engine, confined prototypes, spec-driven implementation, acceptance and workflow/swarm execution modes: /project",
-      "version": "0.6.1",
+      "version": "0.7.0",
       "status": "wip",
       "statusMessage": "Design is still in flux; ship, spend caps, dashboard and archive are paused.",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/project" },

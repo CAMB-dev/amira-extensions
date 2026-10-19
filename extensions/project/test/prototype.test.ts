@@ -9,15 +9,19 @@ import type {
   ExtensionAPI,
   OwnedConversation,
 } from "@amira/api"
+import { disposeAccounting, projectAccounting } from "../src/accounting.ts"
 import { latestPrototypeManifest, Prototypes, validateVariantProposals } from "../src/prototype.ts"
 import { reportText, validatePrototypeReport } from "../src/prototype-sessions.ts"
 import { runStageCommand } from "../src/stage-commands.ts"
 import { createProject, DecisionStore, IterationStore } from "../src/store.ts"
 import { human } from "./iteration-binding-helper.ts"
+import { ownedFixture, zeroUsage } from "./owned-fixture.ts"
 
 setDefaultTimeout(60_000)
 const roots: string[] = []
+const apis: ExtensionAPI[] = []
 afterEach(async () => {
+  await Promise.all(apis.splice(0).map(disposeAccounting))
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
 })
 
@@ -103,9 +107,11 @@ async function fixture(apiVersion: string | undefined = "0.1.53") {
   const specs: ConversationSpec[] = []
   const runtimes: ConversationRuntime[] = []
   const handles = new Map<string, OwnedConversation>()
+  const released = new WeakSet<OwnedConversation>()
+  const usage = new Map<string, ReturnType<typeof zeroUsage>>()
   let history: ReturnType<OwnedConversation["history"]> = []
   let busy = false
-  const send = mock(async () => {
+  const send = mock(async (): Promise<void> => {
     throw new Error("Creation must not send a model turn")
   })
   const createGroup = mock(() => {
@@ -115,6 +121,15 @@ async function fixture(apiVersion: string | undefined = "0.1.53") {
     throw new Error("Commands must not execute tools")
   })
   const stop = mock(async () => {})
+  let modelText = JSON.stringify(proposals)
+  const complete = mock(async (_request: unknown) => ({
+    text: modelText,
+    message: {
+      role: "assistant" as const,
+      model: { provider: "mock", model: "fixture" },
+      content: [{ type: "text" as const, text: modelText }],
+    },
+  }))
   const openOrCreate = mock(async (spec: ConversationSpec, runtime: ConversationRuntime) => {
     specs.push(spec)
     runtimes.push(runtime)
@@ -125,12 +140,16 @@ async function fixture(apiVersion: string | undefined = "0.1.53") {
       cwd: spec.cwd,
       data: { read: () => [], append: () => {} },
       history: () => history,
+      usage: () => structuredClone(usage.get(handle.id) ?? zeroUsage(handle.id)),
+      complete,
       status: () => ({ state: busy ? "working" : "idle", busy }),
       events: { async *[Symbol.asyncIterator]() {} },
       send,
       createGroup,
       stop,
-      release: async () => {},
+      release: async () => {
+        released.add(handle)
+      },
       ...{ runTool },
     }
     handles.set(handle.id, handle)
@@ -140,16 +159,51 @@ async function fixture(apiVersion: string | undefined = "0.1.53") {
     runtimes.push(runtime)
     const handle = handles.get(id)
     if (!handle) throw new Error(`Unknown fake conversation: ${id}`)
-    return handle
+    if (!released.has(handle)) return handle
+    const reopened: OwnedConversation = {
+      ...handle,
+      complete,
+      send,
+      createGroup,
+      stop,
+      runTool,
+      release: async () => {
+        released.add(reopened)
+      },
+    }
+    handles.set(id, reopened)
+    return reopened
   })
-  let modelText = JSON.stringify(proposals)
-  const complete = mock(async (_request: unknown) => ({ text: modelText }))
   const api = {
     apiVersion,
     dataDir: path.join(home, "extension-data"),
-    conversations: { openOrCreate, open },
+    conversations: {
+      openOrCreate: async (spec: ConversationSpec, runtime: ConversationRuntime) => {
+        if (!spec.key.includes("/generation/")) return openOrCreate(spec, runtime)
+        const handle = { ...ownedFixture(spec, spec.key), complete }
+        handles.set(handle.id, handle)
+        return handle
+      },
+      open,
+      read: async (ref: { id: string } | { key: string }) => {
+        const saved = [...handles.values()].find((handle) =>
+          "id" in ref ? handle.id === ref.id : handle.key === ref.key,
+        )
+        if (!saved) return undefined
+        return {
+          id: saved.id,
+          key: saved.key,
+          cwd: saved.cwd,
+          name: saved.name,
+          archived: false,
+          history: saved.history(),
+          usage: saved.usage(),
+        }
+      },
+    },
     complete,
   } as unknown as ExtensionAPI
+  apis.push(api)
   const controller = new Prototypes(api)
   const changed = mock(() => {})
   const checkOrigin = mock(() => {})
@@ -214,6 +268,13 @@ async function fixture(apiVersion: string | undefined = "0.1.53") {
     complete,
     changed,
     quiesceDesign,
+    setCost: (id: string, cost: number) => {
+      const snapshot = zeroUsage(id)
+      snapshot.revision = (usage.get(id)?.revision ?? 0) + 1
+      snapshot.own.knownCostUsd = snapshot.total.knownCostUsd = cost
+      snapshot.own.usage.cost = snapshot.total.usage.cost = cost
+      usage.set(id, snapshot)
+    },
     setModelText: (text: string) => {
       modelText = text
     },
@@ -222,6 +283,31 @@ async function fixture(apiVersion: string | undefined = "0.1.53") {
     },
   }
 }
+
+test("project cap invalidates cached prototype owners and continuation reopens the same variant", async () => {
+  const f = await fixture()
+  await f.plan(true)
+  const original = f.focusConversation.mock.calls[0]![0]
+  const accounting = await projectAccounting(f.api, f.project)
+  await accounting.costs.configure("cap", 1)
+  f.setCost(original.id, 1)
+  await accounting.refresh(original.key, original)
+  await accounting.settled()
+  expect(f.controller.sessions.isPrototypeSession(original.id)).toBe(false)
+  await expect(f.run(["alpha"])).rejects.toThrow("stopped")
+  await accounting.costs.configure("raise", 2)
+  await expect(original.send("Stale composer must stay fenced")).rejects.toThrow("released")
+  await f.run(["alpha"])
+  const reopened = f.focusConversation.mock.calls.at(-1)![0]
+  expect(reopened.id).toBe(original.id)
+  expect(reopened).not.toBe(original)
+  expect(f.specs).toHaveLength(1)
+  expect(f.controller.sessions.isPrototypeSession(reopened.id)).toBe(true)
+  expect(f.send).not.toHaveBeenCalled()
+  f.send.mockImplementationOnce(async () => {})
+  await reopened.send("Explicitly resume the prototype")
+  expect(f.send).toHaveBeenCalledWith("Explicitly resume the prototype")
+})
 
 type Fixture = Awaited<ReturnType<typeof fixture>>
 async function readyVariant(f: Fixture) {

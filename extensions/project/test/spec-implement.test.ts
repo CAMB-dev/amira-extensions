@@ -1,5 +1,5 @@
 import { afterEach, expect, setDefaultTimeout, spyOn, test } from "bun:test"
-import { readFile, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises"
 import path from "node:path"
 import type { SpawnOptions } from "@amira/api"
 import { IMPLEMENT_SPAWN, IMPLEMENT_TOOLS, Implementations } from "../src/implement.ts"
@@ -49,7 +49,9 @@ test("spec generation is text-only, renders the exact plan, revises stable IDs f
   expect(state.phase).toBe("confirmed")
   expect(state.receipts).toHaveLength(1)
   expect(state.artifacts.filter((entry) => entry.kind === "spec")).toHaveLength(2)
-  expect(f.specs).toHaveLength(0)
+  expect(f.specs).toHaveLength(0) // No executable setup or implementation owner.
+  expect(f.generationSpecs).toHaveLength(2)
+  expect(f.generationSpecs.every((spec) => spec.callableTools.length === 0)).toBe(true)
   expect(f.prints.join("\n")).toContain("## Batch plan")
   expect(f.prints.join("\n")).toContain("cwd (relative to iteration project): `.`")
   const requests = JSON.stringify(f.complete.mock.calls)
@@ -250,6 +252,7 @@ test("empty/no-commit repo requires bootstrap confirmation; rejected hook is nev
   await git(f.repo, 'config user.email "fixture@invalid.local"')
   await git(f.repo, "config commit.gpgsign false")
   const hook = path.join(f.repo, ".git", "hooks", "pre-commit")
+  await mkdir(path.dirname(hook), { recursive: true })
   await writeFile(hook, "#!/bin/sh\necho fixture-hook-rejected >&2\nexit 1\n", { mode: 0o755 })
   f.answers.push(true)
   await expect(f.implementations.run(f.project, f.ctx, "en", () => {})).rejects.toThrow(

@@ -40,6 +40,9 @@ export class ImplementationLifecycle {
     this.controller.abort(new Error(reason))
   }
   check(): void {
+    // Accounting cancellation may already have released the host capability.
+    // Observe our terminal fence before querying executable owner state.
+    this.controller.signal.throwIfAborted()
     if (!this.drained && this.handle.status().state === "stopped")
       this.cancel(`${this.label} coordinator was stopped`)
     this.controller.signal.throwIfAborted()

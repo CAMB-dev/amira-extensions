@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto"
 import type { CommandContext, ExtensionAPI } from "@amira/api"
+import { openAccounted } from "./accounting.ts"
 import type { CorrectionInputs } from "./correction.ts"
 import { inDirectory, type Shell, shellCall, verifyWorktree } from "./iteration-git.ts"
 import { IterationStore, type Project } from "./store.ts"
@@ -24,7 +25,10 @@ export async function collectCorrectionChanges(
   if (worktree?.kind !== "iteration-worktree" || worktree.status !== "ready")
     throw new Error("Correction requires the retained ready worktree; no shared-checkout fallback.")
   const shell: Shell = ctx.session.info().shell === "powershell" ? "powershell" : "bash"
-  const handle = await api.conversations.openOrCreate(
+  const handle = await openAccounted(
+    api,
+    project,
+    { stage: "implement", role: "correction-checkout" },
     {
       key: `${project.marker.id}/iteration/${state.iteration}/correction-files/${randomUUID()}`,
       name: "Correction changed-file evidence",

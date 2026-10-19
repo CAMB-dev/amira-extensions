@@ -51,10 +51,14 @@ export async function acceptanceFixture(options: { contributors?: string[]; extr
   let beforeReport: (() => Promise<void>) | undefined
   let commandResult: ((command: string) => ToolResult | undefined) | undefined
   const handles: OwnedConversation[] = []
+  const releases: ReturnType<typeof mock<() => Promise<void>>>[] = []
   const available = ["mock/reviewer", "mock/actual-implementer", "mock/second-implementer"]
   f.ctx.session.models = () => available
   f.api.conversations!.openOrCreate = async (spec: ConversationSpec, runtime: ConversationRuntime) => {
     specs.push(spec)
+    // Accounting decorates the host handle in place; keep the original release spy.
+    const release = mock(async () => {})
+    releases.push(release)
     const handle = {
       id: `review-${specs.length}`,
       ...spec,
@@ -85,7 +89,7 @@ export async function acceptanceFixture(options: { contributors?: string[]; extr
           )
       }),
       stop: mock(async () => {}),
-      release: mock(async () => {}),
+      release,
     } as unknown as OwnedConversation
     handles.push(handle)
     return handle
@@ -99,6 +103,7 @@ export async function acceptanceFixture(options: { contributors?: string[]; extr
     reviewCalls: calls,
     records,
     reviewHandles: handles,
+    reviewReleases: releases,
     report: (value: unknown) => {
       report = value
     },

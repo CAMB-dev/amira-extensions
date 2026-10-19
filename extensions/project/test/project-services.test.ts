@@ -29,13 +29,13 @@ function provider() {
     available: () => true,
     capabilities: { cwd: true, freshRun: true, models: true, ownedLifetime: true, progress: true },
     startBound: mock(async (request, owner) => {
-      owner.createGroup({ name: "Offline provider", maxAgents: 1, maxConcurrent: 1 })
+      const group = owner.createGroup({ name: "Offline provider", maxAgents: 1, maxConcurrent: 1 })
       snapshot = {
         ...snapshot,
         cwd: request.cwd,
         models: ["mock/actual-provider"],
         sessionIds: ["provider-child"],
-        groupId: "provider-group",
+        groupId: group.id,
         phase: "Implement",
         children: [
           { label: "Writer", state: "working", model: "mock/actual-provider", sessionId: "provider-child" },
@@ -165,7 +165,11 @@ test("bound workflow passes owner/cwd, shows progress, saves actual execution ev
   expect(owner.sessionId).toBe(f.handles.at(-1)!.id)
   expect(owner.signal).toBeInstanceOf(AbortSignal)
   expect(owner.label).toBe("Implement B1")
-  expect(f.handles.at(-1)!.createGroup).toHaveBeenCalled()
+  expect(f.groupFactories.get(f.handles.at(-1)!.id)).toHaveBeenCalledWith({
+    name: "Offline provider",
+    maxAgents: 1,
+    maxConcurrent: 1,
+  })
   await writeFile(path.join(request.cwd, "result.txt"), "ready\n")
   p.complete()
   await f.settled()
@@ -179,7 +183,7 @@ test("bound workflow passes owner/cwd, shows progress, saves actual execution ev
     cwd: request.cwd,
     runId: "offline-run",
     sessionIds: ["provider-child"],
-    groupId: "provider-group",
+    groupId: p.runner.status("offline-run")!.groupId,
   })
   f.api.useService = () => undefined
   const restarted = new Implementations(f.api)

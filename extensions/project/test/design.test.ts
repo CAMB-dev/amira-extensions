@@ -16,10 +16,13 @@ import type {
   ToolPresenter,
 } from "@amira/api"
 import { textResult } from "@amira/api"
+import { disposeAccounting, projectAccounting } from "../src/accounting.ts"
+import { initialCostLedger } from "../src/cost.ts"
 import { DesignSessions, type RecordDecisionDetails, recordDecisionPresenter } from "../src/design.ts"
 import { LanguagePolicy } from "../src/language.ts"
 import { DecisionStore, type Project } from "../src/store.ts"
 import { hostTest, loadHostModule } from "./amira-source.ts"
+import { zeroUsage } from "./owned-fixture.ts"
 
 interface HostAskUserModule {
   askUserTool: ToolDefinition<{ questions: AskQuestion[] }>
@@ -56,12 +59,16 @@ async function fixture() {
       schemaVersion: 1,
       id: "project-one",
       name: "Example",
-      created: "2026-10-14T00:00:00.000Z",
+      created: new Date().toISOString(),
       currentIteration: 1,
       settings: {},
     },
   }
   await writeFile(path.join(root, ".amira", "project.json"), JSON.stringify(project.marker))
+  await writeFile(
+    path.join(documents, "costs.json"),
+    JSON.stringify(initialCostLedger(project.marker.id, project.marker.created)),
+  )
   const specs: ConversationSpec[] = []
   const runtimes: ConversationRuntime[] = []
   const opened: string[] = []
@@ -70,6 +77,8 @@ async function fixture() {
   let answers: AskAnswer[] | undefined = [{ selected: ["Small scope"] }]
   const asks: { questions: AskQuestion[]; options: unknown }[] = []
   const handles = new Map<string, OwnedConversation>()
+  const released = new WeakSet<OwnedConversation>()
+  const usage = new Map<string, ReturnType<typeof zeroUsage>>()
   function handle(id: string, key = "project-one/design/1"): OwnedConversation {
     const result: OwnedConversation = {
       id,
@@ -78,13 +87,19 @@ async function fixture() {
       cwd: root,
       data: { read: () => [], append: () => {} },
       history: () => [],
+      usage: () => structuredClone(usage.get(id) ?? zeroUsage(id)),
+      complete: async () => {
+        throw new Error("Design fixture must not generate text")
+      },
       status: () => ({ state: "idle", busy: false }),
       events: { async *[Symbol.asyncIterator]() {} },
       send: async () => {
         throw new Error("Opening must not send a turn")
       },
       stop: async () => {},
-      release: async () => {},
+      release: async () => {
+        released.add(result)
+      },
       createGroup: () => {
         throw new Error("Opening must not spawn research")
       },
@@ -108,7 +123,23 @@ async function fixture() {
     open: async (id: string, runtime: ConversationRuntime) => {
       opened.push(id)
       runtimes.push(runtime)
-      return handles.get(id) ?? handle(id)
+      const saved = handles.get(id)
+      return saved && !released.has(saved) ? saved : handle(id, saved?.key)
+    },
+    read: async (ref: { id: string } | { key: string }) => {
+      const saved = [...handles.values()].find((handle) =>
+        "id" in ref ? handle.id === ref.id : handle.key === ref.key,
+      )
+      if (!saved) return undefined
+      return {
+        id: saved.id,
+        key: saved.key,
+        cwd: saved.cwd,
+        name: saved.name,
+        archived: false,
+        history: saved.history(),
+        usage: saved.usage(),
+      }
     },
   }
   const control = { info: () => ({ id: "main-fixture" }) }
@@ -140,6 +171,7 @@ async function fixture() {
     dataDir: path.join(home, "data"),
     session: () => control,
   } as unknown as ExtensionAPI
+  cleanups.push(() => disposeAccounting(api))
   return {
     api,
     ctx,
@@ -158,6 +190,13 @@ async function fixture() {
       answers = value
     },
     runtime: () => runtimes.at(-1)!,
+    setCost: (id: string, cost: number) => {
+      const snapshot = zeroUsage(id)
+      snapshot.revision = (usage.get(id)?.revision ?? 0) + 1
+      snapshot.own.knownCostUsd = snapshot.total.knownCostUsd = cost
+      snapshot.own.usage.cost = snapshot.total.usage.cost = cost
+      usage.set(id, snapshot)
+    },
   }
 }
 
@@ -174,6 +213,29 @@ test("design opens natively and reopens the saved project/iteration ID without m
   expect(f.opened).toEqual(["design-1"])
   expect(f.specs).toHaveLength(1)
   expect(f.focused).toHaveLength(2)
+})
+
+test("project cap invalidates the cached design owner and continuation reopens its saved identity", async () => {
+  const f = await fixture()
+  const sessions = new DesignSessions(f.api)
+  await sessions.open(f.project, f.ctx, "en")
+  const original = f.focused[0]!
+  const accounting = await projectAccounting(f.api, f.project)
+  await accounting.costs.configure("cap", 1)
+  f.setCost(original.id, 1)
+  await accounting.refresh(original.key, original)
+  await accounting.settled()
+  expect(sessions.isDesignSession(original.id)).toBe(false)
+  await expect(sessions.open(f.project, f.ctx, "en")).rejects.toThrow("stopped")
+  await accounting.costs.configure("raise", 2)
+  await expect(original.send("Stale composer must stay fenced")).rejects.toThrow("released")
+  await sessions.open(f.project, f.ctx, "en")
+  const reopened = f.focused.at(-1)!
+  expect(reopened.id).toBe(original.id)
+  expect(reopened).not.toBe(original)
+  expect(f.specs).toHaveLength(1)
+  expect(f.opened).toEqual([original.id])
+  expect(sessions.isDesignSession(reopened.id)).toBe(true)
 })
 
 const offered: AskQuestion[] = [
@@ -640,13 +702,27 @@ builtinTest(
       managers.push(manager)
       return manager
     }
+    const apis: ExtensionAPI[] = []
     cleanups.push(async () => {
       mainHold.resolve()
+      for (const api of apis) await disposeAccounting(api)
       for (const manager of managers) await manager.drain()
       await main.dispose()
     })
     const host = manager()
-    const api = { ...f.api, conversations: host.forOwner("project-fixture") }
+    const conversations = host.forOwner("project-fixture")
+    let runtime: ConversationRuntime | undefined
+    const api = {
+      ...f.api,
+      conversations: {
+        ...conversations,
+        openOrCreate: (spec: ConversationSpec, value: ConversationRuntime) => {
+          runtime = value
+          return conversations.openOrCreate(spec, value)
+        },
+      },
+    }
+    apis.push(api)
     const sessions = new DesignSessions(api)
     await sessions.open(f.project, f.ctx, "en")
     const conversation = f.focused[0]!
@@ -675,13 +751,11 @@ builtinTest(
     expect(JSON.stringify(modelToolResults)).toContain("not callable")
     expect(JSON.stringify(modelToolResults)).toContain("Human-confirmed decisions saved: D2")
     const history = conversation.history()
-    await expect(
-      new DesignSessions({ ...api, conversations: manager().forOwner("project-fixture") }).open(
-        f.project,
-        f.ctx,
-        "en",
-      ),
-    ).rejects.toThrow("in use")
+    // Exercise the native lease directly: another accounting writer against this
+    // same ledger would test its revision fence instead of the host's owner lease.
+    await expect(manager().forOwner("project-fixture").open(conversation.id, runtime!)).rejects.toThrow(
+      "in use",
+    )
     await main.dispose()
     main = new Agent({ ai, model: ai.model("mock/test"), cwd: f.root, tools, tree, sections: [] })
     await sessions.open(f.project, f.ctx, "zh-CN")
@@ -692,9 +766,13 @@ builtinTest(
     ).toContain("zh-CN")
     expect(conversation.history().length).toBeGreaterThan(history.length)
     const savedHistory = conversation.history()
+    // Unload the extension before releasing its host-owned conversation service.
+    await disposeAccounting(api)
     await host.drain()
     const requestCount = mock.requests.length
-    const restarted = new DesignSessions({ ...api, conversations: manager().forOwner("project-fixture") })
+    const restartedApi = { ...f.api, conversations: manager().forOwner("project-fixture") }
+    apis.push(restartedApi)
+    const restarted = new DesignSessions(restartedApi)
     await restarted.open(f.project, f.ctx, "zh-CN")
     const reopened = f.focused.at(-1)!
     expect(reopened.id).toBe(conversation.id)

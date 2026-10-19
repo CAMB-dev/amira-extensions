@@ -16,6 +16,7 @@ import type {
   ToolResult,
 } from "@amira/api"
 import { textResult } from "@amira/api"
+import { openAccounted, reopenAccounted, retainAccountedRun } from "./accounting.ts"
 import { validateAskAnswers } from "./answers.ts"
 import { ProjectCommandError, projectError } from "./diagnostics.ts"
 import { conversationLanguage, LanguagePolicy, localize, resolveLanguage } from "./language.ts"
@@ -79,6 +80,7 @@ type Binding = {
   handle?: OwnedConversation
   ready?: Promise<OwnedConversation>
   paused?: boolean
+  runtimeCleanup?: () => void
 }
 
 type SavedIdentity = {
@@ -445,8 +447,11 @@ export class DesignSessions {
     }
     const runtime = this.runtime(binding)
     const handle = saved
-      ? await this.api.conversations!.open(saved.id, runtime)
-      : await this.api.conversations!.openOrCreate(
+      ? await reopenAccounted(this.api, project, { stage: "design", role: "conversation" }, saved, runtime)
+      : await openAccounted(
+          this.api,
+          project,
+          { stage: "design", role: "conversation" },
           {
             key,
             name: `${project.marker.name} · ${localize(binding.language, "Design", "设计", "設計")} · ${project.marker.currentIteration}`,
@@ -503,6 +508,14 @@ export class DesignSessions {
         throw error
       }
     }
+    binding.runtimeCleanup?.()
+    binding.runtimeCleanup = retainAccountedRun(handle, {
+      stop: () => {
+        binding.paused = true
+        if (this.bindings.get(key) === binding) this.bindings.delete(key)
+      },
+      drain: async () => {}, // The accounting adapter stops/releases and drains the host owner.
+    })
     return handle
   }
 

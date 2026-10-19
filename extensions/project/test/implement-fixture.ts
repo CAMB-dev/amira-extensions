@@ -1,4 +1,4 @@
-import { expect, mock } from "bun:test"
+import { afterEach, expect, mock } from "bun:test"
 import { mkdir, mkdtemp, realpath, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
@@ -11,10 +11,17 @@ import type {
   ToolContext,
   ToolDefinition,
 } from "@amira/api"
+import { disposeAccounting } from "../src/accounting.ts"
 import type { SpecArtifact } from "../src/artifacts.ts"
 import { Implementations } from "../src/implement.ts"
 import { runSpec } from "../src/spec.ts"
 import { createProject, IterationStore } from "../src/store.ts"
+import { ownedFixture, zeroUsage } from "./owned-fixture.ts"
+
+const accountingApis: ExtensionAPI[] = []
+afterEach(async () => {
+  await Promise.all(accountingApis.splice(0).map((api) => disposeAccounting(api)))
+})
 
 export const specDraft = (
   revision = 1,
@@ -130,9 +137,11 @@ export async function fixture(options: { initialized?: boolean; subdirectory?: b
     },
   } as unknown as CommandContext
   const specs: ConversationSpec[] = []
+  const generationSpecs: ConversationSpec[] = []
   const runtimes: ConversationRuntime[] = []
   const commands: { key: string; cwd: string; command: string }[] = []
   const handles: OwnedConversation[] = []
+  const groupFactories = new Map<string, OwnedConversation["createGroup"]>()
   const notifications: string[] = []
   const drafts = [specDraft()]
   const complete = mock(async (_request: unknown) => ({ text: JSON.stringify(drafts.shift()) }))
@@ -146,6 +155,13 @@ export async function fixture(options: { initialized?: boolean; subdirectory?: b
     notify: (message: string) => notifications.push(message),
     conversations: {
       openOrCreate: async (spec: ConversationSpec, runtime: ConversationRuntime) => {
+        if (!spec.callableTools.length) {
+          generationSpecs.push(spec)
+          return {
+            ...ownedFixture(spec, `generation-${generationSpecs.length}`),
+            complete,
+          } as unknown as OwnedConversation
+        }
         specs.push(spec)
         runtimes.push(runtime)
         const handle = {
@@ -153,6 +169,7 @@ export async function fixture(options: { initialized?: boolean; subdirectory?: b
           ...spec,
           data: { read: () => [], append: () => {} },
           history: () => [],
+          usage: () => zeroUsage(handle.id),
           status: () => ({ state: "idle", busy: false }),
           events: { async *[Symbol.asyncIterator]() {} },
           runTool: mock(async (_name: string, args: Record<string, unknown>) => {
@@ -172,9 +189,11 @@ export async function fixture(options: { initialized?: boolean; subdirectory?: b
           stop: mock(async () => {}),
           release: mock(async () => {}),
           createGroup: mock(() => ({
+            id: `group-${specs.length}`,
             spawn: (opts: unknown) => {
               spawned = opts
               return {
+                id: "real-child-mock",
                 model: { provider: "mock", model: "actual-implementer" },
                 result: async () => {
                   await writeFile(path.join(spec.cwd, "result.txt"), "ready\n")
@@ -190,11 +209,13 @@ export async function fixture(options: { initialized?: boolean; subdirectory?: b
             ended: async () => ({}),
           })),
         } as unknown as OwnedConversation
+        groupFactories.set(handle.id, handle.createGroup)
         handles.push(handle)
         return handle
       },
     },
   } as unknown as ExtensionAPI
+  accountingApis.push(api)
   const implementations = new Implementations(api)
   const approve = async () => {
     answers.push("Approve spec and batch plan")
@@ -223,8 +244,10 @@ export async function fixture(options: { initialized?: boolean; subdirectory?: b
     ctx,
     api,
     specs,
+    generationSpecs,
     runtimes,
     handles,
+    groupFactories,
     commands,
     drafts,
     complete,

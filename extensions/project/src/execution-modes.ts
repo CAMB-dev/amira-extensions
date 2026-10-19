@@ -1,5 +1,6 @@
 import path from "node:path"
 import type { ExtensionAPI, OwnedConversation, SpawnGroup, SpawnGroupOptions } from "@amira/api"
+import { captureAccountedRun, retainAccountedRun } from "./accounting.ts"
 
 export type ExecutionMode = "single" | "workflow" | "swarm"
 type BoundMode = Exclude<ExecutionMode, "single">
@@ -17,6 +18,7 @@ export interface RunnerSnapshot {
   runId: string
   cwd?: string
   groupId?: string
+  groupIds?: string[]
   sessionIds?: string[]
   models?: string[]
   status?: string
@@ -116,6 +118,7 @@ export interface BoundProgress {
   cwd?: string
   runId: string
   groupId?: string
+  groupIds?: string[]
 }
 export interface BoundRunResult {
   text: string
@@ -123,6 +126,7 @@ export interface BoundRunResult {
   runId: string
   sessionIds: string[]
   groupId?: string
+  groupIds?: string[]
   cwd: string
 }
 
@@ -131,6 +135,7 @@ export class BoundRunError extends Error {
   readonly models: string[]
   readonly sessionIds: string[]
   readonly groupId?: string
+  readonly groupIds?: string[]
   readonly cwd?: string
 
   constructor(
@@ -143,6 +148,7 @@ export class BoundRunError extends Error {
     this.models = metadata.models
     this.sessionIds = metadata.sessionIds
     this.groupId = metadata.groupId
+    this.groupIds = metadata.groupIds
     this.cwd = metadata.cwd
   }
 }
@@ -212,8 +218,20 @@ export async function runBound(options: BoundRunOptions): Promise<BoundRunResult
   return new Promise<BoundRunResult>((resolve, reject) => {
     let runId: string | undefined
     let groupId: string | undefined
+    const groupIds = new Set<string>()
+    const groups = new Set<SpawnGroup>()
+    let startFinished!: () => void
+    const startSettled = new Promise<void>((resolve) => {
+      startFinished = resolve
+    })
+    let runFinished!: () => void
+    const runSettled = new Promise<void>((resolve) => {
+      runFinished = resolve
+    })
     let effectiveCwd: string | undefined
     let finished = false
+    let bindingReady = false
+    let pendingResult: RunnerSnapshot | undefined
     let stopRequested = false
     let stopped = false
     const models = new Set<string>()
@@ -227,11 +245,13 @@ export async function runBound(options: BoundRunOptions): Promise<BoundRunResult
     const metadata = () => ({
       runId,
       groupId,
+      groupIds: [...groupIds],
       cwd: effectiveCwd,
       models: [...models],
       sessionIds: [...sessionIds],
     })
     const cleanup = () => {
+      runFinished()
       if (timer !== undefined) clearInterval(timer)
       signal.removeEventListener("abort", aborted)
       for (const unsubscribe of subscriptions) {
@@ -280,6 +300,8 @@ export async function runBound(options: BoundRunOptions): Promise<BoundRunResult
       for (const model of snapshot.models ?? []) models.add(model)
       for (const id of snapshot.sessionIds ?? []) sessionIds.add(id)
       groupId ??= snapshot.groupId
+      if (snapshot.groupId) groupIds.add(snapshot.groupId)
+      for (const id of snapshot.groupIds ?? []) groupIds.add(id)
       // Workflow status() deliberately omits phase/children. Do not erase the
       // detailed onProgress snapshot on each liveness poll.
       if (mode === "swarm" && snapshot.members !== undefined)
@@ -320,12 +342,18 @@ export async function runBound(options: BoundRunOptions): Promise<BoundRunResult
           cwd: effectiveCwd,
           runId: runId!,
           groupId,
+          groupIds: [...groupIds],
         }
         // Each panel invalidation also refreshes durable stage evidence. Liveness
         // polling must not turn unchanged provider status into repeated disk work.
         const fingerprint = JSON.stringify(progress)
         if (fingerprint !== publishedProgress) {
           publishedProgress = fingerprint
+          void captureAccountedRun(handle, {
+            run: { kind: mode, id: runId! },
+            sessionIds: [...sessionIds],
+            groupId,
+          }).catch((error) => fail(error))
           onProgress?.(progress)
         }
       } catch (error) {
@@ -344,6 +372,10 @@ export async function runBound(options: BoundRunOptions): Promise<BoundRunResult
       }
     }
     const result = (snapshot: RunnerSnapshot) => {
+      if (!bindingReady) {
+        pendingResult ??= snapshot
+        return
+      }
       if (!observe(snapshot)) return
       // Terminal status/progress is not a settlement barrier: only onResult reaches here.
       if (mode === "workflow" && (snapshot.status !== "done" || incompleteChild)) {
@@ -405,6 +437,26 @@ export async function runBound(options: BoundRunOptions): Promise<BoundRunResult
       if (finished) unsubscribe()
       else subscriptions.add(unsubscribe)
     }
+    const releaseRuntime = retainAccountedRun(handle, {
+      stop(reason) {
+        stopRequested = true
+        stopRun()
+        cancellation.abort(new Error(reason))
+        for (const group of groups) {
+          try {
+            group.end(reason)
+          } catch {
+            // Still cancel every sibling; drain() reports unsettled groups.
+          }
+        }
+      },
+      async drain() {
+        // A late start can still return an ID after cancellation; stop that exact
+        // original provider before waiting for every retained sibling group.
+        await startSettled
+        await Promise.all([...groups].map((group) => group.ended()))
+      },
+    })
     signal.addEventListener("abort", aborted, { once: true })
     timer = setInterval(poll, 100)
     const owner: RunnerOwner = {
@@ -413,7 +465,9 @@ export async function runBound(options: BoundRunOptions): Promise<BoundRunResult
       createGroup(groupOptions) {
         if (!current()) throw new Error("Implementation owner is no longer active; no group was created")
         const group = handle.createGroup(groupOptions)
+        groups.add(group)
         groupId ??= group.id
+        groupIds.add(group.id)
         return group
       },
     }
@@ -431,24 +485,46 @@ export async function runBound(options: BoundRunOptions): Promise<BoundRunResult
           return
         }
         runId = started.runId
-        if (finished) {
-          stopRun()
-          return
-        }
         if (!runId) {
           fail(`${mode}.runner did not return a run ID`, false)
           return
         }
-        poll()
+        if (finished) {
+          stopRun()
+          // A cancelled pending start can return its identity only after the
+          // caller has already failed. Retain it without admitting new work.
+          await captureAccountedRun(handle, { run: { kind: mode, id: runId }, groupId })
+          return
+        }
+        // Subscribe before the first accounting await: the liveness timer can
+        // publish progress while a slow run-binding write is still pending.
+        // Buffer terminal replay until that binding is durable, never lose it.
+        subscribe(() => runner.onResult(runId!, result))
+        if (!finished)
+          subscribe(() =>
+            runner.onProgress(runId!, (snapshot) => {
+              observe(snapshot)
+            }),
+          )
+        await captureAccountedRun(handle, { run: { kind: mode, id: runId }, groupId })
+        bindingReady = true
         if (finished) return
-        subscribe(() =>
-          runner.onProgress(runId!, (snapshot) => {
-            observe(snapshot)
-          }),
-        )
-        if (!finished) subscribe(() => runner.onResult(runId!, result))
+        if (pendingResult) result(pendingResult)
+        else poll()
       } catch (error) {
         fail(error)
+      } finally {
+        startFinished()
+        // Keep stop authority until a pending start has resolved and every group
+        // settles, even if the caller already observed cancellation/rejection.
+        void runSettled
+          .then(() => Promise.all([...groups].map(async (group) => await group.ended())))
+          .then(
+            () => releaseRuntime(),
+            () => {
+              /* Failed drainage must remain registered for the cap adapter. */
+            },
+          )
       }
     })()
   })

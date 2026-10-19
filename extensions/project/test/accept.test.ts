@@ -98,7 +98,8 @@ test("acceptance uses a fresh read-only reviewer and independently reruns exact 
   expect(denied.stale).toBe(true)
   expect(denied.reason).toContain("Freshness probe denied")
   expect(f.seeds).toHaveLength(1)
-  for (const handle of f.reviewHandles) expect(handle.release).toHaveBeenCalledTimes(1)
+  expect(f.reviewReleases).toHaveLength(f.reviewHandles.length)
+  for (const release of f.reviewReleases) expect(release).toHaveBeenCalledTimes(1)
 })
 
 test("plan-mode Git denial leaves a durable blocked acceptance without a reviewer turn", async () => {

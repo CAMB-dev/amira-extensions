@@ -26,7 +26,7 @@ function fake(mode: Mode = "workflow", replay: "none" | "sync" | "microtask" = "
   const owners: RunnerOwner[] = []
   const stops: string[] = []
   const groupOptions: unknown[] = []
-  const group = { id: "actual-group" } as SpawnGroup
+  const group = { id: "actual-group", end: () => {}, ended: async () => ({}) } as SpawnGroup
   let ownerStopped = false
   const handle = {
     id: "owned-session",
@@ -706,3 +706,41 @@ for (const mode of ["workflow", "swarm"] as const) {
     released(f)
   })
 }
+
+test("bound runs retain every factory group including a swarm member workflow sibling", async () => {
+  const f = fake("swarm")
+  let next = 0
+  f.options.handle.createGroup = () =>
+    ({
+      id: `sibling-${++next}`,
+      end: () => {},
+      ended: async () => ({}),
+    }) as SpawnGroup
+  const pending = runBound(f.options)
+  await launched(f)
+  f.owners[0]!.createGroup({ name: "Member workflow sibling" })
+  f.emit({ ...f.final, groupIds: ["provider-observed-group"] })
+  f.finish()
+  const result = await pending
+  expect(result.groupId).toBe("sibling-1")
+  expect(result.groupIds).toEqual(["sibling-1", "sibling-2", "provider-observed-group"])
+  expect(f.updates.at(-1)?.groupIds).toEqual(result.groupIds)
+})
+
+test("failed bound runs preserve all already-created sibling group identities", async () => {
+  const f = fake()
+  const pending = runBound(f.options).catch((error) => error)
+  await launched(f)
+  f.options.handle.createGroup = () =>
+    ({
+      id: "late-sibling",
+      end: () => {},
+      ended: async () => ({}),
+    }) as SpawnGroup
+  f.owners[0]!.createGroup({ name: "Nested workflow sibling" })
+  f.controller.abort("Cap reached")
+  const error = await pending
+  expect(error).toBeInstanceOf(BoundRunError)
+  expect(error.groupIds).toEqual(["actual-group", "late-sibling"])
+  expect(f.stops).toEqual(["run-1"])
+})

@@ -3,13 +3,16 @@ import { createHash } from "node:crypto"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import type { CommandContext, ConversationSpec, ExtensionAPI, OwnedConversation } from "@amira/api"
+import type { CommandContext, ConversationSpec, ExtensionAPI } from "@amira/api"
+import { disposeAccounting } from "../src/accounting.ts"
 import { DesignSessions } from "../src/design.ts"
 import { createProject, DecisionStore, readDocument } from "../src/store.ts"
+import { ownedFixture } from "./owned-fixture.ts"
 
 const hash = (text: string) => createHash("sha256").update(text).digest("hex")
 test("legacy Other is not exposed as a human rationale, while original evidence/hash history is preserved", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "project-legacy-evidence-"))
+  let api: ExtensionAPI | undefined
   try {
     const project = await createProject(root, "Legacy")
     const question = {
@@ -53,13 +56,13 @@ test("legacy Other is not exposed as a human rationale, while original evidence/
 
     let seed = ""
     const session = { info: () => ({ id: "main" }) }
-    const api = {
+    api = {
       dataDir: path.join(root, "host-data"),
       session: () => session,
       conversations: {
         openOrCreate: async (spec: ConversationSpec) => {
           seed = spec.systemPrompt
-          return { id: "owned", key: spec.key, cwd: root } as OwnedConversation
+          return ownedFixture(spec, "owned")
         },
       },
     } as unknown as ExtensionAPI
@@ -85,6 +88,7 @@ test("legacy Other is not exposed as a human rationale, while original evidence/
     expect((await readFile(path.join(folder, "decisions.evidence.jsonl"), "utf8")).startsWith(raw)).toBe(true)
     expect(await readDocument(project, "decisions.md")).not.toContain("Rationale: SQLite instead")
   } finally {
+    if (api) await disposeAccounting(api)
     await rm(root, { recursive: true, force: true })
   }
 })

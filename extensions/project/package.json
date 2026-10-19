@@ -1,7 +1,7 @@
 {
   "name": "project",
   "license": "Apache-2.0",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "Experimental project discovery, guided design conversations and durable human decisions: /project",
   "type": "module",
   "scripts": {
@@ -12,9 +12,9 @@
   },
   "amira": {
     "status": "wip",
-    "statusMessage": "Design is still in flux; ship, spend caps, dashboard and archive are paused.",
+    "statusMessage": "Experimental project lifecycle and reported-spend caps; ship, dashboard and archive UI are coming later.",
     "engines": {
-      "amira": "^0.1.53"
+      "amira": "^0.1.64"
     },
     "extensions": [
       "./src/index.ts"

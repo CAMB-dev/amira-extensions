@@ -10,6 +10,7 @@ import {
   verifyAcceptanceCheckout,
 } from "./accept-integrity.ts"
 import { prepareManualTrial } from "./accept-trial.ts"
+import { openAccounted } from "./accounting.ts"
 import type { AcceptanceArtifact, BatchPlanArtifact, SpecArtifact } from "./artifacts.ts"
 import { validateArtifact } from "./artifacts.ts"
 import { ImplementationLifecycle } from "./implementation-lifecycle.ts"
@@ -246,7 +247,10 @@ export class Acceptances {
         }
       },
     }
-    handle = await this.api.conversations.openOrCreate(
+    handle = await openAccounted(
+      this.api,
+      project,
+      { stage: "accept", role: "reviewer", attempt: attemptId, batch: batch.id },
       {
         key: `${project.marker.id}/iteration/${state.iteration}/batch/${batch.id}/accept/${attemptId}`,
         name: `Accept ${batch.id} · attempt ${attempt}`,
@@ -580,7 +584,10 @@ export async function checkAcceptanceFreshness(
       return { stale: true, reason: "Owned runTool is unavailable" }
     const shell: Shell = ctx.session.info().shell === "powershell" ? "powershell" : "bash"
     const checkout = await acceptanceCheckout(project, state)
-    handle = await api.conversations.openOrCreate(
+    handle = await openAccounted(
+      api,
+      project,
+      { stage: "accept", role: "freshness", attempt: attempt?.id, batch: artifact.batchId },
       {
         key: `${project.marker.id}/iteration/${state.iteration}/accept-freshness/${randomUUID()}`,
         name: "Acceptance freshness check",

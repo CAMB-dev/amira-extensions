@@ -3,7 +3,15 @@ import { createHash } from "node:crypto"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import type { CommandContext, ExtensionAPI } from "@amira/api"
+import type {
+  CommandContext,
+  CompleteRequest,
+  ConversationSpec,
+  ExtensionAPI,
+  OwnedConversation,
+  OwnedConversationRef,
+} from "@amira/api"
+import { disposeAccounting } from "../src/accounting.ts"
 import {
   type AcceptanceArtifact,
   type BatchResultArtifact,
@@ -23,10 +31,13 @@ import { runStageCommand } from "../src/stage-commands.ts"
 import { createProject, DecisionStore, IterationStore } from "../src/store.ts"
 import { commandHarness, consume, startReview, summarize } from "./batch-test-helper.ts"
 import { human } from "./iteration-binding-helper.ts"
+import { ownedFixture, zeroUsage } from "./owned-fixture.ts"
 
 setDefaultTimeout(240_000)
 const roots: string[] = []
+const apis: ExtensionAPI[] = []
 afterEach(async () => {
+  for (const api of apis.splice(0)) await disposeAccounting(api)
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
 })
 
@@ -87,8 +98,65 @@ async function fixture(carryForward = false) {
       ]
     : [{ id: "B1", itemIds: ["S1"], decisionIds: ["D1"], files: ["result.txt"] }]
   const drafts: unknown[] = [{ spec, batches }]
-  const complete = mock(async (_request: unknown) => ({ text: JSON.stringify(drafts.shift()) }))
-  const api = { complete } as unknown as ExtensionAPI
+  const complete = mock(async (_request: Omit<CompleteRequest, "model">) => {
+    const text = JSON.stringify(drafts.shift())
+    return {
+      text,
+      message: {
+        role: "assistant" as const,
+        model: { provider: "mock", model: "coder" },
+        content: [{ type: "text" as const, text }],
+      },
+    }
+  })
+  const handles = new Map<string, OwnedConversation>()
+  const api = {
+    dataDir: path.join(root, "extension-data"),
+    complete: mock(async () => {
+      throw new Error("Main-bound completion must never run")
+    }),
+    conversations: {
+      openOrCreate: async (spec: ConversationSpec) => {
+        const id = `generation-${handles.size + 1}`
+        let revision = 0
+        const handle: OwnedConversation = {
+          ...ownedFixture(spec, id),
+          complete: async (request) => {
+            revision++
+            return complete(request)
+          },
+          usage: () => {
+            const snapshot = zeroUsage(id)
+            const cost = revision * 0.25
+            const value = {
+              usage: { ...snapshot.own.usage, cost },
+              knownCostUsd: cost,
+              complete: true,
+            }
+            return { ...snapshot, revision, own: value, total: value }
+          },
+        }
+        handles.set(spec.key, handle)
+        return handle
+      },
+      read: async (ref: OwnedConversationRef) => {
+        const handle =
+          "key" in ref ? handles.get(ref.key) : [...handles.values()].find((entry) => entry.id === ref.id)
+        return (
+          handle && {
+            id: handle.id,
+            key: handle.key,
+            name: handle.name,
+            cwd: handle.cwd,
+            archived: false,
+            history: handle.history(),
+            usage: handle.usage(),
+          }
+        )
+      },
+    },
+  } as unknown as ExtensionAPI
+  apis.push(api)
   const prints: string[] = []
   const ctx = {
     signal: new AbortController().signal,

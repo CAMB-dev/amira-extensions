@@ -63,6 +63,13 @@ test("a slash-leading persisted project ID cannot choose a worktree path or ref 
   const marker = JSON.parse(await readFile(markerFile, "utf8"))
   marker.id = selected.replace(/^[A-Za-z]:/, "").replaceAll("\\", "/")
   await writeFile(markerFile, JSON.stringify(marker))
+  // This fixture changes identity before any owned work. Keep its new empty
+  // accounting baseline coherent; production must reject mismatched ledgers.
+  const costFile = path.join(f.root, ".amira", "project", "costs.json")
+  const costs = JSON.parse(await readFile(costFile, "utf8"))
+  expect(costs.owners).toEqual([])
+  costs.projectId = marker.id
+  await writeFile(costFile, JSON.stringify(costs))
   const project = await readProject(f.root)
   f.answers.push("Approve spec and batch plan")
   await runSpec(

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto"
 import { mkdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises"
 import path from "node:path"
 import type { CommandContext, ExtensionAPI, OwnedConversation } from "@amira/api"
+import { inventoryAccounted, openAccounted, reopenAccounted, retainAccountedRun } from "./accounting.ts"
 import { ProjectCommandError } from "./diagnostics.ts"
 import { localize } from "./language.ts"
 import { validateAskQuestions } from "./questions.ts"
@@ -125,6 +126,7 @@ interface Binding {
   paused: boolean
   handle?: OwnedConversation
   ready?: Promise<OwnedConversation>
+  runtimeCleanup?: () => void
 }
 
 /** Host-owned, saved sessions. No custom agent loop, shell executor or file-policy substitute. */
@@ -330,7 +332,12 @@ export class PrototypeSessions {
         (saved.policy === PROTOTYPE_POLICY &&
           saved.sessionKey !== key &&
           saved.sessionKey !== `${key}/policy/${PROTOTYPE_POLICY}`) ||
-        (saved.policy === undefined && saved.sessionKey !== undefined)
+        (saved.policy === undefined && saved.sessionKey !== undefined) ||
+        (saved.previous !== undefined &&
+          (!saved.previous ||
+            saved.previous.key !== key ||
+            typeof saved.previous.id !== "string" ||
+            !saved.previous.id))
       )
         throw new Error("Saved prototype identity does not match this project, iteration and variant")
     } catch (error) {
@@ -350,10 +357,18 @@ export class PrototypeSessions {
     const legacy = !!saved && saved.policy === undefined
     const replacing = legacy && migrate
     const sessionKey = replacing ? `${key}/policy/${PROTOTYPE_POLICY}` : (saved?.sessionKey ?? key)
+    const attribution = { stage: "prototype" as const, role: "variant", variant: variant.id }
+    // Policy migrations retain both identities, even when only the new owner is executable.
+    if (saved?.previous) await inventoryAccounted(this.api, project, attribution, saved.previous)
+    if (saved && replacing)
+      await inventoryAccounted(this.api, project, attribution, { id: saved.id, key: saved.sessionKey ?? key })
     const handle =
       saved && !replacing
-        ? await this.api.conversations!.open(saved.id, runtime)
-        : await this.api.conversations!.openOrCreate(
+        ? await reopenAccounted(this.api, project, attribution, { id: saved.id, key: sessionKey }, runtime)
+        : await openAccounted(
+            this.api,
+            project,
+            attribution,
             {
               key: sessionKey,
               name: `${project.marker.name} · Prototype ${variant.id} · ${project.marker.currentIteration}`,
@@ -409,6 +424,14 @@ Finish by reporting the run command in prose AND an exact JSON object in a fence
         ),
         "warning",
       )
+    binding.runtimeCleanup?.()
+    binding.runtimeCleanup = retainAccountedRun(handle, {
+      stop: () => {
+        binding.paused = true
+        if (this.bindings.get(key) === binding) this.bindings.delete(key)
+      },
+      drain: async () => {}, // The accounting adapter drains the released host owner.
+    })
     return handle
   }
 }

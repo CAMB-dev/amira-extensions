@@ -465,7 +465,9 @@ test("manual trials preserve distinct pending/tried/problem/deferred results and
   const saved = await store.saveArtifact(revision, correction)
   expect(await store.readArtifact(saved.artifact)).toEqual(correction)
   expect(saved.state.artifacts).toHaveLength(9)
-}, 20000)
+  // This multi-transaction case now flushes both project and iteration claims.
+  // Its deadline is a filesystem allowance, not a stage-performance contract.
+}, 60000)
 
 test("non-1 iteration directory replacement and stale captured iteration are rejected", async () => {
   const { store, directory } = await fixture(7)

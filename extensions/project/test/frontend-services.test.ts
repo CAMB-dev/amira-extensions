@@ -218,7 +218,9 @@ async function implement(
       await f.dialog("Use committed base")
       f.terminal.send("\x1b[B\r")
     }
-    await waitFor(() => workflow.runs.length === before + 1, "fresh bound workflow run", 60_000)
+    // Match this fixture's command budget: late correction launches validate the
+    // accumulated immutable history plus both durable writer claims before start.
+    await waitFor(() => workflow.runs.length === before + 1, "fresh bound workflow run", 180_000)
     await f.idle()
     await f.visible("main idle")
     const running = await f.store.read()

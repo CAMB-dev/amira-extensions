@@ -6,6 +6,7 @@ import type {
   SubagentResult,
   ToolDefinition,
 } from "@amira/api"
+import { openAccounted, retainAccountedRun } from "./accounting.ts"
 import type { BatchPlanArtifact, BatchResultArtifact, SpecArtifact, WorktreeArtifact } from "./artifacts.ts"
 import { BoundRunError, boundRunner, runBound } from "./execution-modes.ts"
 import { ImplementationLifecycle } from "./implementation-lifecycle.ts"
@@ -54,6 +55,7 @@ interface Running {
   project: Project
   handle: OwnedConversation
   paused: boolean
+  accountingStopped?: boolean
   childIds: Set<string>
   lifecycle?: ImplementationLifecycle
   done?: Promise<void>
@@ -102,7 +104,8 @@ export class Implementations {
       (binding) =>
         binding.project.marker.id === project.marker.id &&
         binding.project.marker.currentIteration === project.marker.currentIteration &&
-        !binding.paused,
+        !binding.paused &&
+        !binding.accountingStopped,
     )?.progress
   }
   async quiesce(project: Project): Promise<void> {
@@ -112,12 +115,16 @@ export class Implementations {
         binding.project.marker.currentIteration === project.marker.currentIteration,
     )
     for (const binding of bindings) {
+      // A cost stop must publish its interruption before stage bookkeeping moves
+      // on. Do not suppress that result or reuse its already-released capability.
+      if (binding.accountingStopped) continue
       binding.paused = true
       binding.lifecycle?.cancel("Project stage change")
     }
     await Promise.all(
       bindings.map(async (binding) => {
-        await binding.handle.stop("Project stage change; preserve worktree changes")
+        if (!binding.accountingStopped)
+          await binding.handle.stop("Project stage change; preserve worktree changes")
         await binding.done
       }),
     )
@@ -130,7 +137,7 @@ export class Implementations {
     const store = new IterationStore(project)
     let state = await store.read()
     const live = this.running.get(state.activeAttemptId ?? "")
-    if (live && !live.paused) {
+    if (live && !live.paused && !live.accountingStopped) {
       if (!ctx.focusConversation(live.handle)) throw new Error("Unable to focus the running coordinator")
       return
     }
@@ -186,7 +193,10 @@ export class Implementations {
         return ctx.ui.ask(questions, request)
       },
     }
-    const setup = await this.api.conversations.openOrCreate(
+    const setup = await openAccounted(
+      this.api,
+      project,
+      { stage: "implement", role: "setup", attempt: attemptId, batch: batch.id },
       {
         key: `${project.marker.id}/iteration/${state.iteration}/setup/${randomUUID()}`,
         name: `Iteration ${state.iteration} Git setup`,
@@ -280,7 +290,10 @@ export class Implementations {
         }
       },
     }
-    handle = await this.api.conversations.openOrCreate(
+    handle = await openAccounted(
+      this.api,
+      project,
+      { stage: "implement", role: "coordinator", attempt: attemptId, batch: batch.id },
       {
         key: `${project.marker.id}/iteration/${state.iteration}/batch/${batch.id}/implement/${attemptId}`,
         name: `Implement ${batch.id}`,
@@ -379,6 +392,18 @@ export class Implementations {
     const lifecycle = new ImplementationLifecycle(handle)
     binding.lifecycle = lifecycle
     const tools = lifecycle.tools
+    const releaseRun = retainAccountedRun(handle, {
+      stop(reason) {
+        binding.accountingStopped = true
+        lifecycle.cancel(reason)
+      },
+      async drain() {
+        // runBound retains provider/group drainage independently. This lifetime
+        // also covers result publication, but must not await accounting.settled()
+        // or an accounted stop from inside the finalizer (that would await us).
+        await binding.done
+      },
+    })
     try {
       const results: BatchResultArtifact["checks"] = []
       let error: string | undefined
@@ -512,7 +537,8 @@ export class Implementations {
           `git diff --stat ${quote(base, shell)} ${quote(end, shell)}`,
         )
       } catch (cause) {
-        error = cause instanceof Error ? cause.message : String(cause)
+        const reason = binding.accountingStopped ? lifecycle.controller.signal.reason : cause
+        error = reason instanceof Error ? reason.message : String(reason)
         if (context.mode !== "single") {
           if (cause instanceof BoundRunError) {
             for (const model of cause.models) models.add(model)
@@ -528,7 +554,8 @@ export class Implementations {
           error +=
             ". No mode or cwd was changed. Single-agent fallback requires fresh approval: /project next to review continuation, then /project mode and choose Single agent. Completed batches and the selected unresolved batch are retained; no spec regeneration."
           lifecycle.cancel(error)
-          await handle.stop("Provider execution stopped; retain iteration changes")
+          if (!binding.accountingStopped)
+            await handle.stop("Provider execution stopped; retain iteration changes")
         }
       }
       if (binding.paused) return
@@ -650,8 +677,12 @@ export class Implementations {
       }
     } finally {
       binding.paused = true
-      await lifecycle.close()
-      this.changed()
+      try {
+        await lifecycle.close()
+      } finally {
+        releaseRun()
+        this.changed()
+      }
     }
   }
 }

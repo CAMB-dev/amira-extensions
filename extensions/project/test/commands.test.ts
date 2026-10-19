@@ -14,6 +14,7 @@ import type {
 import { ATTACHMENT_KEY, createProjectExtension, panelLines, restoreAttachment, words } from "../src/index.ts"
 import { conversationLanguage, resolveLanguage } from "../src/language.ts"
 import { createProject, Registry } from "../src/store.ts"
+import { ownedFixture } from "./owned-fixture.ts"
 
 const roots: string[] = []
 afterEach(async () => {
@@ -218,7 +219,7 @@ describe("project commands and attachments", () => {
     api.conversations = {
       openOrCreate: async (spec: { systemPrompt: string; key: string }) => {
         observed = spec.systemPrompt
-        return { id: "native-design", key: spec.key, cwd: f.cwd }
+        return ownedFixture({ key: spec.key, cwd: f.cwd })
       },
     }
     f.ctx.focusConversation = () => true
@@ -245,7 +246,7 @@ describe("acceptance command regressions", () => {
     api.conversations = {
       openOrCreate: async (spec: { key: string; systemPrompt: string }) => {
         prompt = spec.systemPrompt
-        return { id: "native-design", key: spec.key, cwd: f.cwd }
+        return ownedFixture({ key: spec.key, cwd: f.cwd })
       },
     }
     f.ctx.focusConversation = () => true

@@ -38,15 +38,28 @@ async function returnToMain(f: Frontend) {
 async function savedConversation(f: Frontend) {
   const home = path.join(f.root, "owned-home")
   const files = await readdir(home, { recursive: true })
-  const specs = files.filter((file) => file.endsWith(".spec.json"))
-  expect(specs).toHaveLength(1)
-  const file = path.join(home, specs[0]!)
-  const saved = JSON.parse(await readFile(file, "utf8")) as {
-    id: string
-    spec: ConversationSpec
-    runtimeTools: string[]
-  }
-  return { ...saved, transcript: file.replace(/\.spec\.json$/, ".jsonl") }
+  const specs = await Promise.all(
+    files
+      .filter((file) => file.endsWith(".spec.json"))
+      .map(async (relative) => {
+        const file = path.join(home, relative)
+        const saved = JSON.parse(await readFile(file, "utf8")) as {
+          id: string
+          spec: ConversationSpec
+          runtimeTools: string[]
+        }
+        return { ...saved, transcript: file.replace(/\.spec\.json$/, ".jsonl") }
+      }),
+  )
+  const variants = specs.filter(
+    (saved) => saved.spec.key === `${f.project.marker.id}/iteration/1/prototype/alpha`,
+  )
+  expect(variants).toHaveLength(1)
+  const generations = specs.filter((saved) => saved.spec.key.includes("/generation/proposal-generation/"))
+  expect(generations).toHaveLength(1)
+  expect(generations[0]!.spec.callableTools).toEqual([])
+  expect(generations[0]!.spec.writeRoots).toEqual([])
+  return variants[0]!
 }
 
 async function propose(f: Frontend) {

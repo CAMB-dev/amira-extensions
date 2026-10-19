@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks"
 import { createHash, randomUUID } from "node:crypto"
 import {
   closeSync,
@@ -9,6 +10,7 @@ import {
   realpathSync,
   renameSync,
   unlinkSync,
+  writeFileSync,
 } from "node:fs"
 import { link, lstat, mkdir, open, readdir, readFile, realpath, rename, unlink } from "node:fs/promises"
 import path from "node:path"
@@ -22,7 +24,15 @@ import {
   sameSpecItem,
   validateArtifact,
 } from "./artifacts.ts"
+import { initialCostLedger } from "./cost.ts"
 import { localize } from "./language.ts"
+import {
+  initialLifecycle,
+  type LifecycleEvent,
+  type ProjectLifecycle,
+  reduceLifecycle,
+  validateLifecycle,
+} from "./lifecycle.ts"
 import { validateAskQuestions } from "./questions.ts"
 import { requiredChecks, validateSpecIdentity } from "./spec-integrity.ts"
 import {
@@ -54,7 +64,9 @@ export type {
 export interface Project {
   root: string
   marker: {
-    schemaVersion: 1
+    schemaVersion: 1 | 2
+    /** Schema 2 makes older extensions fail closed before interpreting lifecycle state. */
+    lifecycle?: ProjectLifecycle
     id: string
     name: string
     created: string
@@ -127,6 +139,7 @@ export type ProjectStorageDetails =
   | { reason: "stale-revision"; expectedRevision: number; currentRevision: number }
   | { reason: "unsupported-schema"; document: string; encountered: number; supported: number }
   | { reason: "transition-rejected" }
+  | { reason: "read-only" | "stale-lifecycle" | "recovery-required" }
   | { reason: "malformed-storage" | "hash-mismatch"; document: string }
 
 export class ProjectStorageError extends Error {
@@ -175,12 +188,12 @@ function invalid(message: string): never {
 }
 
 /** Unsupported formats are not damaged evidence. Never repair or reinterpret them. */
-function checkSchema(value: unknown, document: string): void {
-  if (typeof value === "number" && Number.isSafeInteger(value) && value !== 1)
+function checkSchema(value: unknown, document: string, supported = 1): void {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value !== 1 && value !== supported)
     throw new ProjectStorageError(
       "invalid",
-      `Unsupported ${document} schema version ${value}; supported version: 1. Use a compatible extension without deleting or rewriting evidence.`,
-      { reason: "unsupported-schema", document, encountered: value, supported: 1 },
+      `Unsupported ${document} schema version ${value}; supported version: ${supported}. Use a compatible extension without deleting or rewriting evidence.`,
+      { reason: "unsupported-schema", document, encountered: value, supported },
     )
 }
 
@@ -196,8 +209,13 @@ function settings(value: unknown): asserts value is Project["marker"]["settings"
 }
 
 function marker(value: unknown): asserts value is Project["marker"] {
-  if (isObject(value)) checkSchema(value.schemaVersion, "project marker")
-  if (!isObject(value) || value.schemaVersion !== 1 || !nonempty(value.id) || !nonempty(value.name)) {
+  if (isObject(value)) checkSchema(value.schemaVersion, "project marker", 2)
+  if (
+    !isObject(value) ||
+    ![1, 2].includes(value.schemaVersion as number) ||
+    !nonempty(value.id) ||
+    !nonempty(value.name)
+  ) {
     invalid("Malformed project marker")
   }
   if (!singleLine(value.id) || !singleLine(value.name))
@@ -208,6 +226,16 @@ function marker(value: unknown): asserts value is Project["marker"] {
     invalid("Invalid project iteration")
   }
   settings(value.settings)
+  if (value.schemaVersion === 1 && value.lifecycle !== undefined)
+    invalid("Lifecycle state requires project marker schema 2")
+  if (value.schemaVersion === 2) {
+    if (isObject(value.lifecycle)) checkSchema(value.lifecycle.schemaVersion, "project lifecycle")
+    try {
+      validateLifecycle(value.lifecycle, value.currentIteration as number)
+    } catch (error) {
+      invalid(error instanceof Error ? error.message : String(error))
+    }
+  }
 }
 
 /**
@@ -420,6 +448,7 @@ async function atomicWrite(
   signal?: AbortSignal,
   commitProjectId?: string,
   commitIteration?: number,
+  commitGuard?: (current: Project["marker"]) => void,
 ): Promise<void> {
   const file = await safePath(root, ...parts)
   const temporaryParts = [...parts.slice(0, -1), `.${parts.at(-1)}.${randomUUID()}.tmp`]
@@ -442,6 +471,8 @@ async function atomicWrite(
           "replaced",
           "Project marker or captured iteration was replaced before evidence publication",
         )
+      if (commitGuard) commitGuard(current)
+      else assertWritableMarker(root, current, commitIteration, undefined)
       // One short, non-yielding commit section. Otherwise a queued Stop can overtake a
       // completed rename during post-commit fsync/cleanup and the host reports declined.
       signal?.throwIfAborted()
@@ -650,6 +681,14 @@ export async function createProject(
       await pinDirectory(canonical, ".amira", "project", ...parts)
     }
     await captureDirectories(canonical, project.marker.id)
+    // New projects establish coverage at creation. Absence on older projects is
+    // explicitly incomplete, never an inferred zero historical invoice.
+    const costParts = [".amira", "project", "costs.json"]
+    await exclusiveWrite(
+      await safePath(canonical, ...costParts),
+      json(initialCostLedger(project.marker.id, project.marker.created)),
+      () => safePath(canonical, ...costParts),
+    )
     for (const name of ["design.md", "decisions.md", "suggestions.md"]) {
       const file = await safePath(canonical, ".amira", "project", name)
       if ((await optionalRead(file)) === undefined)
@@ -693,6 +732,11 @@ async function output(project: Project, ...parts: string[]): Promise<string> {
   return safePath(current.root, ".amira", "project", ...parts)
 }
 
+async function mutationOutput(project: Project, ...parts: string[]): Promise<string> {
+  await assertProjectWritable(project)
+  return safePath(project.root, ".amira", "project", ...parts)
+}
+
 export async function readDocument(
   project: Project,
   name: "design.md" | "decisions.md" | "suggestions.md",
@@ -708,10 +752,12 @@ export async function writeDocument(
 ): Promise<{ conflict: boolean; path: string }> {
   if (name !== "design.md" || typeof content !== "string") invalid("Only design.md may be written directly")
   project = structuredClone(project)
-  const file = await output(project, name)
-  return markdownWrite(project.root, [".amira", "project", name], content, await optionalRead(file), () =>
-    output(project, name),
-  )
+  return withProjectClaim(project, async () => {
+    const file = await mutationOutput(project, name)
+    return markdownWrite(project.root, [".amira", "project", name], content, await optionalRead(file), () =>
+      mutationOutput(project, name),
+    )
+  })
 }
 
 export async function appendSuggestion(
@@ -721,27 +767,34 @@ export async function appendSuggestion(
 ): Promise<{ conflict: boolean; path: string }> {
   if (!nonempty(text) || !nonempty(language)) invalid("Suggestion text and language are required")
   project = structuredClone(project)
-  return serialized(`suggestions:${key(project.root)}`, async () => {
-    const file = await output(project, "suggestions.md")
-    const existing = (await optionalRead(file)) ?? ""
-    const heading = localize(language, "Pending suggestion", "待定建议", "未確定の提案")
-    return markdownWrite(
-      project.root,
-      [".amira", "project", "suggestions.md"],
-      `${existing}\n## ${heading} (${new Date().toISOString()}; ${language})\n\n${text}\n`,
-      existing,
-      () => output(project, "suggestions.md"),
-    )
-  })
+  return withProjectClaim(project, () =>
+    serialized(`suggestions:${key(project.root)}`, async () => {
+      const file = await mutationOutput(project, "suggestions.md")
+      const existing = (await optionalRead(file)) ?? ""
+      const heading = localize(language, "Pending suggestion", "待定建议", "未確定の提案")
+      return markdownWrite(
+        project.root,
+        [".amira", "project", "suggestions.md"],
+        `${existing}\n## ${heading} (${new Date().toISOString()}; ${language})\n\n${text}\n`,
+        existing,
+        () => mutationOutput(project, "suggestions.md"),
+      )
+    }),
+  )
 }
 
 export async function saveResearchNote(project: Project, title: string, content: string): Promise<string> {
   if (!nonempty(title) || typeof content !== "string") invalid("Research title and content are required")
   // Titles are document content, not authority over the destination filename.
   const filename = `${new Date().toISOString().slice(0, 10)}-${randomUUID()}.md`
-  const file = await output(project, "research", filename)
-  await exclusiveWrite(file, `# ${title}\n\n${content}\n`, () => output(project, "research", filename))
-  return file
+  project = structuredClone(project)
+  return withProjectClaim(project, async () => {
+    const file = await mutationOutput(project, "research", filename)
+    await exclusiveWrite(file, `# ${title}\n\n${content}\n`, () =>
+      mutationOutput(project, "research", filename),
+    )
+    return file
+  })
 }
 
 export class Registry {
@@ -1138,9 +1191,9 @@ export class DecisionStore {
   private async regenerate(evidence: Evidence[]): Promise<{ conflict: boolean; path: string }> {
     const generated = render(folded(evidence))
     const generatedHash = hash(generated)
-    const file = await output(this.project, "decisions.md")
+    const file = await mutationOutput(this.project, "decisions.md")
     const current = await optionalRead(file)
-    const manifestFile = await output(this.project, "decisions.manifest.json")
+    const manifestFile = await mutationOutput(this.project, "decisions.manifest.json")
     const manifestText = await optionalRead(manifestFile)
     let manifestHash: string | undefined
     if (manifestText !== undefined) {
@@ -1185,7 +1238,7 @@ export class DecisionStore {
       !interruptedGeneration &&
       !legacyProjection
     const name = conflict ? "decisions.generated.md" : "decisions.md"
-    let destination = await output(this.project, name)
+    let destination = await mutationOutput(this.project, name)
     const destinationText = conflict ? await optionalRead(destination) : current
     if (destinationText !== generated) {
       const published = await markdownWrite(
@@ -1193,7 +1246,7 @@ export class DecisionStore {
         [".amira", "project", name],
         generated,
         destinationText,
-        () => output(this.project, name),
+        () => mutationOutput(this.project, name),
       )
       conflict ||= published.conflict
       destination = published.path
@@ -1204,7 +1257,7 @@ export class DecisionStore {
         [".amira", "project", "decisions.manifest.json"],
         json({ schemaVersion: 1, hash: generatedHash }),
         async () => {
-          await output(this.project, "decisions.manifest.json")
+          await mutationOutput(this.project, "decisions.manifest.json")
         },
       )
     }
@@ -1212,8 +1265,8 @@ export class DecisionStore {
   }
 
   async recover(): Promise<{ conflict: boolean; path: string }> {
-    return serialized(`decisions:${key(this.project.root)}`, async () =>
-      this.regenerate(await this.evidence()),
+    return withProjectClaim(this.project, () =>
+      serialized(`decisions:${key(this.project.root)}`, async () => this.regenerate(await this.evidence())),
     )
   }
 
@@ -1222,9 +1275,12 @@ export class DecisionStore {
       // Do not await filesystem work after the human evidence commit on an owner-ask receipt
       // path. recover() rejoins the project queue and re-reads evidence, including newer asks.
       setImmediate(() => {
-        void this.recover()
-          .then(options.onProjection, options.onProjectionError)
-          .catch(() => {})
+        // Deferred projection must acquire its own claim, not inherit a finishing writer's scope.
+        projectClaims.exit(() => {
+          void this.recover()
+            .then(options.onProjection, options.onProjectionError)
+            .catch(() => {})
+        })
       })
       return
     }
@@ -1283,75 +1339,84 @@ export class DecisionStore {
         this.record(captured.questions, captured.answers, guardedMeta, options),
       )
     }
-    return serialized(`decisions:${key(this.project.root)}`, async () => {
-      // A queued ask can have been cancelled while another transaction held this queue.
-      signal?.throwIfAborted()
-      const evidence = await this.evidence()
-      const duplicate = evidence.find((entry) => entry.meta.askId === captured.meta.askId)
-      if (duplicate) {
-        if (
-          stable({
-            questions: duplicate.questions,
-            answers: duplicate.answers,
-            meta: duplicate.meta,
-            ...(duplicate.prototypeChoice ? { prototypeChoice: duplicate.prototypeChoice } : {}),
-          }) !== stable(captured)
+    return withProjectClaim(this.project, () =>
+      serialized(`decisions:${key(this.project.root)}`, async () => {
+        // A queued ask can have been cancelled while another transaction held this queue.
+        signal?.throwIfAborted()
+        const evidence = await this.evidence()
+        const duplicate = evidence.find((entry) => entry.meta.askId === captured.meta.askId)
+        if (duplicate) {
+          if (
+            stable({
+              questions: duplicate.questions,
+              answers: duplicate.answers,
+              meta: duplicate.meta,
+              ...(duplicate.prototypeChoice ? { prototypeChoice: duplicate.prototypeChoice } : {}),
+            }) !== stable(captured)
+          )
+            invalid("askId was already recorded with different evidence")
+          await this.projectEvidence(evidence, projection)
+          return folded(evidence).filter((record) => record.askId === captured.meta.askId)
+        }
+        const existing = folded(evidence)
+        if (captured.meta.supersedes.some((id) => !existing.some((record) => record.id === id)))
+          invalid("Cannot supersede an unknown decision")
+        const records: DecisionRecord[] = captured.questions.map((question, index) => ({
+          id: `D${existing.length + index + 1}`,
+          formatVersion: modern ? 3 : 2,
+          ...(modern
+            ? {
+                ...(captured.meta.reason !== undefined
+                  ? { reason: captured.meta.reason, rationale: captured.meta.reason }
+                  : { reasonSkipped: true as const }),
+                ...(captured.prototypeChoice ? { prototypeChoice: captured.prototypeChoice } : {}),
+              }
+            : {}),
+          question,
+          answer: captured.answers[index]!,
+          date,
+          language: captured.meta.language,
+          sessionId: captured.meta.sessionId,
+          askId: captured.meta.askId,
+          provenance: "human",
+          supersedes: [...captured.meta.supersedes],
+          supersededBy: [],
+        }))
+        const entry: Evidence = {
+          schemaVersion: 1,
+          projectionVersion: modern ? 3 : 2,
+          ...captured,
+          records,
+          priorGeneratedHash: hash(render(existing)),
+        }
+        // Recover any previous interrupted write first. Manual edits remain untouched even when new evidence arrives.
+        const recovered = await this.regenerate(evidence)
+        if (recovered.conflict) projection.onProjection?.(recovered)
+        const file = await output(this.project, "decisions.evidence.jsonl")
+        const prior = (await optionalRead(file)) ?? ""
+        await atomicWrite(
+          this.project.root,
+          [".amira", "project", "decisions.evidence.jsonl"],
+          `${prior}${prior && !prior.endsWith("\n") ? "\n" : ""}${JSON.stringify(entry)}\n`,
+          async () => {
+            await output(this.project, "decisions.evidence.jsonl")
+          },
+          signal,
+          this.project.marker.id,
+          this.project.marker.currentIteration,
+          (current) =>
+            assertWritableMarker(
+              this.project.root,
+              current,
+              this.project.marker.currentIteration,
+              this.project.marker,
+            ),
         )
-          invalid("askId was already recorded with different evidence")
-        await this.projectEvidence(evidence, projection)
-        return folded(evidence).filter((record) => record.askId === captured.meta.askId)
-      }
-      const existing = folded(evidence)
-      if (captured.meta.supersedes.some((id) => !existing.some((record) => record.id === id)))
-        invalid("Cannot supersede an unknown decision")
-      const records: DecisionRecord[] = captured.questions.map((question, index) => ({
-        id: `D${existing.length + index + 1}`,
-        formatVersion: modern ? 3 : 2,
-        ...(modern
-          ? {
-              ...(captured.meta.reason !== undefined
-                ? { reason: captured.meta.reason, rationale: captured.meta.reason }
-                : { reasonSkipped: true as const }),
-              ...(captured.prototypeChoice ? { prototypeChoice: captured.prototypeChoice } : {}),
-            }
-          : {}),
-        question,
-        answer: captured.answers[index]!,
-        date,
-        language: captured.meta.language,
-        sessionId: captured.meta.sessionId,
-        askId: captured.meta.askId,
-        provenance: "human",
-        supersedes: [...captured.meta.supersedes],
-        supersededBy: [],
-      }))
-      const entry: Evidence = {
-        schemaVersion: 1,
-        projectionVersion: modern ? 3 : 2,
-        ...captured,
-        records,
-        priorGeneratedHash: hash(render(existing)),
-      }
-      // Recover any previous interrupted write first. Manual edits remain untouched even when new evidence arrives.
-      const recovered = await this.regenerate(evidence)
-      if (recovered.conflict) projection.onProjection?.(recovered)
-      const file = await output(this.project, "decisions.evidence.jsonl")
-      const prior = (await optionalRead(file)) ?? ""
-      await atomicWrite(
-        this.project.root,
-        [".amira", "project", "decisions.evidence.jsonl"],
-        `${prior}${prior && !prior.endsWith("\n") ? "\n" : ""}${JSON.stringify(entry)}\n`,
-        async () => {
-          await output(this.project, "decisions.evidence.jsonl")
-        },
-        signal,
-        this.project.marker.id,
-        captured.prototypeChoice?.iteration,
-      )
-      await this.hooks.afterEvidenceSync?.()
-      await this.projectEvidence([...evidence, entry], projection)
-      return structuredClone(records)
-    })
+        await this.hooks.afterEvidenceSync?.()
+        await this.projectEvidence([...evidence, entry], projection)
+        return structuredClone(records)
+      }),
+    )
   }
 }
 
@@ -1387,10 +1452,16 @@ export class IterationStore {
   constructor(
     project: Project,
     private readonly options: IterationStoreOptions = {},
+    private readonly historicalIteration?: number,
   ) {
     this.project = structuredClone(project)
     marker(this.project.marker)
-    this.parts = [".amira", "project", "iterations", String(project.marker.currentIteration)]
+    if (historicalIteration !== undefined) {
+      if (!Number.isSafeInteger(historicalIteration) || historicalIteration < 1)
+        invalid("Historical iteration must be a positive integer")
+      this.project.marker.currentIteration = historicalIteration
+    }
+    this.parts = [".amira", "project", "iterations", String(this.project.marker.currentIteration)]
   }
 
   private async check(): Promise<void> {
@@ -1411,11 +1482,24 @@ export class IterationStore {
     marker(current)
     if (
       current.id !== this.project.marker.id ||
-      current.currentIteration !== this.project.marker.currentIteration
+      (this.historicalIteration === undefined &&
+        current.currentIteration !== this.project.marker.currentIteration)
     )
       throw new ProjectStorageError(
         "replaced",
         "Project identity changed or captured iteration is stale; reopen before publication",
+      )
+    if (this.historicalIteration !== undefined && this.historicalIteration > current.currentIteration)
+      throw new ProjectStorageError(
+        "missing",
+        "Historical iteration has no committed journal published by the project marker",
+      )
+    if (this.historicalIteration === undefined)
+      assertWritableMarker(
+        this.project.root,
+        current,
+        this.project.marker.currentIteration,
+        this.project.marker,
       )
   }
 
@@ -1603,55 +1687,13 @@ export class IterationStore {
   }
 
   private async claim(parts: string[], depth = 0): Promise<() => void> {
-    if (depth > 32) invalid("Too many abandoned writer recovery claims")
-    const token = randomUUID()
-    const claim = json({ pid: process.pid, token })
-    const file = await safePath(this.project.root, ...parts)
-    for (;;) {
-      if (await publishVersion(this.project.root, parts, claim, undefined, () => this.check())) {
-        return () => {
-          this.checkSync()
-          if (readFileSync(safePathSync(this.project.root, ...parts), "utf8") !== claim)
-            throw new ProjectStorageError("replaced", "Iteration writer claim was replaced")
-          unlinkSync(file)
-        }
-      }
-      const priorText = await optionalRead(await safePath(this.project.root, ...parts))
-      if (priorText === undefined) continue
-      const prior = this.parse(priorText)
-      if (
-        !isObject(prior) ||
-        !Number.isSafeInteger(prior.pid) ||
-        (prior.pid as number) <= 0 ||
-        typeof prior.token !== "string" ||
-        !/^[a-f0-9-]{36}$/.test(prior.token)
-      )
-        invalid("Malformed iteration writer claim; refusing to steal it")
-      try {
-        process.kill(prior.pid as number, 0)
-        throw new ProjectStorageError("invalid", "Iteration is in use by a live writer; reload and retry")
-      } catch (error) {
-        if (!isObject(error) || error.code !== "ESRCH") throw error
-      }
-      // A per-dead-token recovery claim serializes removers. Without this, two stale
-      // removers can accidentally unlink a NEW live claim after the first removes it.
-      const release = await this.claim([...this.parts, `.writer-recovery-${prior.token}.lock`], depth + 1)
-      try {
-        this.checkSync()
-        const current = safePathSync(this.project.root, ...parts)
-        if (readFileSync(current, "utf8") === priorText) unlinkSync(current)
-      } catch (error) {
-        if (!missing(error)) throw error
-      } finally {
-        release()
-      }
-    }
+    return claimProject(this.project, parts, depth, this.parts)
   }
 
   private async transaction<T>(action: () => Promise<T>): Promise<T> {
-    return serialized(
-      `iteration:${key(this.project.root)}:${this.project.marker.currentIteration}`,
-      async () => {
+    if (this.historicalIteration !== undefined) invalid("Historical iteration reader cannot mutate storage")
+    return withProjectClaim(this.project, () =>
+      serialized(`iteration:${key(this.project.root)}:${this.project.marker.currentIteration}`, async () => {
         await this.directory()
         const release = await this.claim([...this.parts, ".writer.lock"])
         try {
@@ -1661,7 +1703,7 @@ export class IterationStore {
         } finally {
           release()
         }
-      },
+      }),
     )
   }
 
@@ -1734,12 +1776,18 @@ export class IterationStore {
     }
   }
 
-  private async load(): Promise<IterationHead> {
+  private async load(repair = true): Promise<IterationHead> {
     await this.check()
     const directory = await safePath(this.project.root, ...this.parts, ".state")
-    const names = (await readdir(directory))
-      .filter((name) => !name.endsWith(".tmp") && !/^\d{16}\.projected$/.test(name))
-      .sort()
+    let entries: string[]
+    try {
+      entries = await readdir(directory)
+    } catch (error) {
+      if (missing(error) && !repair)
+        throw new ProjectStorageError("missing", "Historical iteration has no committed journal")
+      throw error
+    }
+    const names = entries.filter((name) => !name.endsWith(".tmp") && !/^\d{16}\.projected$/.test(name)).sort()
     let head: IterationHead | undefined
     for await (const { name, content } of this.journalRecords(names)) {
       const expectedRevision = head ? head.state.revision + 1 : 0
@@ -1777,6 +1825,7 @@ export class IterationStore {
       }
     }
     if (!head) {
+      if (!repair) throw new ProjectStorageError("missing", "Historical iteration has no committed journal")
       const existing = await optionalRead(await safePath(this.project.root, ...this.parts, "state.json"))
       if (existing !== undefined) invalid("Unrecognized iteration state.json; existing bytes were preserved")
       const state = initialIteration(this.project.marker.id, this.project.marker.currentIteration)
@@ -1786,8 +1835,29 @@ export class IterationStore {
     // plan metadata before touching state.json or creating a projection acknowledgement.
     await this.validateArtifacts(head.state.artifacts)
     await this.batchMetadata(head.state, true)
-    await this.projection(head, true)
+    if (repair) await this.projection(head, true)
+    else await this.inspectProjection(head)
     return head
+  }
+
+  /** Validate projections without creating receipts, moving files or repairing rename gaps. */
+  private async inspectProjection(head: IterationHead): Promise<void> {
+    await this.auditPreserved(head.history)
+    const current = await optionalRead(await safePath(this.project.root, ...this.parts, "state.json"))
+    const receipt = await optionalRead(
+      await safePath(
+        this.project.root,
+        ...this.parts,
+        ".state",
+        `${String(head.state.revision).padStart(16, "0")}.projected`,
+      ),
+    )
+    if (receipt !== undefined && receipt !== `${head.hash}\n`)
+      invalid("Iteration projection receipt was edited")
+    if (current === head.text) return
+    if (receipt !== undefined || (current !== undefined && !head.history.includes(current)))
+      invalid("Iteration state.json was manually edited; edits were preserved")
+    // An interrupted projection is readable from the authoritative journal, but left untouched.
   }
 
   private async commit(state: IterationState, previous?: IterationHead): Promise<IterationHead> {
@@ -1827,6 +1897,7 @@ export class IterationStore {
   }
 
   async read(): Promise<IterationState> {
+    if (this.historicalIteration !== undefined) return structuredClone((await this.load(false)).state)
     return this.transaction(async () => structuredClone((await this.load()).state))
   }
 
@@ -2077,12 +2148,13 @@ export class IterationStore {
 
   async readArtifact(ref: IterationArtifactRef): Promise<IterationArtifact> {
     const captured = structuredClone(ref)
-    return this.transaction(async () => {
-      const head = await this.load()
+    const read = async () => {
+      const head = await this.load(this.historicalIteration === undefined)
       if (!head.state.artifacts.some((prior) => stable(prior) === stable(captured)))
         invalid("Artifact reference is not committed by this iteration")
       return structuredClone(await this.artifact(captured))
-    })
+    }
+    return this.historicalIteration !== undefined ? read() : this.transaction(read)
   }
 
   private manifest(
@@ -2838,5 +2910,548 @@ export class IterationStore {
       )
     )
       invalid("Acceptance attempt already exists; save a fresh review attempt")
+  }
+}
+
+/** Schema-1 projects (even acceptance-complete ones) have an open, unshipped iteration. */
+export function projectLifecycle(project: Project): ProjectLifecycle {
+  return structuredClone(project.marker.lifecycle ?? initialLifecycle(project.marker.currentIteration))
+}
+
+function assertWritableMarker(
+  root: string,
+  current: Project["marker"],
+  iteration?: number,
+  captured?: Project["marker"],
+): void {
+  const lifecycle = current.lifecycle ?? initialLifecycle(current.currentIteration)
+  if (
+    lifecycle.status !== "active" ||
+    lifecycle.iterations[String(current.currentIteration)]?.status !== "open"
+  )
+    throw new ProjectStorageError("invalid", "Project or iteration is read-only", { reason: "read-only" })
+  if (
+    (iteration !== undefined && iteration !== current.currentIteration) ||
+    (captured !== undefined &&
+      (captured.schemaVersion !== current.schemaVersion ||
+        (captured.lifecycle?.revision ?? 0) !== lifecycle.revision))
+  )
+    throw new ProjectStorageError(
+      "invalid",
+      "Captured project lifecycle is stale; reopen before publication",
+      {
+        reason: "stale-lifecycle",
+      },
+    )
+  const pending = safePathSync(root, ".amira", "project", ".lifecycle-pending.json")
+  try {
+    lstatSync(pending)
+  } catch (error) {
+    if (missing(error)) return
+    throw error
+  }
+  throw new ProjectStorageError("invalid", "Project lifecycle publication needs explicit recovery", {
+    reason: "recovery-required",
+  })
+}
+
+/** Retained selections already have canonical directory pins; avoid repeatedly canonicalizing them. */
+async function retainedProject(project: Project): Promise<Project> {
+  if (!directoryPins.has(key(project.root))) return readProject(project.root, project.marker.id)
+  const current = parseProjectData(
+    readFileSync(safePathSync(project.root, ".amira", "project.json"), "utf8"),
+    "project marker",
+  )
+  marker(current)
+  if (current.id !== project.marker.id)
+    throw new ProjectStorageError("replaced", "Project identity changed or was replaced")
+  return { root: project.root, marker: current }
+}
+
+/** Public admission check for launchers and retained dialogs; storage writers also enforce it. */
+export async function assertProjectWritable(project: Project): Promise<void> {
+  const current = await retainedProject(project)
+  assertWritableMarker(current.root, current.marker, project.marker.currentIteration, project.marker)
+}
+
+/** Synchronous counterpart for retained SpawnGroup admission, which cannot await IO. */
+export function assertProjectWritableNow(project: Project): void {
+  const current = parseProjectData(
+    readFileSync(safePathSync(project.root, ".amira", "project.json"), "utf8"),
+    "project marker",
+  )
+  marker(current)
+  if (current.id !== project.marker.id)
+    throw new ProjectStorageError("replaced", "Project identity changed or was replaced")
+  assertWritableMarker(project.root, current, project.marker.currentIteration, project.marker)
+}
+
+interface ProjectClaimContext {
+  root: string
+  id: string
+  active: boolean
+}
+const projectClaims = new AsyncLocalStorage<ProjectClaimContext>()
+const machineDocumentUpdater = new AsyncLocalStorage<boolean>()
+
+/** The project claim is independent of currentIteration, including during release/recovery. */
+async function claimProject(
+  project: Project,
+  parts: string[],
+  depth = 0,
+  iterationParts?: string[],
+): Promise<() => void> {
+  if (depth > 32) invalid("Too many abandoned project recovery claims")
+  const text = json({ pid: process.pid, token: randomUUID() })
+  const check = async () => {
+    const current = parseProjectData(
+      readFileSync(safePathSync(project.root, ".amira", "project.json"), "utf8"),
+      "project marker",
+    )
+    marker(current)
+    if (current.id !== project.marker.id)
+      throw new ProjectStorageError("replaced", "Project identity changed or was replaced")
+  }
+  for (;;) {
+    await check()
+    const temporaryParts = [...parts.slice(0, -1), `.project-claim-${randomUUID()}.tmp`]
+    const temporary = safePathSync(project.root, ...temporaryParts)
+    let acquired = false
+    try {
+      const descriptor = openSync(temporary, "wx", 0o600)
+      try {
+        writeFileSync(descriptor, text, "utf8")
+        fsyncSync(descriptor)
+      } finally {
+        closeSync(descriptor)
+      }
+      safePathSync(project.root, ...temporaryParts)
+      linkSync(temporary, safePathSync(project.root, ...parts))
+      acquired = true
+      await syncDirectory(path.dirname(temporary))
+    } catch (error) {
+      if (!isObject(error) || error.code !== "EEXIST") throw error
+    } finally {
+      removeTemporarySync(project.root, temporaryParts, temporary)
+    }
+    if (acquired) {
+      return () => {
+        const current: unknown = JSON.parse(
+          readFileSync(safePathSync(project.root, ".amira", "project.json"), "utf8"),
+        )
+        marker(current)
+        if (current.id !== project.marker.id)
+          throw new ProjectStorageError("replaced", "Project identity changed or was replaced")
+        const file = safePathSync(project.root, ...parts)
+        if (readFileSync(file, "utf8") !== text)
+          throw new ProjectStorageError("replaced", "Project writer claim was replaced")
+        unlinkSync(file)
+      }
+    }
+    let priorText: string
+    try {
+      priorText = readFileSync(safePathSync(project.root, ...parts), "utf8")
+    } catch (error) {
+      if (missing(error)) continue
+      throw error
+    }
+    const prior = parseProjectData(priorText, "project writer claim")
+    if (
+      !isObject(prior) ||
+      !exactKeys(prior, ["pid", "token"]) ||
+      !Number.isSafeInteger(prior.pid) ||
+      (prior.pid as number) <= 0 ||
+      typeof prior.token !== "string" ||
+      !/^[a-f0-9-]{36}$/.test(prior.token)
+    )
+      invalid("Malformed project writer claim; refusing to steal it")
+    try {
+      process.kill(prior.pid as number, 0)
+      throw new ProjectStorageError("invalid", "Project is in use by a live writer; reload and retry")
+    } catch (error) {
+      if (!isObject(error) || error.code !== "ESRCH") throw error
+    }
+    const release = await claimProject(
+      project,
+      [
+        ...(iterationParts ?? [".amira", "project"]),
+        `.${iterationParts ? "writer" : "project"}-recovery-${prior.token}.lock`,
+      ],
+      depth + 1,
+      iterationParts,
+    )
+    try {
+      await check()
+      const file = safePathSync(project.root, ...parts)
+      if (readFileSync(file, "utf8") === priorText) unlinkSync(file)
+    } catch (error) {
+      if (!missing(error)) throw error
+    } finally {
+      release()
+    }
+  }
+}
+
+/**
+ * All ordinary storage mutations share this cross-process claim with lifecycle publication.
+ * Administrative mode is only for lifecycle recovery and settled accounting, never work launch.
+ * Nested same-project calls share the held claim, not a second claim or an independent queue.
+ */
+export async function withProjectClaim<T>(
+  project: Project,
+  action: (current: Project) => Promise<T>,
+  options: { administrative?: boolean } = {},
+): Promise<T> {
+  if (machineDocumentUpdater.getStore())
+    invalid("Project machine-document updaters must return data, not start nested mutations")
+  project = structuredClone(project)
+  const run = async () => {
+    const current = await retainedProject(project)
+    if (!options.administrative)
+      assertWritableMarker(current.root, current.marker, project.marker.currentIteration, project.marker)
+    return action(current)
+  }
+  const held = projectClaims.getStore()
+  if (held?.active && held.root === key(project.root) && held.id === project.marker.id) return run()
+  return serialized(`project:${key(project.root)}`, async () => {
+    const current = await retainedProject(project)
+    if (!options.administrative)
+      assertWritableMarker(current.root, current.marker, project.marker.currentIteration, project.marker)
+    const parts = [".amira", "project"]
+    try {
+      if (!lstatSync(safePathSync(project.root, ...parts)).isDirectory())
+        invalid("Project output is not a directory")
+    } catch (error) {
+      if (!missing(error)) throw error
+      await mkdir(await safePath(project.root, ...parts), { recursive: true })
+      await pinDirectory(project.root, ...parts)
+      await syncDirectory(path.dirname(await safePath(project.root, ...parts)))
+    }
+    const release = await claimProject(project, [".amira", "project", ".project-writer.lock"])
+    const context = { root: key(project.root), id: project.marker.id, active: true }
+    try {
+      return await projectClaims.run(context, run)
+    } finally {
+      context.active = false
+      release()
+    }
+  })
+}
+
+function parseProjectData(text: string, document: string): unknown {
+  try {
+    return JSON.parse(text)
+  } catch {
+    throw new ProjectStorageError("invalid", `Malformed ${document}; existing bytes were preserved`, {
+      reason: "malformed-storage",
+      document,
+    })
+  }
+}
+
+/** Independent machine documents (e.g. costs/owned-key inventory), never human Markdown. */
+export class ProjectDocumentStore {
+  private readonly project: Project
+  constructor(project: Project) {
+    this.project = structuredClone(project)
+  }
+  private parts(name: string): string[] {
+    if (!/^[a-z][a-z0-9-]*\.json$/.test(name)) invalid("Invalid project machine-document name")
+    return [".amira", "project", name]
+  }
+  async read(name: string): Promise<unknown | undefined> {
+    const parts = this.parts(name)
+    await retainedProject(this.project)
+    const text = await optionalRead(await safePath(this.project.root, ...parts))
+    return text === undefined ? undefined : parseProjectData(text, name)
+  }
+  /** Updaters return JSON data only; starting another update inside an updater is rejected. */
+  async update<T>(
+    name: string,
+    updater: (previous: unknown | undefined) => T | Promise<T>,
+    options: { administrative?: boolean } = {},
+  ): Promise<T> {
+    if (machineDocumentUpdater.getStore())
+      invalid("Project machine-document updaters must return data, not start nested updates")
+    const parts = this.parts(name)
+    return withProjectClaim(
+      this.project,
+      () =>
+        serialized(`document:${key(this.project.root)}:${name}`, async () => {
+          const next = await machineDocumentUpdater.run(true, async () => updater(await this.read(name)))
+          const encoded = JSON.stringify(next, null, 2)
+          if (encoded === undefined) invalid("Project machine document must be JSON")
+          const content = `${encoded}\n`
+          await atomicWrite(
+            this.project.root,
+            parts,
+            content,
+            undefined,
+            undefined,
+            this.project.marker.id,
+            undefined,
+            (current) => {
+              if (!options.administrative)
+                assertWritableMarker(
+                  this.project.root,
+                  current,
+                  this.project.marker.currentIteration,
+                  this.project.marker,
+                )
+            },
+          )
+          return structuredClone(next)
+        }),
+      options,
+    )
+  }
+}
+
+/** Explicit iteration selection, with no locks, initialization, projection repair, or writes. */
+export class HistoricalIterationReader {
+  private readonly reader: IterationStore
+  constructor(project: Project, iteration: number) {
+    this.reader = new IterationStore(project, {}, iteration)
+  }
+  read(): Promise<IterationState> {
+    return this.reader.read()
+  }
+  readArtifact(ref: IterationArtifactRef): Promise<IterationArtifact> {
+    return this.reader.readArtifact(ref)
+  }
+}
+
+export interface LifecycleStoreOptions {
+  /** Failure injection: recovery publishes only local storage, never replays work or host effects. */
+  afterIntent?: () => void | Promise<void>
+  afterIterationPublish?: () => void | Promise<void>
+  afterIterationFilePublish?: (name: string) => void | Promise<void>
+  afterMarkerPublish?: () => void | Promise<void>
+}
+interface LifecycleIntent {
+  schemaVersion: 1
+  projectId: string
+  previousMarkerHash: string
+  nextMarker: Project["marker"]
+}
+
+/** Storage groundwork only: callers must approve and drain work before settling lifecycle receipts. */
+export class LifecycleStore {
+  private readonly project: Project
+  private readonly pending = [".amira", "project", ".lifecycle-pending.json"]
+  constructor(
+    project: Project,
+    private readonly options: LifecycleStoreOptions = {},
+  ) {
+    this.project = structuredClone(project)
+  }
+  async read(): Promise<ProjectLifecycle> {
+    return projectLifecycle(await retainedProject(this.project))
+  }
+  async transition(expectedRevision: number, event: LifecycleEvent): Promise<Project> {
+    const captured = structuredClone(event)
+    return withProjectClaim(
+      this.project,
+      async (current) => {
+        if ((await optionalRead(await safePath(current.root, ...this.pending))) !== undefined)
+          throw new ProjectStorageError("invalid", "Recover the pending lifecycle publication first", {
+            reason: "recovery-required",
+          })
+        const previous = projectLifecycle(current)
+        if (!Number.isSafeInteger(expectedRevision) || previous.revision !== expectedRevision)
+          throw new ProjectStorageError("invalid", "Stale lifecycle receipt; reload before publication", {
+            reason: "stale-lifecycle",
+          })
+        let result: ReturnType<typeof reduceLifecycle>
+        try {
+          result = reduceLifecycle(previous, current.marker.currentIteration, captured)
+        } catch (error) {
+          throw new ProjectStorageError("invalid", error instanceof Error ? error.message : String(error), {
+            reason: "transition-rejected",
+          })
+        }
+        const previousMarkerText = readFileSync(safePathSync(current.root, ".amira", "project.json"), "utf8")
+        const observed = parseProjectData(previousMarkerText, "project marker")
+        marker(observed)
+        if (stable(observed) !== stable(current.marker))
+          invalid("Project marker changed before lifecycle intent; existing bytes were preserved")
+        const intent: LifecycleIntent = {
+          schemaVersion: 1,
+          projectId: current.marker.id,
+          previousMarkerHash: hash(previousMarkerText),
+          nextMarker: {
+            ...current.marker,
+            schemaVersion: 2,
+            lifecycle: result.lifecycle,
+            currentIteration: result.currentIteration,
+          },
+        }
+        await atomicWrite(
+          current.root,
+          this.pending,
+          json(intent),
+          undefined,
+          undefined,
+          current.marker.id,
+          undefined,
+          () => {},
+        )
+        await this.options.afterIntent?.()
+        return this.finish(intent, json(intent))
+      },
+      { administrative: true },
+    )
+  }
+  /** Explicit, idempotent recovery; ordinary reads and historical views never call this. */
+  async recover(): Promise<Project> {
+    return withProjectClaim(
+      this.project,
+      async (current) => {
+        const text = await optionalRead(await safePath(current.root, ...this.pending))
+        if (text === undefined) return current
+        const value = parseProjectData(text, "project lifecycle intent")
+        if (isObject(value)) checkSchema(value.schemaVersion, "project lifecycle intent")
+        if (
+          !isObject(value) ||
+          !exactKeys(value, ["schemaVersion", "projectId", "previousMarkerHash", "nextMarker"]) ||
+          value.schemaVersion !== 1 ||
+          value.projectId !== current.marker.id ||
+          typeof value.previousMarkerHash !== "string" ||
+          !/^[a-f0-9]{64}$/.test(value.previousMarkerHash)
+        )
+          invalid("Malformed lifecycle intent; existing bytes were preserved")
+        marker(value.nextMarker)
+        if (value.nextMarker.id !== current.marker.id || value.nextMarker.schemaVersion !== 2)
+          invalid("Lifecycle intent belongs to another project or marker format")
+        return this.finish(value as unknown as LifecycleIntent, text)
+      },
+      { administrative: true },
+    )
+  }
+  private async finish(intent: LifecycleIntent, intentText: string): Promise<Project> {
+    const root = this.project.root
+    const markerParts = [".amira", "project.json"]
+    const nextText = json(intent.nextMarker)
+    const check = async () => {
+      const currentText = readFileSync(safePathSync(root, ...markerParts), "utf8")
+      const current = parseProjectData(currentText, "project marker")
+      marker(current)
+      if (current.id !== this.project.marker.id)
+        throw new ProjectStorageError("replaced", "Project identity changed or was replaced")
+      if (readFileSync(safePathSync(root, ...this.pending), "utf8") !== intentText)
+        invalid("Lifecycle intent changed during publication; existing bytes were preserved")
+      if (hash(currentText) !== intent.previousMarkerHash && currentText !== nextText)
+        invalid("Project marker changed during lifecycle publication; existing bytes were preserved")
+      return currentText
+    }
+    let currentText = await check()
+    const current = parseProjectData(currentText, "project marker")
+    marker(current)
+    if (currentText !== nextText) {
+      const oldRevision = current.lifecycle?.revision ?? 0
+      if (
+        intent.nextMarker.lifecycle?.revision !== oldRevision + 1 ||
+        intent.nextMarker.currentIteration < current.currentIteration ||
+        intent.nextMarker.currentIteration > current.currentIteration + 1
+      )
+        invalid("Lifecycle intent is not the next project revision")
+      if (intent.nextMarker.currentIteration !== current.currentIteration) {
+        if (
+          projectLifecycle({ root, marker: current }).iterations[String(current.currentIteration)]?.status !==
+          "closed"
+        )
+          invalid("Next iteration requires a closed predecessor")
+        await this.initializeIteration(intent.nextMarker.currentIteration, check)
+        await this.options.afterIterationPublish?.()
+      }
+      await atomicWrite(
+        root,
+        markerParts,
+        nextText,
+        async () => {
+          currentText = await check()
+        },
+        undefined,
+        this.project.marker.id,
+        undefined,
+        (latest) => {
+          const latestText = readFileSync(safePathSync(root, ...markerParts), "utf8")
+          if (latest.id !== intent.projectId || latestText !== currentText)
+            invalid("Project marker changed before lifecycle publication")
+          if (readFileSync(safePathSync(root, ...this.pending), "utf8") !== intentText)
+            invalid("Lifecycle intent changed before marker publication")
+        },
+      )
+      await this.options.afterMarkerPublish?.()
+    }
+    await check()
+    const pending = safePathSync(root, ...this.pending)
+    if (readFileSync(pending, "utf8") !== intentText) invalid("Lifecycle intent was replaced")
+    unlinkSync(pending)
+    await syncDirectory(path.dirname(pending))
+    return readProject(root, this.project.marker.id)
+  }
+  private async initializeIteration(iteration: number, check: () => Promise<unknown>): Promise<void> {
+    const root = this.project.root
+    const parts = [".amira", "project", "iterations", String(iteration)]
+    for (const suffix of [[], [".state"], ["artifacts"]]) {
+      await check()
+      await mkdir(await safePath(root, ...parts, ...suffix), { recursive: true })
+      await pinDirectory(root, ...parts, ...suffix)
+      await syncDirectory(path.dirname(await safePath(root, ...parts, ...suffix)))
+    }
+    const state = initialIteration(this.project.marker.id, iteration)
+    const record = json({ schemaVersion: 1, previousHash: null, state })
+    const files: [string[], string][] = [
+      [[...parts, ".state", "0000000000000000.json"], record],
+      [[...parts, "state.json"], json(state)],
+      [[...parts, ".state", "0000000000000000.projected"], `${hash(record)}\n`],
+    ]
+    // Refuse an existing executable iteration instead of overwriting or adopting it.
+    for (const [fileParts, content] of files) {
+      await check()
+      const file = await safePath(root, ...fileParts)
+      const existing = await optionalRead(file)
+      if (existing !== undefined && existing !== content)
+        invalid("Next iteration already contains different evidence; existing bytes were preserved")
+      if (existing === undefined) {
+        await this.publishInitial(fileParts, content, check)
+        await this.options.afterIterationFilePublish?.(fileParts.at(-1)!)
+      }
+    }
+    const journal = await readdir(await safePath(root, ...parts, ".state"))
+    if (
+      journal.some(
+        (name) =>
+          !["0000000000000000.json", "0000000000000000.projected"].includes(name) &&
+          !/^\.lifecycle-init-[a-f0-9-]{36}\.tmp$/.test(name),
+      )
+    )
+      invalid("Next iteration has unexpected journal evidence")
+    if ((await readdir(await safePath(root, ...parts, "artifacts"))).length)
+      invalid("Next iteration has unexpected artifacts")
+  }
+  /** A flushed no-clobber link; interrupted staging leaves only an inert, ignored .tmp file. */
+  private async publishInitial(
+    parts: string[],
+    content: string,
+    check: () => Promise<unknown>,
+  ): Promise<void> {
+    const root = this.project.root
+    const temporaryParts = [...parts.slice(0, -1), `.lifecycle-init-${randomUUID()}.tmp`]
+    const temporary = await safePath(root, ...temporaryParts)
+    try {
+      await exclusiveWrite(temporary, content, check)
+      await check()
+      safePathSync(root, ...temporaryParts)
+      linkSync(temporary, safePathSync(root, ...parts))
+      await syncDirectory(path.dirname(temporary))
+    } catch (error) {
+      if (isObject(error) && error.code === "EEXIST")
+        invalid("Next iteration publication was claimed concurrently")
+      throw error
+    } finally {
+      removeTemporarySync(root, temporaryParts, temporary)
+    }
   }
 }
