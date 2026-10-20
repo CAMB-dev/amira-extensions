@@ -20,6 +20,12 @@ export interface Observation {
   ms: number
   cut: boolean
   screenshot?: Screenshot
+  cached?: number
+  fallback?: number
+  visited?: number
+  retried?: boolean
+  chromiumSparse?: boolean
+  search?: boolean
   treeOmitted?: boolean
   density?: number
 }
@@ -131,12 +137,24 @@ export function observationResult(tree: Observation): ToolResult {
           `Target screenshot ${image.id}: ${image.width}×${image.height} PNG; physical bounds ${JSON.stringify(image.bounds)}; DPI ${image.dpi}; scaleX=${image.scaleX}, scaleY=${image.scaleY}.`,
           "For coordinate click/scroll use screenshot ID and image-pixel x,y (origin: top-left); physical = bounds origin + floor(image pixel / axis scale). Do not multiply by DPI again.",
         ]
-      : ["Screenshots explicitly disabled; tree-only observation."]),
+      : [
+          tree.search
+            ? "UIA search results (no screenshot)."
+            : "Screenshots explicitly disabled; tree-only observation.",
+        ]),
     tree.treeOmitted
       ? `Sparse UIA tree omitted (${tree.density} visible readable elements). Use screenshot coordinates.`
       : tree.text,
     ...(tree.cut ? ["… tree cut (node/character/time limit or unreadable node)"] : []),
-    `Traversal: ${tree.ms} ms; ${tree.nodes} nodes; ${tree.chars} characters.`,
+    ...(tree.search && !tree.text
+      ? ["No matching elements. Try another filter or call ui_tree without root."]
+      : []),
+    ...(tree.chromiumSparse
+      ? [
+          "This app looks Chromium/Electron-based and exposes little UI Automation. Relaunching it with ui_launch and the argument --force-renderer-accessibility usually fixes this. This restarts the app and can lose unsaved work; never relaunch without the user's request.",
+        ]
+      : []),
+    `Traversal: ${tree.ms} ms; ${tree.nodes} nodes; ${tree.chars} characters; cached=${tree.cached ?? 0} fallback=${tree.fallback ?? 0}; retried=${tree.retried === true}${tree.visited === undefined ? "" : `; visited=${tree.visited}`}.`,
   ].join("\n")
   return {
     content: [

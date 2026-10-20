@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
+import { fileURLToPath } from "node:url"
 
-// Static source contracts only: never start PowerShell, a helper, windows or hotkeys.
+// Source contracts plus an offline stub harness: never run helper startup or real UIA.
 const source = readFileSync(new URL("../helper/uia.ps1", import.meta.url), "utf8").replace(/\r\n/g, "\n")
 const overlay = readFileSync(new URL("../helper/overlay.ps1", import.meta.url), "utf8")
 const lifetime = readFileSync(new URL("../helper/lifetime.ps1", import.meta.url), "utf8")
@@ -24,6 +25,37 @@ function ordered(text: string, ...fragments: string[]) {
     after = index + fragment.length
   }
 }
+
+test.skipIf(process.platform !== "win32")(
+  "rooted tree/find ancestry shares the traversal deadline (offline fake clock/providers)",
+  async () => {
+    const child = Bun.spawn(
+      [
+        "powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        fileURLToPath(new URL("./helper-budget.ps1", import.meta.url)),
+        fileURLToPath(new URL("../helper/uia.ps1", import.meta.url)),
+      ],
+      { stdout: "pipe", stderr: "pipe" },
+    )
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ])
+    expect({ code, stderr, stdout }).toEqual({
+      code: 0,
+      stderr: "",
+      stdout: expect.stringContaining("Offline ancestry budget regressions passed"),
+    })
+  },
+  30_000,
+)
 
 describe("D112 any-window source contracts (not runtime/provider verification)", () => {
   test("no allowlist or launched-window reading guard remains", () => {
@@ -168,7 +200,7 @@ describe("D112 any-window source contracts (not runtime/provider verification)",
     expect(tree).not.toContain("Assert-Element $window $element")
     ordered(
       tree,
-      "IsPasswordProperty",
+      "$password = $metadata.Password",
       "$passwordUnknown = $password -isnot [bool]",
       "if ($password -is [bool] -and $password) { $line += ' password=true' }",
       "elseif ($passwordUnknown -and $typeName -in @('Edit', 'Document')) { $line += ' password=unknown' }",
@@ -233,6 +265,273 @@ describe("D112 any-window source contracts (not runtime/provider verification)",
       "$id = Get-Argument",
     )
     expect(source).toContain("SetThreadDpiAwarenessContext([IntPtr]::new(-4))")
+  })
+})
+
+describe("U1 cached tree/find source contracts (not runtime/provider verification)", () => {
+  test("cache allowlist is exactly six metadata, eight availability and toggle-state properties", () => {
+    const properties = helperFunction("Get-TreeProperties")
+    const names = [...properties.matchAll(/::(\w+Property)\b/g)].map((match) => match[1]).sort()
+    expect(names).toEqual(
+      [
+        "ControlTypeProperty",
+        "NameProperty",
+        "AutomationIdProperty",
+        "IsEnabledProperty",
+        "IsOffscreenProperty",
+        "IsPasswordProperty",
+        "IsValuePatternAvailableProperty",
+        "IsTogglePatternAvailableProperty",
+        "IsTextPatternAvailableProperty",
+        "IsScrollItemPatternAvailableProperty",
+        "IsScrollPatternAvailableProperty",
+        "IsExpandCollapsePatternAvailableProperty",
+        "IsInvokePatternAvailableProperty",
+        "IsSelectionItemPatternAvailableProperty",
+        "ToggleStateProperty",
+      ].sort(),
+    )
+    const cache = helperFunction("New-TreeCacheRequest")
+    expect(cache).toContain("AutomationElementMode]::Full")
+    expect(cache).toContain("TreeScope]::Element")
+    expect(cache).toContain("$cache.TreeFilter = [System.Windows.Automation.Condition]::TrueCondition")
+    expect(cache).toContain("foreach ($property in $properties.Values) { $cache.Add($property) }")
+    expect(source.match(/\$cache\.Add\(/g)).toHaveLength(1)
+    expect(properties + cache).not.toMatch(
+      /ValueProperty|IsReadOnlyProperty|TextPattern\]::Pattern|\.Add\([^)]*Pattern/,
+    )
+  })
+
+  test("owns its cached root and pops each parent request even when FindAll throws", () => {
+    const tree = helperFunction("Get-OwnedTree")
+    ordered(
+      tree,
+      "$properties = Get-TreeProperties",
+      "$cachedRoot = $root",
+      "$rootCacheReady = $false",
+      "$cache = New-TreeCacheRequest $properties",
+      "$root.GetUpdatedCache($cache)",
+      "$rootCacheReady = $true",
+      "$stack.Push",
+      "-UseCache ($item.Depth -gt 0 -or $rootCacheReady)",
+    )
+    expect(tree).not.toContain("$window.Root =")
+    const children = helperFunction("Get-TreeChildren")
+    ordered(
+      children,
+      "$cache = New-TreeCacheRequest $properties",
+      "$pushed = $false",
+      "try {",
+      "$cache.Push()",
+      "$pushed = $true",
+      "return ,$element.FindAll",
+      "finally { if ($pushed) { $cache.Pop() } }",
+      "catch {",
+      "Assert-TreeBudget $clock",
+      "return ,$element.FindAll",
+    )
+    expect(children.match(/TreeScope\]::Children/g)).toHaveLength(2)
+    expect(children.match(/Condition\]::TrueCondition/g)).toHaveLength(2)
+    expect(children).not.toMatch(/::(?:ControlViewCondition|ContentViewCondition)/) // Raw nodes remain included.
+    expect(tree + children).not.toContain("TreeScope]::Descendants")
+    expect(tree + children).not.toContain("TreeScope]::Subtree")
+  })
+
+  test("fallback is per node, budgeted, counted and fail-closed on unknown passwords", () => {
+    const read = helperFunction("Read-TreeProperties")
+    ordered(
+      read,
+      "if ($UseCache)",
+      "GetCachedPropertyValue($entry.Value, $true)",
+      "$metrics.cached++",
+      "catch {",
+      "$metrics.fallback++",
+      "Read-Property $window $element $entry.Value -Verified -Clock $clock",
+    )
+    expect(read).toContain("Assert-TreeBudget $clock")
+    expect(read).toContain("$values[$entry.Key] = $null")
+    expect(read).toContain("@('Type', 'Name', 'AutomationId', 'Enabled', 'Offscreen')")
+    // Password is deliberately NOT required metadata: failed reads become unknown,
+    // and the shared formatter's password gate must still precede current reads.
+    const tree = helperFunction("Get-OwnedTree")
+    ordered(
+      tree,
+      "$password = $metadata.Password",
+      "if ($password -is [bool] -and $password)",
+      "elseif ($passwordUnknown -and $typeName -in @('Edit', 'Document'))",
+      "else {",
+      "ValuePattern]::Pattern",
+      "Assert-TreeBudget $clock",
+      "$valuePattern.Current.Value",
+      "Assert-TreeBudget $clock",
+      "$valuePattern.Current.IsReadOnly",
+      "TextPattern]::Pattern",
+      "Assert-TreeBudget $clock",
+      "$range = $textPattern.DocumentRange",
+      "Assert-TreeBudget $clock",
+      "$range.GetText(512)",
+    )
+    expect(tree).not.toContain("GetCachedPattern")
+    expect(tree).not.toContain(".Cached.Value")
+    expect(tree).not.toContain(".Cached.IsReadOnly")
+    expect(tree).toContain("$metadata.ToggleState -is [System.Windows.Automation.ToggleState]")
+  })
+
+  test("failed root refresh bypasses old cached password metadata and counts a node fallback", () => {
+    const tree = helperFunction("Get-OwnedTree")
+    ordered(
+      tree,
+      "$cachedRoot = $root",
+      "$rootCacheReady = $false",
+      "try {",
+      "$cache = New-TreeCacheRequest $properties",
+      "$root.GetUpdatedCache($cache)",
+      "$rootCacheReady = $true",
+      "catch {",
+      "Read-TreeProperties $window $element $properties $metrics $clock -UseCache ($item.Depth -gt 0 -or $rootCacheReady)",
+    )
+    const read = helperFunction("Read-TreeProperties")
+    ordered(
+      read,
+      "if ($UseCache)",
+      "GetCachedPropertyValue",
+      "catch {",
+      "$metrics.fallback++",
+      "Read-Property",
+    )
+    // Static regression: even if the old root cache contains Password=false,
+    // failed refresh forces current IsPassword before any current Value/Text.
+    // Cached getters succeeding cannot bypass that branch.
+    expect(source).toContain("[bool] $UseCache = $true")
+    expect(tree).toContain("$password = $metadata.Password")
+    expect(tree).toContain("elseif ($passwordUnknown -and $typeName -in @('Edit', 'Document'))")
+  })
+
+  test("old root is resolved and revalidated before replacement, not treated as an action", () => {
+    const tree = helperFunction("Get-OwnedTree")
+    ordered(
+      tree,
+      "$clock = [Diagnostics.Stopwatch]::StartNew()",
+      "$rootRef = Get-Argument $parameters 'root'",
+      "$window.Refs.ContainsKey($rootRef)",
+      "$root = $window.Refs[$rootRef]",
+      "Assert-Element $window $root -Clock $clock",
+      "$window.Refs = @{}",
+      "do {",
+      "Assert-Element $window $root -Clock $clock",
+      "$window.Refs = @{}",
+    )
+    expect(tree).toContain("Unknown or stale root reference; call ui_tree without root.")
+    expect(tree).not.toContain("Get-Element $window") // Disabled roots are still readable.
+    expect(tree).not.toContain("Assert-ActionWindow")
+    const loop = source.slice(source.indexOf("while (-not $script:stopping)"))
+    const preDispatch = loop.slice(0, loop.indexOf("$result = switch"))
+    expect(preDispatch).not.toContain(".Refs = @{}")
+    ordered(
+      loop,
+      "'tree' { Get-OwnedTree $parameters; break }",
+      "'find' { Get-OwnedTree $parameters -Find; break }",
+      "} catch {",
+      "if ($method -cin @('tree', 'find')) { $script:windows[$targetRef].Refs = @{} }",
+    )
+  })
+
+  test("ancestry checks the optional snapshot deadline between provider calls", () => {
+    const ancestry = helperFunction("Assert-Element")
+    ordered(
+      ancestry,
+      "Assert-TreeBudget $Clock",
+      "Assert-Window $window",
+      "for ($i = 0; $i -lt 128; $i++)",
+      "Assert-TreeBudget $Clock",
+      "Automation]::Compare",
+      "Assert-TreeBudget $Clock",
+      "Assert-Window $window",
+      "return",
+      "Assert-TreeBudget $Clock",
+      "GetCurrentPropertyValue",
+      "Assert-TreeBudget $Clock",
+      "Native]::GetAncestor",
+      "Assert-TreeBudget $Clock",
+      "$script:walker.GetParent",
+    )
+    expect(source).toContain("function Assert-Element($window, $element, $Clock = $null)")
+    const tree = helperFunction("Get-OwnedTree")
+    expect(tree.match(/Assert-Element \$window \$root -Clock \$clock/g)).toHaveLength(2)
+    expect(tree.match(/catch \[TimeoutException\]/g)).toHaveLength(2)
+    expect(tree).toContain("Tree traversal budget exhausted during root validation.")
+  })
+
+  test("find shares traversal, bounded conjunctive filters, fresh matching refs and three-ancestor context", () => {
+    const tree = helperFunction("Get-OwnedTree")
+    expect(source).toContain("function Get-OwnedTree($parameters, [switch] $Find)")
+    expect(tree).toContain("if ($Find) { $depthDefault = 30 }")
+    expect(tree).toContain("'depth' $depthDefault 0 30")
+    expect(tree).toContain("'maxResults' 20 1 100")
+    expect(tree).toContain("if ($Find) { $maxVisited = 3000; $maxLines = $maxResults }")
+    expect(tree).toContain("$maxLines = $maxNodes")
+    expect(tree).toContain("$lines.Count -ge $maxLines")
+    expect(tree).toContain("$metrics.visited -ge $maxVisited")
+    expect(tree).toContain("$clock.ElapsedMilliseconds -ge 20000")
+    expect(tree).toContain("@('name', 'role', 'automationId')")
+    expect(tree).toContain("$filter -isnot [string] -or [string]::IsNullOrWhiteSpace($filter)")
+    expect(tree).toContain("$filter -notmatch '^[A-Za-z]+$'")
+    expect(tree).toContain("ui_find requires at least one of name, role or automationId.")
+    expect(tree).toContain("$name.IndexOf($filters.name, [StringComparison]::OrdinalIgnoreCase)")
+    expect(tree).toContain(
+      "[string]::Equals($typeName, $filters.role, [StringComparison]::OrdinalIgnoreCase)",
+    )
+    expect(tree).toContain(
+      "$automationId.IndexOf($filters.automationId, [StringComparison]::OrdinalIgnoreCase) -ge 0",
+    )
+    ordered(
+      tree,
+      "$window.Refs = @{}",
+      "$script:nextElement++",
+      "$ref = 'e' + $script:nextElement",
+      "$matches = -not $Find -or (",
+      "if ($matches) {",
+      "ValuePattern]::Pattern",
+      "$window.Refs[$ref] = $element",
+      "$lines.Add($line)",
+      "Get-TreeChildren $element $properties $clock",
+    )
+    expect(tree.match(/\$window\.Refs\[\$ref\] = /g)).toHaveLength(1)
+    expect(tree).toContain("if ($path.Count -gt 3)")
+    expect(tree).toContain("$path[($path.Count - 3)..($path.Count - 1)]")
+    expect(tree).toContain("[string]::Join(' > ', [string[]]$item.Path)")
+    expect(tree).toContain("if (-not $Find) {") // Unreadable nodes are never find results.
+  })
+
+  test("bounded output and protocol metrics include both retry attempts without leaking refs", () => {
+    const tree = helperFunction("Get-OwnedTree")
+    expect(tree).toContain("$chars + $line.Length + 1 -gt 199900")
+    expect(tree).toContain("$window.Refs.Remove($ref)")
+    for (const field of [
+      "text = $text",
+      "nodes = $nodes",
+      "chars = $text.Length",
+      "ms = $clock.ElapsedMilliseconds",
+      "cut = $cut",
+      "cached = $metrics.cached",
+      "fallback = $metrics.fallback",
+      "retried = [bool]$retried",
+      "chromiumSparse = [bool]$chromiumSparse",
+      "visited = $metrics.visited",
+      "density = $density",
+    ])
+      expect(tree).toContain(field)
+    ordered(
+      tree,
+      "$metrics = @{ cached = 0; fallback = 0; visited = 0 }",
+      "do {",
+      "$window.Refs = @{}",
+      "$lines = New-Object",
+      "$density = 0",
+      "$metrics.visited++",
+    )
+    expect(tree.match(/\$metrics = /g)).toHaveLength(1)
+    expect(tree).not.toContain("$script:nextElement =")
   })
 })
 

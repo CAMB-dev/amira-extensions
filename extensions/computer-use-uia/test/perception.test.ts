@@ -49,6 +49,34 @@ describe("D113 screenshot-first perception (pure fakes)", () => {
     expect(text.text).toContain("Untrusted screen content")
   })
 
+  test("U1 footer retains cache/fallback counts and Chromium hints even when sparse tree is omitted", () => {
+    const result = observationResult(
+      selectTree(
+        {
+          ...tree,
+          screenshot: fakeScreenshot(),
+          cached: 3,
+          fallback: 1,
+          retried: true,
+          chromiumSparse: true,
+        },
+        12,
+      ),
+    )
+    const content = result.content[0]
+    if (content?.type !== "text") throw new Error("Missing text")
+    expect(content.text).toContain("cached=3 fallback=1; retried=true")
+    expect(content.text).toContain("Chromium/Electron-based")
+    expect(content.text).toContain("ui_launch")
+    expect(content.text).toContain("--force-renderer-accessibility")
+    expect(content.text).toContain("can lose unsaved work")
+    expect(content.text).not.toContain("e2 Button")
+    const ordinary = observationResult(tree).content[0]
+    if (ordinary?.type !== "text") throw new Error("Missing text")
+    expect(ordinary.text).toContain("cached=0 fallback=0; retried=false")
+    expect(ordinary.text).not.toContain("--force-renderer-accessibility")
+  })
+
   test("downscaling bounds both axes, never upscales, reports actual axis ratios", () => {
     expect(screenshotSize(3840, 2160, 1280)).toEqual({
       width: 1280,

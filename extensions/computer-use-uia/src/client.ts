@@ -103,7 +103,7 @@ export class UiaClient {
   /** Serialize even direct callers: snapshots, focus and cleanup must not race. */
   call(method: string, params: Record<string, unknown> = {}, signal?: AbortSignal): Promise<unknown> {
     const epoch = this.sessionEpoch
-    const queuedWhileStopped = this.emergency.stopped && !["windows", "tree"].includes(method)
+    const queuedWhileStopped = this.emergency.stopped && !["windows", "tree", "find"].includes(method)
     const run = this.queue.then(async () => {
       if (signal?.aborted) throw new Error("UIA request cancelled")
       if (queuedWhileStopped) throw new Error(STOP_MESSAGE)
@@ -112,7 +112,8 @@ export class UiaClient {
           this.emergency.stopped ? STOP_MESSAGE : "UIA session ended before the request started",
         )
       // A queued cancellation must not retire another request's provider.
-      const cancel = () => (["windows", "tree"].includes(method) ? this.cancelRead() : this.emergencyStop())
+      const cancel = () =>
+        ["windows", "tree", "find"].includes(method) ? this.cancelRead() : this.emergencyStop()
       signal?.addEventListener("abort", cancel, { once: true })
       try {
         return await this.execute(method, params)
@@ -126,7 +127,7 @@ export class UiaClient {
 
   private async execute(method: string, params: Record<string, unknown>): Promise<unknown> {
     if (this.stopping) throw new Error("computer-use-uia is stopping")
-    if (!["windows", "tree"].includes(method)) this.emergency.assertAction()
+    if (!["windows", "tree", "find"].includes(method)) this.emergency.assertAction()
     if (method === "windows") {
       if (params.filter !== undefined && typeof params.filter !== "string")
         throw new Error("filter must be a string")
@@ -194,11 +195,11 @@ export class UiaClient {
         throw new Error("Invalid helper launch response")
       return result
     }
-    if (!["tree", "click", "scroll", "type", "key", "focus", "close"].includes(method))
+    if (!["tree", "find", "click", "scroll", "type", "key", "focus", "close"].includes(method))
       throw new Error("Unknown UIA request")
     if (typeof params.window !== "string" || !/^[1-9]\d*$/.test(params.window))
       throw new Error("window must be a native window handle from ui_windows or ui_launch")
-    if (method !== "tree" && this.protectedWindows.has(params.window))
+    if (!["tree", "find"].includes(method) && this.protectedWindows.has(params.window))
       throw new Error("Refused: shell, system, overlay and Amira windows cannot be controlled")
     let snapshot = this.windows.get(params.window)
     if (!snapshot) {
@@ -206,12 +207,33 @@ export class UiaClient {
       this.windows.set(params.window, snapshot)
     }
     const safe: Record<string, unknown> = { window: params.window }
-    if (method === "tree") {
-      safe.depth = boundedInt(params.depth, 8, 0, 30, "depth")
-      safe.maxNodes = boundedInt(params.maxNodes, 300, 1, 1000, "maxNodes")
-      safe.screenshot = this.settings.screenshot
-      safe.screenshotMaxEdge = this.settings.screenshotMaxEdge
-      // A failed traversal/capture also invalidates the previous snapshot.
+    if (method === "tree" || method === "find") {
+      if (method === "tree") {
+        safe.depth = boundedInt(params.depth, 8, 0, 30, "depth")
+        safe.maxNodes = boundedInt(params.maxNodes, 300, 1, 1000, "maxNodes")
+        safe.screenshot = this.settings.screenshot
+        safe.screenshotMaxEdge = this.settings.screenshotMaxEdge
+      } else {
+        for (const key of ["name", "role", "automationId"]) {
+          const value = params[key]
+          if (value === undefined) continue
+          if (typeof value !== "string" || !value.trim()) throw new Error(`${key} must be a nonempty string`)
+          if (key === "role" && !/^[a-z]+$/i.test(value))
+            throw new Error("role must be a ControlType name without 'ControlType.' (for example Button)")
+          safe[key] = value
+        }
+        if ([safe.name, safe.role, safe.automationId].every((value) => value === undefined))
+          throw new Error("ui_find requires at least one of name, role or automationId")
+        safe.maxResults = boundedInt(params.maxResults, 20, 1, 100, "maxResults")
+      }
+      if (params.root !== undefined) {
+        if (typeof params.root !== "string" || !snapshot.refs.has(params.root))
+          throw new Error("Invalid or stale root ref; call ui_tree without root to get fresh refs")
+        safe.root = params.root
+      }
+      safe.treeDensityThreshold = this.settings.treeDensityThreshold
+      // Resolve root against the old generation before replacing it. A failed
+      // traversal/capture also invalidates the previous snapshot and coordinates.
       snapshot.refs.clear()
       snapshot.screenshot = undefined
     }
@@ -237,7 +259,9 @@ export class UiaClient {
       throw new Error("Use either ref or screenshot/x/y, not both")
     if ((method === "click" && !coordinateAction) || (method === "type" && params.ref !== undefined)) {
       if (typeof params.ref !== "string" || !snapshot.refs.has(params.ref))
-        throw new Error("Refused: ref is not in this window's latest tree; call ui_tree first")
+        throw new Error(
+          "Refused: ref is not in this window's latest tree/find snapshot; call ui_tree or ui_find first",
+        )
       safe.ref = params.ref
     }
     if (method === "type") {
@@ -247,17 +271,20 @@ export class UiaClient {
     }
     if (method === "key") safe.keys = validateKeys(params.keys)
     const result = await this.request(method, safe)
-    if (method === "tree") {
+    if (method === "tree" || method === "find") {
       const tree = result as TreeResult
-      const formatted = selectTree(
-        {
-          ...formatTree(tree, safe.maxNodes as number),
-          ...(this.settings.screenshot
-            ? { screenshot: validateScreenshot(tree.screenshot, this.settings.screenshotMaxEdge) }
-            : {}),
-        },
-        this.settings.treeDensityThreshold,
-      )
+      const formatted =
+        method === "find"
+          ? { ...formatTree(tree, safe.maxResults as number), search: true }
+          : selectTree(
+              {
+                ...formatTree(tree, safe.maxNodes as number),
+                ...(this.settings.screenshot
+                  ? { screenshot: validateScreenshot(tree.screenshot, this.settings.screenshotMaxEdge) }
+                  : {}),
+              },
+              this.settings.treeDensityThreshold,
+            )
       // Retain only coordinate metadata, not a PNG per observed window.
       const image = formatted.screenshot
       snapshot.screenshot = image && {
@@ -1036,7 +1063,7 @@ export class UiaClient {
   }
 
   private async request(method: string, params: Record<string, unknown>): Promise<unknown> {
-    const action = !["windows", "tree"].includes(method)
+    const action = !["windows", "tree", "find"].includes(method)
     const alreadyStarted = !!this.pipe
     try {
       await this.start()
@@ -1374,5 +1401,16 @@ export function formatTree(tree: TreeResult, maxNodes: number): TreeResult {
   }
   const cut = tree.cut || kept.length < lines.length
   const text = kept.join("\n")
-  return { text, nodes: kept.length, chars: text.length, ms: tree.ms, cut }
+  return {
+    text,
+    nodes: kept.length,
+    chars: text.length,
+    ms: tree.ms,
+    cut,
+    ...(tree.cached === undefined ? {} : { cached: tree.cached }),
+    ...(tree.fallback === undefined ? {} : { fallback: tree.fallback }),
+    ...(tree.visited === undefined ? {} : { visited: tree.visited }),
+    ...(tree.retried === undefined ? {} : { retried: tree.retried }),
+    ...(tree.chromiumSparse === undefined ? {} : { chromiumSparse: tree.chromiumSparse }),
+  }
 }
