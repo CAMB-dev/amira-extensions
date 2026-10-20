@@ -1,6 +1,6 @@
 # computer-use-uia
 
-> **Experimental 0.1.0 — Windows only, off by default.** This extension can read and control
+> **Experimental 0.2.0 — Windows only, off by default.** This extension can read and control
 > **any window**, including apps you already have open. It is not an application sandbox.
 > Interfaces and safety limits may change. Do not enable it unless you accept the risks below.
 
@@ -33,7 +33,7 @@ eligible for termination.
   sensitive fields are not automatically redacted. A provider that mislabels secrets can still expose them.
 - In **auto mode**, desktop actions can run **without asking**, including launching arbitrary
   programs, entering text, clicking controls and closing windows. Amira's normal permission
-  policy applies; there is no extension-specific approval path. Only `ui_windows`, `ui_tree` and `ui_find`
+  policy applies; there is no extension-specific approval path. Only `ui_windows`, `ui_tree`, `ui_find` and `ui_wait`
   declare `readOnly`; all other tools are actions.
 - Actions can modify files, send messages, make purchases or trigger other application-specific
   effects. Closing a window or cleanup of a launched app can discard unsaved work.
@@ -47,7 +47,7 @@ All tools are serialized and main-session-only. UIA patterns are preferred and *
 real mouse**. Mouse fallback checks the target's foreground status and clickable point, then
 rechecks the actual cursor position and hit test immediately before mouse-down. Keyboard fallback
 checks the focused native control belongs to the target window. Element refs are window-local,
-validated against the target window, and replaced by each new `ui_tree` or `ui_find` snapshot.
+validated against the target window, and replaced by each new `ui_tree` or `ui_find` snapshot or successful element `ui_wait`.
 
 ## Enable and settings
 
@@ -99,7 +99,7 @@ this extension while gaming or using software that prohibits input hooks. The ch
 
 If registration fails, the error is **“Stop hotkey ctrl+alt+q is unavailable — set stopHotkey or
 disable the overlay”** (with your configured chord). Other startup failures report their real error.
-These failures are **not user stops** and do not latch. `ui_windows`, `ui_tree` and `ui_find` still work without
+These failures are **not user stops** and do not latch. `ui_windows`, `ui_tree`, `ui_find` and `ui_wait` still work without
 an overlay; actions require a working stop monitor and retry startup on the next action.
 
 Set **`overlay: false` explicitly** to disable the pointer, banner, hotkey, Escape stop and low-level
@@ -110,7 +110,7 @@ Set `enabled: false` to disable all desktop tools.
 Stopping immediately terminates the **exact helper PID/creation-time identity**, including when a
 synchronous UIA provider blocks. The model receives **“the user stopped desktop control”**. Further
 actions are refused until you run **`/uia resume`**. Cancelling an in-flight action (including an
-action timeout) also latches the stop; cancelling `ui_windows`, `ui_tree` or `ui_find` does **not**. Cancelling
+action timeout) also latches the stop; cancelling `ui_windows`, `ui_tree`, `ui_find` or `ui_wait` does **not**. Cancelling
 a queued read neither runs that read nor interrupts another request. New or queued messages do
 not resume control. Read tools remain available while stopped; they may start a fresh helper/monitor,
 but do not clear the action latch.
@@ -208,7 +208,7 @@ to physical (−960, 640): `origin + floor(imageCoordinate / axisScale)`. **Do n
 DPI multiplier**. Pass image pixels and the screenshot ID to `ui_click`/`ui_scroll`; the helper
 maps them and repeats foreground, target identity, hit-test, held-modifier and actual-cursor
 checks. Moved/resized/DPI-changed/minimized targets or stale IDs are refused; observe again.
-No coordinate input is available with screenshots disabled.
+No coordinate input is available with screenshots disabled; ref-based scrolling remains available.
 
 Density is the count of readable non-Window UIA rows not flagged offscreen in the bounded
 snapshot; unknown visibility counts. It is a heuristic, not screen-area coverage or proof of
@@ -246,6 +246,46 @@ share the 20 s budget, with deadline checks between ancestry calls; screenshot c
 excluded. A single synchronous provider call can still overrun the budget. Real-provider
 performance and behavior need manual Windows verification.
 
+### Virtualized lists and waiting
+
+With a `root` container that supports ItemContainerPattern, `ui_find` also uses
+`FindItemByProperty` for a supplied name or automation ID, iterating with `startAfter` up to
+`maxResults`. **Only exact API property matches can find unrealized items**; ordinary realized
+subtree matches still use case-insensitive substrings and all filters combine with AND. Matching
+items get refs in the same snapshot and `virtualized=true` when they support VirtualizedItemPattern.
+The read never calls Realize and consumes each placeholder before the next lookup can invalidate it.
+The exact lookup establishes its selected Name/AutomationId predicate even when that getter is
+unavailable; additional filters still require readable matching properties.
+
+Use `ui_scroll` with `ref` and `into: true` to realize a virtualized item (which may itself scroll
+the list), then call ScrollItemPattern.ScrollIntoView when supported. The result lists the steps
+that ran and the containing ScrollPattern's `verticalPercent` when available. Unrealized refs
+revalidate their source container and reacquire a fresh item on the bounded worker only when a
+captured runtime ID establishes identity. Without a runtime ID, the action is refused with an
+instruction to run `ui_find` again and act on the fresh ref; even a unique Name/AutomationId match
+cannot authorize substituting another element. A fresh ref still needs verifiable identity.
+Additional filters are checked again, and realized items must pass the normal window ancestry
+check before further scrolling.
+Without either pattern, the action is refused; it never falls back to the mouse.
+Ref/delta searches no more than five parent levels, never outside the target window, and refuses
+non-vertically-scrollable containers. Pattern dispatch uses the existing background worker and
+five-second wait. A provider already executing an action may continue after that wait; timeout
+is not rollback. Only vertical small-step scrolling is supported, not horizontal or absolute-position scrolling.
+
+`ui_wait` polls every 250 ms outside the serialized helper. Without element filters it checks
+visible top-level windows using the same case-insensitive substring filter as `ui_windows`
+(title, handle, process, PID and class). A handle targets that exact top-level window. With element
+filters it searches the target window using `ui_find` matching, without realizing virtualized items.
+Each poll shares a 1000-node budget across all candidate windows, including failed searches, and
+has a short cooperative deadline. Incomplete enumeration or an unreadable search cannot prove
+that an element is gone. `ui_windows.cut` includes display-only title truncation; its separate
+`incomplete` flag identifies unfinished enumeration. Shortened titles alone do not prevent a gone wait. Large/sparse/provider-limited trees may time out even when
+the desired condition is true. A synchronous provider call can overrun a poll budget; the overall
+wait deadline retires a blocked helper without latching the action stop. Cancellation, emergency
+stop and session teardown interrupt both polling and sleep promptly. A successful element exists
+wait replaces that window's refs and screenshot ID; window-only/gone/unsuccessful waits do not
+publish new refs. Read waits remain available while stopped and never resume actions.
+
 ### Chromium and Electron
 
 Windows with classes starting `Chrome_WidgetWin_` sometimes populate accessibility only after
@@ -277,7 +317,8 @@ including negative monitor coordinates, using per-monitor DPI awareness. Its tra
 layered, topmost, toolwindow and no-activate styles keep it click-through, out of Alt+Tab and
 away from keyboard focus. It hides after three idle seconds, and exits with the helper/session.
 Setting `overlay: false` prevents the overlay/stop-monitor process from starting. This is a **virtual** pointer: pattern
-operations never reposition your real cursor.
+operations never reposition your real cursor. Ref-based `ui_scroll` also leaves the real pointer
+in place; it does not use wheel input or require screenshot coordinates.
 
 ## Tools
 
@@ -285,10 +326,11 @@ operations never reposition your real cursor.
 | --- | --- | --- |
 | `ui_windows` | optional `filter` | Up to 200 visible top-level `windows`: native handle (`window`), title (120 characters), process name, PID, class, physical bounds, minimized/foreground state. Case-insensitive substring across these identifiers; a `cut` flag/note reports truncated output. |
 | `ui_tree` | `window`, optional `root` ref, `depth` (8, 0–30), `maxNodes` (300, 1–1000) | Whole-target PNG ImageBlock, screenshot ID, physical bounds, image size, DPI and axis scales; dense UIA summary starting at `root` with fresh refs, password flags and traversal footer |
-| `ui_find` | `window`, at least one of `name`, `role`, `automationId`; optional `root` ref, `maxResults` (20, 1–100) | Read-only UIA search, no screenshot; matching rows with fresh refs and up to 3 ancestor names/roles, plus traversal footer. Filters combine with AND: name/automationId are case-insensitive substrings; role is a case-insensitive ControlType name without `ControlType.` (for example `Button`). |
+| `ui_find` | `window`, at least one of `name`, `role`, `automationId`; optional `root` ref, `maxResults` (20, 1–100) | Read-only UIA search, no screenshot; matching rows with fresh refs and up to 3 ancestor names/roles, plus traversal footer; exact ItemContainerPattern lookup can also return unrealized items marked `virtualized=true`. Filters combine with AND: name/automationId are case-insensitive substrings; role is a case-insensitive ControlType name without `ControlType.` (for example `Button`). |
+| `ui_wait` | Either `window` or `title`; `until: "exists"` or `"gone"`; optional `name`, `role`, `automationId`, `timeoutMs` (5000, 100–30000) | Read-only polling without screenshots; `status: "met"` or `"timed-out"`, `elapsedMs`, and on exists a matching window handle or element row with a fresh ref. Uses ui_windows-style title filtering and ui_find-style element matching. |
 | `ui_launch` | `command`, optional string-array `args`, `cwd` | New PID plus an unambiguous new window, or a PID and instruction to use `ui_windows` |
 | `ui_click` | `window`, either `ref` or `screenshot`, `x`, `y` | UIA pattern/clickable-point input for refs, or guarded screenshot-space click; reports path |
-| `ui_scroll` | `window`, `screenshot`, `x`, `y`, `delta` | Guarded wheel at screenshot-space point; integer nonzero delta −10…10 notches, positive up, negative down |
+| `ui_scroll` | `window`; either `screenshot`, `x`, `y`, `delta`; or `ref`, `delta`; or `ref`, `into: true` | Coordinates: guarded wheel input. Ref/delta: ScrollPattern on the element or nearest supporting ancestor (up to 5 parent levels), repeated small vertical steps. Ref/into: Realize when virtualized, then ScrollIntoView when supported. Reports `path: "scrollpattern"` or `"scrollitem"`, the steps that ran, and VerticalScrollPercent when available. Integer nonzero delta −10…10, positive up, negative down; forms cannot be mixed. Remains an action. |
 | `ui_type` | `window`, `text`, optional `ref` | ValuePattern.SetValue or guarded focused Unicode input; reports path |
 | `ui_key` | `window`, `keys` | Single chord such as `ctrl+s`, `enter`, `shift+tab`; refuses desktop-switching chords and `alt+f4` |
 | `ui_focus` | `window` | Restore a minimized window and bring it to the foreground; refuses focus failure |
@@ -306,9 +348,9 @@ actual descendants remain owned through their launch job, not executable-name ma
 Use filtered `ui_windows` to select the intended target, including existing apps and separate
 child dialogs. Refresh with `ui_tree` or `ui_find` after UI changes. Handles may be recycled by
 Windows; old refs are invalid after helper death, closing or a new snapshot. **There is one ref
-generation per window:** every new `ui_tree`/`ui_find` replaces all its refs, including the `root`
-ref used for that request (the element gets a new ID if returned). Neither tool preserves refs
-from the previous snapshot, and `ui_find` also invalidates old screenshot IDs. Invalid/stale roots
+generation per window:** every new `ui_tree`/`ui_find` or successful element `ui_wait` replaces all its refs, including the `root`
+ref used for that request (the element gets a new ID if returned). These reads do not preserve refs
+from the previous snapshot, and `ui_find` and successful element `ui_wait` also invalidate old screenshot IDs. Invalid/stale roots
 require `ui_tree` **without root** to recover. Trees are bounded by node/depth
 limits, a cooperative 20 s traversal budget and a 200,000-character TypeScript ceiling.
 Unreadable nodes receive no actionable ref and do not prevent reading siblings. Text fields
@@ -511,7 +553,11 @@ subtree/search validation, ref replacement, search readOnly/untrusted framing, c
 contracts and Chromium retry/hint source contracts. On Windows, `helper.test.ts` also runs an
 **offline PowerShell stub harness** for ancestry deadlines: it extracts selected functions, uses a
 fake clock/providers, and never executes helper startup or loads UIAutomationClient. This is
-not native UIA/provider verification.
+not native UIA/provider verification. U2 adds fake-clock wait deadlines, polling/cancellation/stop
+and queued-startup regressions, scroll-form validation and virtualized refs. Its offline helper
+harness compiles the bounded worker against inert UIA/native stand-ins to exercise scroll batches,
+ancestor limits, Realize/ScrollIntoView ordering, exact container lookup and bounded presence polls.
+It does not load real UIA or call desktop APIs.
 
 The test script lists only fake/static suites explicitly, including density/omission,
 ImageBlock shape, PNG scaling and coordinate/DPI math, settings validation, stop classification,

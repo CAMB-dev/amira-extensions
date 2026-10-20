@@ -210,7 +210,8 @@ describe("D112 any-window source contracts (not runtime/provider verification)",
       "TextPattern]::Pattern",
     )
     expect(tree).toContain("$window.Refs = @{}")
-    expect(tree).toContain("$clock.ElapsedMilliseconds -ge 20000")
+    expect(tree).toContain("$budgetMs = 20000")
+    expect(tree).toContain("$clock.ElapsedMilliseconds -ge $budgetMs")
     expect(tree).toContain("GetText(512)")
     expect(tree).toContain("$window.Refs.Remove($ref)")
     expect(tree).not.toContain("RootElement")
@@ -313,7 +314,7 @@ describe("U1 cached tree/find source contracts (not runtime/provider verificatio
       "$root.GetUpdatedCache($cache)",
       "$rootCacheReady = $true",
       "$stack.Push",
-      "-UseCache ($item.Depth -gt 0 -or $rootCacheReady)",
+      "-UseCache (-not $item.ContainerItem -and ($item.Depth -gt 0 -or $rootCacheReady))",
     )
     expect(tree).not.toContain("$window.Root =")
     const children = helperFunction("Get-TreeChildren")
@@ -388,7 +389,7 @@ describe("U1 cached tree/find source contracts (not runtime/provider verificatio
       "$root.GetUpdatedCache($cache)",
       "$rootCacheReady = $true",
       "catch {",
-      "Read-TreeProperties $window $element $properties $metrics $clock -UseCache ($item.Depth -gt 0 -or $rootCacheReady)",
+      "Read-TreeProperties $window $element $properties $metrics $clock -UseCache (-not $item.ContainerItem -and ($item.Depth -gt 0 -or $rootCacheReady))",
     )
     const read = helperFunction("Read-TreeProperties")
     ordered(
@@ -432,7 +433,9 @@ describe("U1 cached tree/find source contracts (not runtime/provider verificatio
       "'tree' { Get-OwnedTree $parameters; break }",
       "'find' { Get-OwnedTree $parameters -Find; break }",
       "} catch {",
-      "if ($method -cin @('tree', 'find')) { $script:windows[$targetRef].Refs = @{} }",
+      "if ($method -cin @('tree', 'find')) {",
+      "$script:windows[$targetRef].Refs = @{}",
+      "$script:windows[$targetRef].VirtualRefs = @{}",
     )
   })
 
@@ -464,7 +467,9 @@ describe("U1 cached tree/find source contracts (not runtime/provider verificatio
 
   test("find shares traversal, bounded conjunctive filters, fresh matching refs and three-ancestor context", () => {
     const tree = helperFunction("Get-OwnedTree")
-    expect(source).toContain("function Get-OwnedTree($parameters, [switch] $Find)")
+    expect(source).toContain(
+      "function Get-OwnedTree($parameters, [switch] $Find, [switch] $Poll, $Clock = $null)",
+    )
     expect(tree).toContain("if ($Find) { $depthDefault = 30 }")
     expect(tree).toContain("'depth' $depthDefault 0 30")
     expect(tree).toContain("'maxResults' 20 1 100")
@@ -472,7 +477,8 @@ describe("U1 cached tree/find source contracts (not runtime/provider verificatio
     expect(tree).toContain("$maxLines = $maxNodes")
     expect(tree).toContain("$lines.Count -ge $maxLines")
     expect(tree).toContain("$metrics.visited -ge $maxVisited")
-    expect(tree).toContain("$clock.ElapsedMilliseconds -ge 20000")
+    expect(tree).toContain("$budgetMs = 20000")
+    expect(tree).toContain("$clock.ElapsedMilliseconds -ge $budgetMs")
     expect(tree).toContain("@('name', 'role', 'automationId')")
     expect(tree).toContain("$filter -isnot [string] -or [string]::IsNullOrWhiteSpace($filter)")
     expect(tree).toContain("$filter -notmatch '^[A-Za-z]+$'")
@@ -841,4 +847,101 @@ test("desktop test module has no import-time probes; fixture is isolated", () =>
   expect(fixture).toContain("$password.UseSystemPasswordChar = $true")
   expect(fixture).toContain("$form.Dispose()")
   expect(fixture).not.toMatch(/Start-Process|Bun\.spawn/)
+})
+
+test.skipIf(process.platform !== "win32")(
+  "U2 offline helper regressions",
+  async () => {
+    const child = Bun.spawn(
+      [
+        "powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        fileURLToPath(new URL("./helper-u2.ps1", import.meta.url)),
+        fileURLToPath(new URL("../helper/uia.ps1", import.meta.url)),
+      ],
+      { stdout: "pipe", stderr: "pipe" },
+    )
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ])
+    expect({ code, stderr, stdout }).toEqual({
+      code: 0,
+      stderr: "",
+      stdout: expect.stringContaining("Offline U2 regressions passed"),
+    })
+  },
+  30_000,
+)
+
+for (const regression of [
+  "placeholder-observation",
+  "placeholder-action",
+  "placeholder-identity",
+  "placeholder-replacement",
+  "title-suffix",
+  "shared-failed-budget",
+  "display-truncation",
+  "exact-property-unavailable",
+  "bounded-vertical-getter",
+])
+  test.skipIf(process.platform !== "win32")(
+    `U2 reviewer regression: ${regression}`,
+    async () => {
+      const child = Bun.spawn(
+        [
+          "powershell.exe",
+          "-NoLogo",
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          fileURLToPath(new URL("./helper-u2.ps1", import.meta.url)),
+          fileURLToPath(new URL("../helper/uia.ps1", import.meta.url)),
+          "-Case",
+          regression,
+        ],
+        { stdout: "pipe", stderr: "pipe" },
+      )
+      const [stdout, stderr, code] = await Promise.all([
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+        child.exited,
+      ])
+      expect({ code, stderr, stdout }).toEqual({
+        code: 0,
+        stderr: "",
+        stdout: expect.stringContaining(`Offline reviewer regression passed: ${regression}`),
+      })
+    },
+    30_000,
+  )
+
+test("U2 helper test source uses LF line endings", () => {
+  expect(readFileSync(new URL("./helper.test.ts", import.meta.url), "utf8")).not.toContain("\r")
+})
+
+test("U2 pattern actions use the existing bounded worker, including the whole scroll batch", () => {
+  const worker = source.slice(
+    source.indexOf("public sealed class PatternCall"),
+    source.indexOf("public static class Native"),
+  )
+  expect(worker).toContain("worker.Join(5000)")
+  for (const action of ["scroll", "realize", "scrollIntoView"]) expect(worker).toContain(`case "${action}":`)
+  expect(worker).toContain("ScrollAmount.SmallDecrement")
+  expect(worker).toContain("ScrollAmount.SmallIncrement")
+  expect(worker).toContain("ScrollAmount.NoAmount")
+  expect(worker).toContain("VerticallyScrollable")
+  expect(worker).toContain("VerticalScrollPercent")
+  expect(worker.indexOf("CompareExchange(ref result.dispatchState, 1, 0)")).toBeLessThan(
+    worker.indexOf('case "scroll":'),
+  )
+  expect(source).toContain("'wait_poll' { Get-WaitPoll $parameters; break }")
 })
