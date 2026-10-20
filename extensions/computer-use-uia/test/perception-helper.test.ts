@@ -62,6 +62,76 @@ describe("D113 helper perception contracts (not runtime capture/input verificati
     expect(capture).not.toContain("Focus-Window")
   })
 
+  test("rooted trees still capture the whole window once; find never captures or focuses", () => {
+    const tree = helperFunction("Get-OwnedTree")
+    ordered(
+      tree,
+      "$clock = [Diagnostics.Stopwatch]::StartNew()",
+      "$root = $window.Refs[$rootRef]",
+      "if (-not $Find -and $includeScreenshot) {",
+      "$clock.Stop()",
+      "try { $screenshot = Get-TargetScreenshot $window $maxEdge }",
+      "finally { $clock.Start() }",
+      "do {",
+      "$cachedRoot = $root",
+      "$root.GetUpdatedCache($cache)",
+    )
+    expect(tree.match(/Get-TargetScreenshot/g)).toHaveLength(1)
+    expect(tree).toContain("if (-not $Find -and $includeScreenshot) { $result.screenshot = $screenshot }")
+    for (const action of ["Focus-Window", "Show-Action", "SetFocus", "SendInput", "SendMessage"])
+      expect(tree).not.toContain(action)
+    const loop = source.slice(source.indexOf("while (-not $script:stopping)"))
+    expect(loop).toContain("'find' { Get-OwnedTree $parameters -Find; break }")
+    // Find is a read: neither overlay action setup nor done notifications include it.
+    expect(source.match(/@\('launch', 'click', 'scroll', 'type', 'key', 'focus', 'close'\)/g)).toHaveLength(2)
+  })
+
+  test("Chromium warm-up is prefix-scoped and retries once within the shared total budgets", () => {
+    const tree = helperFunction("Get-OwnedTree")
+    expect(tree).toContain("'treeDensityThreshold' 12 0 1000")
+    expect(tree).toContain("GetClassName($window.Handle, $class, $class.Capacity)")
+    expect(tree).toContain("StartsWith('Chrome_WidgetWin_', [StringComparison]::Ordinal)")
+    expect(tree).toContain("$chromiumSparse = $chromium -and $density -lt $threshold")
+    ordered(
+      tree,
+      "$clock = [Diagnostics.Stopwatch]::StartNew()",
+      "$retried = $false",
+      "do {",
+      "$chromiumSparse =",
+      "$chromiumSparse -and -not $retried -and $metrics.visited -lt $maxVisited",
+      "$clock.ElapsedMilliseconds -lt 19500",
+      "Start-Sleep -Milliseconds 500",
+      "$retried = $true",
+      "continue",
+      "break",
+      "} while ($true)",
+    )
+    expect(tree.match(/Stopwatch\]::StartNew\(\)/g)).toHaveLength(1)
+    expect(tree.match(/Start-Sleep/g)).toHaveLength(1)
+    expect(tree.match(/\$retried = \$true/g)).toHaveLength(1)
+    expect(tree).toContain("chromiumSparse = [bool]$chromiumSparse")
+    expect(tree).toContain("retried = [bool]$retried; chromiumSparse = [bool]$chromiumSparse")
+    // It must not force browser accessibility or send synthetic input to warm it up.
+    expect(tree).not.toMatch(/force-renderer-accessibility|WM_GETOBJECT|0x003D|SetFocus\(/)
+  })
+
+  test("find density counts readable visited non-window nodes before match filtering", () => {
+    const tree = helperFunction("Get-OwnedTree")
+    ordered(
+      tree,
+      "$metrics.visited++",
+      "Read-TreeProperties $window $element $properties $metrics $clock",
+      "if ($typeName -ne 'Window' -and $offscreen -ne $true) { $density++; $countedDensity = $true }",
+      "$matches = -not $Find -or (",
+      "if ($matches) {",
+      "$lines.Add($line)",
+    )
+    expect(tree).toContain("if ($countedDensity) { $density-- }")
+    expect(tree).not.toContain("$density = $lines.Count")
+    expect(tree).not.toContain("$density = $window.Refs.Count")
+    expect(tree).toContain("visited = $metrics.visited; density = $density")
+  })
+
   test("native capture is physical, target-bounded, disposable PNG with no upscaling", () => {
     expect(source).toContain("GetDpiForWindow(window)")
     expect(source).toContain("AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), new IntPtr(-4))")
@@ -212,7 +282,7 @@ describe("D113 helper perception contracts (not runtime capture/input verificati
       loop,
       "$targetRef = $null",
       "$targetRef = Get-Argument $parameters 'window'",
-      "$method -ceq 'tree'",
+      "$method -cin @('tree', 'find')",
       "$script:windows[$targetRef].Screenshot = $null",
       "$result = switch",
       "} catch {",

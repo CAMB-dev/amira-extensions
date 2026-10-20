@@ -33,7 +33,7 @@ eligible for termination.
   sensitive fields are not automatically redacted. A provider that mislabels secrets can still expose them.
 - In **auto mode**, desktop actions can run **without asking**, including launching arbitrary
   programs, entering text, clicking controls and closing windows. Amira's normal permission
-  policy applies; there is no extension-specific approval path. Only `ui_windows` and `ui_tree`
+  policy applies; there is no extension-specific approval path. Only `ui_windows`, `ui_tree` and `ui_find`
   declare `readOnly`; all other tools are actions.
 - Actions can modify files, send messages, make purchases or trigger other application-specific
   effects. Closing a window or cleanup of a launched app can discard unsaved work.
@@ -47,7 +47,7 @@ All tools are serialized and main-session-only. UIA patterns are preferred and *
 real mouse**. Mouse fallback checks the target's foreground status and clickable point, then
 rechecks the actual cursor position and hit test immediately before mouse-down. Keyboard fallback
 checks the focused native control belongs to the target window. Element refs are window-local,
-validated against the target window, and replaced by each new tree.
+validated against the target window, and replaced by each new `ui_tree` or `ui_find` snapshot.
 
 ## Enable and settings
 
@@ -99,7 +99,7 @@ this extension while gaming or using software that prohibits input hooks. The ch
 
 If registration fails, the error is **“Stop hotkey ctrl+alt+q is unavailable — set stopHotkey or
 disable the overlay”** (with your configured chord). Other startup failures report their real error.
-These failures are **not user stops** and do not latch. `ui_windows` and `ui_tree` still work without
+These failures are **not user stops** and do not latch. `ui_windows`, `ui_tree` and `ui_find` still work without
 an overlay; actions require a working stop monitor and retry startup on the next action.
 
 Set **`overlay: false` explicitly** to disable the pointer, banner, hotkey, Escape stop and low-level
@@ -110,7 +110,7 @@ Set `enabled: false` to disable all desktop tools.
 Stopping immediately terminates the **exact helper PID/creation-time identity**, including when a
 synchronous UIA provider blocks. The model receives **“the user stopped desktop control”**. Further
 actions are refused until you run **`/uia resume`**. Cancelling an in-flight action (including an
-action timeout) also latches the stop; cancelling `ui_windows` or `ui_tree` does **not**. Cancelling
+action timeout) also latches the stop; cancelling `ui_windows`, `ui_tree` or `ui_find` does **not**. Cancelling
 a queued read neither runs that read nor interrupts another request. New or queued messages do
 not resume control. Read tools remain available while stopped; they may start a fresh helper/monitor,
 but do not clear the action latch.
@@ -217,6 +217,49 @@ exposed or accepted. Traversal limits can underestimate density. Dense summaries
 names, IDs, flags and values with the existing password-value protections. Refresh observations
 after UI changes; the image is captured before tree traversal, not atomically with the tree.
 
+## Perception and performance
+
+For large apps, prefer `ui_find` or `ui_tree` with a `root` ref over a full deep tree.
+`root` must come from the latest snapshot of that window; depth and node limits start at that
+element. A subtree observation still captures the **whole target window**, not just the element,
+and uses the same screenshot privacy/visibility rules. Density omission also applies to subtrees;
+disable screenshots explicitly if you need sparse tree-only refs. `ui_find` never captures an image
+or omits sparse matches. It walks at most **3000 visited nodes**, to depth **30**, with a cooperative
+**20 s** budget, stopping at `maxResults`; the ancestor path shows up to three names/roles within
+the searched subtree. A cut result is not proof that no further matches exist.
+
+Reads use UIA2 `CacheRequest` batches per parent's `FindAll(Children, TrueCondition)`, never one
+whole-tree `Subtree` fetch. The root gets its own `GetUpdatedCache`. The cache uses
+`AutomationElementMode.Full` so refs remain actionable, `TreeScope.Element`, and an explicit
+`TrueCondition` **raw-view TreeFilter** to preserve the old child set (the default ControlView
+filter would change it). Only control type, name, automation ID, enabled/offscreen/password
+flags, pattern-availability flags and non-secret toggle state are cached. **Value, IsReadOnly and
+text are never cached.** Those current per-element reads remain budget-guarded and password-gated:
+password controls never query values/text, and unknown-password Edit/Document nodes fail closed.
+Cache failures fall back to current reads for that node, not the whole tree. A failed root cache
+refresh must not reuse metadata from the previous snapshot, including its password flag.
+
+The footer reports milliseconds, returned nodes and characters, `cached=<n> fallback=<n>`, and
+`retried=true|false`; search also reports visited nodes. Cache/fallback counters describe read
+attempts, not a promise of native speed. Root ancestry validation and Chromium retry validation
+share the 20 s budget, with deadline checks between ancestry calls; screenshot capture time is
+excluded. A single synchronous provider call can still overrun the budget. Real-provider
+performance and behavior need manual Windows verification.
+
+### Chromium and Electron
+
+Windows with classes starting `Chrome_WidgetWin_` sometimes populate accessibility only after
+the first UIA query. If the bounded snapshot has fewer readable on-screen elements than
+`treeDensityThreshold`, wait **500 ms** and traverse once more, within the same 20 s budget.
+The footer reports `retried=true` when the second traversal runs. Search checks the density of
+visited nodes, not the number of matches. If it remains sparse, the result explains that the app
+looks Chromium/Electron-based and exposes little UI Automation.
+
+Relaunching with `ui_launch` and the argument **`--force-renderer-accessibility`** usually fixes
+this. **This restarts the app and can lose unsaved work; never relaunch without the user's
+request.** The extension never changes or relaunches an already-running app to enable accessibility,
+and does not use CDP or remote debugging. Retrying is read-only and does not focus the app.
+
 ## Virtual pointer
 
 Before each action the helper sends a physical-pixel UIA clickable point, or bounds center, to a
@@ -241,7 +284,8 @@ operations never reposition your real cursor.
 | Tool | Arguments | Result |
 | --- | --- | --- |
 | `ui_windows` | optional `filter` | Up to 200 visible top-level `windows`: native handle (`window`), title (120 characters), process name, PID, class, physical bounds, minimized/foreground state. Case-insensitive substring across these identifiers; a `cut` flag/note reports truncated output. |
-| `ui_tree` | `window`, optional `depth` (8, 0–30), `maxNodes` (300, 1–1000) | Target PNG ImageBlock, screenshot ID, physical bounds, image size, DPI and axis scales; dense UIA summary with unique element refs, password flags, and timing/size footer |
+| `ui_tree` | `window`, optional `root` ref, `depth` (8, 0–30), `maxNodes` (300, 1–1000) | Whole-target PNG ImageBlock, screenshot ID, physical bounds, image size, DPI and axis scales; dense UIA summary starting at `root` with fresh refs, password flags and traversal footer |
+| `ui_find` | `window`, at least one of `name`, `role`, `automationId`; optional `root` ref, `maxResults` (20, 1–100) | Read-only UIA search, no screenshot; matching rows with fresh refs and up to 3 ancestor names/roles, plus traversal footer. Filters combine with AND: name/automationId are case-insensitive substrings; role is a case-insensitive ControlType name without `ControlType.` (for example `Button`). |
 | `ui_launch` | `command`, optional string-array `args`, `cwd` | New PID plus an unambiguous new window, or a PID and instruction to use `ui_windows` |
 | `ui_click` | `window`, either `ref` or `screenshot`, `x`, `y` | UIA pattern/clickable-point input for refs, or guarded screenshot-space click; reports path |
 | `ui_scroll` | `window`, `screenshot`, `x`, `y`, `delta` | Guarded wheel at screenshot-space point; integer nonzero delta −10…10 notches, positive up, negative down |
@@ -260,8 +304,12 @@ correlation is **not proof of launch ownership**. Discovery never grants kill el
 actual descendants remain owned through their launch job, not executable-name matching.
 
 Use filtered `ui_windows` to select the intended target, including existing apps and separate
-child dialogs. Refresh `ui_tree` after UI changes. Handles may be recycled by Windows; old refs
-are invalid after helper death, closing or a new snapshot. Trees are bounded by node/depth
+child dialogs. Refresh with `ui_tree` or `ui_find` after UI changes. Handles may be recycled by
+Windows; old refs are invalid after helper death, closing or a new snapshot. **There is one ref
+generation per window:** every new `ui_tree`/`ui_find` replaces all its refs, including the `root`
+ref used for that request (the element gets a new ID if returned). Neither tool preserves refs
+from the previous snapshot, and `ui_find` also invalidates old screenshot IDs. Invalid/stale roots
+require `ui_tree` **without root** to recover. Trees are bounded by node/depth
 limits, a cooperative 20 s traversal budget and a 200,000-character TypeScript ceiling.
 Unreadable nodes receive no actionable ref and do not prevent reading siblings. Text fields
 are escaped onto one line and limited to 512 characters. `ui_type` accepts at most 20,000
@@ -434,7 +482,8 @@ These are fake/static checks, not proof of native Windows scheduling or process 
   Session 0 and disconnected RDP sessions are unsupported.
 - **Elevated windows are inaccessible from a non-elevated helper.** Do not use this to operate
   UAC/security prompts. UIA/input may fail across integrity levels.
-- Electron apps often need **`--force-renderer-accessibility`** in their launch arguments.
+- Chromium/Electron apps may remain sparse after the one-time retry; see the relaunch guidance
+  above. Enabling renderer accessibility does not guarantee a complete or accurate tree.
 - Games, canvas apps and custom-drawn controls often expose sparse or empty UIA trees. These
   use screenshot-space input; no OCR is provided. Providers can be stale, expensive or hang.
 - UIA2 behavior varies by provider. Some editors expose TextPattern rather than writable
@@ -457,8 +506,12 @@ bun run test
 
 `unit.test.ts` uses fake host/jobs/pipes for settings, tool traits, arbitrary handles/launches,
 window-local refs, emergency-stop latching/explicit resume, startup-stop races, timeout aborts,
-untrusted-result framing, model-facing stop notices and overlay protocol/lifecycle. `helper.test.ts`
-reads source files only: these contracts are **not PowerShell runtime or provider tests**.
+untrusted-result framing, model-facing stop notices and overlay protocol/lifecycle. U1 coverage adds
+subtree/search validation, ref replacement, search readOnly/untrusted framing, cache/fallback footer
+contracts and Chromium retry/hint source contracts. On Windows, `helper.test.ts` also runs an
+**offline PowerShell stub harness** for ancestry deadlines: it extracts selected functions, uses a
+fake clock/providers, and never executes helper startup or loads UIAutomationClient. This is
+not native UIA/provider verification.
 
 The test script lists only fake/static suites explicitly, including density/omission,
 ImageBlock shape, PNG scaling and coordinate/DPI math, settings validation, stop classification,
@@ -579,6 +632,12 @@ have **not** been run by the coding agent:
   retain complete measured usage in the former; leave unknown total usage `null` in the latter.
 - Run the opt-in desktop suite with a temporary directory containing an apostrophe and spaces;
   its windowed-child wrapper must pass the exact paths without PowerShell source interpolation.
+- Compare cached reads against raw `FindAll(Children, TrueCondition)` on disposable UIA providers,
+  including non-ControlView children, unsupported metadata and cache failures. Verify password and
+  unknown-password Edit/Document values are never queried. Check subtree depth/node limits, whole-window
+  screenshots, search filters/ancestor paths and ref replacement across tree/find; old root refs must fail.
+  In a disposable Chromium/Electron app, verify the 500 ms sparse retry, shared budgets and advisory
+  relaunch hint without any automatic restart. Measure native latency separately from fake contracts.
 - Retest screenshot density/omission, image-space click/scroll, moved/stale/obscured targets,
   maximized frames and rounded corners on mixed-DPI/negative-coordinate monitors, including
   a DPI-unaware target at 300% scaling. Use dummy secrets only; images are not password-redacted.

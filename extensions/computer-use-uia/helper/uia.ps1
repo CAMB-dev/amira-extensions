@@ -744,26 +744,34 @@ namespace OwnedUia {
         }
     }
 
-    function Assert-Element($window, $element) {
+    function Assert-Element($window, $element, $Clock = $null) {
+        Assert-TreeBudget $Clock
         Assert-Window $window
         if ($null -eq $element) { Deny 'Element is unavailable.' }
         # Identity properties only until the entire ancestry is proven. Stop at
         # our FromHandle root; never ask for its parent (the desktop/foreign UIA).
         $cursor = $element
         for ($i = 0; $i -lt 128; $i++) {
+            Assert-TreeBudget $Clock
             if ([System.Windows.Automation.Automation]::Compare($cursor, $window.Root)) {
+                Assert-TreeBudget $Clock
                 Assert-Window $window
                 return
             }
+            # Check between provider calls: one may overrun, but must not start
+            # more ancestry work after the shared snapshot deadline.
+            Assert-TreeBudget $Clock
             # A native child must also be inside this exact top-level HWND.
             $handleValue = $cursor.GetCurrentPropertyValue(
                 [System.Windows.Automation.AutomationElement]::NativeWindowHandleProperty, $true)
             if ($handleValue -is [int] -and $handleValue -ne 0) {
                 $handle = [IntPtr]::new([long]$handleValue)
+                Assert-TreeBudget $Clock
                 if ([OwnedUia.Native]::GetAncestor($handle, 2) -ne $window.Handle) {
                     Deny 'Element is outside the target window.'
                 }
             }
+            Assert-TreeBudget $Clock
             $cursor = $script:walker.GetParent($cursor)
             if ($null -eq $cursor) { break }
         }
@@ -1273,126 +1281,323 @@ namespace OwnedUia {
             ($shot.bounds.y + [int][Math]::Floor($y / $shot.scaleY)))
     }
 
-    # tree: bounded snapshot with unique refs, cheap state/text and traversal metrics.
-    function Get-OwnedTree($parameters) {
-        $window = Get-Window $parameters
-        # Invalidate refs and coordinates even if validation/capture/traversal fails.
-        $window.Refs = @{}
-        $window.Screenshot = $null
-        $depth = Get-Integer $parameters 'depth' 8 0 30
-        $maxNodes = Get-Integer $parameters 'maxNodes' 300 1 1000
-        $includeScreenshot = Get-Argument $parameters 'screenshot' $false
-        if ($includeScreenshot -isnot [bool]) { Deny 'screenshot must be a boolean.' }
-        $maxEdge = Get-Integer $parameters 'screenshotMaxEdge' 1280 128 4096
-        $screenshot = $null
-        # Capture before slow UIA provider traversal; reads must never focus/restore.
-        if ($includeScreenshot) { $screenshot = Get-TargetScreenshot $window $maxEdge }
-        $clock = [Diagnostics.Stopwatch]::StartNew()
-        $lines = New-Object System.Collections.Generic.List[string]
-        $stack = New-Object System.Collections.Generic.Stack[object]
-        $stack.Push([pscustomobject]@{ Element = $window.Root; Depth = 0; Sibling = $false })
-        $cut = $false
-        try {
-            while ($stack.Count -gt 0) {
-                if ($lines.Count -ge $maxNodes -or $clock.ElapsedMilliseconds -ge 20000) {
-                    $cut = $true
-                    break
-                }
-                $item = $stack.Pop()
-                $element = $item.Element
-                # Queue already-fetched siblings first, so an unreadable node does
-                # not prevent visiting the rest. No provider call on the parent.
-                if ($item.Sibling) {
-                    $siblings = $item.Siblings
-                    $next = $item.Index + 1
-                    if ($next -lt $siblings.Count) {
-                        $stack.Push([pscustomobject]@{
-                            Element = $siblings[$next]; Depth = $item.Depth; Sibling = $true
-                            Siblings = $siblings; Index = $next
-                        })
-                    }
-                }
-                $script:nextElement++
-                $ref = 'e' + $script:nextElement
-                $lineIndex = $lines.Count
-                try {
-                    Assert-Window $window
-                    # FindAll(Children) scopes this read to the target's UIA subtree.
-                    # Include cross-process/pop-up providers; refs are revalidated before actions.
-                    $type = Read-Property $window $element ([System.Windows.Automation.AutomationElement]::ControlTypeProperty) -Verified -Clock $clock
-                    $name = Read-Property $window $element ([System.Windows.Automation.AutomationElement]::NameProperty) -Verified -Clock $clock
-                    $automationId = Read-Property $window $element ([System.Windows.Automation.AutomationElement]::AutomationIdProperty) -Verified -Clock $clock
-                    $enabled = Read-Property $window $element ([System.Windows.Automation.AutomationElement]::IsEnabledProperty) -Verified -Clock $clock
-                    $offscreen = Read-Property $window $element ([System.Windows.Automation.AutomationElement]::IsOffscreenProperty) -Verified -Clock $clock
-                    $typeName = 'Unknown'
-                    if ($type -is [System.Windows.Automation.ControlType]) {
-                        $typeName = $type.ProgrammaticName.Replace('ControlType.', '')
-                    }
-                    $enabledFlag = '?'
-                    $offscreenFlag = '?'
-                    if ($enabled -is [bool]) { $enabledFlag = ([string]$enabled).ToLowerInvariant() }
-                    if ($offscreen -is [bool]) { $offscreenFlag = ([string]$offscreen).ToLowerInvariant() }
-                    $line = ('{0}{1} {2} name="{3}" enabled={4} offscreen={5}' -f
-                        ('  ' * $item.Depth), $ref, $typeName, (Escape-Field $name), $enabledFlag, $offscreenFlag)
-                    if ($automationId -is [string] -and $automationId.Length -gt 0) {
-                        $line += ' automationId="' + (Escape-Field $automationId) + '"'
-                    }
-                    $password = $null
-                    try {
-                        $password = Read-Property $window $element ([System.Windows.Automation.AutomationElement]::IsPasswordProperty) -Verified -Clock $clock
-                    } catch { Assert-TreeBudget $clock }
-                    $passwordUnknown = $password -isnot [bool]
-                    # Unknown is not a password flag for arbitrary controls, but text
-                    # inputs/documents fail closed without querying Value/Text patterns.
-                    if ($password -is [bool] -and $password) { $line += ' password=true' }
-                    elseif ($passwordUnknown -and $typeName -in @('Edit', 'Document')) { $line += ' password=unknown' }
-                    else {
-                        $valuePattern = Get-Pattern $window $element ([System.Windows.Automation.ValuePattern]::Pattern) -Verified -Clock $clock
-                        if ($null -ne $valuePattern) {
-                            $line += ' value="' + (Escape-Field $valuePattern.Current.Value) + '"'
-                            $line += ' readonly=' + ([string]$valuePattern.Current.IsReadOnly).ToLowerInvariant()
-                        } elseif ($typeName -eq 'Document' -or $typeName -eq 'Edit') {
-                            $textPattern = Get-Pattern $window $element ([System.Windows.Automation.TextPattern]::Pattern) -Verified -Clock $clock
-                            if ($null -ne $textPattern) {
-                                $line += ' text="' + (Escape-Field $textPattern.DocumentRange.GetText(512)) + '"'
-                            }
-                        }
-                    }
-                    $togglePattern = Get-Pattern $window $element ([System.Windows.Automation.TogglePattern]::Pattern) -Verified -Clock $clock
-                    if ($null -ne $togglePattern) {
-                        $line += ' toggle=' + (Escape-Field $togglePattern.Current.ToggleState)
-                    }
+    # The complete cache allowlist. Never add values, readOnly, text or patterns:
+    # those require current, password-guarded reads after this metadata is available.
+    function Get-TreeProperties {
+        return [ordered]@{
+            Type = [System.Windows.Automation.AutomationElement]::ControlTypeProperty
+            Name = [System.Windows.Automation.AutomationElement]::NameProperty
+            AutomationId = [System.Windows.Automation.AutomationElement]::AutomationIdProperty
+            Enabled = [System.Windows.Automation.AutomationElement]::IsEnabledProperty
+            Offscreen = [System.Windows.Automation.AutomationElement]::IsOffscreenProperty
+            Password = [System.Windows.Automation.AutomationElement]::IsPasswordProperty
+            ValueAvailable = [System.Windows.Automation.AutomationElement]::IsValuePatternAvailableProperty
+            ToggleAvailable = [System.Windows.Automation.AutomationElement]::IsTogglePatternAvailableProperty
+            TextAvailable = [System.Windows.Automation.AutomationElement]::IsTextPatternAvailableProperty
+            ScrollItemAvailable = [System.Windows.Automation.AutomationElement]::IsScrollItemPatternAvailableProperty
+            ScrollAvailable = [System.Windows.Automation.AutomationElement]::IsScrollPatternAvailableProperty
+            ExpandCollapseAvailable = [System.Windows.Automation.AutomationElement]::IsExpandCollapsePatternAvailableProperty
+            InvokeAvailable = [System.Windows.Automation.AutomationElement]::IsInvokePatternAvailableProperty
+            SelectionItemAvailable = [System.Windows.Automation.AutomationElement]::IsSelectionItemPatternAvailableProperty
+            ToggleState = [System.Windows.Automation.TogglePattern]::ToggleStateProperty
+        }
+    }
+
+    function New-TreeCacheRequest($properties) {
+        $cache = New-Object System.Windows.Automation.CacheRequest
+        $cache.AutomationElementMode = [System.Windows.Automation.AutomationElementMode]::Full
+        $cache.TreeScope = [System.Windows.Automation.TreeScope]::Element
+        $cache.TreeFilter = [System.Windows.Automation.Condition]::TrueCondition
+        foreach ($property in $properties.Values) { $cache.Add($property) }
+        return $cache
+    }
+
+    function Read-TreeProperties($window, $element, $properties, $metrics, $clock, [bool] $UseCache = $true) {
+        $values = @{}
+        if ($UseCache) {
+            try {
+                foreach ($entry in $properties.GetEnumerator()) {
                     Assert-TreeBudget $clock
-                    $window.Refs[$ref] = $element
-                    $lines.Add($line)
-                    if ($item.Depth -lt $depth -and $lines.Count -lt $maxNodes -and $clock.ElapsedMilliseconds -lt 20000) {
-                        # Children only, scoped to the target's UIA subtree.
-                        $children = $element.FindAll([System.Windows.Automation.TreeScope]::Children,
-                            [System.Windows.Automation.Condition]::TrueCondition)
-                        Assert-TreeBudget $clock
-                        if ($children.Count -gt 0) {
+                    $values[$entry.Key] = $element.GetCachedPropertyValue($entry.Value, $true)
+                }
+                $metrics.cached++
+                return $values
+            } catch { } # Per-node/provider fallback, not an all-or-nothing snapshot.
+        }
+        $metrics.fallback++
+        foreach ($entry in $properties.GetEnumerator()) {
+            try {
+                $values[$entry.Key] = Read-Property $window $element $entry.Value -Verified -Clock $clock
+            } catch {
+                Assert-TreeBudget $clock
+                # Keep the original fail-closed handling for unknown password
+                # flags, and tolerate unavailable optional pattern metadata.
+                if ($entry.Key -in @('Type', 'Name', 'AutomationId', 'Enabled', 'Offscreen')) { throw }
+                $values[$entry.Key] = $null
+            }
+        }
+        return $values
+    }
+
+    function Get-TreeChildren($element, $properties, $clock) {
+        Assert-TreeBudget $clock
+        try {
+            # Build independently for each parent: construction failures must not
+            # disable caching for other nodes/providers in this traversal.
+            $cache = New-TreeCacheRequest $properties
+            $pushed = $false
+            try {
+                $cache.Push()
+                $pushed = $true
+                # Raw Children enumeration is unchanged; the cache covers each
+                # returned element, never a ControlView-filtered subtree.
+                return ,$element.FindAll([System.Windows.Automation.TreeScope]::Children,
+                    [System.Windows.Automation.Condition]::TrueCondition)
+            } finally { if ($pushed) { $cache.Pop() } }
+        } catch {
+            # A provider may reject caching yet still support current reads.
+            Assert-TreeBudget $clock
+            return ,$element.FindAll([System.Windows.Automation.TreeScope]::Children,
+                [System.Windows.Automation.Condition]::TrueCondition)
+        }
+    }
+
+    # tree/find share the same bounded raw traversal and reference generations.
+    function Get-OwnedTree($parameters, [switch] $Find) {
+        $window = Get-Window $parameters
+        $window.Screenshot = $null
+        # Root ancestry (including retry validation) shares the traversal deadline.
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            $rootRef = Get-Argument $parameters 'root'
+            $root = $window.Root
+            if ($null -ne $rootRef) {
+                if ($rootRef -isnot [string] -or -not $window.Refs.ContainsKey($rootRef)) {
+                    Deny 'Unknown or stale root reference; call ui_tree without root.'
+                }
+                $root = $window.Refs[$rootRef]
+                try { Assert-Element $window $root -Clock $clock }
+                catch [TimeoutException] { Deny 'Tree traversal budget exhausted during root validation.' }
+                catch { Deny 'Unknown or stale root reference; call ui_tree without root.' }
+            }
+            # Resolve and validate the old root before replacing its generation.
+            $window.Refs = @{}
+            $depthDefault = 8
+            if ($Find) { $depthDefault = 30 }
+            $depth = Get-Integer $parameters 'depth' $depthDefault 0 30
+            $maxNodes = Get-Integer $parameters 'maxNodes' 300 1 1000
+            $maxResults = Get-Integer $parameters 'maxResults' 20 1 100
+            # Tree's node cap applies to the returned attempt; find has a hard
+            # total visited cap, including unmatched nodes and any retry.
+            $maxVisited = $maxNodes * 2
+            $maxLines = $maxNodes
+            if ($Find) { $maxVisited = 3000; $maxLines = $maxResults }
+            $threshold = Get-Integer $parameters 'treeDensityThreshold' 12 0 1000
+            $filters = @{}
+            foreach ($key in @('name', 'role', 'automationId')) {
+                $filter = Get-Argument $parameters $key
+                if ($null -ne $filter -and ($filter -isnot [string] -or [string]::IsNullOrWhiteSpace($filter))) {
+                    Deny 'Find filters must be nonempty strings.'
+                }
+                if ($key -eq 'role' -and $null -ne $filter -and $filter -notmatch '^[A-Za-z]+$') {
+                    Deny "role must be a ControlType name without 'ControlType.'."
+                }
+                if ($null -eq $filter) { $filter = '' }
+                $filters[$key] = $filter
+            }
+            if ($Find -and $filters.name.Length -eq 0 -and $filters.role.Length -eq 0 -and $filters.automationId.Length -eq 0) {
+                Deny 'ui_find requires at least one of name, role or automationId.'
+            }
+            $includeScreenshot = Get-Argument $parameters 'screenshot' $false
+            if ($includeScreenshot -isnot [bool]) { Deny 'screenshot must be a boolean.' }
+            $maxEdge = Get-Integer $parameters 'screenshotMaxEdge' 1280 128 4096
+            $screenshot = $null
+            # Find never captures. A rooted tree still captures the whole target
+            # window, once, before slow UIA reads; never focus or restore it.
+            if (-not $Find -and $includeScreenshot) {
+                Assert-TreeBudget $clock
+                # Capture/startup overhead stays outside the cooperative UIA budget.
+                $clock.Stop()
+                try { $screenshot = Get-TargetScreenshot $window $maxEdge }
+                finally { $clock.Start() }
+            }
+            $properties = Get-TreeProperties
+            $metrics = @{ cached = 0; fallback = 0; visited = 0 }
+            $class = New-Object Text.StringBuilder 256
+            $null = [OwnedUia.Native]::GetClassName($window.Handle, $class, $class.Capacity)
+            $chromium = $class.ToString().StartsWith('Chrome_WidgetWin_', [StringComparison]::Ordinal)
+            $retried = $false
+            do {
+                Assert-Window $window
+                if ($null -ne $rootRef) {
+                    try { Assert-Element $window $root -Clock $clock }
+                    catch [TimeoutException] { Deny 'Tree traversal budget exhausted during root validation.' }
+                    catch { Deny 'Unknown or stale root reference; call ui_tree without root.' }
+                }
+                # Every attempt has its own refs; no first-pass or unmatched refs survive.
+                $window.Refs = @{}
+                $lines = New-Object System.Collections.Generic.List[string]
+                $stack = New-Object System.Collections.Generic.Stack[object]
+                $cachedRoot = $root
+                $rootCacheReady = $false
+                try {
+                    Assert-TreeBudget $clock
+                    $cache = New-TreeCacheRequest $properties
+                    $cachedRoot = $root.GetUpdatedCache($cache)
+                    $rootCacheReady = $true
+                } catch { } # Never reuse a previous generation's cached root metadata.
+                $stack.Push([pscustomobject]@{ Element = $cachedRoot; Depth = 0; Sibling = $false; Path = @() })
+                $cut = $false
+                $density = 0
+                $chars = 0
+                while ($stack.Count -gt 0) {
+                    if ($metrics.visited -ge $maxVisited -or $clock.ElapsedMilliseconds -ge 20000 -or
+                        $lines.Count -ge $maxLines) {
+                        $cut = $true
+                        break
+                    }
+                    $item = $stack.Pop()
+                    $element = $item.Element
+                    # Queue fetched siblings before reading this node, including
+                    # unreadable nodes. No additional call on their parent.
+                    if ($item.Sibling) {
+                        $siblings = $item.Siblings
+                        $next = $item.Index + 1
+                        if ($next -lt $siblings.Count) {
                             $stack.Push([pscustomobject]@{
-                                Element = $children[0]; Depth = $item.Depth + 1; Sibling = $true
-                                Siblings = $children; Index = 0
+                                Element = $siblings[$next]; Depth = $item.Depth; Sibling = $true
+                                Siblings = $siblings; Index = $next; Path = $item.Path
                             })
                         }
-                    } elseif ($item.Depth -lt $depth) { $cut = $true }
-                } catch {
-                    if ($_.Exception.Message.StartsWith('UIA_SAFE: ', [StringComparison]::Ordinal)) { throw }
-                    # Provider errors reveal no exception details and grant no ref.
-                    $window.Refs.Remove($ref)
-                    $unreadable = ('{0}{1} unreadable' -f ('  ' * $item.Depth), $ref)
-                    if ($lines.Count -gt $lineIndex) { $lines[$lineIndex] = $unreadable }
-                    else { $lines.Add($unreadable) }
-                    $cut = $true
+                    }
+                    $metrics.visited++
+                    $script:nextElement++
+                    $ref = 'e' + $script:nextElement
+                    $lineIndex = $lines.Count
+                    $countedDensity = $false
+                    try {
+                        Assert-Window $window
+                        $metadata = Read-TreeProperties $window $element $properties $metrics $clock -UseCache ($item.Depth -gt 0 -or $rootCacheReady)
+                        $type = $metadata.Type
+                        $name = $metadata.Name
+                        $automationId = $metadata.AutomationId
+                        $enabled = $metadata.Enabled
+                        $offscreen = $metadata.Offscreen
+                        $password = $metadata.Password
+                        $typeName = 'Unknown'
+                        if ($type -is [System.Windows.Automation.ControlType]) {
+                            $typeName = $type.ProgrammaticName.Replace('ControlType.', '')
+                        }
+                        # Density covers all readable visited nodes, not just find
+                        # matches; unknown visibility counts conservatively.
+                        if ($typeName -ne 'Window' -and $offscreen -ne $true) { $density++; $countedDensity = $true }
+                        $matches = -not $Find -or (
+                            ($filters.name.Length -eq 0 -or ($name -is [string] -and $name.IndexOf($filters.name, [StringComparison]::OrdinalIgnoreCase) -ge 0)) -and
+                            ($filters.role.Length -eq 0 -or [string]::Equals($typeName, $filters.role, [StringComparison]::OrdinalIgnoreCase)) -and
+                            ($filters.automationId.Length -eq 0 -or ($automationId -is [string] -and $automationId.IndexOf($filters.automationId, [StringComparison]::OrdinalIgnoreCase) -ge 0)))
+                        if ($matches) {
+                            $enabledFlag = '?'
+                            $offscreenFlag = '?'
+                            if ($enabled -is [bool]) { $enabledFlag = ([string]$enabled).ToLowerInvariant() }
+                            if ($offscreen -is [bool]) { $offscreenFlag = ([string]$offscreen).ToLowerInvariant() }
+                            $line = ('{0}{1} {2} name="{3}" enabled={4} offscreen={5}' -f
+                                ('  ' * $item.Depth), $ref, $typeName, (Escape-Field $name), $enabledFlag, $offscreenFlag)
+                            if ($automationId -is [string] -and $automationId.Length -gt 0) {
+                                $line += ' automationId="' + (Escape-Field $automationId) + '"'
+                            }
+                            if ($Find -and $item.Path.Count -gt 0) {
+                                $line += ' path="' + (Escape-Field ([string]::Join(' > ', [string[]]$item.Path))) + '"'
+                            }
+                            $passwordUnknown = $password -isnot [bool]
+                            # Passwords and unknown Edit/Document flags never query
+                            # current Value/Text patterns; neither is ever cached.
+                            if ($password -is [bool] -and $password) { $line += ' password=true' }
+                            elseif ($passwordUnknown -and $typeName -in @('Edit', 'Document')) { $line += ' password=unknown' }
+                            else {
+                                $valuePattern = $null
+                                if ($metadata.ValueAvailable -ne $false) {
+                                    $valuePattern = Get-Pattern $window $element ([System.Windows.Automation.ValuePattern]::Pattern) -Verified -Clock $clock
+                                }
+                                if ($null -ne $valuePattern) {
+                                    Assert-TreeBudget $clock
+                                    $line += ' value="' + (Escape-Field $valuePattern.Current.Value) + '"'
+                                    Assert-TreeBudget $clock
+                                    $line += ' readonly=' + ([string]$valuePattern.Current.IsReadOnly).ToLowerInvariant()
+                                } elseif ($typeName -in @('Document', 'Edit') -and $metadata.TextAvailable -ne $false) {
+                                    $textPattern = Get-Pattern $window $element ([System.Windows.Automation.TextPattern]::Pattern) -Verified -Clock $clock
+                                    if ($null -ne $textPattern) {
+                                        Assert-TreeBudget $clock
+                                        $range = $textPattern.DocumentRange
+                                        Assert-TreeBudget $clock
+                                        $line += ' text="' + (Escape-Field $range.GetText(512)) + '"'
+                                    }
+                                }
+                            }
+                            if ($metadata.ToggleAvailable -eq $true -and
+                                $metadata.ToggleState -is [System.Windows.Automation.ToggleState]) {
+                                $line += ' toggle=' + (Escape-Field $metadata.ToggleState)
+                            }
+                            Assert-TreeBudget $clock
+                            # Reserve 100 characters for the cut note/newline.
+                            if ($chars + $line.Length + 1 -gt 199900) { $cut = $true; break }
+                            $window.Refs[$ref] = $element
+                            $lines.Add($line)
+                            $chars += $line.Length + 1
+                        }
+                        if ($item.Depth -lt $depth -and $metrics.visited -lt $maxVisited -and
+                            $lines.Count -lt $maxLines -and $clock.ElapsedMilliseconds -lt 20000) {
+                            $children = Get-TreeChildren $element $properties $clock
+                            Assert-TreeBudget $clock
+                            if ($children.Count -gt 0) {
+                                # Context only: no refs for unmatched ancestors, and
+                                # never climb outside the requested traversal root.
+                                $path = @($item.Path) + @($typeName + ' ' + (Escape-Field $name))
+                                if ($path.Count -gt 3) { $path = @($path[($path.Count - 3)..($path.Count - 1)]) }
+                                $stack.Push([pscustomobject]@{
+                                    Element = $children[0]; Depth = $item.Depth + 1; Sibling = $true
+                                    Siblings = $children; Index = 0; Path = $path
+                                })
+                            }
+                        } elseif ($item.Depth -lt $depth) { $cut = $true }
+                    } catch {
+                        if ($_.Exception.Message.StartsWith('UIA_SAFE: ', [StringComparison]::Ordinal)) { throw }
+                        $window.Refs.Remove($ref)
+                        if ($countedDensity) { $density-- }
+                        # Provider errors reveal no details or matching ref. A tree
+                        # retains its unreadable marker; find returns matches only.
+                        if ($lines.Count -gt $lineIndex) {
+                            $chars -= $lines[$lineIndex].Length + 1
+                            $lines.RemoveAt($lineIndex)
+                        }
+                        if (-not $Find) {
+                            $unreadable = ('{0}{1} unreadable' -f ('  ' * $item.Depth), $ref)
+                            if ($chars + $unreadable.Length + 1 -gt 199900) { $cut = $true; break }
+                            $lines.Add($unreadable)
+                            $chars += $unreadable.Length + 1
+                        }
+                        $cut = $true
+                    }
                 }
-            }
+                $chromiumSparse = $chromium -and $density -lt $threshold
+                if ($chromiumSparse -and -not $retried -and $metrics.visited -lt $maxVisited -and
+                    $clock.ElapsedMilliseconds -lt 19500) {
+                    # One Chromium accessibility warm-up retry, inside the SAME
+                    # 20 s and visited-node budgets (no focus/flags/messages).
+                    Start-Sleep -Milliseconds 500
+                    $retried = $true
+                    continue
+                }
+                break
+            } while ($true)
+            Assert-Window $window
             $nodes = $lines.Count
-            if ($cut) { $lines.Add('[cut: node/character/time limit or unreadable node]') }
+            if ($cut) { $lines.Add('[cut: node/character/time/result limit or unreadable node]') }
             $text = [string]::Join("`n", $lines.ToArray())
             $result = @{ text = $text; nodes = $nodes; chars = $text.Length;
-                ms = $clock.ElapsedMilliseconds; cut = $cut }
-            if ($includeScreenshot) { $result.screenshot = $screenshot }
+                ms = $clock.ElapsedMilliseconds; cut = $cut; cached = $metrics.cached;
+                fallback = $metrics.fallback; retried = [bool]$retried; chromiumSparse = [bool]$chromiumSparse;
+                visited = $metrics.visited; density = $density }
+            if (-not $Find -and $includeScreenshot) { $result.screenshot = $screenshot }
             return $result
         } catch {
             $window.Refs = @{}
@@ -1721,10 +1926,10 @@ namespace OwnedUia {
                 Deny 'Invalid method or params.'
             }
             $targetRef = Get-Argument $parameters 'window'
-            if ($method -ceq 'tree' -and $targetRef -is [string] -and $script:windows.ContainsKey($targetRef)) {
-                # Clear before Get-Window too: failed root/identity validation cannot retain tokens.
+            if ($method -cin @('tree', 'find') -and $targetRef -is [string] -and $script:windows.ContainsKey($targetRef)) {
+                # Clear coordinates before Get-Window too. Keep refs until the
+                # optional root has been resolved/revalidated, or clear on error.
                 $script:windows[$targetRef].Screenshot = $null
-                $script:windows[$targetRef].Refs = @{}
             }
             if ($method -in @('launch', 'click', 'scroll', 'type', 'key', 'focus', 'close')) {
                 $script:overlayClass = [string](Get-Argument $parameters 'overlayClass' '')
@@ -1734,6 +1939,7 @@ namespace OwnedUia {
                 'windows' { Get-Windows $parameters; break }
                 'launch' { Start-OwnedApp $parameters; break }
                 'tree' { Get-OwnedTree $parameters; break }
+                'find' { Get-OwnedTree $parameters -Find; break }
                 'click' { Invoke-OwnedClick $parameters; break }
                 'scroll' { Invoke-OwnedScroll $parameters; break }
                 'type' { Set-OwnedText $parameters; break }
@@ -1753,6 +1959,7 @@ namespace OwnedUia {
         } catch {
             if ($targetRef -is [string] -and $script:windows.ContainsKey($targetRef)) {
                 $script:windows[$targetRef].Screenshot = $null
+                if ($method -cin @('tree', 'find')) { $script:windows[$targetRef].Refs = @{} }
             }
             $message = 'Operation failed or target could not be verified.'
             $exception = $_.Exception
