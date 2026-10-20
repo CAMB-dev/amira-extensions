@@ -189,9 +189,75 @@ namespace OwnedUia {
         int dispatchState; // 0 pending, 1 dispatched, 2 cancelled; timeout and dispatch have one winner.
         public bool Completed { get; private set; }
         public bool Failed { get; private set; }
+        public double? VerticalScrollPercent { get; private set; }
+        public System.Windows.Automation.AutomationElement Element { get; private set; }
+        public sealed class ItemReference {
+            public System.Windows.Automation.AutomationElement Container;
+            public string Property, Value, Name, Role, AutomationId;
+            public int[] RuntimeId;
+        }
+        static bool SameRuntimeId(int[] first, int[] second) {
+            if (first == null || second == null || first.Length != second.Length) return false;
+            for (int i = 0; i < first.Length; i++) if (first[i] != second[i]) return false;
+            return true;
+        }
+        static System.Windows.Automation.AutomationElement Reacquire(ItemReference reference) {
+            // Property equality (even uniqueness) cannot establish continuity
+            // with an observed placeholder. Never look up an opaque replacement.
+            if (reference.RuntimeId == null || reference.RuntimeId.Length == 0) throw new InvalidOperationException();
+            object containerPattern;
+            if (!reference.Container.TryGetCurrentPattern(System.Windows.Automation.ItemContainerPattern.Pattern,
+                out containerPattern)) throw new InvalidOperationException();
+            var container = (System.Windows.Automation.ItemContainerPattern)containerPattern;
+            var property = reference.Property == "automationId" ?
+                System.Windows.Automation.AutomationElement.AutomationIdProperty :
+                System.Windows.Automation.AutomationElement.NameProperty;
+            var current = container.FindItemByProperty(null, property, reference.Value);
+            for (int i = 0; current != null && i < 100; i++) {
+                if (SameRuntimeId(current.GetRuntimeId(), reference.RuntimeId)) return current;
+                current = container.FindItemByProperty(current, property, reference.Value);
+            }
+            throw new InvalidOperationException();
+        }
+        static bool MatchesAdditionalFilters(System.Windows.Automation.AutomationElement element, ItemReference reference) {
+            if (reference.Property != "name" && !String.IsNullOrEmpty(reference.Name)) {
+                var name = element.GetCurrentPropertyValue(System.Windows.Automation.AutomationElement.NameProperty, true) as string;
+                if (name == null || name.IndexOf(reference.Name, StringComparison.OrdinalIgnoreCase) < 0) return false;
+            }
+            if (reference.Property != "automationId" && !String.IsNullOrEmpty(reference.AutomationId)) {
+                var id = element.GetCurrentPropertyValue(System.Windows.Automation.AutomationElement.AutomationIdProperty, true) as string;
+                if (id == null || id.IndexOf(reference.AutomationId, StringComparison.OrdinalIgnoreCase) < 0) return false;
+            }
+            if (!String.IsNullOrEmpty(reference.Role)) {
+                var type = element.GetCurrentPropertyValue(System.Windows.Automation.AutomationElement.ControlTypeProperty, true)
+                    as System.Windows.Automation.ControlType;
+                if (type == null || !String.Equals(type.ProgrammaticName.Replace("ControlType.", ""), reference.Role,
+                    StringComparison.OrdinalIgnoreCase)) return false;
+            }
+            return true;
+        }
+        static bool WithinWindow(System.Windows.Automation.AutomationElement element,
+            System.Windows.Automation.AutomationElement root, IntPtr window) {
+            var cursor = element;
+            for (int i = 0; cursor != null && i < 128; i++) {
+                if (System.Windows.Automation.Automation.Compare(cursor, root)) return true;
+                object value = cursor.GetCurrentPropertyValue(
+                    System.Windows.Automation.AutomationElement.NativeWindowHandleProperty, true);
+                if (value is int && (int)value != 0 &&
+                    Native.GetAncestor(new IntPtr((int)value), 2) != window) throw new InvalidOperationException();
+                cursor = System.Windows.Automation.TreeWalker.RawViewWalker.GetParent(cursor);
+            }
+            return false;
+        }
         public static PatternCall Run(object pattern, string action, string text,
             System.Windows.Automation.AutomationElement element,
             System.Windows.Automation.AutomationElement root, IntPtr window, int pid, long started) {
+            return Run(pattern, action, text, element, root, window, pid, started, null);
+        }
+        public static PatternCall Run(object pattern, string action, string text,
+            System.Windows.Automation.AutomationElement element,
+            System.Windows.Automation.AutomationElement root, IntPtr window, int pid, long started,
+            ItemReference reference) {
             if (System.Threading.Interlocked.Increment(ref active) > 8) {
                 System.Threading.Interlocked.Decrement(ref active);
                 throw new InvalidOperationException("UIA_SAFE: Too many busy pattern calls; close the target dialog first.");
@@ -209,19 +275,24 @@ namespace OwnedUia {
                                 !Native.IsWindow(window) || Native.WindowPid(window) != pid ||
                                 !System.Windows.Automation.Automation.Compare(root,
                                     System.Windows.Automation.AutomationElement.FromHandle(window))) throw new InvalidOperationException();
-                            var cursor = element;
-                            bool verified = false;
-                            for (int i = 0; cursor != null && i < 128; i++) {
-                                if (System.Windows.Automation.Automation.Compare(cursor, root)) { verified = true; break; }
-                                object value = cursor.GetCurrentPropertyValue(
-                                    System.Windows.Automation.AutomationElement.NativeWindowHandleProperty, true);
-                                if (value is int && (int)value != 0 &&
-                                    Native.GetAncestor(new IntPtr((int)value), 2) != window) throw new InvalidOperationException();
-                                cursor = System.Windows.Automation.TreeWalker.RawViewWalker.GetParent(cursor);
+                            if (!WithinWindow(reference == null ? element : reference.Container, root, window))
+                                throw new InvalidOperationException();
+                            if (reference != null) {
+                                if (action != "realize") throw new InvalidOperationException();
+                                element = Reacquire(reference);
+                                // Validate the fresh item, never the expired observation.
+                                try {
+                                    if (!WithinWindow(element, root, window)) throw new InvalidOperationException();
+                                } catch (System.Windows.Automation.ElementNotAvailableException) { }
+                                if (!MatchesAdditionalFilters(element, reference) ||
+                                    !element.TryGetCurrentPattern(System.Windows.Automation.VirtualizedItemPattern.Pattern, out pattern))
+                                    throw new InvalidOperationException();
                             }
-                            if (!verified || target.HasExited || Native.CreationTime(handle) != started ||
+                            if (target.HasExited || Native.CreationTime(handle) != started ||
                                 Native.WindowPid(window) != pid || !System.Windows.Automation.Automation.Compare(root,
                                     System.Windows.Automation.AutomationElement.FromHandle(window))) throw new InvalidOperationException();
+                            if (action == "scroll" && !((System.Windows.Automation.ScrollPattern)pattern).Current.VerticallyScrollable)
+                                throw new InvalidOperationException();
                             // A timed-out preflight must not dispatch a delayed action.
                             if (System.Threading.Interlocked.CompareExchange(ref result.dispatchState, 1, 0) != 0) return;
                             switch (action) {
@@ -233,7 +304,39 @@ namespace OwnedUia {
                                 case "value": ((System.Windows.Automation.ValuePattern)pattern).SetValue(text); break;
                                 case "close": ((System.Windows.Automation.WindowPattern)pattern).Close(); break;
                                 case "focus": element.SetFocus(); break;
+                                case "realize": ((System.Windows.Automation.VirtualizedItemPattern)pattern).Realize(); break;
+                                case "scrollIntoView": ((System.Windows.Automation.ScrollItemPattern)pattern).ScrollIntoView(); break;
+                                case "scroll":
+                                    var scroll = (System.Windows.Automation.ScrollPattern)pattern;
+                                    int delta = Int32.Parse(text, System.Globalization.CultureInfo.InvariantCulture);
+                                    if (delta == 0 || Math.Abs(delta) > 10) throw new InvalidOperationException();
+                                    for (int step = 0; step < Math.Abs(delta); step++) {
+                                        if (!scroll.Current.VerticallyScrollable) throw new InvalidOperationException();
+                                        scroll.Scroll(System.Windows.Automation.ScrollAmount.NoAmount,
+                                            delta > 0 ? System.Windows.Automation.ScrollAmount.SmallDecrement :
+                                                System.Windows.Automation.ScrollAmount.SmallIncrement);
+                                    }
+                                    try { result.VerticalScrollPercent = scroll.Current.VerticalScrollPercent; } catch { }
+                                    break;
                                 default: throw new InvalidOperationException();
+                            }
+                            result.Element = element;
+                            if (action == "realize" || action == "scrollIntoView") {
+                                // Realize does not grant authority over a foreign/moved item.
+                                if (!WithinWindow(element, root, window)) throw new InvalidOperationException();
+                                try {
+                                    var cursor = element;
+                                    for (int level = 0; cursor != null && level <= 5; level++) {
+                                        if (!WithinWindow(cursor, root, window)) break;
+                                        object scrollPattern;
+                                        if (cursor.TryGetCurrentPattern(System.Windows.Automation.ScrollPattern.Pattern, out scrollPattern)) {
+                                            result.VerticalScrollPercent = ((System.Windows.Automation.ScrollPattern)scrollPattern).Current.VerticalScrollPercent;
+                                            break;
+                                        }
+                                        if (System.Windows.Automation.Automation.Compare(cursor, root)) break;
+                                        cursor = System.Windows.Automation.TreeWalker.RawViewWalker.GetParent(cursor);
+                                    }
+                                } catch { } // Percentage is optional; never replace a successful action with a read error.
                             }
                         }
                     } catch { result.Failed = true; }
@@ -779,7 +882,9 @@ namespace OwnedUia {
     }
 
     function Assert-TreeBudget($clock) {
-        if ($null -ne $clock -and $clock.ElapsedMilliseconds -ge 20000) {
+        $budgetMs = 20000
+        if ($null -ne $clock -and $null -ne $clock.PSObject.Properties['BudgetMs']) { $budgetMs = $clock.BudgetMs }
+        if ($null -ne $clock -and $clock.ElapsedMilliseconds -ge $budgetMs) {
             # Not a safety Deny: the snapshot can return a partial/unreadable node.
             throw [TimeoutException]::new('Tree traversal budget exhausted.')
         }
@@ -800,7 +905,8 @@ namespace OwnedUia {
         return $null
     }
 
-    function Get-Window($parameters) {
+    function Get-Window($parameters, $Clock = $null) {
+        Assert-TreeBudget $Clock
         $ref = Get-Argument $parameters 'window'
         $number = 0L
         if ($ref -isnot [string] -or -not [long]::TryParse($ref, [ref]$number) -or $number -le 0) {
@@ -810,13 +916,17 @@ namespace OwnedUia {
         if (-not [OwnedUia.Native]::IsWindow($handle) -or [OwnedUia.Native]::GetAncestor($handle, 2) -ne $handle) {
             Deny 'Target is not a top-level window; use ui_windows.'
         }
+        Assert-TreeBudget $Clock
         $identity = Get-Identity ([OwnedUia.Native]::WindowPid($handle))
         if ($null -eq $identity) { Deny 'Target process is inaccessible or exited.' }
+        Assert-TreeBudget $Clock
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($handle)
+        Assert-TreeBudget $Clock
         if ($script:windows.ContainsKey($ref)) {
             $window = $script:windows[$ref]
             $sameRoot = $false
             try { $sameRoot = [System.Windows.Automation.Automation]::Compare($window.Root, $root) } catch { }
+            Assert-TreeBudget $Clock
             if ($window.Identity.Key -eq $identity.Key -and $sameRoot) {
                 Assert-Window $window
                 return $window
@@ -826,7 +936,7 @@ namespace OwnedUia {
         }
         $window = [pscustomobject]@{
             Ref = $ref; Handle = $handle; Identity = $identity
-            Root = $root; Refs = @{}; Screenshot = $null
+            Root = $root; Refs = @{}; VirtualRefs = @{}; Screenshot = $null
         }
         Assert-Window $window
         $script:windows[$ref] = $window
@@ -857,25 +967,35 @@ namespace OwnedUia {
         }
     }
 
-    function Get-Windows($parameters) {
+    function Get-Windows($parameters, $Clock = $null) {
         $filter = Get-Argument $parameters 'filter' ''
         if ($filter -isnot [string]) { Deny 'Filter must be a substring.' }
         $matches = New-Object System.Collections.Generic.List[object]
         $cut = $false
-        foreach ($native in [OwnedUia.Native]::Windows()) {
-            if (-not $native.Visible) { continue }
-            $info = Get-WindowInfo $native
-            # Filter against the full native title; truncate only the returned text.
-            $filterTitle = New-Object Text.StringBuilder 4096
-            $null = [OwnedUia.Native]::GetWindowText($native.Handle, $filterTitle, $filterTitle.Capacity)
-            $search = $info.window + ' ' + $filterTitle.ToString() + ' ' + $info.process + ' ' + $info.pid + ' ' + $info.class
-            if ($search.IndexOf($filter, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                if ($matches.Count -ge 200) { $cut = $true; break }
-                if ($info.titleCut) { $cut = $true }
-                $matches.Add($info)
+        $incomplete = $false
+        Assert-TreeBudget $Clock
+        try {
+            foreach ($native in [OwnedUia.Native]::Windows()) {
+                Assert-TreeBudget $Clock
+                if (-not $native.Visible) { continue }
+                $info = Get-WindowInfo $native
+                Assert-TreeBudget $Clock
+                # Filter against the full native title; truncate only the returned text.
+                $filterTitle = New-Object Text.StringBuilder 4096
+                $copied = [OwnedUia.Native]::GetWindowText($native.Handle, $filterTitle, $filterTitle.Capacity)
+                # Unlike 120-character display shortening, a full native filter
+                # buffer can hide a matching suffix. Absence is then unproven.
+                if ($copied -ge $filterTitle.Capacity - 1) { $cut = $true; $incomplete = $true }
+                Assert-TreeBudget $Clock
+                $search = $info.window + ' ' + $filterTitle.ToString() + ' ' + $info.process + ' ' + $info.pid + ' ' + $info.class
+                if ($search.IndexOf($filter, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    if ($matches.Count -ge 200) { $cut = $true; $incomplete = $true; break }
+                    if ($info.titleCut) { $cut = $true }
+                    $matches.Add($info)
+                }
             }
-        }
-        $result = @{ windows = @($matches.ToArray()); cut = $cut }
+        } catch [TimeoutException] { $cut = $true; $incomplete = $true }
+        $result = @{ windows = @($matches.ToArray()); cut = $cut; incomplete = $incomplete }
         if ($cut) { $result.note = '[cut: window list limited to 200 entries; titles limited to 120 characters]' }
         return $result
     }
@@ -1362,12 +1482,57 @@ namespace OwnedUia {
         }
     }
 
+    # Exact provider lookup supplements (never changes) the normal substring AND filters.
+    # No Realize/ScrollIntoView here: placeholders are observations, not actions.
+    function Get-ContainerLookup($window, $root, $filters, $clock) {
+        $key = 'name'
+        if ($filters.automationId.Length -gt 0) { $key = 'automationId' }
+        if ($filters[$key].Length -eq 0) { return $null }
+        $property = [System.Windows.Automation.AutomationElement]::NameProperty
+        if ($key -eq 'automationId') { $property = [System.Windows.Automation.AutomationElement]::AutomationIdProperty }
+        $pattern = Get-Pattern $window $root ([System.Windows.Automation.ItemContainerPattern]::Pattern) -Verified -Clock $clock
+        if ($null -eq $pattern) { return $null }
+        return @{ Pattern = $pattern; Property = $property; Key = $key; Value = $filters[$key] }
+    }
+
+    function Read-VirtualMetadata($element, $properties, $clock) {
+        $metadata = @{}
+        foreach ($key in @('Type', 'Name', 'AutomationId', 'Enabled', 'Offscreen', 'Password')) {
+            Assert-TreeBudget $clock
+            try { $metadata[$key] = $element.GetCurrentPropertyValue($properties[$key], $true) }
+            catch { Assert-TreeBudget $clock; $metadata[$key] = $null }
+        }
+        # A virtualized placeholder can expose only Name/AutomationId. Never query
+        # values or text, nor require enabled/visibility/type to be available.
+        $metadata.ValueAvailable = $false
+        $metadata.TextAvailable = $false
+        $metadata.ToggleAvailable = $false
+        return $metadata
+    }
+
     # tree/find share the same bounded raw traversal and reference generations.
-    function Get-OwnedTree($parameters, [switch] $Find) {
-        $window = Get-Window $parameters
+    function Get-OwnedTree($parameters, [switch] $Find, [switch] $Poll, $Clock = $null) {
+        if ($Poll) { $window = Get-Window $parameters -Clock $Clock }
+        else { $window = Get-Window $parameters }
+        $publishWindow = $window
+        if ($null -eq $window.PSObject.Properties['VirtualRefs']) { $window | Add-Member NoteProperty VirtualRefs @{} }
+        if ($Poll) {
+            # Missing/gone polls never retire the caller's existing generation.
+            $window = $window.PSObject.Copy()
+            $window.Refs = @{}
+            $window.VirtualRefs = @{}
+        }
         $window.Screenshot = $null
         # Root ancestry (including retry validation) shares the traversal deadline.
-        $clock = [Diagnostics.Stopwatch]::StartNew()
+        if ($null -eq $clock) { $clock = [Diagnostics.Stopwatch]::StartNew() }
+        $budgetMs = 20000
+        if ($Poll) {
+            $budgetMs = Get-Integer $parameters 'budgetMs' 1000 1 1000
+            if ($null -eq $clock.PSObject.Properties['BudgetMs']) { $clock | Add-Member NoteProperty BudgetMs $budgetMs }
+            if ($null -eq $clock.PSObject.Properties['RemainingNodes']) {
+                $clock | Add-Member NoteProperty RemainingNodes (Get-Integer $parameters 'maxVisited' 1000 1 1000)
+            }
+        }
         try {
             $rootRef = Get-Argument $parameters 'root'
             $root = $window.Root
@@ -1382,6 +1547,7 @@ namespace OwnedUia {
             }
             # Resolve and validate the old root before replacing its generation.
             $window.Refs = @{}
+            $window.VirtualRefs = @{}
             $depthDefault = 8
             if ($Find) { $depthDefault = 30 }
             $depth = Get-Integer $parameters 'depth' $depthDefault 0 30
@@ -1392,6 +1558,7 @@ namespace OwnedUia {
             $maxVisited = $maxNodes * 2
             $maxLines = $maxNodes
             if ($Find) { $maxVisited = 3000; $maxLines = $maxResults }
+            if ($Poll) { $maxVisited = Get-Integer $parameters 'maxVisited' 1000 1 1000; $maxLines = 1 }
             $threshold = Get-Integer $parameters 'treeDensityThreshold' 12 0 1000
             $filters = @{}
             foreach ($key in @('name', 'role', 'automationId')) {
@@ -1422,6 +1589,14 @@ namespace OwnedUia {
                 finally { $clock.Start() }
             }
             $properties = Get-TreeProperties
+            if ($Poll) {
+                # Cheap presence checks never read value/text or action patterns.
+                $cheapProperties = [ordered]@{}
+                foreach ($key in @('Type', 'Name', 'AutomationId', 'Enabled', 'Offscreen', 'Password')) {
+                    $cheapProperties[$key] = $properties[$key]
+                }
+                $properties = $cheapProperties
+            }
             $metrics = @{ cached = 0; fallback = 0; visited = 0 }
             $class = New-Object Text.StringBuilder 256
             $null = [OwnedUia.Native]::GetClassName($window.Handle, $class, $class.Capacity)
@@ -1436,6 +1611,8 @@ namespace OwnedUia {
                 }
                 # Every attempt has its own refs; no first-pass or unmatched refs survive.
                 $window.Refs = @{}
+                $window.VirtualRefs = @{}
+                $publishedContainer = New-Object System.Collections.Generic.List[object]
                 $lines = New-Object System.Collections.Generic.List[string]
                 $stack = New-Object System.Collections.Generic.Stack[object]
                 $cachedRoot = $root
@@ -1446,18 +1623,36 @@ namespace OwnedUia {
                     $cachedRoot = $root.GetUpdatedCache($cache)
                     $rootCacheReady = $true
                 } catch { } # Never reuse a previous generation's cached root metadata.
-                $stack.Push([pscustomobject]@{ Element = $cachedRoot; Depth = 0; Sibling = $false; Path = @() })
+                $stack.Push([pscustomobject]@{ Element = $cachedRoot; Depth = 0; Sibling = $false; Path = @(); ContainerItem = $false })
                 $cut = $false
+                $lookup = $null
+                $containerAfter = $null
+                $containerCount = 0
+                if ($Find -and -not $Poll) {
+                    try { $lookup = Get-ContainerLookup $window $root $filters $clock }
+                    catch { $cut = $true }
+                }
                 $density = 0
                 $chars = 0
-                while ($stack.Count -gt 0) {
-                    if ($metrics.visited -ge $maxVisited -or $clock.ElapsedMilliseconds -ge 20000 -or
+                while ($stack.Count -gt 0 -or $null -ne $lookup) {
+                    if ($metrics.visited -ge $maxVisited -or $clock.ElapsedMilliseconds -ge $budgetMs -or
                         $lines.Count -ge $maxLines) {
                         $cut = $true
                         break
                     }
-                    $item = $stack.Pop()
-                    $element = $item.Element
+                    if ($null -ne $lookup) {
+                        # A new lookup may invalidate the preceding placeholder, even
+                        # when it returns null. Consume this item before advancing.
+                        if ($containerCount -ge $maxResults) { $cut = $true; $lookup = $null; continue }
+                        try {
+                            Assert-TreeBudget $clock
+                            $element = $lookup.Pattern.FindItemByProperty($containerAfter, $lookup.Property, $lookup.Value)
+                        } catch { $cut = $true; $lookup = $null; continue }
+                        if ($null -eq $element) { $lookup = $null; continue }
+                        $containerAfter = $element
+                        $containerCount++
+                        $item = [pscustomobject]@{ Element = $element; Depth = 1; Sibling = $false; Path = @(); ContainerItem = $true }
+                    } else { $item = $stack.Pop(); $element = $item.Element }
                     # Queue fetched siblings before reading this node, including
                     # unreadable nodes. No additional call on their parent.
                     if ($item.Sibling) {
@@ -1466,9 +1661,28 @@ namespace OwnedUia {
                         if ($next -lt $siblings.Count) {
                             $stack.Push([pscustomobject]@{
                                 Element = $siblings[$next]; Depth = $item.Depth; Sibling = $true
-                                Siblings = $siblings; Index = $next; Path = $item.Path
+                                Siblings = $siblings; Index = $next; Path = $item.Path; ContainerItem = $false
                             })
                         }
+                    }
+                    if (-not $item.ContainerItem -and $publishedContainer.Count -gt 0) {
+                        $duplicate = $false
+                        try {
+                            foreach ($candidate in $publishedContainer) {
+                                Assert-TreeBudget $clock
+                                try {
+                                    if ([System.Windows.Automation.Automation]::Compare($candidate, $element)) { $duplicate = $true; break }
+                                } catch [System.Windows.Automation.ElementNotAvailableException] { }
+                                # Previously consumed virtual placeholders may now be invalid.
+
+                            }
+                        } catch { $cut = $true; break }
+                        # Skip duplicate output, not its children (it may be a container).
+                        if ($duplicate) { $item | Add-Member NoteProperty Duplicate $true }
+                    }
+                    if ($Poll) {
+                        if ($clock.RemainingNodes -le 0) { $cut = $true; break }
+                        $clock.RemainingNodes--
                     }
                     $metrics.visited++
                     $script:nextElement++
@@ -1477,7 +1691,18 @@ namespace OwnedUia {
                     $countedDensity = $false
                     try {
                         Assert-Window $window
-                        $metadata = Read-TreeProperties $window $element $properties $metrics $clock -UseCache ($item.Depth -gt 0 -or $rootCacheReady)
+                        $virtualized = $false
+                        if ($item.ContainerItem) {
+                            $virtualized = $null -ne (Get-Pattern $window $element ([System.Windows.Automation.VirtualizedItemPattern]::Pattern) -Verified -Clock $clock)
+                        }
+                        if ($virtualized) {
+                            $metadata = Read-VirtualMetadata $element $properties $clock
+                            # FindItemByProperty already proves this one exact predicate;
+                            # placeholders need not expose the corresponding getter.
+                            if ($metadata[$lookup.Key] -isnot [string]) { $metadata[$lookup.Key] = $lookup.Value }
+                        }
+                        else { $metadata = Read-TreeProperties $window $element $properties $metrics $clock -UseCache (-not $item.ContainerItem -and ($item.Depth -gt 0 -or $rootCacheReady)) }
+                        if ($Poll) { $metadata.ValueAvailable = $false; $metadata.TextAvailable = $false; $metadata.ToggleAvailable = $false }
                         $type = $metadata.Type
                         $name = $metadata.Name
                         $automationId = $metadata.AutomationId
@@ -1493,8 +1718,9 @@ namespace OwnedUia {
                         if ($typeName -ne 'Window' -and $offscreen -ne $true) { $density++; $countedDensity = $true }
                         $matches = -not $Find -or (
                             ($filters.name.Length -eq 0 -or ($name -is [string] -and $name.IndexOf($filters.name, [StringComparison]::OrdinalIgnoreCase) -ge 0)) -and
-                            ($filters.role.Length -eq 0 -or [string]::Equals($typeName, $filters.role, [StringComparison]::OrdinalIgnoreCase)) -and
+                            ($filters.role.Length -eq 0 -or ($type -is [System.Windows.Automation.ControlType] -and [string]::Equals($typeName, $filters.role, [StringComparison]::OrdinalIgnoreCase))) -and
                             ($filters.automationId.Length -eq 0 -or ($automationId -is [string] -and $automationId.IndexOf($filters.automationId, [StringComparison]::OrdinalIgnoreCase) -ge 0)))
+                        if ($null -ne $item.PSObject.Properties['Duplicate']) { $matches = $false }
                         if ($matches) {
                             $enabledFlag = '?'
                             $offscreenFlag = '?'
@@ -1508,6 +1734,7 @@ namespace OwnedUia {
                             if ($Find -and $item.Path.Count -gt 0) {
                                 $line += ' path="' + (Escape-Field ([string]::Join(' > ', [string[]]$item.Path))) + '"'
                             }
+                            if ($virtualized) { $line += ' virtualized=true' }
                             $passwordUnknown = $password -isnot [bool]
                             # Passwords and unknown Edit/Document flags never query
                             # current Value/Text patterns; neither is ever cached.
@@ -1541,11 +1768,18 @@ namespace OwnedUia {
                             # Reserve 100 characters for the cut note/newline.
                             if ($chars + $line.Length + 1 -gt 199900) { $cut = $true; break }
                             $window.Refs[$ref] = $element
+                            if ($item.ContainerItem) { $publishedContainer.Add($element) }
+                            if ($virtualized) {
+                                $runtimeId = $null
+                                try { Assert-TreeBudget $clock; $runtimeId = $element.GetRuntimeId() } catch { Assert-TreeBudget $clock }
+                                $window.VirtualRefs[$ref] = @{ Container = $root; Property = $lookup.Key; Value = $lookup.Value;
+                                    RuntimeId = $runtimeId; Name = $filters.name; Role = $filters.role; AutomationId = $filters.automationId }
+                            }
                             $lines.Add($line)
                             $chars += $line.Length + 1
                         }
-                        if ($item.Depth -lt $depth -and $metrics.visited -lt $maxVisited -and
-                            $lines.Count -lt $maxLines -and $clock.ElapsedMilliseconds -lt 20000) {
+                        if (-not $item.ContainerItem -and $item.Depth -lt $depth -and $metrics.visited -lt $maxVisited -and
+                            $lines.Count -lt $maxLines -and $clock.ElapsedMilliseconds -lt $budgetMs) {
                             $children = Get-TreeChildren $element $properties $clock
                             Assert-TreeBudget $clock
                             if ($children.Count -gt 0) {
@@ -1555,13 +1789,14 @@ namespace OwnedUia {
                                 if ($path.Count -gt 3) { $path = @($path[($path.Count - 3)..($path.Count - 1)]) }
                                 $stack.Push([pscustomobject]@{
                                     Element = $children[0]; Depth = $item.Depth + 1; Sibling = $true
-                                    Siblings = $children; Index = 0; Path = $path
+                                    Siblings = $children; Index = 0; Path = $path; ContainerItem = $false
                                 })
                             }
-                        } elseif ($item.Depth -lt $depth) { $cut = $true }
+                        } elseif (-not $item.ContainerItem) { $cut = $true }
                     } catch {
                         if ($_.Exception.Message.StartsWith('UIA_SAFE: ', [StringComparison]::Ordinal)) { throw }
                         $window.Refs.Remove($ref)
+                        $window.VirtualRefs.Remove($ref)
                         if ($countedDensity) { $density-- }
                         # Provider errors reveal no details or matching ref. A tree
                         # retains its unreadable marker; find returns matches only.
@@ -1579,7 +1814,7 @@ namespace OwnedUia {
                     }
                 }
                 $chromiumSparse = $chromium -and $density -lt $threshold
-                if ($chromiumSparse -and -not $retried -and $metrics.visited -lt $maxVisited -and
+                if (-not $Poll -and $chromiumSparse -and -not $retried -and $metrics.visited -lt $maxVisited -and
                     $clock.ElapsedMilliseconds -lt 19500) {
                     # One Chromium accessibility warm-up retry, inside the SAME
                     # 20 s and visited-node budgets (no focus/flags/messages).
@@ -1598,23 +1833,119 @@ namespace OwnedUia {
                 fallback = $metrics.fallback; retried = [bool]$retried; chromiumSparse = [bool]$chromiumSparse;
                 visited = $metrics.visited; density = $density }
             if (-not $Find -and $includeScreenshot) { $result.screenshot = $screenshot }
+            if ($Poll -and $nodes -gt 0 -and (Get-Argument $parameters 'publish' $true)) {
+                $publishWindow.Refs = $window.Refs
+                $publishWindow.VirtualRefs = $window.VirtualRefs
+                $publishWindow.Screenshot = $null
+            }
             return $result
         } catch {
             $window.Refs = @{}
+            $window.VirtualRefs = @{}
             $window.Screenshot = $null
             throw
         }
     }
 
+    # Exactly one cooperative poll. TS owns all sleeps, deadlines and cancellation.
+    function Get-WaitPoll($parameters) {
+        $windowRef = Get-Argument $parameters 'window'
+        $title = Get-Argument $parameters 'title'
+        $hasWindow = $null -ne $parameters.PSObject.Properties['window']
+        $hasTitle = $null -ne $parameters.PSObject.Properties['title']
+        if ($hasWindow -eq $hasTitle) { Deny 'Use either window or title for wait_poll.' }
+        $number = 0L
+        if ($hasWindow -and ($windowRef -isnot [string] -or $windowRef -notmatch '^[1-9][0-9]*$' -or
+            -not [long]::TryParse($windowRef, [ref]$number))) { Deny 'Invalid native window handle; use ui_windows.' }
+        if ($hasTitle -and ($title -isnot [string] -or [string]::IsNullOrWhiteSpace($title))) {
+            Deny 'title must be a nonempty window filter.'
+        }
+        $publish = Get-Argument $parameters 'publish' $true
+        if ($publish -isnot [bool]) { Deny 'publish must be a boolean.' }
+        $budgetMs = Get-Integer $parameters 'budgetMs' 1000 1 1000
+        $maxVisited = Get-Integer $parameters 'maxVisited' 1000 1 1000
+        $query = @{}
+        foreach ($key in @('name', 'role', 'automationId')) {
+            if ($null -eq $parameters.PSObject.Properties[$key]) { continue }
+            $value = Get-Argument $parameters $key
+            if ($value -isnot [string] -or [string]::IsNullOrWhiteSpace($value)) { Deny 'Wait filters must be nonempty strings.' }
+            if ($key -eq 'role' -and $value -notmatch '^[A-Za-z]+$') { Deny "role must be a ControlType name without 'ControlType.'." }
+            $query[$key] = $value
+        }
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $clock | Add-Member NoteProperty BudgetMs $budgetMs
+        $clock | Add-Member NoteProperty RemainingNodes $maxVisited
+        $cut = $false
+        $candidates = @($windowRef)
+        if ($hasTitle) {
+            # Identical case-insensitive identifier/title substring matching to ui_windows.
+            try {
+                $listing = Get-Windows ([pscustomobject]@{ filter = $title }) -Clock $clock
+                $cut = $listing.incomplete
+                $candidates = @($listing.windows | ForEach-Object { $_.window })
+            } catch {
+                if ($_.Exception.Message.StartsWith('UIA_SAFE: ', [StringComparison]::Ordinal)) { throw }
+                return @{ found = $false; cut = $true }
+            }
+        }
+        $elementMode = $query.Count -gt 0
+        foreach ($candidate in $candidates) {
+            $windowRef = [string]$candidate
+            $handle = [IntPtr]::new([long]$windowRef)
+            $validatedWindow = $false
+            try {
+                Assert-TreeBudget $clock
+                if (-not [OwnedUia.Native]::IsWindow($handle)) { continue }
+                Assert-TreeBudget $clock
+                if ([OwnedUia.Native]::GetAncestor($handle, 2) -ne $handle) { Deny 'Target is not a top-level window; use ui_windows.' }
+                $validatedWindow = $true
+                if (-not $elementMode) { return @{ found = $true; cut = $cut; window = $windowRef } }
+                if ($clock.RemainingNodes -le 0) { $cut = $true; break }
+                $query.window = $windowRef
+                $query.publish = $publish
+                $query.budgetMs = $budgetMs
+                $query.maxVisited = $clock.RemainingNodes
+                $query.maxResults = 1
+                $query.screenshot = $false
+                $tree = Get-OwnedTree ([pscustomobject]$query) -Find -Poll -Clock $clock
+                $cut = $cut -or $tree.cut
+                if ($tree.nodes -gt 0) {
+                    $result = @{ found = $true; cut = $cut; window = $windowRef }
+                    if ($publish) { $result.element = $tree }
+                    return $result
+                }
+            } catch {
+                if (-not $validatedWindow -and $_.Exception.Message.StartsWith('UIA_SAFE: ', [StringComparison]::Ordinal)) { throw }
+                # A provider failure/overrun or window disappearing mid-query is
+                # unknown, never evidence of absence. The next poll may prove gone.
+                $cut = $true
+            }
+        }
+        return @{ found = $false; cut = $cut }
+    }
+
     # A modal provider may block its calling thread until the dialog closes. Dispatch
     # on a typed background MTA thread, with a bounded wait; never kill apps on timeout.
-    function Invoke-BoundedPattern($window, $element, $pattern, [string] $action, [string] $path, [string] $text = '') {
+    function Invoke-BoundedPattern($window, $element, $pattern, [string] $action, [string] $path, [string] $text = '', $Virtual = $null) {
         Assert-ActionWindow $window
-        Assert-Element $window $element
-        $call = [OwnedUia.PatternCall]::Run($pattern, $action, $text, $element, $window.Root,
-            $window.Handle, $window.Identity.Pid, $window.Identity.Started)
+        if ($null -ne $Virtual) {
+            if ($null -eq $Virtual.RuntimeId -or @($Virtual.RuntimeId).Count -eq 0) {
+                Deny 'Placeholder identity cannot be verified without a runtime ID; run ui_find again and act on the fresh ref. No replacement item was selected.'
+            }
+            Assert-Element $window $Virtual.Container
+            $reference = New-Object 'OwnedUia.PatternCall+ItemReference'
+            foreach ($key in @('Container', 'Property', 'Value', 'RuntimeId', 'Name', 'Role', 'AutomationId')) { $reference.$key = $Virtual[$key] }
+            $call = [OwnedUia.PatternCall]::Run($pattern, $action, $text, $element, $window.Root,
+                $window.Handle, $window.Identity.Pid, $window.Identity.Started, $reference)
+            if ($call.Completed -and -not $call.Failed) { $Virtual.Element = $call.Element }
+        } else {
+            Assert-Element $window $element
+            $call = [OwnedUia.PatternCall]::Run($pattern, $action, $text, $element, $window.Root,
+                $window.Handle, $window.Identity.Pid, $window.Identity.Started)
+        }
         if ($call.Completed -and $call.Failed) { Deny 'Pattern action failed or target could not be verified.' }
         $result = @{ path = $path }
+        if ($null -ne $call.VerticalScrollPercent) { $result.verticalPercent = $call.VerticalScrollPercent }
         if (-not $call.Completed) {
             if ($action -eq 'focus') { Deny 'Element focus timed out; input was not sent.' }
             $result.instruction = 'action timed out; it may still be running or the target may be busy - use ui_windows'
@@ -1658,10 +1989,83 @@ namespace OwnedUia {
         return @{ path = 'SendInput'; screenshot = (Get-Argument $parameters 'screenshot') }
     }
 
+    # Ref itself plus at most five parent levels, never the parent of our root.
+    function Get-ScrollPattern($window, $element) {
+        $cursor = $element
+        for ($level = 0; $level -le 5 -and $null -ne $cursor; $level++) {
+            Assert-Element $window $cursor
+            $pattern = Get-Pattern $window $cursor ([System.Windows.Automation.ScrollPattern]::Pattern)
+            if ($null -ne $pattern) {
+                return @{ Element = $cursor; Pattern = $pattern; Ancestor = $level }
+            }
+            if ($level -eq 5 -or [System.Windows.Automation.Automation]::Compare($cursor, $window.Root)) { break }
+            $cursor = $script:walker.GetParent($cursor)
+        }
+        Deny 'No vertically scrollable ScrollPattern on the ref or within five parent levels.'
+    }
+
     function Invoke-OwnedScroll($parameters) {
+        # Presence, not truthiness: null/false/mixed forms must never fall through to mouse input.
+        $hasRef = $null -ne $parameters.PSObject.Properties['ref']
+        $hasInto = $null -ne $parameters.PSObject.Properties['into']
+        $hasDelta = $null -ne $parameters.PSObject.Properties['delta']
+        $coordinates = @('screenshot', 'x', 'y') | Where-Object { $null -ne $parameters.PSObject.Properties[$_] }
+        if ($hasRef) {
+            if (@($coordinates).Count -gt 0) { Deny 'Use ref or screenshot coordinates, not both.' }
+            if ($hasInto) {
+                $into = Get-Argument $parameters 'into'
+                if ($into -isnot [bool] -or -not $into -or $hasDelta) { Deny 'Use ref with either delta or into:true.' }
+            } elseif (-not $hasDelta) { Deny 'Use ref with either delta or into:true.' }
+        } elseif ($hasInto -or @($coordinates).Count -ne 3 -or -not $hasDelta) {
+            Deny 'Use ref with delta/into:true, or screenshot/x/y with delta.'
+        }
+        $delta = 0
+        if ($hasDelta) {
+            if ($null -eq (Get-Argument $parameters 'delta')) { Deny 'Scroll delta must be nonzero wheel notches.' }
+            $delta = Get-Integer $parameters 'delta' 0 -10 10
+            if ($delta -eq 0) { Deny 'Scroll delta must be nonzero wheel notches.' }
+        }
         $window = Get-Window $parameters
         Assert-ActionWindow $window
-        return Invoke-CoordinateInput $window $parameters 'scroll'
+        if (-not $hasRef) { return Invoke-CoordinateInput $window $parameters 'scroll' }
+        $ref = Get-Argument $parameters 'ref'
+        if ($ref -isnot [string] -or -not $window.Refs.ContainsKey($ref)) {
+            Deny 'Unknown element reference; request a new tree.'
+        }
+        # Only provider-produced placeholders may Realize using their verified
+        # source container as the worker's ancestry anchor: unrealized items can
+        # reject even NativeWindowHandle/parent reads. No other action gets this
+        # exception, and ScrollIntoView must validate the realized item itself.
+        $element = $window.Refs[$ref]
+        $anchor = $element
+        $virtual = $hasInto -and $null -ne $window.PSObject.Properties['VirtualRefs'] -and $window.VirtualRefs.ContainsKey($ref)
+        $provenance = $null
+        if ($virtual) { $provenance = $window.VirtualRefs[$ref]; $anchor = $provenance.Container }
+        Assert-Element $window $anchor
+        Show-Action $window $anchor 'scroll' 'Scroll'
+        if ($hasInto) {
+            $steps = New-Object System.Collections.Generic.List[string]
+            $pattern = $null
+            if (-not $virtual) { $pattern = Get-Pattern $window $element ([System.Windows.Automation.VirtualizedItemPattern]::Pattern) }
+            if ($virtual -or $null -ne $pattern) {
+                $result = Invoke-BoundedPattern $window $element $pattern 'realize' 'VirtualizedItemPattern.Realize' -Virtual $provenance
+                $steps.Add($result.path)
+                if ($result.ContainsKey('instruction')) { $result.steps = @($steps.ToArray()); $result.path = 'scrollitem'; return $result }
+                if ($virtual) { $element = $provenance.Element; $window.Refs[$ref] = $element }
+            }
+            $pattern = Get-Pattern $window $element ([System.Windows.Automation.ScrollItemPattern]::Pattern)
+            if ($null -ne $pattern) {
+                $result = Invoke-BoundedPattern $window $element $pattern 'scrollIntoView' 'ScrollItemPattern.ScrollIntoView'
+                $steps.Add($result.path)
+            } elseif ($steps.Count -eq 0) { Deny 'Ref supports neither VirtualizedItemPattern nor ScrollItemPattern.' }
+            $result.steps = @($steps.ToArray())
+            $result.path = 'scrollitem'
+            return $result
+        }
+        $target = Get-ScrollPattern $window $element
+        $result = Invoke-BoundedPattern $window $target.Element $target.Pattern 'scroll' 'scrollpattern' ([string]$delta)
+        $result.ancestor = $target.Ancestor
+        return $result
     }
 
     # click: prefer UIA patterns; fallback requires a verified target-window clickable point.
@@ -1940,6 +2344,7 @@ namespace OwnedUia {
                 'launch' { Start-OwnedApp $parameters; break }
                 'tree' { Get-OwnedTree $parameters; break }
                 'find' { Get-OwnedTree $parameters -Find; break }
+                'wait_poll' { Get-WaitPoll $parameters; break }
                 'click' { Invoke-OwnedClick $parameters; break }
                 'scroll' { Invoke-OwnedScroll $parameters; break }
                 'type' { Set-OwnedText $parameters; break }
@@ -1959,7 +2364,10 @@ namespace OwnedUia {
         } catch {
             if ($targetRef -is [string] -and $script:windows.ContainsKey($targetRef)) {
                 $script:windows[$targetRef].Screenshot = $null
-                if ($method -cin @('tree', 'find')) { $script:windows[$targetRef].Refs = @{} }
+                if ($method -cin @('tree', 'find')) {
+                    $script:windows[$targetRef].Refs = @{}
+                    $script:windows[$targetRef].VirtualRefs = @{}
+                }
             }
             $message = 'Operation failed or target could not be verified.'
             $exception = $_.Exception

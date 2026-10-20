@@ -38,6 +38,13 @@ interface Snapshot {
 }
 
 type Host = Pick<ExtensionAPI, "openPipe" | "backgroundJobs" | "cwd" | "reportError">
+const READ_METHODS = ["windows", "tree", "find", "wait", "wait_poll"]
+
+interface WaitClock {
+  now(): number
+  sleep(ms: number, signal: AbortSignal): Promise<void>
+}
+
 interface Pending {
   resolve(value: unknown): void
   reject(error: Error): void
@@ -90,12 +97,16 @@ export class UiaClient {
   private retired: Promise<void> = Promise.resolve()
   private retirementRecovery?: () => Promise<void>
   private stopWait: Promise<void> = Promise.resolve()
+  private waiting?: AbortController
+  private readonly queuedWaits = new Set<(error: Error) => void>()
+  private starting?: Promise<void>
 
   constructor(
     private readonly host: Host,
     readonly settings: UiaSettings,
     private readonly timeoutMs = 60_000,
     private readonly onStopped: () => void = () => {},
+    private readonly waitClock: WaitClock = { now: () => performance.now(), sleep: waitDelay },
   ) {
     this.statePath = `${process.env.TEMP ?? process.env.TMP ?? host.cwd}/amira-uia-${crypto.randomUUID()}.json`
   }
@@ -103,8 +114,10 @@ export class UiaClient {
   /** Serialize even direct callers: snapshots, focus and cleanup must not race. */
   call(method: string, params: Record<string, unknown> = {}, signal?: AbortSignal): Promise<unknown> {
     const epoch = this.sessionEpoch
-    const queuedWhileStopped = this.emergency.stopped && !["windows", "tree", "find"].includes(method)
+    const queuedWhileStopped = this.emergency.stopped && !READ_METHODS.includes(method)
+    let interruptWait: ((error: Error) => void) | undefined
     const run = this.queue.then(async () => {
+      if (interruptWait) this.queuedWaits.delete(interruptWait)
       if (signal?.aborted) throw new Error("UIA request cancelled")
       if (queuedWhileStopped) throw new Error(STOP_MESSAGE)
       if (epoch !== this.sessionEpoch)
@@ -112,8 +125,7 @@ export class UiaClient {
           this.emergency.stopped ? STOP_MESSAGE : "UIA session ended before the request started",
         )
       // A queued cancellation must not retire another request's provider.
-      const cancel = () =>
-        ["windows", "tree", "find"].includes(method) ? this.cancelRead() : this.emergencyStop()
+      const cancel = () => (READ_METHODS.includes(method) ? this.cancelRead() : this.emergencyStop())
       signal?.addEventListener("abort", cancel, { once: true })
       try {
         return await this.execute(method, params)
@@ -122,12 +134,33 @@ export class UiaClient {
       }
     })
     this.queue = run.catch(() => {})
-    return run
+    if (method !== "wait") return run
+    // A queued wait must settle promptly without interrupting the active request.
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        this.queuedWaits.delete(interrupt)
+        signal?.removeEventListener("abort", cancel)
+      }
+      const interrupt = (error: Error) => {
+        cleanup()
+        reject(error)
+      }
+      const cancel = () => interrupt(new Error("UIA request cancelled"))
+      interruptWait = interrupt
+      this.queuedWaits.add(interrupt)
+      if (signal?.aborted) cancel()
+      else signal?.addEventListener("abort", cancel, { once: true })
+      void run.then((value) => {
+        cleanup()
+        resolve(value)
+      }, interrupt)
+    })
   }
 
   private async execute(method: string, params: Record<string, unknown>): Promise<unknown> {
     if (this.stopping) throw new Error("computer-use-uia is stopping")
-    if (!["windows", "tree", "find"].includes(method)) this.emergency.assertAction()
+    if (!READ_METHODS.includes(method)) this.emergency.assertAction()
+    if (method === "wait") return this.wait(params)
     if (method === "windows") {
       if (params.filter !== undefined && typeof params.filter !== "string")
         throw new Error("filter must be a string")
@@ -214,14 +247,7 @@ export class UiaClient {
         safe.screenshot = this.settings.screenshot
         safe.screenshotMaxEdge = this.settings.screenshotMaxEdge
       } else {
-        for (const key of ["name", "role", "automationId"]) {
-          const value = params[key]
-          if (value === undefined) continue
-          if (typeof value !== "string" || !value.trim()) throw new Error(`${key} must be a nonempty string`)
-          if (key === "role" && !/^[a-z]+$/i.test(value))
-            throw new Error("role must be a ControlType name without 'ControlType.' (for example Button)")
-          safe[key] = value
-        }
+        Object.assign(safe, elementQuery(params))
         if ([safe.name, safe.role, safe.automationId].every((value) => value === undefined))
           throw new Error("ui_find requires at least one of name, role or automationId")
         safe.maxResults = boundedInt(params.maxResults, 20, 1, 100, "maxResults")
@@ -237,7 +263,24 @@ export class UiaClient {
       snapshot.refs.clear()
       snapshot.screenshot = undefined
     }
-    const coordinateAction = method === "scroll" || (method === "click" && params.ref === undefined)
+    if (method === "scroll") {
+      const coordinates = [params.screenshot, params.x, params.y]
+      if (
+        (params.ref !== undefined && coordinates.some((value) => value !== undefined)) ||
+        (params.into !== undefined &&
+          (params.ref === undefined || params.into !== true || params.delta !== undefined))
+      )
+        throw new Error("Use screenshot/x/y/delta, ref/delta, or ref/into: true; do not mix scroll forms")
+      if (params.into === undefined) {
+        safe.delta = boundedInt(params.delta, 0, -10, 10, "delta")
+        if (safe.delta === 0) throw new Error("delta must be nonzero wheel notches (-10 to 10)")
+      } else safe.into = true
+      if (params.ref === undefined && coordinates.some((value) => value === undefined))
+        throw new Error(
+          "Coordinate scrolling requires screenshot, x, y and delta; or use ref/delta or ref/into: true",
+        )
+    }
+    const coordinateAction = ["click", "scroll"].includes(method) && params.ref === undefined
     if (coordinateAction) {
       const image = snapshot.screenshot
       if (!image || params.screenshot !== image.id)
@@ -246,10 +289,6 @@ export class UiaClient {
       safe.x = params.x
       safe.y = params.y
       safe.screenshot = image.id
-      if (method === "scroll") {
-        safe.delta = boundedInt(params.delta, 0, -10, 10, "delta")
-        if (safe.delta === 0) throw new Error("delta must be nonzero wheel notches (-10 to 10)")
-      }
     }
     if (
       method === "click" &&
@@ -257,7 +296,10 @@ export class UiaClient {
       [params.x, params.y, params.screenshot].some((value) => value !== undefined)
     )
       throw new Error("Use either ref or screenshot/x/y, not both")
-    if ((method === "click" && !coordinateAction) || (method === "type" && params.ref !== undefined)) {
+    if (
+      (["click", "scroll"].includes(method) && !coordinateAction) ||
+      (method === "type" && params.ref !== undefined)
+    ) {
       if (typeof params.ref !== "string" || !snapshot.refs.has(params.ref))
         throw new Error(
           "Refused: ref is not in this window's latest tree/find snapshot; call ui_tree or ui_find first",
@@ -306,6 +348,95 @@ export class UiaClient {
     return result
   }
 
+  /** Poll outside PowerShell: no sleeping request can starve cancellation or stop. */
+  private async wait(params: Record<string, unknown>): Promise<unknown> {
+    if ((params.window === undefined) === (params.title === undefined))
+      throw new Error("ui_wait requires either window or title, not both")
+    if (
+      params.window !== undefined &&
+      (typeof params.window !== "string" || !/^[1-9]\d*$/.test(params.window))
+    )
+      throw new Error("window must be a native window handle from ui_windows or ui_launch")
+    if (params.title !== undefined && (typeof params.title !== "string" || !params.title.trim()))
+      throw new Error("title must be a nonempty ui_windows-style substring filter")
+    if (params.until !== "exists" && params.until !== "gone") throw new Error("until must be exists or gone")
+    const timeoutMs = boundedInt(params.timeoutMs, 5000, 100, 30_000, "timeoutMs")
+    const query = elementQuery(params)
+    const safe = {
+      ...(params.window === undefined ? { title: params.title } : { window: params.window }),
+      ...query,
+      publish: params.until === "exists",
+      maxVisited: 1000,
+    }
+    const controller = new AbortController()
+    this.waiting = controller
+    const started = this.waitClock.now()
+    let timedOut = false
+    const interrupted = new Promise<never>((_, reject) => {
+      controller.signal.addEventListener("abort", () => reject(controller.signal.reason), { once: true })
+    })
+    const deadline = this.waitClock.sleep(timeoutMs, controller.signal).then(() => {
+      timedOut = true
+      // Also retires a provider stuck in a synchronous poll. Read timeouts never latch stop.
+      this.breakPipe("UIA wait timed out")
+      throw new Error("UIA wait timed out")
+    })
+    // Both promises are observed even when completion/cancellation wins the race.
+    const ended = Promise.race([interrupted, deadline])
+    const elapsed = () => Math.round(this.waitClock.now() - started)
+    try {
+      while (this.waitClock.now() - started < timeoutMs) {
+        const polledAt = this.waitClock.now()
+        const poll = (await Promise.race([
+          this.request(
+            "wait_poll",
+            { ...safe, budgetMs: Math.max(1, Math.min(250, timeoutMs - elapsed())) },
+            controller.signal,
+          ),
+          ended,
+        ])) as { found: boolean; cut?: boolean; window?: string; element?: TreeResult }
+        if (this.waitClock.now() - started >= timeoutMs) {
+          this.breakPipe("UIA wait timed out")
+          return { status: "timed-out", elapsedMs: elapsed() }
+        }
+        if (
+          !poll ||
+          typeof poll.found !== "boolean" ||
+          (poll.found && (typeof poll.window !== "string" || !/^[1-9]\d*$/.test(poll.window))) ||
+          (poll.found && safe.publish && Object.keys(query).length > 0 && !poll.element)
+        )
+          throw new Error("Invalid helper wait response")
+        if (params.until === "exists" ? poll.found : !poll.found && !poll.cut) {
+          if (poll.found && poll.element && poll.window) {
+            const element = formatTree(poll.element, 1)
+            const refs = new Set<string>()
+            const ref = /^\s*(e\d+)\s/.exec(element.text)?.[1]
+            if (!ref || /^\s*e\d+\s+unreadable\b/.test(element.text))
+              throw new Error("Invalid helper wait element response")
+            refs.add(ref)
+            this.windows.set(poll.window, { refs })
+            return { status: "met", elapsedMs: elapsed(), window: poll.window, element }
+          }
+          return { status: "met", elapsedMs: elapsed(), ...(poll.found ? { window: poll.window } : {}) }
+        }
+        await Promise.race([
+          this.waitClock.sleep(
+            Math.max(0, Math.min(250 - (this.waitClock.now() - polledAt), timeoutMs - elapsed())),
+            controller.signal,
+          ),
+          ended,
+        ])
+      }
+      return { status: "timed-out", elapsedMs: elapsed() }
+    } catch (error) {
+      if (timedOut) return { status: "timed-out", elapsedMs: elapsed() }
+      throw error
+    } finally {
+      this.waiting = undefined
+      controller.abort(new Error("UIA wait completed"))
+    }
+  }
+
   private rotateJournal(): void {
     // Called only after the previous watchdog exited. Independent custody still
     // retains the original kernel jobs; this journal is never recovery authority.
@@ -321,7 +452,29 @@ export class UiaClient {
     this.journalNonce = crypto.randomUUID()
   }
 
-  private async start(): Promise<void> {
+  private async start(signal?: AbortSignal): Promise<void> {
+    const epoch = this.sessionEpoch
+    signal?.throwIfAborted()
+    // A wait can finish while startup is still unwinding. Do not let its losing
+    // request overlap the next request's lifetime/custody/watchdog startup.
+    while (this.starting) {
+      await this.starting.catch(() => {})
+      signal?.throwIfAborted()
+      if (epoch !== this.sessionEpoch) throw new Error("UIA session ended during startup")
+    }
+    signal?.throwIfAborted()
+    if (this.stopping || epoch !== this.sessionEpoch) throw new Error("UIA session ended during startup")
+    if (this.pipe) return
+    const starting = this.startHelper()
+    this.starting = starting
+    try {
+      await starting
+    } finally {
+      if (this.starting === starting) this.starting = undefined
+    }
+  }
+
+  private async startHelper(): Promise<void> {
     if (this.pipe) return
     const previousGeneration = this.generation
     await this.confirmRetirement()
@@ -474,6 +627,7 @@ export class UiaClient {
     }
     // Start exact-helper retirement NOW, even if a prior stop's custody pass is pending.
     this.breakPipe(STOP_MESSAGE)
+    for (const interrupt of this.queuedWaits) interrupt(new Error(STOP_MESSAGE))
     this.requestCustodyCleanup()
     if (changed) this.onStopped()
   }
@@ -1062,11 +1216,15 @@ export class UiaClient {
     }
   }
 
-  private async request(method: string, params: Record<string, unknown>): Promise<unknown> {
-    const action = !["windows", "tree", "find"].includes(method)
+  private async request(
+    method: string,
+    params: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    const action = !READ_METHODS.includes(method)
     const alreadyStarted = !!this.pipe
     try {
-      await this.start()
+      await this.start(signal)
       if (
         (action || (method === "tree" && this.settings.screenshot)) &&
         alreadyStarted &&
@@ -1081,6 +1239,7 @@ export class UiaClient {
       if (this.emergency.stopped) throw new Error(STOP_MESSAGE)
       throw error
     }
+    signal?.throwIfAborted()
     if (action) this.emergency.assertAction()
     if (!this.pipe || this.stopping) throw new Error("UIA helper exited before the request started")
     const id = ++this.nextId
@@ -1271,6 +1430,7 @@ export class UiaClient {
   }
 
   private breakPipe(message: string, graceMs = 0) {
+    this.waiting?.abort(new Error(message))
     const pipe = this.pipe
     const overlay = this.overlay
     const retirement = pipe ? this.retireHelper(pipe, graceMs) : this.retired
@@ -1324,6 +1484,7 @@ export class UiaClient {
     // Teardown uses the same identity-bound retirement/recovery gate as interruption.
     // Even a failed stop must not permit a replacement while the old helper is alive.
     this.breakPipe("UIA session ended")
+    for (const interrupt of this.queuedWaits) interrupt(new Error("UIA session ended"))
     this.watchdog = undefined
     this.sessionEpoch++
     // Watchdog EOF grace (3 s), helper retirement (1 s), then two 2 s job drains.
@@ -1413,4 +1574,35 @@ export function formatTree(tree: TreeResult, maxNodes: number): TreeResult {
     ...(tree.retried === undefined ? {} : { retried: tree.retried }),
     ...(tree.chromiumSparse === undefined ? {} : { chromiumSparse: tree.chromiumSparse }),
   }
+}
+
+function elementQuery(params: Record<string, unknown>): Record<string, string> {
+  const query: Record<string, string> = {}
+  for (const key of ["name", "role", "automationId"]) {
+    const value = params[key]
+    if (value === undefined) continue
+    if (typeof value !== "string" || !value.trim()) throw new Error(`${key} must be a nonempty string`)
+    if (key === "role" && !/^[a-z]+$/i.test(value))
+      throw new Error("role must be a ControlType name without 'ControlType.' (for example Button)")
+    query[key] = value
+  }
+  return query
+}
+
+function waitDelay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    signal.throwIfAborted()
+    const cancel = () => {
+      clearTimeout(timer)
+      reject(signal.reason)
+    }
+    const timer = setTimeout(
+      () => {
+        signal.removeEventListener("abort", cancel)
+        resolve()
+      },
+      Math.max(0, ms),
+    )
+    signal.addEventListener("abort", cancel, { once: true })
+  })
 }
