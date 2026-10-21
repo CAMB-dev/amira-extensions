@@ -6,9 +6,11 @@ export interface LifecycleReceipt {
   date: string
 }
 export interface IterationLifecycle {
-  status: "open" | "closed"
+  status: "open" | "close-pending" | "closed"
   ship: ShipStatus
   receipt?: LifecycleReceipt
+  /** Restore is metadata-only; a separate exact-stage continuation receipt reopens writers. */
+  continuationRequired?: true
 }
 export interface ProjectLifecycle {
   schemaVersion: 1
@@ -19,9 +21,9 @@ export interface ProjectLifecycle {
 }
 export type LifecycleEvent =
   | { type: "ship"; status: Exclude<ShipStatus, "not-started">; receipt: LifecycleReceipt }
-  | { type: "close"; receipt: LifecycleReceipt }
+  | { type: "close-pending" | "close"; receipt: LifecycleReceipt }
   | { type: "next-iteration"; receipt: LifecycleReceipt }
-  | { type: "archive-pending" | "archived" | "restore"; receipt: LifecycleReceipt }
+  | { type: "archive-pending" | "archived" | "restore" | "continue"; receipt: LifecycleReceipt }
 
 const object = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value)
@@ -73,16 +75,15 @@ export function validateLifecycle(
       !Number.isSafeInteger(Number(number)) ||
       Number(number) > currentIteration ||
       !object(entry) ||
-      !keys(entry, ["status", "ship", "receipt"]) ||
-      !["open", "closed"].includes(entry.status as string) ||
+      !keys(entry, ["status", "ship", "receipt", "continuationRequired"]) ||
+      (entry.continuationRequired !== undefined &&
+        (entry.continuationRequired !== true || entry.status !== "open")) ||
+      !["open", "close-pending", "closed"].includes(entry.status as string) ||
       !["not-started", "pending", "running", "blocked", "shipped", "skipped"].includes(entry.ship as string)
     )
       throw new Error("Malformed iteration lifecycle")
     if (entry.receipt !== undefined) receipt(entry.receipt)
-    if (
-      entry.status === "closed" &&
-      (!["shipped", "skipped"].includes(entry.ship as string) || !entry.receipt)
-    )
+    if (entry.status !== "open" && (!["shipped", "skipped"].includes(entry.ship as string) || !entry.receipt))
       throw new Error("Closed iteration requires shipped or explicitly skipped evidence")
     if (entry.ship !== "not-started" && !entry.receipt) throw new Error("Ship state requires a receipt")
   }
@@ -98,8 +99,13 @@ export function reduceLifecycle(
   const lifecycle = structuredClone(previous)
   const iteration = lifecycle.iterations[String(currentIteration)]!
   if (event.type === "restore") {
-    if (lifecycle.status === "active") throw new Error("Project is already active")
+    if (lifecycle.status !== "archived") throw new Error("Restore requires a safely settled archived project")
     lifecycle.status = "active"
+    lifecycle.receipt = event.receipt
+    if (iteration.status === "open") iteration.continuationRequired = true
+  } else if (event.type === "archive-pending" && lifecycle.status === "archived") {
+    // Explicit re-archive revalidates administrative cleanup owners without restoring work.
+    lifecycle.status = "archive-pending"
     lifecycle.receipt = event.receipt
   } else if (event.type === "archived") {
     if (lifecycle.status !== "archive-pending") throw new Error("Archive requires a pending admission fence")
@@ -107,7 +113,11 @@ export function reduceLifecycle(
     lifecycle.receipt = event.receipt
   } else {
     if (lifecycle.status !== "active") throw new Error("Project lifecycle is read-only")
-    if (event.type === "archive-pending") {
+    if (event.type === "continue") {
+      if (iteration.status !== "open") throw new Error("Only an open iteration can explicitly continue")
+      delete iteration.continuationRequired
+      lifecycle.receipt = event.receipt
+    } else if (event.type === "archive-pending") {
       lifecycle.status = "archive-pending"
       lifecycle.receipt = event.receipt
     } else if (event.type === "next-iteration") {
@@ -117,10 +127,15 @@ export function reduceLifecycle(
       if (!Number.isSafeInteger(currentIteration)) throw new Error("Invalid next iteration")
       lifecycle.iterations[String(currentIteration)] = { status: "open", ship: "not-started" }
       lifecycle.receipt = event.receipt
-    } else if (event.type === "close") {
-      if (iteration.status !== "open" || !["shipped", "skipped"].includes(iteration.ship))
+    } else if (event.type === "close-pending" || event.type === "close") {
+      if (
+        iteration.status === "closed" ||
+        (event.type === "close-pending" && iteration.status !== "open") ||
+        !["shipped", "skipped"].includes(iteration.ship)
+      )
         throw new Error("Closure requires a shipped or explicitly ship-skipped open iteration")
-      iteration.status = "closed"
+      iteration.status = event.type === "close" ? "closed" : "close-pending"
+      delete iteration.continuationRequired
       iteration.receipt = event.receipt
     } else if (event.type === "ship") {
       if (iteration.status !== "open" || ["shipped", "skipped"].includes(iteration.ship))

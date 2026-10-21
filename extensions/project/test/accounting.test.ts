@@ -504,6 +504,13 @@ test("a cap-cancelled pending provider start retains its late run identity after
   const start = Promise.withResolvers<{ runId: string }>()
   const began = Promise.withResolvers<void>()
   const stopped: string[] = []
+  let completed = false
+  const listeners = new Set<(snapshot: RunnerSnapshot) => void>()
+  const snapshot = (): RunnerSnapshot => ({
+    runId: "late-run",
+    cwd: f.project.root,
+    status: completed ? "stopped" : "running",
+  })
   const runner: BoundRunner = {
     available: () => true,
     capabilities: { cwd: true, freshRun: true, models: true, ownedLifetime: true, progress: true },
@@ -511,13 +518,21 @@ test("a cap-cancelled pending provider start retains its late run identity after
       began.resolve()
       return start.promise
     },
-    status: () => undefined,
+    status: snapshot,
     stop: (id) => {
       stopped.push(id)
+      completed = true
+      for (const listener of listeners) listener(snapshot())
       return true
     },
     onProgress: () => () => {},
-    onResult: () => () => {},
+    onResult: (_id, listener) => {
+      listeners.add(listener)
+      if (completed) listener(snapshot())
+      return () => {
+        listeners.delete(listener)
+      }
+    },
   }
   f.api.useService = () => runner as never
   const running = runBound({

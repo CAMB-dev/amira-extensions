@@ -201,8 +201,10 @@ test("archive inspection writes nothing; storage rejects every retained ordinary
   await expect(writeDocument(project, "design.md", "stale after restore")).rejects.toThrow(/stale/i)
   expect(() => assertProjectWritableNow(project)).toThrow(/stale/i)
   await expect(lifecycle.transition(1, { type: "archive-pending", receipt })).rejects.toThrow(/stale/i)
-  expect((await new IterationStore(restored).read()).attempts).toEqual([])
-  expect((await writeDocument(restored, "design.md", "explicit fresh publication")).conflict).toBe(false)
+  await expect(new IterationStore(restored).read()).rejects.toThrow(/continuation/i)
+  const continued = await new LifecycleStore(restored).transition(3, { type: "continue", receipt })
+  expect((await new IterationStore(continued).read()).attempts).toEqual([])
+  expect((await writeDocument(continued, "design.md", "explicit fresh publication")).conflict).toBe(false)
 }, 20000)
 
 test("an interrupted lifecycle intent fences ordinary mutation until explicit recovery", async () => {

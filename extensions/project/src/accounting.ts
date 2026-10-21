@@ -9,6 +9,7 @@ import type {
 import { type CostLedger, costRollups, ProjectCosts } from "./cost.ts"
 import { FileCostPersistence } from "./cost-storage.ts"
 import { recoverOwnerInventory } from "./owner-inventory.ts"
+import { publishOwnerOpening } from "./owner-openings.ts"
 import {
   assertProjectWritable,
   assertProjectWritableNow,
@@ -39,6 +40,7 @@ interface ActiveOwner {
   tools: number
   draining: boolean
   releaseDrain?: Promise<void>
+  drainFailed?: boolean
   children: Set<string>
 }
 const options = new WeakMap<ExtensionAPI, AccountingOptions>()
@@ -67,6 +69,8 @@ export class ProjectAccounting {
   private readonly active = new Map<string, ActiveOwner>()
   private readonly bindings = new Map<string, ActiveOwner>()
   private readonly runs = new Set<AccountedRun>()
+  private readonly openings = new Set<Promise<void>>()
+  private lifecycleStopped = false
   retain(run: AccountedRun): () => void {
     this.assertAdmission()
     this.runs.add(run)
@@ -100,8 +104,11 @@ export class ProjectAccounting {
     const lifecycle = projectLifecycle(this.project)
     const writable =
       lifecycle.status === "active" &&
-      lifecycle.iterations[this.project.marker.currentIteration]?.status === "open"
-    await this.costs.load(true, writable ? options.get(this.api)?.defaultCapUsd?.() : undefined)
+      lifecycle.iterations[this.project.marker.currentIteration]?.status === "open" &&
+      !lifecycle.iterations[this.project.marker.currentIteration]?.continuationRequired
+    await this.costs.load(true, writable ? options.get(this.api)?.defaultCapUsd?.() : undefined, {
+      initializePolicy: writable,
+    })
     for (const owner of await recoverOwnerInventory(this.api, this.project, this.costs.snapshot())) {
       const { key, id, ...attribution } = owner
       await this.costs.intent(key, attribution, "recovered")
@@ -130,7 +137,7 @@ export class ProjectAccounting {
       try {
         run.stop(reason)
       } catch (error) {
-        this.report(error)
+        pending.push(Promise.reject(error))
       }
       try {
         pending.push(run.drain())
@@ -139,29 +146,45 @@ export class ProjectAccounting {
       }
     }
     for (const [key, owner] of this.active) {
-      this.active.delete(key)
-      if (owner.released) continue
+      if (owner.released && !owner.drainFailed) continue
+      const previouslyReleased = owner.released
       owner.released = true
+      owner.drainFailed = false
+      const drainage: Promise<unknown>[] = []
       for (const group of owner.groups) {
         try {
           group.end(reason)
+          drainage.push(group.ended())
         } catch (error) {
-          this.report(error)
+          drainage.push(Promise.reject(error))
         }
       }
-      try {
-        pending.push(owner.stop(reason))
-      } catch (error) {
-        this.report(error)
+      if (!previouslyReleased) {
+        try {
+          drainage.push(owner.stop(reason))
+        } catch (error) {
+          drainage.push(Promise.reject(error))
+        }
       }
       // Cancellation/release never waits for ledger reads or writes, and one failure
       // cannot interrupt cancellation of subsequent project owners.
       try {
-        pending.push(owner.release())
+        drainage.push(owner.release())
       } catch (error) {
-        pending.push(Promise.reject(error))
+        drainage.push(Promise.reject(error))
       }
+      pending.push(
+        Promise.allSettled(drainage).then((results) => {
+          const failure = results.find((result) => result.status === "rejected")
+          if (failure?.status === "rejected") {
+            owner.drainFailed = true
+            throw failure.reason
+          }
+          if (this.active.get(key) === owner) this.active.delete(key)
+        }),
+      )
     }
+    this.drainFailure = undefined
     this.stopping = Promise.allSettled(pending).then(async (results) => {
       const failure = results.find((result) => result.status === "rejected")
       if (failure?.status === "rejected") {
@@ -175,6 +198,7 @@ export class ProjectAccounting {
   }
   assertAdmission(): void {
     if (this.disposed) throw new Error("Project accounting has unloaded")
+    if (this.lifecycleStopped) throw new Error("Project work was stopped for lifecycle settlement")
     this.costs.assertAdmission()
   }
   async intent(key: string, attribution: OwnerAttribution): Promise<void> {
@@ -276,10 +300,15 @@ export class ProjectAccounting {
           } catch (error) {
             owner.releaseDrain = Promise.reject(error)
           }
-          owner.releaseDrain = owner.releaseDrain.finally(() => {
-            owner.draining = false
-            owner.children.clear()
-          })
+          owner.releaseDrain = owner.releaseDrain
+            .catch((error) => {
+              owner.releaseDrain = undefined
+              throw error
+            })
+            .finally(() => {
+              owner.draining = false
+              owner.children.clear()
+            })
         }
         return owner.releaseDrain
       },
@@ -436,6 +465,51 @@ export class ProjectAccounting {
     guard()
     return handle
   }
+  /** Track an admitted open through binding/release so closure cannot miss an in-flight key. */
+  async openOwner(open: () => Promise<OwnedConversation>): Promise<OwnedConversation> {
+    this.assertAdmission()
+    assertProjectWritableNow(this.project)
+    let resolve!: () => void
+    let reject!: (error: unknown) => void
+    const drain = new Promise<void>((yes, no) => {
+      resolve = yes
+      reject = no
+    })
+    this.openings.add(drain)
+    void drain.catch(() => {})
+    let handle: OwnedConversation | undefined
+    try {
+      handle = await open()
+      this.assertAdmission()
+      assertProjectWritableNow(this.project)
+      return await this.track(handle)
+    } catch (error) {
+      try {
+        await handle?.release()
+      } catch (releaseError) {
+        reject(releaseError)
+        throw releaseError
+      }
+      throw error
+    } finally {
+      resolve()
+      this.openings.delete(drain)
+    }
+  }
+  /** Fences synchronously, cancels providers/owners, drains openings, then reconciles H1. */
+  async stopAndDrain(reason = "Project lifecycle settlement"): Promise<void> {
+    this.lifecycleStopped = true
+    if (this.timer) clearInterval(this.timer)
+    // A preceding budget stop may still own an in-flight release. Wait for that
+    // attempt before retrying it, rather than overwriting its drainage promise.
+    await this.stopping.catch(() => {})
+    this.stop(reason)
+    const results = await Promise.allSettled([this.settled(), ...this.openings])
+    const failure = results.find((result) => result.status === "rejected")
+    if (failure?.status === "rejected") throw failure.reason
+    this.disposed = true
+    accounts.get(this.api)?.delete(`${this.project.root}/${this.project.marker.id}`)
+  }
   async settled(): Promise<void> {
     try {
       await this.stopping
@@ -475,6 +549,52 @@ export async function projectAccounting(api: ExtensionAPI, project: Project): Pr
   accounting.project = project
   return accounting
 }
+/** An inert lookup: never initializes accounting or creates a ledger for historical inspection. */
+export async function cachedProjectAccounting(
+  api: ExtensionAPI,
+  project: Project,
+): Promise<ProjectAccounting | undefined> {
+  return accounts.get(api)?.get(`${project.root}/${project.marker.id}`)
+}
+/** Explicit lifecycle administration: runtime-free H1 reconciliation after H3 has drained owners.
+ * No timer, defaults, owner open, model resolution or execution admission is introduced. */
+export async function reconcileLifecycleCosts(
+  api: ExtensionAPI,
+  project: Project,
+  owners: readonly import("./owner-inventory.ts").RecoveredOwner[],
+): Promise<void> {
+  const costs = new ProjectCosts(project.marker.id, new FileCostPersistence(project), {
+    stop() {},
+    notify() {},
+  })
+  await costs.load(true, undefined, { initializePolicy: false })
+  for (const owner of owners) {
+    const { key, id, iteration, stage, role, attempt, batch, variant } = owner
+    await costs.intent(
+      key,
+      {
+        iteration,
+        stage,
+        role,
+        ...(attempt ? { attempt } : {}),
+        ...(batch ? { batch } : {}),
+        ...(variant ? { variant } : {}),
+      },
+      "recovered",
+    )
+    const snapshot = await api.conversations!.read({ key })
+    if (!snapshot) {
+      if (id) await costs.unavailable(key)
+      continue
+    }
+    if (snapshot.key !== key || (id && snapshot.id !== id))
+      throw new Error("Lifecycle accounting owner identity changed")
+    await costs.bind(key, snapshot.id)
+    await costs.observe(key, snapshot.usage, { pending: false, pendingSessions: [] })
+  }
+  await costs.flush()
+}
+
 export async function disposeAccounting(api: ExtensionAPI): Promise<void> {
   const all = accounts.get(api)
   accounts.delete(api)
@@ -497,15 +617,9 @@ export async function openAccounted(
 ): Promise<OwnedConversation> {
   const accounting = await projectAccounting(api, project)
   await accounting.intent(spec.key, attribution)
-  let handle: OwnedConversation | undefined
-  try {
-    handle = await api.conversations!.openOrCreate(spec, runtime)
-    accounting.assertAdmission()
-    return await accounting.track(handle)
-  } catch (error) {
-    await handle?.release()
-    throw error
-  }
+  return accounting.openOwner(() =>
+    publishOwnerOpening(project, spec.key, () => api.conversations!.openOrCreate(spec, runtime)),
+  )
 }
 export async function reopenAccounted(
   api: ExtensionAPI,
@@ -517,13 +631,7 @@ export async function reopenAccounted(
   const accounting = await projectAccounting(api, project)
   await accounting.inventory(attribution, ref)
   await accounting.intent(ref.key, attribution)
-  let handle: OwnedConversation | undefined
-  try {
-    handle = await api.conversations!.open(ref.id, runtime)
-    accounting.assertAdmission()
-    return await accounting.track(handle)
-  } catch (error) {
-    await handle?.release()
-    throw error
-  }
+  return accounting.openOwner(() =>
+    publishOwnerOpening(project, ref.key, () => api.conversations!.open(ref.id, runtime)),
+  )
 }

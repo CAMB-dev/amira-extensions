@@ -5,6 +5,7 @@ import type { CommandContext, ExtensionAPI } from "@amira/api"
 import { accountedGeneration } from "./accounted-generation.ts"
 import { type PrototypeManifestArtifact, validateArtifact } from "./artifacts.ts"
 import { localize } from "./language.ts"
+import { type PrototypeCodeAvailability, prototypeAvailability } from "./project-cleanup.ts"
 import {
   PrototypeSessions,
   prototypeBoundary,
@@ -74,12 +75,24 @@ async function fileCount(directory: string): Promise<number> {
   return count
 }
 
+function unavailableCode(variant: Variant, availability?: PrototypeCodeAvailability) {
+  const code = availability?.find((entry) => entry.id === variant.id)
+  return code &&
+    !code.runnable &&
+    (code.removalStatus !== undefined || code.status === "removed" || variant.status === "ready")
+    ? code
+    : undefined
+}
+
 export function prototypePanelText(
   manifest: PrototypeManifestArtifact,
   language: string,
   showChoice = true,
+  availability?: PrototypeCodeAvailability,
 ): string {
-  const variants = manifest.variants.map((variant) => `${variant.id}: ${variant.status}`).join(" · ")
+  const variants = manifest.variants
+    .map((variant) => `${variant.id}: ${unavailableCode(variant, availability)?.status ?? variant.status}`)
+    .join(" · ")
   const chosen =
     manifest.chosen && showChoice
       ? localize(
@@ -95,6 +108,7 @@ export function prototypePanelText(
 export async function prototypeComparison(
   manifest: PrototypeManifestArtifact,
   language: string,
+  availability?: PrototypeCodeAvailability,
 ): Promise<string> {
   const title = localize(
     language,
@@ -104,11 +118,14 @@ export async function prototypeComparison(
   )
   const rows = await Promise.all(
     manifest.variants.map(async (variant) => {
+      const code = unavailableCode(variant, availability)
+      if (code)
+        return `${variant.id} · ${variant.idea} · ${code.status}\n  ${variant.question}\n  ${localize(language, "Code removed or unavailable; historical run command is not runnable.", "代码已删除或不可用；历史运行命令不可执行。", "コードは削除済みまたは利用不可です。以前の実行コマンドは使用できません。")}`
       const relativeCwd = path.relative(path.resolve(variant.directory, "../../../../.."), variant.cwd)
       return `${variant.id} · ${variant.idea} · ${variant.status} · ${await fileCount(variant.directory)} ${localize(language, "files changed", "个变更文件", "変更ファイル")}\n  ${variant.question}\n  ${variant.runCommand ?? localize(language, "Run command not reported yet", "尚未报告运行命令", "実行コマンド未報告")}\n  cwd (${localize(language, "project-relative", "项目相对路径", "プロジェクト相対")}): ${relativeCwd}${variant.notes ? `\n  ${variant.notes}` : ""}${variant.prerequisites.length ? `\n  ${localize(language, "Prerequisites", "前提条件", "前提条件")}: ${variant.prerequisites.join("; ")}` : ""}`
     }),
   )
-  return `${title}\n${rows.join("\n\n")}\n${prototypePanelText(manifest, language)}\n\n${prototypeBoundary(language)}`
+  return `${title}\n${rows.join("\n\n")}\n${prototypePanelText(manifest, language, true, availability)}\n\n${prototypeBoundary(language)}`
 }
 
 /** Controller owns the manifest; model reports are data, never storage paths or human evidence. */
@@ -185,7 +202,7 @@ export class Prototypes {
       kind: "stage-summary",
       stage: "prototype",
       language,
-      summary: `${localize(language, "Prototype choice", "原型选择", "プロトタイプの選択")}: ${saved.manifest.chosen.variantId ?? "none"}\n${decision.reasonSkipped ? localize(language, "Reason explicitly skipped", "已明确跳过理由", "理由は明示的に省略") : decision.reason}\n${await prototypeComparison(saved.manifest, language)}`,
+      summary: `${localize(language, "Prototype choice", "原型选择", "プロトタイプの選択")}: ${saved.manifest.chosen.variantId ?? "none"}\n${decision.reasonSkipped ? localize(language, "Reason explicitly skipped", "已明确跳过理由", "理由は明示的に省略") : decision.reason}\n${await prototypeComparison(saved.manifest, language, await prototypeAvailability(project, project.marker.currentIteration, saved.manifest))}`,
       outputs: [saved.ref.id, decision.id],
       suggestion: localize(
         language,
@@ -302,6 +319,11 @@ export class Prototypes {
     if (action === "run") {
       const variant = manifest?.variants.find((entry) => entry.id === args[1])
       if (!variant) throw new Error("Choose a recorded variant: /project prototype run <variant>")
+      const availability = await prototypeAvailability(project, project.marker.currentIteration, manifest!)
+      if (unavailableCode(variant, availability))
+        throw new Error(
+          "Prototype code is removed, missing or redirected. Its saved run command is historical, not runnable.",
+        )
       if (!variant.runCommand)
         throw new Error(
           "This variant has not reported a valid run command. Open it with /project prototype <variant>.",
@@ -330,7 +352,14 @@ export class Prototypes {
       return
     }
     if (state.pending || manifest?.chosen) {
-      if (manifest) ctx.print(await prototypeComparison(manifest, language))
+      if (manifest)
+        ctx.print(
+          await prototypeComparison(
+            manifest,
+            language,
+            await prototypeAvailability(project, project.marker.currentIteration, manifest),
+          ),
+        )
       ctx.print(
         localize(
           language,
@@ -414,7 +443,15 @@ export class Prototypes {
       state = saved.state
       manifest = { kind: "prototype-manifest", variants }
     }
-    ctx.print(await prototypeComparison(manifest, language), "info", { persist: true })
+    ctx.print(
+      await prototypeComparison(
+        manifest,
+        language,
+        await prototypeAvailability(project, project.marker.currentIteration, manifest),
+      ),
+      "info",
+      { persist: true },
+    )
     await changed()
     let id = action
     if (!id) {
@@ -472,13 +509,27 @@ export class Prototypes {
         attemptId: randomUUID(),
       })
     if (saved.manifest.chosen) {
-      ctx.print(await prototypeComparison(saved.manifest, language))
+      ctx.print(
+        await prototypeComparison(
+          saved.manifest,
+          language,
+          await prototypeAvailability(project, project.marker.currentIteration, saved.manifest),
+        ),
+      )
       await runStageCommand("next", [], project, ctx, language, checkOrigin, quiesceDesign)
       return
     }
     if (state.pending || !["ready", "confirmed", "running"].includes(state.phase))
       throw new Error("Review /project next before choosing a prototype")
-    ctx.print(await prototypeComparison(saved.manifest, language), "info", { persist: true })
+    ctx.print(
+      await prototypeComparison(
+        saved.manifest,
+        language,
+        await prototypeAvailability(project, project.marker.currentIteration, saved.manifest),
+      ),
+      "info",
+      { persist: true },
+    )
     const none = t("None", "都不选", "選択なし")
     const question = {
       question: t("Choose a prototype variant", "选择原型变体", "プロトタイプ案を選ぶ"),

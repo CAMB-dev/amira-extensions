@@ -4,13 +4,16 @@ import { Acceptances, checkAcceptanceFreshness } from "./accept.ts"
 import { type AcceptanceView, acceptancePanelText, acceptanceView } from "./accept-view.ts"
 import { configureAccounting, disposeAccounting, projectAccounting } from "./accounting.ts"
 import type { PrototypeManifestArtifact } from "./artifacts.ts"
+import { runCleanupCommand } from "./cleanup-command.ts"
 import { type CostLedger, costText } from "./cost.ts"
 import { FileCostPersistence } from "./cost-storage.ts"
 import { DesignSessions } from "./design.ts"
 import { ProjectCommandError, projectError } from "./diagnostics.ts"
 import { Implementations, implementationStatus } from "./implement.ts"
 import { conversationLanguage, LanguagePolicy, localize, resolveLanguage, validLanguage } from "./language.ts"
+import { runLifecycleCommand } from "./lifecycle-command.ts"
 import { runModeChange } from "./mode-change.ts"
+import { type PrototypeCodeAvailability, prototypeAvailability } from "./project-cleanup.ts"
 import { latestPrototypeManifest, Prototypes, prototypePanelText } from "./prototype.ts"
 import { supportsPrototype } from "./prototype-sessions.ts"
 import { shipSummary } from "./ship.ts"
@@ -27,6 +30,8 @@ import {
   HistoricalIterationReader,
   IterationStore,
   type Project,
+  ProjectStorageError,
+  projectLifecycle,
   Registry,
   readProject,
 } from "./store.ts"
@@ -53,6 +58,27 @@ export function restoreAttachment(data?: SessionData): Attachment | undefined {
   return undefined
 }
 
+export function lifecycleStatus(project: Project, language = "en"): string {
+  const lifecycle = projectLifecycle(project)
+  const iteration = lifecycle.iterations[project.marker.currentIteration]!
+  return (
+    localize(
+      language,
+      `Project: ${lifecycle.status} · iteration ${project.marker.currentIteration}: ${iteration.status} · ship: ${iteration.ship}`,
+      `项目：${lifecycle.status} · 迭代 ${project.marker.currentIteration}：${iteration.status} · 发布：${iteration.ship}`,
+      `プロジェクト：${lifecycle.status} · イテレーション ${project.marker.currentIteration}：${iteration.status} · リリース：${iteration.ship}`,
+    ) +
+    (lifecycle.status === "active" && iteration.continuationRequired
+      ? localize(
+          language,
+          "\nRead-only until fresh continuation approval: /project iteration continue",
+          "\n只读，需重新批准继续：/project iteration continue",
+          "\n継続の再承認まで読み取り専用：/project iteration continue",
+        )
+      : "")
+  )
+}
+
 export function panelLines(
   project: Project | undefined,
   error: string | undefined,
@@ -65,6 +91,7 @@ export function panelLines(
   acceptance?: AcceptanceView,
   executionProgress?: string,
   costs?: CostLedger,
+  prototypeCode?: PrototypeCodeAvailability,
 ): ToolLine[] {
   const lang = language ?? project?.marker.settings.language ?? "en"
   if (error)
@@ -86,14 +113,19 @@ export function panelLines(
   const state = iterationState ?? initialIteration(project.marker.id, iteration)
   const stage = stageName(state.stage, lang)
   const status = statusName(state.status, lang)
+  const lifecycle = projectLifecycle(project)
+  const historical =
+    lifecycle.status !== "active" ||
+    lifecycle.iterations[iteration]?.status !== "open" ||
+    lifecycle.iterations[iteration]?.continuationRequired
   const lines: ToolLine[] = [
     {
       kind: "accent",
       text: localize(
         lang,
-        `Project ${name} · iteration ${iteration} · ${stage} · ${status}`,
-        `项目 ${name} · 迭代 ${iteration} · ${stage} · ${status}`,
-        `プロジェクト ${name} · イテレーション ${iteration} · ${stage} · ${status}`,
+        `Project ${name} · iteration ${iteration} · ${stage} · ${status}${historical ? ` · read-only (${lifecycle.status}/${lifecycle.iterations[iteration]?.status})` : ""}`,
+        `项目 ${name} · 迭代 ${iteration} · ${stage} · ${status}${historical ? ` · 只读（${lifecycle.status}/${lifecycle.iterations[iteration]?.status}）` : ""}`,
+        `プロジェクト ${name} · イテレーション ${iteration} · ${stage} · ${status}${historical ? ` · 読み取り専用（${lifecycle.status}/${lifecycle.iterations[iteration]?.status}）` : ""}`,
       ),
       wrap: true,
     },
@@ -101,7 +133,14 @@ export function panelLines(
       kind: "muted",
       // Host panels receive the MAIN id even while native design has focus. Do not infer focus
       // or keep a stale "next: open" instruction after a saved design has become available.
-      text: nextSuggestion(state, lang, designAvailable),
+      text: historical
+        ? localize(
+            lang,
+            `Read-only: ${lifecycle.status}, iteration ${lifecycle.iterations[iteration]?.status}. Use /project restore, /project iteration continue or /project iteration new explicitly.`,
+            `只读：项目 ${lifecycle.status}，迭代 ${lifecycle.iterations[iteration]?.status}。请明确使用 /project restore、/project iteration continue 或 /project iteration new。`,
+            `読み取り専用：${lifecycle.status}、イテレーション ${lifecycle.iterations[iteration]?.status}。/project restore、/project iteration continue または /project iteration new を明示的に実行してください。`,
+          )
+        : nextSuggestion(state, lang, designAvailable),
       wrap: true,
     },
   ]
@@ -127,13 +166,13 @@ export function panelLines(
   if (prototype)
     lines.push({
       kind: "muted",
-      text: prototypePanelText(prototype, lang, !!state.prototypeChoice),
+      text: prototypePanelText(prototype, lang, !!state.prototypeChoice, prototypeCode),
       wrap: true,
     })
   return collapsed ? lines.slice(0, 1) : lines
 }
 
-const HELP = `/project [list] — choose a known project or the nearest discovered project
+const HELP = `/project [list] [--archived] — choose a known project or the nearest discovered project
 /project new [name] [--root <directory>] [--language <tag>] [--commit-documents]
 /project switch [name, id, or directory]
 /project status
@@ -149,14 +188,14 @@ const HELP = `/project [list] — choose a known project or the nearest discover
 /project revisit design|prototype
 Attachment does not change the main session's working directory.
 Prototype file tools are variant-scoped; shell uses current permissions. This is not a sandbox.
-Spec and mode review: /project spec. Approved batch execution: /project implement. Acceptance: /project next, then /project accept. Ship: /project ship [status|reconcile|local-only|skip]. Close/archive UI: coming later.`
+Spec and mode review: /project spec. Approved batch execution: /project implement. Acceptance: /project next, then /project accept. Ship: /project ship [status|reconcile|local-only|skip]. Close: /project iteration close. Next: /project iteration new. End project: /project archive. Inert restore: /project restore. Safe optional cleanup: /project iteration cleanup [worktree|branch|prototypes].`
 
 function help(language: string): string {
   return localize(
     language,
     HELP,
-    `/project [list] — 选择已知项目或最近识别的项目\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 查看项目阶段和状态\n/project cost [cap <USD>|raise <USD>|continue|remove] — 查看花费并管理项目上限\n/project design — 打开设计会话\n/project prototype [<variant>|choose|run <variant>] — 查看原型变体、选择结论或显示运行命令\n/project next — 查看总结并确认下一步\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n关联项目不会改变主会话工作目录。原型文件工具仅能写入各自目录，Shell 遵循当前权限模式；这不是沙箱。规格和执行模式审阅：/project spec；保留已完成批次并重新批准执行模式：/project mode；按已批准的模式实现批次：/project implement。验收：/project next 确认后用 /project accept。发布：/project ship [status|reconcile|local-only|skip]。关闭和归档界面将在后续版本提供。`,
-    `/project [list] — 登録済みまたは最寄りのプロジェクトを選択\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 段階と状態を確認\n/project cost [cap <USD>|raise <USD>|continue|remove] — 費用とプロジェクト上限を確認\n/project design — 設計会話を開く\n/project prototype [<variant>|choose|run <variant>] — 案の表示・選択・実行コマンドの確認\n/project next — 要約を確認して次の手順を承認\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n関連付けてもメインの作業ディレクトリは変わりません。試作のファイルツールは各案のディレクトリ内だけに書き込みます。シェルは現在の権限モードに従い、サンドボックスではありません。仕様と実行モードの確認：/project spec、完了済みバッチを保持してモードを再承認：/project mode、承認済みモードでのバッチ実装：/project implement。受け入れ確認：/project next で承認後 /project accept。リリース：/project ship [status|reconcile|local-only|skip]。終了・アーカイブの画面は今後対応予定です。`,
+    `/project [list] — 选择已知项目或最近识别的项目\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 查看项目阶段和状态\n/project cost [cap <USD>|raise <USD>|continue|remove] — 查看花费并管理项目上限\n/project design — 打开设计会话\n/project prototype [<variant>|choose|run <variant>] — 查看原型变体、选择结论或显示运行命令\n/project next — 查看总结并确认下一步\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n关联项目不会改变主会话工作目录。原型文件工具仅能写入各自目录，Shell 遵循当前权限模式；这不是沙箱。规格和执行模式审阅：/project spec；保留已完成批次并重新批准执行模式：/project mode；按已批准的模式实现批次：/project implement。验收：/project next 确认后用 /project accept。发布：/project ship [status|reconcile|local-only|skip]。关闭迭代：/project iteration close；新建迭代：/project iteration new；结束项目：/project archive；恢复（不启动工作）：/project restore。查看归档项目：/project list --archived。`,
+    `/project [list] — 登録済みまたは最寄りのプロジェクトを選択\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 段階と状態を確認\n/project cost [cap <USD>|raise <USD>|continue|remove] — 費用とプロジェクト上限を確認\n/project design — 設計会話を開く\n/project prototype [<variant>|choose|run <variant>] — 案の表示・選択・実行コマンドの確認\n/project next — 要約を確認して次の手順を承認\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n関連付けてもメインの作業ディレクトリは変わりません。試作のファイルツールは各案のディレクトリ内だけに書き込みます。シェルは現在の権限モードに従い、サンドボックスではありません。仕様と実行モードの確認：/project spec、完了済みバッチを保持してモードを再承認：/project mode、承認済みモードでのバッチ実装：/project implement。受け入れ確認：/project next で承認後 /project accept。リリース：/project ship [status|reconcile|local-only|skip]。イテレーション終了：/project iteration close、次回：/project iteration new、プロジェクト終了：/project archive、作業を再開せず復元：/project restore。アーカイブ一覧：/project list --archived。`,
   )
 }
 
@@ -228,6 +267,7 @@ export function createProjectExtension(): Extension {
     const worktreePanels = new Map<string, string>()
     const panelArtifactRefs = new Map<string, { worktree?: string; prototype?: string }>()
     const prototypePanels = new Map<string, PrototypeManifestArtifact>()
+    const prototypeCodePanels = new Map<string, PrototypeCodeAvailability>()
     async function refreshPrototypePanel(project: Project, iteration?: IterationState) {
       // Panel artifact reads must not acquire writer claims or repair saved projections.
       const store = new IterationStore(project, {}, project.marker.currentIteration)
@@ -250,6 +290,10 @@ export function createProjectExtension(): Extension {
         if (saved) prototypePanels.set(key, saved.manifest)
         cached.prototype = prototypeRef.id
       }
+      const manifest = prototypePanels.get(key)
+      if (manifest)
+        prototypeCodePanels.set(key, await prototypeAvailability(project, current.iteration, manifest))
+      else prototypeCodePanels.delete(key)
       panelArtifactRefs.set(key, cached)
     }
     const costPanels = new Map<string, CostLedger>()
@@ -384,8 +428,28 @@ export function createProjectExtension(): Extension {
       return new ProjectCommandError(localize(interfaceLanguage(ctx), en, zh, ja))
     }
 
+    const readOnly = (project: Project) => {
+      const lifecycle = projectLifecycle(project)
+      return (
+        lifecycle.status !== "active" ||
+        lifecycle.iterations[project.marker.currentIteration]?.status !== "open" ||
+        lifecycle.iterations[project.marker.currentIteration]?.continuationRequired === true
+      )
+    }
+    async function displayIteration(project: Project): Promise<IterationState> {
+      return readOnly(project) ? historicalIteration(project) : new IterationStore(project).read()
+    }
+    async function historicalIteration(project: Project): Promise<IterationState> {
+      try {
+        return await new HistoricalIterationReader(project, project.marker.currentIteration).read()
+      } catch (error) {
+        if (error instanceof ProjectStorageError && error.code === "missing")
+          return initialIteration(project.marker.id, project.marker.currentIteration)
+        throw error
+      }
+    }
     async function attach(project: Project, ctx: CommandContext, origin: string): Promise<void> {
-      await registry.remember(project)
+      if (!readOnly(project)) await registry.remember(project)
       if (!active(origin) || ctx.signal.aborted)
         throw commandFailure(
           ctx,
@@ -400,11 +464,16 @@ export function createProjectExtension(): Extension {
       }
       if (ctx.session.data) ctx.session.data.append(ATTACHMENT_KEY, snapshot)
       else memoryAttachments.set(origin, snapshot)
-      const accounting = await projectAccounting(api, project)
-      costPanels.set(project.marker.id, accounting.costs.snapshot())
+      if (!readOnly(project)) {
+        const accounting = await projectAccounting(api, project)
+        costPanels.set(project.marker.id, accounting.costs.snapshot())
+      } else {
+        const ledger = await new FileCostPersistence(project).read()
+        if (ledger) costPanels.set(project.marker.id, ledger)
+      }
       // Retain the selected marker/language even when its iteration data cannot be read.
       states.set(origin, { fingerprint: JSON.stringify(snapshot), project })
-      const iteration = await new IterationStore(project).read()
+      const iteration = await displayIteration(project)
       if (!active(origin) || ctx.signal.aborted)
         throw commandFailure(
           ctx,
@@ -454,7 +523,7 @@ export function createProjectExtension(): Extension {
         // Do not fall back to cached/pre-resume settings for compatibility diagnostics.
         selectedProject = project
         lang = displayLanguage(project, (notice) => ctx.print(notice, "warning"))
-        const iteration = await new IterationStore(project).read()
+        const iteration = await displayIteration(project)
         await refreshPrototypePanel(project, iteration)
         states.set(origin, { fingerprint: JSON.stringify(attachment), project, iteration })
         api.requestRender()
@@ -478,8 +547,13 @@ export function createProjectExtension(): Extension {
       }
     }
 
-    async function choose(ctx: CommandContext, origin: string, target?: string): Promise<void> {
-      const known = await registry.list()
+    async function choose(
+      ctx: CommandContext,
+      origin: string,
+      target?: string,
+      includeArchived = false,
+    ): Promise<void> {
+      const known = await registry.list({ includeArchived: includeArchived || !!target })
       const lang = interfaceLanguage(ctx)
       if (target) {
         const pathKey = (value: string) => (process.platform === "win32" ? value.toLowerCase() : value)
@@ -519,7 +593,7 @@ export function createProjectExtension(): Extension {
       let discovered: Project | undefined
       let discoveryError: string | undefined
       try {
-        discovered = await discoverProject(ctx.cwd)
+        discovered = await discoverProject(ctx.cwd, { includeArchived })
       } catch (error) {
         discoveryError = projectError(error, lang)
         ctx.print(
@@ -571,8 +645,8 @@ export function createProjectExtension(): Extension {
         return
       }
       const labels = checked.map(
-        ({ entry, error }) =>
-          `${error ? localize(lang, "[missing or invalid] ", "[缺失或无效] ", "[未検出または無効] ") : ""}${entry.name} — ${entry.root} (${entry.id})`,
+        ({ entry, error, project }) =>
+          `${error ? localize(lang, "[missing or invalid] ", "[缺失或无效] ", "[未検出または無効] ") : project && projectLifecycle(project).status !== "active" ? `[${projectLifecycle(project).status}] ` : ""}${entry.name} — ${entry.root} (${entry.id})`,
       )
       if (ctx.frontend === "print") {
         ctx.print(
@@ -670,6 +744,7 @@ export function createProjectExtension(): Extension {
         state.project && acceptancePanels.get(designKey(state.project)),
         state.project && implementations.progress(state.project),
         state.project && costPanels.get(state.project.marker.id),
+        state.project && prototypeCodePanels.get(designKey(state.project)),
       )
     }
     api.registerPanel({ id: "project", order: 10, render })
@@ -697,7 +772,7 @@ export function createProjectExtension(): Extension {
       name: "project",
       description: "Attach a project, inspect its status, or open its saved design conversation",
       args: {
-        hint: "[list|new|switch|status|design|prototype|spec|implement|accept|ship|next|skip|revisit]",
+        hint: "[list|new|switch|status|design|prototype|spec|implement|accept|ship|iteration|archive|restore|next|skip|revisit]",
         complete: (prefix) =>
           [
             "list",
@@ -712,6 +787,9 @@ export function createProjectExtension(): Extension {
             "implement",
             "accept",
             "ship",
+            "iteration",
+            "archive",
+            "restore",
             "next",
             "skip",
             "revisit",
@@ -744,6 +822,15 @@ export function createProjectExtension(): Extension {
             const attachment = attachmentFor(origin, ctx.session.data)
             if (!attachment) throw new Error("No project attached. Use /project switch first.")
             const project = await readProject(attachment.root, attachment.projectId)
+            if (readOnly(project)) {
+              if (tokens.length)
+                throw new Error(
+                  "Project or iteration is read-only. Restore, confirm /project iteration continue, or start a new iteration explicitly before changing a cap.",
+                )
+              const ledger = await new FileCostPersistence(project).read()
+              ctx.print(ledger ? costText(ledger, displayLanguage(project)) : "No recorded project costs.")
+              return
+            }
             const accounting = await projectAccounting(api, project)
             await accounting.settled()
             const action = tokens.shift()
@@ -780,7 +867,9 @@ export function createProjectExtension(): Extension {
             )
             api.requestRender()
           } else if (verb === "list" || verb === "switch") {
-            await choose(ctx, origin, tokens.join(" ") || undefined)
+            const includeArchived = tokens[0] === "--archived"
+            if (includeArchived) tokens.shift()
+            await choose(ctx, origin, tokens.join(" ") || undefined, includeArchived)
           } else if (verb === "new") {
             let root = ctx.cwd
             let selectedLanguage: string | undefined
@@ -828,6 +917,69 @@ export function createProjectExtension(): Extension {
               commitDocuments,
             })
             await attach(project, ctx, origin)
+          } else if (verb === "iteration" || verb === "archive" || verb === "restore") {
+            const attachment = attachmentFor(origin, ctx.session.data)
+            if (!attachment)
+              throw new Error("No project attached. Use /project switch <id or directory> first.")
+            const project = await readProject(attachment.root, attachment.projectId)
+            const checkOrigin = () => {
+              ctx.signal.throwIfAborted()
+              const selected = attachmentFor(origin, ctx.session.data)
+              if (
+                !active(origin) ||
+                selected?.projectId !== project.marker.id ||
+                selected.root !== project.root
+              )
+                throw new Error("Main session or attached project changed. Run the command again.")
+            }
+            try {
+              if (verb === "iteration" && tokens[0] === "cleanup")
+                await runCleanupCommand(
+                  api,
+                  project,
+                  tokens.slice(1),
+                  ctx,
+                  displayLanguage(project),
+                  checkOrigin,
+                )
+              else
+                await runLifecycleCommand(
+                  api,
+                  project,
+                  verb,
+                  tokens,
+                  ctx,
+                  displayLanguage(project),
+                  checkOrigin,
+                  async () => {
+                    const drained = await Promise.allSettled([
+                      designs.quiesce(project),
+                      prototypes.sessions.quiesce(project),
+                      implementations.quiesce(project),
+                      acceptances.quiesce(project),
+                    ])
+                    const failure = drained.find((result) => result.status === "rejected")
+                    if (failure?.status === "rejected") throw failure.reason
+                  },
+                )
+            } finally {
+              const current = await readProject(project.root, project.marker.id)
+              const selected = attachmentFor(origin, ctx.session.data)
+              if (
+                active(origin) &&
+                selected?.projectId === project.marker.id &&
+                selected.root === project.root
+              ) {
+                const iteration = await historicalIteration(current)
+                await refreshPrototypePanel(current, iteration)
+                states.set(origin, {
+                  fingerprint: JSON.stringify(selected),
+                  project: current,
+                  iteration,
+                })
+                api.requestRender()
+              }
+            }
           } else if (verb === "ship") {
             const project = await attached(ctx, origin)
             const checkOrigin = () => {
@@ -850,7 +1002,7 @@ export function createProjectExtension(): Extension {
             states.set(origin, {
               fingerprint: JSON.stringify(attachmentFor(origin, ctx.session.data)),
               project: current,
-              iteration: await new IterationStore(current).read(),
+              iteration: await displayIteration(current),
             })
             api.requestRender()
           } else if (verb === "spec" || verb === "mode" || verb === "implement" || verb === "accept") {
@@ -1104,6 +1256,7 @@ export function createProjectExtension(): Extension {
                 "メインセッションが変わりました。コマンドをもう一度実行してください。",
               )
             if (verb === "design") {
+              await assertProjectWritable(project)
               const store = new IterationStore(project)
               const iteration = await store.read()
               if (
@@ -1135,12 +1288,16 @@ export function createProjectExtension(): Extension {
               api.requestRender()
             } else {
               const lang = displayLanguage(project, (notice) => ctx.print(notice, "warning"))
-              if (supportsPrototype(api.apiVersion) && states.get(origin)?.iteration?.stage === "prototype")
+              if (
+                !readOnly(project) &&
+                supportsPrototype(api.apiVersion) &&
+                states.get(origin)?.iteration?.stage === "prototype"
+              )
                 await prototypes.refresh(project, ctx, lang)
-              const iteration = await new IterationStore(project).read()
+              const iteration = await displayIteration(project)
               await refreshPrototypePanel(project, iteration)
               const view = acceptancePanels.get(designKey(project))
-              if (view?.outcome && !view.running) {
+              if (!readOnly(project) && view?.outcome && !view.running) {
                 const freshness = await checkAcceptanceFreshness(api, project, ctx)
                 acceptancePanels.set(designKey(project), { ...view, ...freshness, verified: true })
               }
@@ -1156,33 +1313,24 @@ export function createProjectExtension(): Extension {
                   `${project.marker.name}\n目录：${project.root}\n迭代：${project.marker.currentIteration}`,
                   `${project.marker.name}\nディレクトリ：${project.root}\nイテレーション：${project.marker.currentIteration}`,
                 ) +
-                  `\n${stageStatus(iteration, lang)}\n${implementationStatus(iteration)}${implementations.progress(project) ? `\n${implementations.progress(project)}` : ""}${worktreePanels.has(designKey(project)) ? `\nWorktree: ${worktreePanels.get(designKey(project))}` : ""}\n${nextSuggestion(iteration, lang, availableDesigns.has(designKey(project)))}` +
+                  `\n${lifecycleStatus(project, lang)}\n${stageStatus(iteration, lang)}\n${implementationStatus(iteration)}${implementations.progress(project) ? `\n${implementations.progress(project)}` : ""}${worktreePanels.has(designKey(project)) ? `\nWorktree: ${worktreePanels.get(designKey(project))}` : ""}\n${readOnly(project) ? lifecycleStatus(project, lang) : nextSuggestion(iteration, lang, availableDesigns.has(designKey(project)))}` +
                   (acceptancePanels.has(designKey(project))
                     ? `\n${acceptancePanelText(acceptancePanels.get(designKey(project))!, lang)}`
                     : "") +
                   (prototypePanels.has(designKey(project))
-                    ? `\n${prototypePanelText(prototypePanels.get(designKey(project))!, lang, !!iteration.prototypeChoice)}`
+                    ? `\n${prototypePanelText(prototypePanels.get(designKey(project))!, lang, !!iteration.prototypeChoice, prototypeCodePanels.get(designKey(project)))}`
                     : "") +
                   localize(
                     lang,
-                    "\nAcceptance: /project next, then /project accept. Ship: /project ship. Close/archive UI: coming later.",
-                    "\n验收：/project next 确认后用 /project accept。发布：/project ship。关闭和归档界面：后续版本提供。",
-                    "\n受け入れ確認：/project next で承認後 /project accept。リリース：/project ship。終了・アーカイブの画面は今後対応予定です。",
+                    "\nAcceptance: /project next, then /project accept. Ship: /project ship. Close: /project iteration close. Next: /project iteration new. End project: /project archive. Inert restore: /project restore. Safe optional cleanup: /project iteration cleanup [worktree|branch|prototypes].",
+                    "\n验收：/project next 确认后用 /project accept。发布：/project ship。关闭迭代：/project iteration close；新建迭代：/project iteration new；归档：/project archive；恢复：/project restore。",
+                    "\n受け入れ確認：/project next で承認後 /project accept。リリース：/project ship。イテレーション終了：/project iteration close、次回：/project iteration new、プロジェクト終了：/project archive、作業を再開せず復元：/project restore。アーカイブ一覧：/project list --archived。",
                   ),
               )
               const ship = await new ShipStore(project).latest()
               if (ship) ctx.print(shipSummary(ship))
               api.requestRender()
             }
-          } else if (["prototype", "implement", "accept", "archive", "iteration"].includes(verb)) {
-            ctx.print(
-              localize(
-                interfaceLanguage(ctx),
-                "Coming later: execution is not available yet. This step stores stage state and human approvals only; no work was started.",
-                "后续版本提供：执行尚未开放。当前仅保存阶段状态和用户审批，未启动任何工作。",
-                "実行はまだ利用できません。現在は段階の状態と承認のみを保存します。作業は開始していません。",
-              ),
-            )
           } else throw new Error(HELP)
         } catch (error) {
           const lang = interfaceLanguage(ctx)

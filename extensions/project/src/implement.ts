@@ -84,20 +84,28 @@ export class Implementations {
       )
       if (!entry) return { action: "pass" as const }
       const [attemptId, binding] = entry
+      const blocked = {
+        action: "block" as const,
+        reason:
+          "Implementation is paused or finished. F6 returns to main; review /project next before further work.",
+      }
+      // Lifecycle/cap cancellation is immediate and must not wait behind journal IO.
+      if (binding.paused || binding.accountingStopped || binding.lifecycle?.controller.signal.aborted)
+        return blocked
       const state = await new IterationStore(binding.project).read()
       return !binding.paused &&
+        !binding.accountingStopped &&
         !binding.lifecycle?.controller.signal.aborted &&
         state.activeAttemptId === attemptId &&
         state.phase === "running"
         ? { action: "pass" as const }
-        : {
-            action: "block" as const,
-            reason:
-              "Implementation is paused or finished. F6 returns to main; review /project next before further work.",
-          }
+        : blocked
     }
-    api.intercept?.("context.build", (_value, context) => allowed(context.sessionId))
-    api.intercept?.("tool.call.before", (_value, context) => allowed(context.sessionId))
+    // As in acceptance, complete immutable-history validation can exceed 5s on
+    // Windows/long iterations. Keep the guard awaited and bounded, not bypassed.
+    const validation = { timeoutMs: 30_000 }
+    api.intercept?.("context.build", (_value, context) => allowed(context.sessionId), validation)
+    api.intercept?.("tool.call.before", (_value, context) => allowed(context.sessionId), validation)
   }
   progress(project: Project): string | undefined {
     return [...this.running.values()].find(

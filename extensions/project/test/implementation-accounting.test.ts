@@ -1,9 +1,10 @@
 import { afterEach, expect, setDefaultTimeout, spyOn, test } from "bun:test"
 import { readFile, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
-import type { ConversationUsageSnapshot, OwnedConversationSnapshot } from "@amira/api"
+import type { ConversationUsageSnapshot, ExtensionAPI, OwnedConversationSnapshot } from "@amira/api"
 import { disposeAccounting, projectAccounting } from "../src/accounting.ts"
 import type { BoundRunner, RunnerSnapshot } from "../src/execution-modes.ts"
+import { Implementations } from "../src/implement.ts"
 import { ImplementationLifecycle } from "../src/implementation-lifecycle.ts"
 import { runSpec } from "../src/spec.ts"
 import { runStageCommand } from "../src/stage-commands.ts"
@@ -122,11 +123,16 @@ for (const mode of ["single", "workflow", "swarm"] as const) {
       status: () => providerSnapshot,
       stop(id) {
         stops.push(id)
+        if (providerSnapshot) {
+          providerSnapshot = { ...providerSnapshot, status: "stopped", state: "stopped" }
+          for (const listener of results) listener(providerSnapshot)
+        }
         return true
       },
       onProgress: () => () => {},
       onResult(_id, listener) {
         results.add(listener)
+        if (providerSnapshot?.status === "stopped") listener(providerSnapshot)
         return () => {
           results.delete(listener)
         }
@@ -260,6 +266,20 @@ for (const mode of ["single", "workflow", "swarm"] as const) {
     expect(illegal).toEqual([])
   })
 }
+
+test("implementation admission retains awaited bounded full-history validation", () => {
+  const registrations: { event: string; options: unknown }[] = []
+  new Implementations({
+    intercept(event: string, _listener: unknown, options: unknown) {
+      registrations.push({ event, options })
+      return () => {}
+    },
+  } as unknown as ExtensionAPI)
+  expect(registrations).toEqual([
+    { event: "context.build", options: { timeoutMs: 30_000 } },
+    { event: "tool.call.before", options: { timeoutMs: 30_000 } },
+  ])
+})
 
 test("accounting-cancelled lifecycle rejects before probing a released owner's status", async () => {
   const handle = ownedFixture({ key: "released-implementation", cwd: process.cwd() })

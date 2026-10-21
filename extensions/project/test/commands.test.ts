@@ -122,7 +122,7 @@ describe("project commands and attachments", () => {
       f.panel.render({ sessionId: "main-1", data: f.data(), width: 60, now: 0, collapsed: true }),
     ).toHaveLength(1)
     await f.command.run("status", f.ctx)
-    expect(f.output.at(-1)?.text).toContain("coming later")
+    expect(f.output.at(-1)?.text).toContain("Project: active")
     expect(f.ctx.session.messages()).toEqual([])
   })
 

@@ -16,7 +16,7 @@
       "description": "Experimental project discovery, guided design conversations, durable human decisions, a confirmed stage engine, confined prototypes, spec-driven implementation, acceptance and workflow/swarm execution modes: /project",
       "version": "0.7.0",
       "status": "wip",
-      "statusMessage": "Batch 3 in progress: spend caps and ship are in; archive and the dashboard view are not done yet.",
+      "statusMessage": "Batch 3 in progress: spend caps, ship and archive are in; the dashboard view is not done yet.",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/project" },
       "engines": { "amira": "^0.1.64" },
       "tags": ["experimental", "project", "design", "decisions"],
