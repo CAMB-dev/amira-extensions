@@ -198,6 +198,8 @@ export async function runBound(options: BoundRunOptions): Promise<BoundRunResult
   // Deliberately rediscover at launch, never retain a recommendation-time service.
   const runner = boundRunner(api, mode)
   const stop = runner.stop.bind(runner)
+  const onResult = runner.onResult.bind(runner)
+  const status = runner.status.bind(runner)
   const label = `Implement ${batchId}`
   const startedBy = { sessionId: handle.id, label }
   const members = items.map((item, index) => ({
@@ -228,12 +230,66 @@ export async function runBound(options: BoundRunOptions): Promise<BoundRunResult
     const runSettled = new Promise<void>((resolve) => {
       runFinished = resolve
     })
+    let providerFinished = false
+    let settlementFailure: Error | undefined
+    // A failed stop/observation is not provider settlement. Wake drain callers
+    // with an error but retain the original result subscription and retry authority.
+    let drainFailure: Error | undefined
+    let failedDrain = Promise.withResolvers<Error>()
+    let runtimeReleased = false
+    let timer: ReturnType<typeof setInterval> | undefined
+    const clearTimer = () => {
+      if (timer !== undefined) clearInterval(timer)
+      timer = undefined
+    }
+    const failDrain = (reason: string) => {
+      const error = new Error(reason)
+      drainFailure = error
+      failedDrain.resolve(error)
+      clearTimer()
+    }
+    let resultSubscription: (() => void) | undefined
+    const settleProvider = (error?: Error) => {
+      if (providerFinished) return
+      providerFinished = true
+      settlementFailure = error
+      clearTimer()
+      runFinished()
+      try {
+        resultSubscription?.()
+      } catch {
+        /* Settlement is already observed; still release command subscriptions. */
+      }
+      resultSubscription = undefined
+    }
+    const drain = async () => {
+      // Group end does not cover provider finalizers (pending calls/journals).
+      // Keep the original provider's onResult barrier even after caller failure.
+      if (drainFailure) throw drainFailure
+      // Pin this failure generation: a later explicit retry cannot hide the
+      // failure from callers already draining the previous attempt.
+      const failure = failedDrain.promise.then((error) => {
+        throw error
+      })
+      await Promise.race([startSettled, failure])
+      await Promise.race([runSettled, failure])
+      // Snapshot only after provider settlement: a live run may create siblings
+      // after startBound returned (for example a swarm member's workflow).
+      await Promise.race([Promise.all([...groups].map((group) => group.ended())), failure])
+      if (drainFailure) throw drainFailure
+      if (settlementFailure) throw settlementFailure
+      if (!runtimeReleased) {
+        runtimeReleased = true
+        releaseRuntime()
+      }
+    }
     let effectiveCwd: string | undefined
     let finished = false
     let bindingReady = false
     let pendingResult: RunnerSnapshot | undefined
     let stopRequested = false
     let stopped = false
+    let stopAcknowledged: boolean | undefined
     const models = new Set<string>()
     const sessionIds = new Set<string>()
     let children: BoundProgress["children"] = []
@@ -241,7 +297,6 @@ export async function runBound(options: BoundRunOptions): Promise<BoundRunResult
     let incompleteChild: BoundProgress["children"][number] | undefined
     let publishedProgress: string | undefined
     const subscriptions = new Set<() => void>()
-    let timer: ReturnType<typeof setInterval> | undefined
     const metadata = () => ({
       runId,
       groupId,
@@ -251,8 +306,9 @@ export async function runBound(options: BoundRunOptions): Promise<BoundRunResult
       sessionIds: [...sessionIds],
     })
     const cleanup = () => {
-      runFinished()
-      if (timer !== undefined) clearInterval(timer)
+      // A refused stop with a still-visible run can have a delayed finalizer.
+      // Keep checking only the captured provider's observation, not new admission.
+      if (stopAcknowledged !== false || providerFinished || drainFailure) clearTimer()
       signal.removeEventListener("abort", aborted)
       for (const unsubscribe of subscriptions) {
         try {
@@ -263,13 +319,35 @@ export async function runBound(options: BoundRunOptions): Promise<BoundRunResult
       }
       subscriptions.clear()
     }
-    const stopRun = () => {
-      if (!runId || stopped || !stopRequested) return
-      stopped = true
+    const checkStopRefusal = () => {
+      if (!runId || stopAcknowledged !== false || providerFinished || drainFailure) return
       try {
-        stop(runId)
-      } catch {
-        /* Preserve the original cancellation/loss reason. */
+        const snapshot = runner.status(runId)
+        if (!snapshot || typeof snapshot !== "object" || snapshot.runId !== runId)
+          throw new Error(`original provider lost run ${runId}`)
+      } catch (error) {
+        failDrain(
+          `${mode}.runner settlement unavailable for ${runId}: stop returned false; ${message(error)}. Restore the original provider's run observation, then explicitly retry archive/close.`,
+        )
+      }
+    }
+    const stopRun = () => {
+      if (!runId || !stopRequested) return
+      if (!stopped) {
+        stopped = true
+        try {
+          stopAcknowledged = stop(runId)
+          if (typeof stopAcknowledged !== "boolean") throw new Error("stop did not return an acknowledgement")
+        } catch (error) {
+          failDrain(
+            `${mode}.runner stop failed for ${runId}: ${message(error)}. Settlement is unverified; repair the original provider and explicitly retry archive/close.`,
+          )
+        }
+      }
+      checkStopRefusal()
+      if (stopAcknowledged === false && !providerFinished && !drainFailure && timer === undefined) {
+        timer = setInterval(poll, 100)
+        timer.unref?.()
       }
     }
     const fail = (reason: unknown, shouldStop = true) => {
@@ -362,6 +440,10 @@ export async function runBound(options: BoundRunOptions): Promise<BoundRunResult
       return !finished
     }
     const poll = () => {
+      if (finished) {
+        checkStopRefusal()
+        return
+      }
       if (!current() || !runId) return
       try {
         const snapshot = runner.status(runId)
@@ -372,6 +454,16 @@ export async function runBound(options: BoundRunOptions): Promise<BoundRunResult
       }
     }
     const result = (snapshot: RunnerSnapshot) => {
+      // Provider observation is independent of admission/service discovery. Even
+      // a removed or replaced provider must finish its original run before drain.
+      if (!snapshot || typeof snapshot !== "object" || snapshot.runId !== runId) {
+        const error = new Error(`${mode}.runner settlement unavailable: mismatched result run ID`)
+        settleProvider(error)
+        fail(error)
+        return
+      }
+      settleProvider()
+      if (finished) return
       if (!bindingReady) {
         pendingResult ??= snapshot
         return
@@ -439,6 +531,16 @@ export async function runBound(options: BoundRunOptions): Promise<BoundRunResult
     }
     const releaseRuntime = retainAccountedRun(handle, {
       stop(reason) {
+        // Only a new lifecycle/cap stop explicitly retries a known failed attempt.
+        // Do not restart the provider or discard its original result observer.
+        if (drainFailure) {
+          drainFailure = undefined
+          failedDrain = Promise.withResolvers<Error>()
+          if (!providerFinished) {
+            stopped = false
+            stopAcknowledged = undefined
+          }
+        }
         stopRequested = true
         stopRun()
         cancellation.abort(new Error(reason))
@@ -450,12 +552,7 @@ export async function runBound(options: BoundRunOptions): Promise<BoundRunResult
           }
         }
       },
-      async drain() {
-        // A late start can still return an ID after cancellation; stop that exact
-        // original provider before waiting for every retained sibling group.
-        await startSettled
-        await Promise.all([...groups].map((group) => group.ended()))
-      },
+      drain,
     })
     signal.addEventListener("abort", aborted, { once: true })
     timer = setInterval(poll, 100)
@@ -485,9 +582,30 @@ export async function runBound(options: BoundRunOptions): Promise<BoundRunResult
           return
         }
         runId = started.runId
-        if (!runId) {
+        if (typeof runId !== "string" || !runId) {
+          runId = undefined
           fail(`${mode}.runner did not return a run ID`, false)
           return
+        }
+        // Subscribe on the captured original object, including a late identity
+        // returned after cancellation. Stop can synchronously emit the result.
+        try {
+          const unsubscribe: unknown = onResult(runId, result)
+          if (typeof unsubscribe !== "function")
+            throw new Error("onResult did not return an unsubscribe function")
+          if (providerFinished) unsubscribe()
+          else resultSubscription = unsubscribe as () => void
+          // Providers may silently return a no-op subscription for an unknown ID.
+          // Do not certify that missing run as settled, even after cancellation.
+          if (!providerFinished) {
+            const snapshot = status(runId)
+            if (!snapshot || typeof snapshot !== "object" || snapshot.runId !== runId)
+              throw new Error("original provider cannot observe the returned run ID")
+          }
+        } catch (error) {
+          const unavailable = new Error(`${mode}.runner settlement unavailable: ${message(error)}`)
+          settleProvider(unavailable)
+          fail(unavailable)
         }
         if (finished) {
           stopRun()
@@ -496,16 +614,12 @@ export async function runBound(options: BoundRunOptions): Promise<BoundRunResult
           await captureAccountedRun(handle, { run: { kind: mode, id: runId }, groupId })
           return
         }
-        // Subscribe before the first accounting await: the liveness timer can
-        // publish progress while a slow run-binding write is still pending.
-        // Buffer terminal replay until that binding is durable, never lose it.
-        subscribe(() => runner.onResult(runId!, result))
-        if (!finished)
-          subscribe(() =>
-            runner.onProgress(runId!, (snapshot) => {
-              observe(snapshot)
-            }),
-          )
+        // Buffer terminal replay until binding is durable, never lose it.
+        subscribe(() =>
+          runner.onProgress(runId!, (snapshot) => {
+            observe(snapshot)
+          }),
+        )
         await captureAccountedRun(handle, { run: { kind: mode, id: runId }, groupId })
         bindingReady = true
         if (finished) return
@@ -514,17 +628,19 @@ export async function runBound(options: BoundRunOptions): Promise<BoundRunResult
       } catch (error) {
         fail(error)
       } finally {
-        startFinished()
-        // Keep stop authority until a pending start has resolved and every group
-        // settles, even if the caller already observed cancellation/rejection.
-        void runSettled
-          .then(() => Promise.all([...groups].map(async (group) => await group.ended())))
-          .then(
-            () => releaseRuntime(),
-            () => {
-              /* Failed drainage must remain registered for the cap adapter. */
-            },
+        if (!runId)
+          settleProvider(
+            groups.size
+              ? new Error(`${mode}.runner settlement unavailable: created groups without a run ID`)
+              : undefined,
           )
+        startFinished()
+        // Keep stop authority through late starts and the true provider barrier,
+        // even if command cancellation was already returned to the caller.
+        void drain().catch(() => {
+          /* Failed drainage remains registered for an explicit retry. Only a
+           * successful drain releases runtime authority, including after retry. */
+        })
       }
     })()
   })

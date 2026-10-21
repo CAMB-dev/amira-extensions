@@ -139,7 +139,7 @@ export type ProjectStorageDetails =
   | { reason: "stale-revision"; expectedRevision: number; currentRevision: number }
   | { reason: "unsupported-schema"; document: string; encountered: number; supported: number }
   | { reason: "transition-rejected" }
-  | { reason: "read-only" | "stale-lifecycle" | "recovery-required" }
+  | { reason: "read-only" | "stale-lifecycle" | "recovery-required" | "continuation-required" }
   | { reason: "malformed-storage" | "hash-mismatch"; document: string }
 
 export class ProjectStorageError extends Error {
@@ -387,14 +387,19 @@ export async function readProject(root: string, expectedId?: string): Promise<Pr
   return { root: canonical, marker: value }
 }
 
-export async function discoverProject(cwd: string): Promise<Project | undefined> {
+export async function discoverProject(
+  cwd: string,
+  options: { includeArchived?: boolean } = {},
+): Promise<Project | undefined> {
   let root = await canonicalRoot(cwd)
   while (true) {
     const file = await safePath(root, ".amira", "project.json")
     try {
       await lstat(file)
       // A present but invalid/inaccessible nearest marker blocks discovery of an outer project.
-      return await readProject(root)
+      const project = await readProject(root)
+      // A hidden nearest project still shadows outer markers; never attach an outer writer.
+      return options.includeArchived || projectLifecycle(project).status === "active" ? project : undefined
     } catch (error) {
       if (!missing(error)) throw error
     }
@@ -833,8 +838,9 @@ export class Registry {
     return value as RegistryEntry[]
   }
 
-  async list(): Promise<RegistryEntry[]> {
-    const root = await this.root()
+  async list(options: { includeArchived?: boolean } = {}): Promise<RegistryEntry[]> {
+    // Listing, including archived lookup, never initializes extension storage.
+    const root = await safePath(path.resolve(this.dataDir))
     const entries = await this.entries(root)
     const directory = await safePath(root, "registry.entries")
     const files = await readdir(directory).catch((error) => {
@@ -875,7 +881,11 @@ export class Registry {
       [...candidates.values()].map(async (entry) => {
         try {
           const project = await readProject(entry.root, entry.id)
-          return { healthy: true, entry: { ...entry, root: project.root, name: project.marker.name } }
+          return {
+            healthy: true,
+            hidden: projectLifecycle(project).status !== "active",
+            entry: { ...entry, root: project.root, name: project.marker.name },
+          }
         } catch {
           // Preserve stale/inaccessible identities as visible rows; never substitute another ID.
           return { healthy: false, entry }
@@ -885,8 +895,12 @@ export class Registry {
     checked.sort(
       (a, b) => Number(b.healthy) - Number(a.healthy) || b.entry.lastUsed.localeCompare(a.entry.lastUsed),
     )
+    // A moved project's stale projection must not resurrect its now-hidden identity.
+    const hiddenIds = new Set(checked.filter((row) => row.healthy && row.hidden).map((row) => row.entry.id))
     const valid: RegistryEntry[] = []
-    for (const { entry } of checked) {
+    for (const row of checked) {
+      if (hiddenIds.has(row.entry.id) && !options.includeArchived) continue
+      const { entry } = row
       if (!valid.some((other) => other.id === entry.id || key(other.root) === key(entry.root)))
         valid.push(entry)
     }
@@ -1521,6 +1535,52 @@ export class IterationStore {
     )
       invalid("Invalid prototype variant ID")
     return [".amira", "project", "prototypes", String(this.project.marker.currentIteration), variantId]
+  }
+
+  /** Administrative restore bookkeeping only: retire an archived running attempt before
+   * reopening ordinary writers. Never grants an execution approval or launches work. */
+  async retireArchivedAttempt(expectedRevision: number): Promise<IterationState> {
+    const current = await retainedProject(this.project)
+    const lifecycle = projectLifecycle(current)
+    if (
+      this.historicalIteration !== undefined ||
+      lifecycle.status !== "active" ||
+      !lifecycle.iterations[current.marker.currentIteration]?.continuationRequired ||
+      lifecycle.revision !== projectLifecycle(this.project).revision ||
+      current.marker.currentIteration !== this.project.marker.currentIteration
+    )
+      invalid("Archived attempt retirement requires a current restored continuation fence")
+    const reader = new HistoricalIterationReader(current, current.marker.currentIteration)
+    const state = await reader.read()
+    if (state.revision !== expectedRevision) invalid("Stage changed before archived attempt retirement")
+    if (state.phase !== "running" || state.status !== "working" || !state.activeAttemptId) return state
+    const changes = [
+      ...(state.attempts.find((attempt) => attempt.id === state.activeAttemptId)?.changes ?? []),
+    ]
+    const ref = state.artifacts.findLast((entry) => entry.kind === "iteration-worktree")
+    if (ref) {
+      const worktree = await reader.readArtifact(ref)
+      if (worktree.kind === "iteration-worktree") changes.push(worktree.root)
+    }
+    const context = {
+      root: key(current.root),
+      id: current.marker.id,
+      iteration: current.marker.currentIteration,
+      revision: lifecycle.revision,
+      active: true,
+    }
+    try {
+      return await continuationBookkeeping.run(context, () =>
+        this.dispatch(expectedRevision, {
+          type: state.stage === "implement" ? "interrupt-batch" : "interrupt-work",
+          expectedRevision,
+          attemptId: state.activeAttemptId!,
+          changes: [...new Set(changes)],
+        }),
+      )
+    } finally {
+      context.active = false
+    }
   }
 
   /** Create/check a variant-scoped directory without trusting model-selected paths. */
@@ -2966,6 +3026,19 @@ function assertWritableMarker(
         reason: "stale-lifecycle",
       },
     )
+  const continuation = continuationBookkeeping.getStore()
+  const retiring =
+    continuation?.active &&
+    continuation.root === key(root) &&
+    continuation.id === current.id &&
+    continuation.iteration === current.currentIteration &&
+    continuation.revision === lifecycle.revision
+  if (lifecycle.iterations[String(current.currentIteration)]?.continuationRequired && !retiring)
+    throw new ProjectStorageError(
+      "invalid",
+      "Restored iteration is read-only until explicit continuation: /project iteration continue",
+      { reason: "continuation-required" },
+    )
   const pending = safePathSync(root, ".amira", "project", ".lifecycle-pending.json")
   try {
     lstatSync(pending)
@@ -3016,6 +3089,13 @@ interface ProjectClaimContext {
 }
 const projectClaims = new AsyncLocalStorage<ProjectClaimContext>()
 const machineDocumentUpdater = new AsyncLocalStorage<boolean>()
+const continuationBookkeeping = new AsyncLocalStorage<{
+  root: string
+  id: string
+  iteration: number
+  revision: number
+  active: boolean
+}>()
 
 /** The project claim is independent of currentIteration, including during release/recovery. */
 async function claimProject(

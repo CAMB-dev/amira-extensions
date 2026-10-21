@@ -70,6 +70,17 @@ async function owner(
   await costs.observe(key, usage(key, 0, 0))
 }
 
+test("administrative archive accounting defers cap defaults until the next writable initialization", async () => {
+  const historical = fixture()
+  await historical.costs.load(true, 25, { initializePolicy: false })
+  expect(historical.saved().policy.capUsd).toBeUndefined()
+  expect(historical.saved().coverage.policyInitialized).toBe(false)
+  const writable = fixture(historical.saved())
+  await writable.costs.load(true, 25)
+  expect(writable.saved().policy.capUsd).toBe(25)
+  expect(writable.saved().coverage.policyInitialized).toBe(true)
+})
+
 test("pending priced requests retain coverage without becoming unpriced, including across serialization", async () => {
   const f = fixture()
   await f.costs.load(false, 100)

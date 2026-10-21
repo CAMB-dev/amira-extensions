@@ -13,11 +13,17 @@ const object = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === "object" && !Array.isArray(value)
 const missing = (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT"
 
+/** H3 deliberately withholds snapshots during an interrupted archive. Do not treat
+ * that documented fail-closed result as a missing identity or an arbitrary IO error. */
+export const incompleteOwnedArchive = (error: unknown): boolean =>
+  object(error) && error.message === "owned conversation archive is incomplete; retry archive"
+
 /** Read extension-owned identity/evidence only, never host session files or provider storage. */
 export async function recoverOwnerInventory(
   api: ExtensionAPI,
   project: Project,
   ledger?: CostLedger,
+  options: { includePredecessors?: boolean } = {},
 ): Promise<RecoveredOwner[]> {
   const recovered = new Map<string, RecoveredOwner>()
   const add = (row: RecoveredOwner) => {
@@ -148,7 +154,8 @@ export async function recoverOwnerInventory(
             value.previous.key !== value.key
           )
             throw new Error("Malformed prototype predecessor identity")
-          add({ ...attribution, key: value.previous.key, id: value.previous.id })
+          if (options.includePredecessors !== false)
+            add({ ...attribution, key: value.previous.key, id: value.previous.id })
         }
       }
     }
@@ -157,8 +164,15 @@ export async function recoverOwnerInventory(
     // Recovers a legacy design even if its extension-side ID publication crashed.
     if (typeof api.conversations?.read === "function") {
       const key = `${project.marker.id}/design/${iteration}`
-      const saved = await api.conversations.read({ key })
-      if (saved) add({ key, id: saved.id, iteration, stage: "design", role: "conversation" })
+      try {
+        const saved = await api.conversations.read({ key })
+        if (saved) add({ key, id: saved.id, iteration, stage: "design", role: "conversation" })
+      } catch (error) {
+        if (!incompleteOwnedArchive(error)) throw error
+        // Keep the deterministic key so an explicitly approved H3 retry can settle
+        // its archive before read() becomes available again.
+        add({ key, iteration, stage: "design", role: "conversation" })
+      }
     }
   }
   return [...recovered.values()]

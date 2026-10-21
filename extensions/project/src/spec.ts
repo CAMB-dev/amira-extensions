@@ -13,35 +13,44 @@ import {
 import { collectCorrectionChanges } from "./correction-checkout.ts"
 import { discoverModes, recommendMode } from "./execution-modes.ts"
 import { localize } from "./language.ts"
+import { prototypeAvailability } from "./project-cleanup.ts"
 import { bindSpecIdentity, requiredChecks, type SavedSpec } from "./spec-integrity.ts"
 import type { ApprovalContext, IterationState } from "./stage.ts"
-import { DecisionStore, IterationStore, type Project } from "./store.ts"
+import { DecisionStore, HistoricalIterationReader, IterationStore, type Project } from "./store.ts"
 
 export async function specInputs(project: Project, state: IterationState) {
   const decisions = (await new DecisionStore(project).records()).filter(
     (record) => !record.supersededBy.length,
   )
-  const store = new IterationStore(project)
+  const store = new HistoricalIterationReader(project, state.iteration)
   const ref = state.artifacts.findLast((entry) => entry.kind === "prototype-manifest")
   const manifest = ref && (await store.readArtifact(ref))
   const variant =
     manifest?.kind === "prototype-manifest" && state.prototypeChoice
       ? manifest.variants.find((entry) => entry.id === state.prototypeChoice?.variantId)
       : undefined
+  const code =
+    variant && manifest?.kind === "prototype-manifest"
+      ? (await prototypeAvailability(project, state.iteration, manifest)).find(
+          (entry) => entry.id === variant.id,
+        )
+      : undefined
   return {
     decisions,
     prototype: state.prototypeChoice
       ? {
           conclusion: decisions.find((entry) => entry.id === state.prototypeChoice?.decisionId),
-          pointer: variant
-            ? {
-                directory: variant.directory,
-                cwd: variant.cwd,
-                runCommand: variant.runCommand,
-                prerequisites: variant.prerequisites,
-                notes: variant.notes,
-              }
-            : null,
+          ...(code && !code.runnable ? { codeStatus: code.status } : {}),
+          pointer:
+            variant && code?.runnable
+              ? {
+                  directory: variant.directory,
+                  cwd: variant.cwd,
+                  runCommand: variant.runCommand,
+                  prerequisites: variant.prerequisites,
+                  notes: variant.notes,
+                }
+              : null,
         }
       : null,
   }

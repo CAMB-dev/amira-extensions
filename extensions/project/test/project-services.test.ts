@@ -44,7 +44,11 @@ function provider() {
       return { runId: snapshot.runId }
     }),
     status: () => snapshot,
-    stop: mock(() => true),
+    stop: mock(() => {
+      snapshot = { ...snapshot, status: "stopped" }
+      for (const listener of results) listener(snapshot)
+      return true
+    }),
     onProgress: (_id, listener) => {
       progress.add(listener)
       queueMicrotask(() => {
@@ -56,6 +60,7 @@ function provider() {
     },
     onResult: (_id, listener) => {
       results.add(listener)
+      if (snapshot.status !== "running") listener(snapshot)
       return () => {
         results.delete(listener)
       }

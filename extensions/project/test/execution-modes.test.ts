@@ -1,6 +1,9 @@
-import { expect, test } from "bun:test"
+import { afterEach, expect, spyOn, test } from "bun:test"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
 import path from "node:path"
 import type { ExtensionAPI, OwnedConversation, SpawnGroup } from "@amira/api"
+import { ProjectAccounting } from "../src/accounting.ts"
 import {
   type BoundProgress,
   BoundRunError,
@@ -13,6 +16,13 @@ import {
   recommendMode,
   runBound,
 } from "../src/execution-modes.ts"
+import { createProject } from "../src/store.ts"
+import { ownedFixture, zeroUsage } from "./owned-fixture.ts"
+
+const cleanups: (() => Promise<void>)[] = []
+afterEach(async () => {
+  for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
+})
 
 type Mode = "workflow" | "swarm"
 const cwd = path.resolve("iteration")
@@ -26,7 +36,14 @@ function fake(mode: Mode = "workflow", replay: "none" | "sync" | "microtask" = "
   const owners: RunnerOwner[] = []
   const stops: string[] = []
   const groupOptions: unknown[] = []
-  const group = { id: "actual-group", end: () => {}, ended: async () => ({}) } as SpawnGroup
+  const group = {
+    id: "actual-group",
+    end: () => {},
+    ended: async () => ({}),
+    spawn: () => {
+      throw new Error("Unexpected child spawn")
+    },
+  } as unknown as SpawnGroup
   let ownerStopped = false
   const handle = {
     id: "owned-session",
@@ -43,6 +60,8 @@ function fake(mode: Mode = "workflow", replay: "none" | "sync" | "microtask" = "
   let unsubscriptions = 0
   let startError: string | undefined
   let startGate: Promise<void> | undefined
+  let stopResultDeferred = false
+  let settledResult: RunnerSnapshot | undefined
   let snapshot: RunnerSnapshot =
     mode === "workflow"
       ? { runId: "run-1", cwd, status: "running", phase: "Implement", models: [], children: [] }
@@ -72,6 +91,11 @@ function fake(mode: Mode = "workflow", replay: "none" | "sync" | "microtask" = "
             },
           ],
         }
+  const finish = (value = final) => {
+    snapshot = value
+    settledResult = value
+    for (const listener of [...results]) listener(value)
+  }
   const runner: BoundRunner = {
     available: () => true,
     capabilities: capabilities(),
@@ -83,7 +107,10 @@ function fake(mode: Mode = "workflow", replay: "none" | "sync" | "microtask" = "
       // A late provider response can still return an ID without creating work.
       if (!owner.signal.aborted)
         owner.createGroup({ name: "Provider-owned group", maxAgents: 2, maxConcurrent: 2 })
-      if (replay !== "none") snapshot = final
+      if (replay !== "none") {
+        snapshot = final
+        settledResult = final
+      }
       return { runId: "run-1" }
     },
     status() {
@@ -92,6 +119,10 @@ function fake(mode: Mode = "workflow", replay: "none" | "sync" | "microtask" = "
     },
     stop(runId) {
       stops.push(runId)
+      // stop() acknowledges cancellation; provider settlement still emits/replays
+      // onResult. Most tests settle promptly; finalizer tests hold this barrier.
+      if (!stopResultDeferred && !settledResult)
+        queueMicrotask(() => finish({ ...final, status: "aborted", reason: "stopped by caller" }))
       return true
     },
     onProgress(_id, listener) {
@@ -108,11 +139,13 @@ function fake(mode: Mode = "workflow", replay: "none" | "sync" | "microtask" = "
     },
     onResult(_id, listener) {
       results.add(listener)
-      if (replay === "sync") listener(final)
-      if (replay === "microtask")
-        queueMicrotask(() => {
-          if (results.has(listener)) listener(final)
-        })
+      if (settledResult) {
+        if (replay === "sync") listener(settledResult)
+        else
+          queueMicrotask(() => {
+            if (results.has(listener)) listener(settledResult!)
+          })
+      }
       return () => {
         unsubscriptions++
         results.delete(listener)
@@ -167,6 +200,9 @@ function fake(mode: Mode = "workflow", replay: "none" | "sync" | "microtask" = "
     stopOwner() {
       ownerStopped = true
     },
+    deferStopResult() {
+      stopResultDeferred = true
+    },
     setStartError(value: string) {
       startError = value
     },
@@ -180,16 +216,46 @@ function fake(mode: Mode = "workflow", replay: "none" | "sync" | "microtask" = "
       snapshot = value
       for (const listener of [...progress]) listener(value)
     },
-    finish(value = final) {
-      snapshot = value
-      for (const listener of [...results]) listener(value)
-    },
+    finish,
   }
 }
 
 async function launched(f: ReturnType<typeof fake>) {
   for (let i = 0; i < 50 && !f.results.size; i++) await Bun.sleep(1)
   expect(f.results.size).toBe(1)
+}
+
+async function accounted(f: ReturnType<typeof fake>) {
+  const root = await mkdtemp(path.join(tmpdir(), "project-bound-settlement-"))
+  const project = await createProject(root, "Provider settlement")
+  const handle = ownedFixture({ key: "bound-owner", cwd: root }, "owned-session")
+  handle.createGroup = f.options.handle.createGroup.bind(f.options.handle)
+  Object.assign(f.api, {
+    conversations: {
+      async read(ref: { key: string }) {
+        if (ref.key !== handle.key) return undefined
+        return {
+          id: handle.id,
+          key: handle.key,
+          name: handle.name,
+          cwd: root,
+          archived: false,
+          history: [],
+          usage: zeroUsage(handle.id),
+        }
+      },
+    },
+  })
+  const account = new ProjectAccounting(f.api as ExtensionAPI, project)
+  cleanups.push(async () => {
+    f.finish()
+    await account.dispose().catch(() => {})
+    await rm(root, { recursive: true, force: true })
+  })
+  await account.initialize()
+  await account.costs.intent(handle.key, { iteration: 1, stage: "implement", role: "coordinator" })
+  f.options.handle = await account.track(handle)
+  return account
 }
 
 function released(f: ReturnType<typeof fake>) {
@@ -726,6 +792,310 @@ test("bound runs retain every factory group including a swarm member workflow si
   expect(result.groupIds).toEqual(["sibling-1", "sibling-2", "provider-observed-group"])
   expect(f.updates.at(-1)?.groupIds).toEqual(result.groupIds)
 })
+
+for (const mode of ["workflow", "swarm"] as const) {
+  for (const service of ["present", "unload", "replace"] as const) {
+    test(`${mode} lifecycle drain waits for the original provider finalizer after groups have ended (${service})`, async () => {
+      const f = fake(mode)
+      f.deferStopResult()
+      const account = await accounted(f)
+      const retained = spyOn(account, "retain")
+      const pending = runBound(f.options).catch((error: unknown) => error)
+      await launched(f)
+      await account.costs.flush()
+      const replacement = fake(mode)
+      if (service === "unload") delete f.services[`${mode}.runner`]
+      if (service === "replace") f.services[`${mode}.runner`] = replacement.runner
+      if (service === "present") f.controller.abort("human paused the batch")
+      else f.emit({ ...f.final, status: "running" })
+      // Command failure must be prompt, independent of provider finalization.
+      const error = await pending
+      expect(error).toBeInstanceOf(BoundRunError)
+      expect(f.stops).toEqual(["run-1"])
+      const updates = f.updates.length
+      let lifecycleDrained = false
+      const drainage = account.stopAndDrain().then(() => {
+        lifecycleDrained = true
+      })
+      let drained = false
+      const runtimeDrain = retained.mock.calls[0]![0].drain().then(() => {
+        drained = true
+      })
+      // The fake group's ended() is already resolved, like a workflow whose
+      // finalizer is still awaiting its own pending calls/journal writes.
+      await Bun.sleep(30)
+      try {
+        expect(drained).toBe(false)
+        expect(lifecycleDrained).toBe(false)
+        expect(f.progress.size).toBe(0)
+        expect(f.results.size).toBe(1)
+      } finally {
+        f.finish({ ...f.final, status: "aborted" })
+        await Promise.all([runtimeDrain, drainage])
+        retained.mockRestore()
+      }
+      expect(drained).toBe(true)
+      expect(lifecycleDrained).toBe(true)
+      expect(f.updates).toHaveLength(updates)
+      expect(f.stops).toEqual(["run-1"])
+      expect(replacement.stops).toEqual([])
+      released(f)
+    })
+  }
+}
+
+for (const mode of ["workflow", "swarm"] as const) {
+  test(`${mode} retains sibling groups created after start until their own drainage`, async () => {
+    const f = fake(mode)
+    const account = await accounted(f)
+    const retain = account.retain.bind(account)
+    let runtimeReleased = false
+    const retained = spyOn(account, "retain").mockImplementation((run) => {
+      const release = retain(run)
+      return () => {
+        runtimeReleased = true
+        release()
+      }
+    })
+    const pending = runBound(f.options)
+    await launched(f)
+    await account.costs.flush()
+    const sibling = Promise.withResolvers<void>()
+    cleanups.push(async () => sibling.resolve())
+    f.options.handle.createGroup = () =>
+      ({
+        id: "late-sibling",
+        end: () => {},
+        ended: () => sibling.promise,
+      }) as unknown as SpawnGroup
+    f.owners[0]!.createGroup({ name: "Late workflow sibling" })
+    f.finish()
+    await pending
+    let drained = false
+    const drainage = retained.mock.calls[0]![0].drain().then(() => {
+      drained = true
+    })
+    await Bun.sleep(10)
+    try {
+      expect(drained).toBe(false)
+      expect(runtimeReleased).toBe(false)
+    } finally {
+      sibling.resolve()
+      await drainage
+      retained.mockRestore()
+    }
+    await account.stopAndDrain()
+    expect(runtimeReleased).toBe(true)
+  })
+
+  test(`${mode} late start retains original result observation across cancellation and service loss`, async () => {
+    const f = fake(mode)
+    f.deferStopResult()
+    const account = await accounted(f)
+    const retained = spyOn(account, "retain")
+    const gate = Promise.withResolvers<void>()
+    f.setStartGate(gate.promise)
+    cleanups.push(async () => gate.resolve())
+    const pending = runBound(f.options).catch((error: unknown) => error)
+    f.controller.abort("cancel pending confirmation")
+    const error = await pending
+    expect(error).toBeInstanceOf(BoundRunError)
+    expect((error as Error).message).toContain("cancel pending confirmation")
+    delete f.services[`${mode}.runner`]
+    let drained = false
+    const drainage = account.stopAndDrain().then(() => {
+      drained = true
+    })
+    await Bun.sleep(10)
+    expect(drained).toBe(false)
+    gate.resolve()
+    await launched(f)
+    await account.costs.flush()
+    let runtimeDrained = false
+    const runtimeDrain = retained.mock.calls[0]![0].drain().then(() => {
+      runtimeDrained = true
+    })
+    await Bun.sleep(10)
+    try {
+      expect(f.stops).toEqual(["run-1"])
+      expect(f.groupOptions).toHaveLength(0)
+      expect(runtimeDrained).toBe(false)
+      expect(drained).toBe(false)
+      expect(f.results.size).toBe(1)
+      expect(account.costs.snapshot().owners.find((owner) => owner.key === "bound-owner")?.runs).toEqual([
+        { kind: mode, id: "run-1" },
+      ])
+    } finally {
+      f.finish({ ...f.final, status: "aborted" })
+      await Promise.all([runtimeDrain, drainage])
+      retained.mockRestore()
+    }
+    released(f)
+  })
+
+  for (const settlement of ["synchronous stop", "replay"] as const) {
+    test(`${mode} late cancelled start accepts the original provider's ${settlement} settlement`, async () => {
+      const f = fake(mode)
+      const account = await accounted(f)
+      const gate = Promise.withResolvers<void>()
+      f.setStartGate(gate.promise)
+      cleanups.push(async () => gate.resolve())
+      const originalStop = f.runner.stop.bind(f.runner)
+      if (settlement === "synchronous stop")
+        f.runner.stop = (id) => {
+          f.finish({ ...f.final, status: "aborted" })
+          return originalStop(id)
+        }
+      const pending = runBound(f.options).catch((error: unknown) => error)
+      f.controller.abort("cancel pending confirmation")
+      expect(await pending).toBeInstanceOf(BoundRunError)
+      const drainage = account.stopAndDrain()
+      if (settlement === "replay") f.finish({ ...f.final, status: "aborted" })
+      gate.resolve()
+      await drainage
+      expect(f.stops).toEqual(["run-1"])
+      released(f)
+    })
+  }
+
+  for (const unavailable of ["throws", "invalid subscription", "unknown run", "no identity"] as const) {
+    test(`${mode} lifecycle drain reports unavailable provider settlement (${unavailable})`, async () => {
+      const f = fake(mode)
+      const account = await accounted(f)
+      if (unavailable === "throws")
+        f.runner.onResult = () => {
+          throw new Error("provider result observation failed")
+        }
+      if (unavailable === "invalid subscription") Reflect.set(f.runner, "onResult", () => undefined)
+      if (unavailable === "unknown run") f.runner.status = () => undefined
+      if (unavailable === "no identity")
+        f.runner.startBound = async (_request, owner) => {
+          owner.createGroup({ name: "Started without an identity" })
+          return { error: "failed after creating work" }
+        }
+      await expect(runBound(f.options)).rejects.toThrow()
+      await expect(account.stopAndDrain()).rejects.toThrow("settlement unavailable")
+      released(f)
+    })
+  }
+}
+
+for (const mode of ["workflow", "swarm"] as const) {
+  for (const fault of ["throwing stop", "lost run refusal"] as const) {
+    test(`${mode} drain reports ${fault} without a fabricated result and retries the original provider`, async () => {
+      const f = fake(mode)
+      f.deferStopResult()
+      const account = await accounted(f)
+      const retained = spyOn(account, "retain")
+      const originalStatus = f.runner.status.bind(f.runner)
+      const originalStop = f.runner.stop.bind(f.runner)
+      let broken = true
+      let lost = false
+      f.runner.status = (id) => (lost ? undefined : originalStatus(id))
+      f.runner.stop = (id) => {
+        if (!broken) return originalStop(id)
+        f.stops.push(id)
+        if (fault === "throwing stop") throw new Error("provider stop sentinel")
+        return false
+      }
+      const command = runBound(f.options).catch((error: unknown) => error)
+      await launched(f)
+      if (fault === "lost run refusal") lost = true
+      else f.controller.abort("human interrupted")
+      expect(await command).toBeInstanceOf(BoundRunError)
+      const runtime = retained.mock.calls[0]![0]
+      const drainage = runtime.drain().catch((error: unknown) => error)
+      try {
+        const outcome = await Promise.race([drainage, Bun.sleep(250).then(() => "still waiting")])
+        expect(outcome).toBeInstanceOf(Error)
+        expect((outcome as Error).message).toMatch(
+          fault === "throwing stop" ? /provider stop sentinel/ : /settlement unavailable/,
+        )
+        expect(f.results.size).toBe(1)
+        broken = false
+        lost = false
+        const replacement = fake(mode)
+        f.services[`${mode}.runner`] = replacement.runner
+        let drained = false
+        const retry = account.stopAndDrain().then(() => {
+          drained = true
+        })
+        await Bun.sleep(30)
+        expect(drained).toBe(false)
+        f.finish({ ...f.final, status: "aborted" })
+        await retry
+        expect(drained).toBe(true)
+        expect(replacement.stops).toEqual([])
+        expect(f.requests).toHaveLength(1)
+        released(f)
+      } finally {
+        broken = false
+        lost = false
+        f.finish({ ...f.final, status: "aborted" })
+        await drainage
+        retained.mockRestore()
+      }
+    }, 60000)
+  }
+}
+
+for (const mode of ["workflow", "swarm"] as const) {
+  for (const outcome of ["delayed result", "lost observation"] as const) {
+    test(`${mode} refused stop waits for ${outcome} without mistaking status for settlement`, async () => {
+      const f = fake(mode)
+      const account = await accounted(f)
+      const retained = spyOn(account, "retain")
+      const originalStatus = f.runner.status.bind(f.runner)
+      let lost = false
+      f.runner.status = (id) => (lost ? undefined : originalStatus(id))
+      f.runner.stop = (id) => {
+        f.stops.push(id)
+        return false
+      }
+      const command = runBound(f.options).catch((error: unknown) => error)
+      await launched(f)
+      f.controller.abort("stop while finalizing")
+      expect(await command).toBeInstanceOf(BoundRunError)
+      let completed = false
+      const drainage = retained.mock.calls[0]![0].drain().then(
+        () => {
+          completed = true
+        },
+        (error: unknown) => error,
+      )
+      if (outcome === "delayed result") f.setSnapshot(f.final)
+      try {
+        await Bun.sleep(30)
+        expect(completed).toBe(false)
+        expect(f.results.size).toBe(1)
+        if (outcome === "lost observation") {
+          lost = true
+          const result = await Promise.race([drainage, Bun.sleep(500).then(() => "still waiting")])
+          expect(result).toBeInstanceOf(Error)
+          expect((result as Error).message).toContain("settlement unavailable")
+          lost = false
+          const retry = account.stopAndDrain()
+          await Bun.sleep(30)
+          expect(completed).toBe(false)
+          f.finish({ ...f.final, status: "aborted" })
+          await retry
+        } else {
+          f.finish({ ...f.final, status: "aborted" })
+          await drainage
+          expect(completed).toBe(true)
+          await account.stopAndDrain()
+        }
+        expect(f.requests).toHaveLength(1)
+        released(f)
+      } finally {
+        lost = false
+        f.finish({ ...f.final, status: "aborted" })
+        await drainage
+        retained.mockRestore()
+      }
+    }, 60000)
+  }
+}
 
 test("failed bound runs preserve all already-created sibling group identities", async () => {
   const f = fake()

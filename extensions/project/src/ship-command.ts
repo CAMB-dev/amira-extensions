@@ -722,6 +722,7 @@ export async function settleShipLifecycle(
       throw new Error("Conflicting settled lifecycle receipt; inspect local evidence")
     return
   }
+  await assertProjectWritable(project)
   await new LifecycleStore(current).transition(lifecycle.revision, {
     type: "ship",
     status,

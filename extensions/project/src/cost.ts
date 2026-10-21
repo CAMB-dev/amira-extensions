@@ -317,8 +317,13 @@ export class ProjectCosts {
   private unpriced(row: AccountedUsage): boolean {
     return row.usage.pricingUnknown === true || this.hooks.unpriced?.(row.usage) === true
   }
-  async load(legacyIncomplete = false, defaultCapUsd?: number): Promise<void> {
+  async load(
+    legacyIncomplete = false,
+    defaultCapUsd?: number,
+    options: { initializePolicy?: boolean } = {},
+  ): Promise<void> {
     if (this.ledger) return
+    if (options.initializePolicy === false) defaultCapUsd = undefined
     const saved = await this.persistence.read()
     if (saved) {
       validateCostLedger(saved, this.projectId)
@@ -329,13 +334,18 @@ export class ProjectCosts {
         schemaVersion: 1,
         projectId: this.projectId,
         revision: 0,
-        coverage: { since: new Date().toISOString(), legacyIncomplete },
+        coverage: {
+          since: new Date().toISOString(),
+          legacyIncomplete,
+          ...(options.initializePolicy === false ? { policyInitialized: false } : {}),
+        },
         owners: [],
         policy: { warned: false, ...(defaultCapUsd ? { capUsd: defaultCapUsd } : {}) },
         receipts: [],
       }
     }
-    const initializePolicy = this.state.coverage.policyInitialized === false
+    const initializePolicy =
+      this.state.coverage.policyInitialized === false && options.initializePolicy !== false
     if (initializePolicy) {
       this.state.coverage.policyInitialized = true
       if (defaultCapUsd !== undefined) this.state.policy.capUsd = defaultCapUsd
@@ -448,6 +458,7 @@ export class ProjectCosts {
     key: string,
     attribution: CostAttribution,
     provenance: CostOwner["provenance"] = "owned",
+    options: { administrative?: boolean } = {},
   ): Promise<void> {
     if (this.state.owners.some((owner) => owner.key === key)) {
       await this.flush()
@@ -455,7 +466,7 @@ export class ProjectCosts {
     }
     this.state.owners.push({ key, ...attribution, provenance, groups: [], sessions: [], runs: [] })
     // Do not treat a newly intended, never-opened owner as an unpriced request.
-    await this.persist(provenance === "recovered")
+    await this.persist(provenance === "recovered" || options.administrative === true)
   }
   async bind(key: string, id: string): Promise<void> {
     const owner = this.owner(key)

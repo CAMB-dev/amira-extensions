@@ -33,6 +33,20 @@ export function projectError(error: unknown, language: string): string {
         `${ja}の形式バージョン ${detail.encountered} には対応していません。対応バージョンは ${detail.supported} です。互換性のある拡張を使用し、既存の証拠を削除・書き換えないでください。`,
       )
     }
+    if (detail.reason === "continuation-required")
+      return localize(
+        language,
+        error.message,
+        "恢复的迭代仍为只读。请用 /project iteration continue 审阅并确认精确阶段输入；不会自动恢复旧工作进程。",
+        "復元したイテレーションは読み取り専用です。/project iteration continue で段階の入力を確認・承認してください。以前のワーカーは自動再開しません。",
+      )
+    if (detail.reason === "read-only")
+      return localize(
+        language,
+        error.message,
+        "项目或迭代为只读。请查看 /project iteration；归档项目需明确恢复，已关闭迭代需明确新建下一轮。",
+        "プロジェクトまたはイテレーションは読み取り専用です。/project iteration で確認し、アーカイブの復元や次回の開始を明示的に実行してください。",
+      )
     if (detail.reason === "transition-rejected")
       return localize(
         language,
