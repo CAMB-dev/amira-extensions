@@ -2506,6 +2506,19 @@ export class IterationStore {
     }
   }
 
+  /** Bind checks to the checkout recorded when this evidence was published, not a later checkout. */
+  private async acceptanceChecksCwd(state: IterationState, evidenceId?: string): Promise<string> {
+    const end = evidenceId
+      ? state.artifacts.findIndex((entry) => entry.id === evidenceId)
+      : state.artifacts.length
+    const ref = state.artifacts.slice(0, end).findLast((entry) => entry.kind === "iteration-worktree")
+    if (!ref) return this.project.root
+    const worktree = await this.artifact(ref)
+    if (worktree.kind !== "iteration-worktree" || worktree.status !== "ready")
+      invalid("Acceptance checks require the recorded ready iteration checkout")
+    return worktree.cwd
+  }
+
   /** A correction points at the original acceptance owner, not its new target spec/plan. */
   private async confirmedAcceptedEvidence(state: IterationState, ref: AcceptedBatchRef) {
     const resolution = state.batchResolutions?.find(
@@ -2558,15 +2571,20 @@ export class IterationStore {
       invalid("Correction accepted evidence must cover every original batch item")
     const items = spec.items.filter((entry) => batch.itemIds.includes(entry.id))
     const checks = new Set(items.flatMap((entry) => entry.checkIds))
+    const cwd = await this.acceptanceChecksCwd(state, evidenceRef!.id)
     if (
       evidence.checks.length !== checks.size ||
-      evidence.checks.some(
-        (check) =>
+      evidence.checks.some((check) => {
+        const agreed = spec.checks.find((entry) => entry.id === check.checkId)
+        return (
           !checks.has(check.checkId) ||
-          spec.checks.find((entry) => entry.id === check.checkId)?.command !== check.command,
-      )
+          !agreed ||
+          agreed.command !== check.command ||
+          key(check.cwd) !== key(path.resolve(cwd, agreed.cwd ?? "."))
+        )
+      })
     )
-      invalid("Correction accepted evidence must include every agreed original check")
+      invalid("Correction accepted evidence must include every agreed original exact check command/cwd")
     const trialRequired = items.some((entry) => entry.ui)
     if ((attempt.acceptance.manualTrialRequired ?? false) !== trialRequired)
       invalid("Correction accepted evidence must retain its UI trial requirement")
@@ -2899,9 +2917,14 @@ export class IterationStore {
     )
     if (artifact.checks.length !== checks.size || artifact.checks.some((check) => !checks.has(check.checkId)))
       invalid("Acceptance must include every agreed check result")
+    const cwd = await this.acceptanceChecksCwd(
+      state,
+      consuming ? state.artifacts.find((entry) => entry.id === active.acceptance?.artifactId)?.id : undefined,
+    )
     for (const check of artifact.checks) {
-      if (spec.checks.find((agreed) => agreed.id === check.checkId)?.command !== check.command)
-        invalid("Acceptance command does not match the agreed spec check")
+      const agreed = spec.checks.find((entry) => entry.id === check.checkId)!
+      if (check.command !== agreed.command || key(check.cwd) !== key(path.resolve(cwd, agreed.cwd ?? ".")))
+        invalid("Acceptance command/cwd does not match the agreed exact check")
     }
     if (
       !consuming &&

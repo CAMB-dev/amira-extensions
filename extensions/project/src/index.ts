@@ -13,6 +13,9 @@ import { conversationLanguage, LanguagePolicy, localize, resolveLanguage, validL
 import { runModeChange } from "./mode-change.ts"
 import { latestPrototypeManifest, Prototypes, prototypePanelText } from "./prototype.ts"
 import { supportsPrototype } from "./prototype-sessions.ts"
+import { shipSummary } from "./ship.ts"
+import { runShip } from "./ship-command.ts"
+import { ShipStore } from "./ship-storage.ts"
 import { runSpec } from "./spec.ts"
 import { type IterationState, initialIteration } from "./stage.ts"
 import { runStageCommand, stageStatus } from "./stage-commands.ts"
@@ -146,14 +149,14 @@ const HELP = `/project [list] — choose a known project or the nearest discover
 /project revisit design|prototype
 Attachment does not change the main session's working directory.
 Prototype file tools are variant-scoped; shell uses current permissions. This is not a sandbox.
-Spec and mode review: /project spec. Approved batch execution: /project implement. Acceptance: /project next, then /project accept. Ship and archive: coming later.`
+Spec and mode review: /project spec. Approved batch execution: /project implement. Acceptance: /project next, then /project accept. Ship: /project ship [status|reconcile|local-only|skip]. Close/archive UI: coming later.`
 
 function help(language: string): string {
   return localize(
     language,
     HELP,
-    `/project [list] — 选择已知项目或最近识别的项目\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 查看项目阶段和状态\n/project cost [cap <USD>|raise <USD>|continue|remove] — 查看花费并管理项目上限\n/project design — 打开设计会话\n/project prototype [<variant>|choose|run <variant>] — 查看原型变体、选择结论或显示运行命令\n/project next — 查看总结并确认下一步\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n关联项目不会改变主会话工作目录。原型文件工具仅能写入各自目录，Shell 遵循当前权限模式；这不是沙箱。规格和执行模式审阅：/project spec；保留已完成批次并重新批准执行模式：/project mode；按已批准的模式实现批次：/project implement。验收：/project next 确认后用 /project accept。发布和归档将在后续版本提供。`,
-    `/project [list] — 登録済みまたは最寄りのプロジェクトを選択\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 段階と状態を確認\n/project cost [cap <USD>|raise <USD>|continue|remove] — 費用とプロジェクト上限を確認\n/project design — 設計会話を開く\n/project prototype [<variant>|choose|run <variant>] — 案の表示・選択・実行コマンドの確認\n/project next — 要約を確認して次の手順を承認\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n関連付けてもメインの作業ディレクトリは変わりません。試作のファイルツールは各案のディレクトリ内だけに書き込みます。シェルは現在の権限モードに従い、サンドボックスではありません。仕様と実行モードの確認：/project spec、完了済みバッチを保持してモードを再承認：/project mode、承認済みモードでのバッチ実装：/project implement。受け入れ確認：/project next で承認後 /project accept。リリース・アーカイブは今後対応予定です。`,
+    `/project [list] — 选择已知项目或最近识别的项目\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 查看项目阶段和状态\n/project cost [cap <USD>|raise <USD>|continue|remove] — 查看花费并管理项目上限\n/project design — 打开设计会话\n/project prototype [<variant>|choose|run <variant>] — 查看原型变体、选择结论或显示运行命令\n/project next — 查看总结并确认下一步\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n关联项目不会改变主会话工作目录。原型文件工具仅能写入各自目录，Shell 遵循当前权限模式；这不是沙箱。规格和执行模式审阅：/project spec；保留已完成批次并重新批准执行模式：/project mode；按已批准的模式实现批次：/project implement。验收：/project next 确认后用 /project accept。发布：/project ship [status|reconcile|local-only|skip]。关闭和归档界面将在后续版本提供。`,
+    `/project [list] — 登録済みまたは最寄りのプロジェクトを選択\n/project new [name] [--root <directory>] [--language <tag>] [--commit-documents]\n/project switch [name, id, or directory]\n/project status — 段階と状態を確認\n/project cost [cap <USD>|raise <USD>|continue|remove] — 費用とプロジェクト上限を確認\n/project design — 設計会話を開く\n/project prototype [<variant>|choose|run <variant>] — 案の表示・選択・実行コマンドの確認\n/project next — 要約を確認して次の手順を承認\n/project skip batch|design|prototype|implement|accept\n/project revisit design|prototype\n関連付けてもメインの作業ディレクトリは変わりません。試作のファイルツールは各案のディレクトリ内だけに書き込みます。シェルは現在の権限モードに従い、サンドボックスではありません。仕様と実行モードの確認：/project spec、完了済みバッチを保持してモードを再承認：/project mode、承認済みモードでのバッチ実装：/project implement。受け入れ確認：/project next で承認後 /project accept。リリース：/project ship [status|reconcile|local-only|skip]。終了・アーカイブの画面は今後対応予定です。`,
   )
 }
 
@@ -694,7 +697,7 @@ export function createProjectExtension(): Extension {
       name: "project",
       description: "Attach a project, inspect its status, or open its saved design conversation",
       args: {
-        hint: "[list|new|switch|status|design|prototype|spec|implement|accept|next|skip|revisit]",
+        hint: "[list|new|switch|status|design|prototype|spec|implement|accept|ship|next|skip|revisit]",
         complete: (prefix) =>
           [
             "list",
@@ -708,6 +711,7 @@ export function createProjectExtension(): Extension {
             "mode",
             "implement",
             "accept",
+            "ship",
             "next",
             "skip",
             "revisit",
@@ -824,6 +828,31 @@ export function createProjectExtension(): Extension {
               commitDocuments,
             })
             await attach(project, ctx, origin)
+          } else if (verb === "ship") {
+            const project = await attached(ctx, origin)
+            const checkOrigin = () => {
+              ctx.signal.throwIfAborted()
+              const selected = attachmentFor(origin, ctx.session.data)
+              if (
+                !active(origin) ||
+                selected?.projectId !== project.marker.id ||
+                selected.root !== project.root
+              )
+                throw new Error("Main session or attached project changed. Run the command again.")
+            }
+            await runShip(api, project, tokens, ctx, displayLanguage(project), checkOrigin, async () => {
+              await designs.quiesce(project)
+              await prototypes.sessions.quiesce(project)
+              await implementations.quiesce(project)
+              await acceptances.quiesce(project)
+            })
+            const current = await readProject(project.root, project.marker.id)
+            states.set(origin, {
+              fingerprint: JSON.stringify(attachmentFor(origin, ctx.session.data)),
+              project: current,
+              iteration: await new IterationStore(current).read(),
+            })
+            api.requestRender()
           } else if (verb === "spec" || verb === "mode" || verb === "implement" || verb === "accept") {
             if (tokens.length) throw new Error(HELP)
             const project = await attached(ctx, origin)
@@ -1136,14 +1165,16 @@ export function createProjectExtension(): Extension {
                     : "") +
                   localize(
                     lang,
-                    "\nAcceptance: /project next, then /project accept. Ship and archive: coming later.",
-                    "\n验收：/project next 确认后用 /project accept。发布和归档：后续版本提供。",
-                    "\n受け入れ確認：/project next で承認後 /project accept。リリースとアーカイブは今後対応予定です。",
+                    "\nAcceptance: /project next, then /project accept. Ship: /project ship. Close/archive UI: coming later.",
+                    "\n验收：/project next 确认后用 /project accept。发布：/project ship。关闭和归档界面：后续版本提供。",
+                    "\n受け入れ確認：/project next で承認後 /project accept。リリース：/project ship。終了・アーカイブの画面は今後対応予定です。",
                   ),
               )
+              const ship = await new ShipStore(project).latest()
+              if (ship) ctx.print(shipSummary(ship))
               api.requestRender()
             }
-          } else if (["prototype", "implement", "accept", "ship", "archive", "iteration"].includes(verb)) {
+          } else if (["prototype", "implement", "accept", "archive", "iteration"].includes(verb)) {
             ctx.print(
               localize(
                 interfaceLanguage(ctx),

@@ -194,13 +194,13 @@ describe("project commands and attachments", () => {
     ).toEqual([])
   })
 
-  test("unsupported host design refuses persistence substitution and future flows say coming later", async () => {
+  test("unsupported host design refuses substitution and ship requires completed evidence", async () => {
     const f = await fixture()
     await f.command.run("new Demo --language en", f.ctx)
     await f.command.run("design", f.ctx)
     expect(f.output.at(-1)?.text).toMatch(/support|require|available/i)
     await f.command.run("ship", f.ctx)
-    expect(f.output.at(-1)?.text).toContain("Coming later")
+    expect(f.output.at(-1)?.text).toContain("Ship requires a complete")
   })
 
   test("creation follows the extension default without pinning an implicit project override", async () => {

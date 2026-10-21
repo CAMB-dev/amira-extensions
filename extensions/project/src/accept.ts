@@ -59,8 +59,12 @@ export class Acceptances {
             reason: "Acceptance is paused, finished or obsolete. Return to main and review /project next.",
           }
     }
-    api.intercept?.("context.build", (_value, ctx) => allowed(ctx.sessionId))
-    api.intercept?.("tool.call.before", (_value, ctx) => allowed(ctx.sessionId))
+    // Validating accumulated immutable history/claims can exceed the host's
+    // generic 5s interceptor deadline. Still await the same current-state guard;
+    // tool failure/timeout remains fail-closed and cancellation never authorizes it.
+    const validation = { timeoutMs: 30_000 }
+    api.intercept?.("context.build", (_value, ctx) => allowed(ctx.sessionId), validation)
+    api.intercept?.("tool.call.before", (_value, ctx) => allowed(ctx.sessionId), validation)
   }
 
   async wait(project: Project): Promise<void> {

@@ -132,7 +132,7 @@ async function boundFixture() {
   })
   return { ...f, specRef: savedSpec.artifact, planRef: plan.artifact, revision: state.revision }
 }
-function acceptance(ref: ArtifactRef, plan: ArtifactRef): AcceptanceArtifact {
+function acceptance(ref: ArtifactRef, plan: ArtifactRef, cwd: string): AcceptanceArtifact {
   return {
     kind: "acceptance",
     specHash: ref.hash,
@@ -150,7 +150,7 @@ function acceptance(ref: ArtifactRef, plan: ArtifactRef): AcceptanceArtifact {
     checks: [
       {
         checkId: "C1",
-        cwd: "worktree",
+        cwd,
         command: "bun test",
         startedAt: "2026-10-15T00:00:00Z",
         finishedAt: "2026-10-15T00:00:01Z",
@@ -383,8 +383,8 @@ test("an edit racing state publication remains at its pathname and prevents the 
 })
 
 test("artifact schemas require stable spec IDs, complete checks, and honest acceptance", async () => {
-  const { store, specRef, planRef, revision } = await boundFixture()
-  const review = acceptance(specRef, planRef)
+  const { project, store, specRef, planRef, revision } = await boundFixture()
+  const review = acceptance(specRef, planRef, project.root)
   await expect(store.saveArtifact(revision, { ...review, items: [] })).rejects.toThrow("per-item")
   await expect(store.saveArtifact(revision, { ...review, checks: [] })).rejects.toThrow("every agreed check")
   await expect(store.saveArtifact(revision, { ...review, specHash: "b".repeat(64) })).rejects.toThrow(
@@ -412,9 +412,9 @@ test("artifact schemas require stable spec IDs, complete checks, and honest acce
 }, 60000)
 
 test("manual trials preserve distinct pending/tried/problem/deferred results and corrections map impacts", async () => {
-  const { store, specRef, planRef, revision: initial } = await boundFixture()
+  const { project, store, specRef, planRef, revision: initial } = await boundFixture()
   let revision = initial
-  const verdict = await store.saveArtifact(revision, acceptance(specRef, planRef))
+  const verdict = await store.saveArtifact(revision, acceptance(specRef, planRef, project.root))
   revision = verdict.state.revision
   for (const status of ["pending", "tried", "problem", "deferred"] as const) {
     const trial = {

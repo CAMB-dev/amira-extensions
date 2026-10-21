@@ -176,13 +176,15 @@ async function approveSpec(
 ) {
   f.mock.push({ text: JSON.stringify(value) })
   f.send("spec")
-  await f.dialog("Choose execution mode")
+  // Correction generation validates the accumulated immutable history first;
+  // use this fixture's explicit command budget, not the generic 60s dialog wait.
+  await f.dialog("Choose execution mode", 180_000)
   expect(f.live()).toContain("Workflow")
   expect(f.live()).toContain("Single agent")
   expect(f.live()).not.toContain("Swarm")
   expect((await f.store.read()).approvedContext?.spec?.revision).not.toBe(value.spec.revision)
   f.terminal.send("\x1b[B\r") // Single, Workflow: explicitly select Workflow.
-  await f.dialog("Review implementation spec")
+  await f.dialog("Review implementation spec", 180_000)
   expect(f.all()).toContain("Batch plan")
   f.terminal.send("\r")
   await f.dismissed()
@@ -285,7 +287,12 @@ async function accept(f: Frontend, itemId: string, outcome: "pass" | "fail") {
   )
   const ref = state.artifacts.findLast((entry) => entry.kind === "acceptance")!
   const verdict = await f.store.readArtifact(ref)
-  expect(verdict).toMatchObject({
+  const reviewerEvidence = f.mock.requests.slice(before).map((request) => ({
+    model: request.model.id,
+    // Keep failures actionable without dumping the entire design transcript.
+    messages: request.messages.filter((message) => message.role !== "user").slice(-3),
+  }))
+  expect(verdict, `Reviewer recording evidence: ${JSON.stringify(reviewerEvidence)}`).toMatchObject({
     kind: "acceptance",
     outcome,
     reviewerModel: "mock/reviewer",

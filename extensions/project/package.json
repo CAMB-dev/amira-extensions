@@ -12,7 +12,7 @@
   },
   "amira": {
     "status": "wip",
-    "statusMessage": "Experimental project lifecycle and reported-spend caps; ship, dashboard and archive UI are coming later.",
+    "statusMessage": "Batch 3 in progress: spend caps and ship are in; archive and the dashboard view are not done yet.",
     "engines": {
       "amira": "^0.1.64"
     },

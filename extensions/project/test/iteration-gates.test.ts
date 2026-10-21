@@ -126,7 +126,7 @@ async function fixture() {
     checks: [
       {
         checkId: "C1",
-        cwd: "worktree",
+        cwd: project.root,
         command: "bun test",
         startedAt: "2026-10-15T00:00:00Z",
         finishedAt: "2026-10-15T00:00:01Z",

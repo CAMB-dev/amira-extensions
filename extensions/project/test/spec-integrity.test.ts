@@ -9,6 +9,7 @@ import {
   validateSpecIdentity,
 } from "../src/spec-integrity.ts"
 import { fixture, specDraft } from "./implement-fixture.ts"
+import { human } from "./iteration-binding-helper.ts"
 
 setDefaultTimeout(120_000)
 const fixtures: Awaited<ReturnType<typeof fixture>>[] = []
@@ -110,6 +111,56 @@ test("batch result publication requires the complete approved exact-check set an
     release()
     await f.settled()
   }
+})
+
+test("acceptance publication rejects a correct command recorded in a different cwd", async () => {
+  const f = await setup(true)
+  await f.approve()
+  f.answers.push(true)
+  await f.implementations.run(f.project, f.ctx, "en", () => {})
+  await f.settled()
+  let state = await f.store.read()
+  state = await f.store.dispatch(state.revision, {
+    type: "confirm-transition",
+    expectedRevision: state.revision,
+    receipt: human(state, state.pending!.id, "accept"),
+  })
+  const codeHash = "a".repeat(64)
+  state = await f.store.dispatch(state.revision, {
+    type: "start-work",
+    expectedRevision: state.revision,
+    attemptId: "cwd-review",
+    review: { attempt: 1, codeHash },
+  })
+  const context = state.approvedContext!
+  const check = {
+    checkId: "C1",
+    cwd: f.root,
+    command: "git --version",
+    startedAt: new Date().toISOString(),
+    finishedAt: new Date().toISOString(),
+    status: "passed" as const,
+    exitCode: 0,
+    output: "git version fixture",
+  }
+  await expect(
+    f.store.saveArtifact(state.revision, {
+      kind: "acceptance",
+      specHash: context.spec!.hash,
+      specRevision: context.spec!.revision,
+      batchPlan: context.batchPlan!,
+      batchId: context.batchId!,
+      attemptId: "cwd-review",
+      attempt: 1,
+      codeHash,
+      reviewerModel: "mock/reviewer",
+      implementerModels: ["mock/fixture"],
+      sameModelFallback: false,
+      outcome: "pass",
+      items: [{ itemId: "S1", status: "pass", evidence: ["Observed"], reason: "Works" }],
+      checks: [check],
+    }),
+  ).rejects.toThrow(/cwd|exact check/i)
 })
 
 test("feedback cannot silently renumber an identical requirement", async () => {
