@@ -25,9 +25,9 @@ export function statusName(status: IterationState["status"], language: string): 
 export function executionUnavailable(language: string): string {
   return localize(
     language,
-    "Start an approved batch with /project implement or its approved review with /project accept. No work was started. Ship: coming later.",
-    "用 /project implement 开始已批准的实现批次，或用 /project accept 开始已批准的验收。未启动任何工作。发布：稍后提供。",
-    "承認済みバッチは /project implement、承認済みの確認は /project accept で開始します。作業は開始していません。リリースは今後対応。",
+    "Start an approved batch with /project implement or its approved review with /project accept. No work was started.\nShip requires separate approval: /project ship.",
+    "用 /project implement 开始已批准的实现批次，或用 /project accept 开始已批准的验收。未启动任何工作。发布需单独批准：/project ship。",
+    "承認済みバッチは /project implement、承認済みの確認は /project accept で開始します。作業は開始していません。リリースは個別の承認が必要です：/project ship。",
   )
 }
 
@@ -95,9 +95,9 @@ export function nextSuggestion(state: IterationState, language: string, designAv
   if (state.stage === "accept" && state.phase === "complete")
     return localize(
       language,
-      "Iteration complete · ship: coming later",
-      "迭代已完成 · 发布：稍后提供",
-      "イテレーション完了 · リリースは今後対応",
+      "Acceptance complete · iteration still open · review ship: /project ship",
+      "验收已完成 · 迭代仍开放 · 审阅发布：/project ship",
+      "受け入れ確認完了 · イテレーションは未終了 · リリースを確認：/project ship",
     )
   if (state.stage === "accept" && state.phase === "confirmed")
     return localize(
