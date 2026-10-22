@@ -1,0 +1,27 @@
+{
+  "name": "prompt-suggest",
+  "license": "Apache-2.0",
+  "version": "0.1.0",
+  "description": "Predict your next message as Tab-acceptable ghost text in an empty prompt",
+  "type": "module",
+  "scripts": {
+    "link-amira": "bun scripts/link-amira.ts",
+    "test": "bun test",
+    "typecheck": "tsc -p tsconfig.json",
+    "lint": "biome check ."
+  },
+  "amira": {
+    "status": "experimental",
+    "engines": {
+      "amira": "^0.1.67"
+    },
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.14",
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2"
+  }
+}
