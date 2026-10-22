@@ -1,6 +1,6 @@
 import { afterEach, expect, mock, setDefaultTimeout, spyOn, test } from "bun:test"
 import { rm } from "node:fs/promises"
-import type { CommandContext, ExtensionAPI } from "@amira/api"
+import type { CommandContext, CompleteResult, ExtensionAPI } from "@amira/api"
 import { Implementations } from "../src/implement.ts"
 import { runModeChange } from "../src/mode-change.ts"
 import { batchProgress, reduceStage } from "../src/stage.ts"
@@ -26,9 +26,18 @@ async function acceptedB1(skipped = false) {
   expect(state.approvedContext?.batchId).toBe("B2")
   expect(batchProgress(state).resolutions.map((entry) => entry.batchId)).toEqual(["B1"])
   const spec = await f.store.readArtifact(state.artifacts.find((ref) => ref.kind === "spec")!)
-  const complete = mock(async () => ({
-    text: JSON.stringify({ spec: { ...spec, revision: 2 }, batches: f.plan.batches }),
-  }))
+  const complete = mock(async (): Promise<CompleteResult> => {
+    const text = JSON.stringify({ spec: { ...spec, revision: 2 }, batches: f.plan.batches })
+    return {
+      toolsKept: false,
+      text,
+      message: {
+        role: "assistant",
+        model: { provider: "offline", model: "coder" },
+        content: [{ type: "text", text }],
+      },
+    }
+  })
   const api = {
     apiVersion: "0.1.53",
     conversations: {},

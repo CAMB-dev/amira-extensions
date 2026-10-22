@@ -43,6 +43,7 @@ async function fixture() {
     return { sessionId: "generation-owner", revision, own: value, total: value, descendants: [] }
   }
   let generate: (request: Omit<CompleteRequest, "model">) => Promise<CompleteResult> = async () => ({
+    toolsKept: false,
     text: "not valid JSON",
     message: {
       role: "assistant",
@@ -132,12 +133,14 @@ test("text generation uses an inventoried tool-less owner, never main complete o
   const f = await fixture()
   const result = await f.run()
   expect(result.text).toBe("not valid JSON")
+  expect(result.toolsKept).toBe(false)
   expect(() => JSON.parse(result.text)).toThrow()
   expect(f.specs).toHaveLength(1)
   expect(f.specs[0]).toMatchObject({ cwd: f.project.root, callableTools: [], writeRoots: [] })
   expect(f.specs[0]!.key).toContain("/iteration/1/generation/spec-generation/")
   expect(f.complete).toHaveBeenCalledTimes(1)
   expect(f.complete.mock.calls[0]![0]).not.toHaveProperty("model")
+  expect(f.complete.mock.calls[0]![0]).not.toHaveProperty("keepSessionTools")
   expect(f.api.complete).not.toHaveBeenCalled()
   expect(f.release).toHaveBeenCalledTimes(1)
   expect(f.usage().total.knownCostUsd).toBe(0.25)

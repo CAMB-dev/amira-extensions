@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import type {
   CommandContext,
+  CompleteResult,
   ConversationRuntime,
   ConversationSpec,
   ExtensionAPI,
@@ -144,7 +145,18 @@ export async function fixture(options: { initialized?: boolean; subdirectory?: b
   const groupFactories = new Map<string, OwnedConversation["createGroup"]>()
   const notifications: string[] = []
   const drafts = [specDraft()]
-  const complete = mock(async (_request: unknown) => ({ text: JSON.stringify(drafts.shift()) }))
+  const complete = mock(async (_request: unknown): Promise<CompleteResult> => {
+    const text = JSON.stringify(drafts.shift())
+    return {
+      toolsKept: false,
+      text,
+      message: {
+        role: "assistant",
+        model: { provider: "mock", model: "implementer" },
+        content: [{ type: "text", text }],
+      },
+    }
+  })
   let blockCommand: string | undefined
   let hold: (() => Promise<void>) | undefined
   let spawned: unknown

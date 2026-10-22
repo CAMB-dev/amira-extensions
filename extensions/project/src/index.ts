@@ -7,6 +7,7 @@ import type { PrototypeManifestArtifact } from "./artifacts.ts"
 import { runCleanupCommand } from "./cleanup-command.ts"
 import { type CostLedger, costText } from "./cost.ts"
 import { FileCostPersistence } from "./cost-storage.ts"
+import { ProjectDashboards } from "./dashboard.ts"
 import { DesignSessions } from "./design.ts"
 import { ProjectCommandError, projectError } from "./diagnostics.ts"
 import { Implementations, implementationStatus } from "./implement.ts"
@@ -219,6 +220,7 @@ interface PanelState {
 export function createProjectExtension(): Extension {
   return (api) => {
     const registry = new Registry(api.dataDir)
+    const dashboards = new ProjectDashboards(api)
     const languagePolicy = new LanguagePolicy()
     const availableDesigns = new Set<string>()
     const designKey = (project: Project) => `${project.marker.id}/${project.marker.currentIteration}`
@@ -310,15 +312,18 @@ export function createProjectExtension(): Extension {
       },
       changed(project, ledger) {
         costPanels.set(project.marker.id, ledger)
+        dashboards.track(project)
       },
     })
     api.onUnload?.(() => {
       unloaded = true
+      dashboards.dispose()
       panelGeneration++
       states.clear()
       costPanels.clear()
       void disposeAccounting(api)
     })
+    api.onExit?.(() => dashboards.dispose())
     const states = new Map<string, PanelState>()
     const memoryAttachments = new Map<string, Attachment>()
     const active = (id: string) => api.session()?.info().id === id
@@ -346,6 +351,7 @@ export function createProjectExtension(): Extension {
         const project = await readProject(attachment.root, attachment.projectId)
         if (!current()) return
         state.project = project
+        dashboards.track(project)
         // Display only: no accounting initialization, policy defaults, inventory recovery or repair.
         const cached = costPanels.get(project.marker.id)
         const ledger = await new FileCostPersistence(project).read()
@@ -449,6 +455,7 @@ export function createProjectExtension(): Extension {
       }
     }
     async function attach(project: Project, ctx: CommandContext, origin: string): Promise<void> {
+      dashboards.track(project)
       if (!readOnly(project)) await registry.remember(project)
       if (!active(origin) || ctx.signal.aborted)
         throw commandFailure(
@@ -519,6 +526,7 @@ export function createProjectExtension(): Extension {
         )
       try {
         const project = await readProject(attachment.root, attachment.projectId)
+        dashboards.track(project)
         // A validated marker is the current language source even if iteration loading fails.
         // Do not fall back to cached/pre-resume settings for compatibility diagnostics.
         selectedProject = project
@@ -620,7 +628,9 @@ export function createProjectExtension(): Extension {
       const checked = await Promise.all(
         entries.map(async (entry) => {
           try {
-            return { entry, project: await readProject(entry.root, entry.id), error: undefined }
+            const project = await readProject(entry.root, entry.id)
+            dashboards.track(project)
+            return { entry, project, error: undefined }
           } catch (error) {
             return { entry, project: undefined, error: projectError(error, lang) }
           }
@@ -1335,6 +1345,9 @@ export function createProjectExtension(): Extension {
         } catch (error) {
           const lang = interfaceLanguage(ctx)
           ctx.print(message(error) === HELP ? help(lang) : projectError(error, lang), "error")
+        } finally {
+          // Refresh outside render, including lifecycle changes and failed/partial operations.
+          void dashboards.refresh()
         }
       },
     })

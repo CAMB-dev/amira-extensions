@@ -14,6 +14,7 @@ import type {
 import extension, { sourceRegistry } from "../src/index.ts"
 import { agentsOf, type DashboardSource, type DashboardSources } from "../src/source.ts"
 import type { DashboardViewData } from "../src/view.ts"
+import { projectFixture } from "./project-fixture.ts"
 
 const source = (id = "workflow"): DashboardSource => ({
   id,
@@ -61,11 +62,36 @@ test("service reserves built-in IDs, rejects duplicates and releases subscriptio
   expect(registry.sources.size).toBe(0)
 })
 
+test("terminal disposal releases every registration even when one subscriber throws", () => {
+  const registry = sourceRegistry(() => {})
+  let released = 0
+  registry.service.register({
+    ...source("broken"),
+    subscribe: () => () => {
+      throw new Error("broken unsubscribe")
+    },
+  })
+  registry.service.register({
+    ...source("healthy"),
+    subscribe: () => () => {
+      released++
+    },
+  })
+  registry.subscribe("broken", () => {})
+  registry.subscribe("healthy", () => {})
+  expect(() => registry.dispose()).toThrow("unsubscribe")
+  expect(released).toBe(1)
+  expect(registry.sources.size).toBe(0)
+  expect(() => registry.dispose()).not.toThrow()
+  expect(() => registry.service.register(source("later"))).toThrow("closed")
+})
+
 function setup(agents: SubagentInfo[] = []) {
   const commands: CommandDefinition[] = []
   const views: ViewDefinition[] = []
   let service: DashboardSources | undefined
   const exits: (() => void)[] = []
+  const unloads: (() => void)[] = []
   let renders = 0
   let listeners = 0
   let subscriptions = 0
@@ -92,6 +118,10 @@ function setup(agents: SubagentInfo[] = []) {
     on: bus.on,
     onExit: (fn: () => void) => {
       exits.push(fn)
+      return () => {}
+    },
+    onUnload: (fn: () => void) => {
+      unloads.push(fn)
       return () => {}
     },
     provideService: (name: string, value: DashboardSources) => {
@@ -151,6 +181,7 @@ function setup(agents: SubagentInfo[] = []) {
     opened,
     printed,
     exits,
+    unloads,
     renders: () => renders,
     listeners: () => listeners,
     subscriptions: () => subscriptions,
@@ -442,4 +473,110 @@ test("unavailable frontends, unknown sources and rejected opens are explicit", a
     "Unknown dashboard source: missing. Use /dashboard agents or /dashboard trace.",
     "The dashboard could not open. Close the current dialog and try again.",
   ])
+})
+
+test("closed registry advertises cards and refuses registration and subscriptions permanently", () => {
+  const registry = sourceRegistry(() => {})
+  expect(registry.service.capabilities).toEqual({ cards: true })
+  let calls = 0
+  let releases = 0
+  registry.service.register({
+    ...source("project.checkout"),
+    subscribe: () => {
+      calls++
+      return () => releases++
+    },
+  })
+  registry.subscribe("project.checkout", () => {})
+  registry.dispose()
+  registry.dispose()
+  registry.subscribe("project.checkout", () => {})()
+  registry.subscribe("missing", () => {})()
+  expect(calls).toBe(1)
+  expect(releases).toBe(1)
+  expect(registry.sources.size).toBe(0)
+  expect(registry.registrations.size).toBe(0)
+  expect(() => registry.service.register(source("project.checkout"))).toThrow("closed")
+})
+
+test("synchronous unregistration during subscription still releases the returned listener once", () => {
+  const registry = sourceRegistry(() => {})
+  let releases = 0
+  const remove = registry.service.register({
+    ...source(),
+    subscribe: (changed) => {
+      changed()
+      return () => releases++
+    },
+  })
+  const release = registry.subscribe("workflow", remove)
+  expect(releases).toBe(1)
+  release()
+  registry.dispose()
+  expect(releases).toBe(1)
+})
+
+test("unload is terminal and idempotent for retained project service, view and callbacks", async () => {
+  const s = setup()
+  const fixture = projectFixture()
+  let subscriptions = 0
+  let releases = 0
+  let notify: (() => void) | undefined
+  fixture.data.source.subscribe = (changed) => {
+    subscriptions++
+    notify = changed
+    return () => releases++
+  }
+  const remove = s.service.register(fixture.data.source)
+  await s.command.run("project.checkout", s.ctx)
+  const opened = s.opened[0]!
+  if (!("data" in opened)) throw new Error("Expected extension view")
+  const data = opened.data as DashboardViewData
+  expect(data.source.snapshot()).toEqual(fixture.snapshot)
+  expect(await data.source.act!("checkout.i2.spec.r3", "stop")).toContain("read-only")
+  expect(fixture.act).not.toHaveBeenCalled()
+  s.unloads[0]!()
+  s.unloads[0]!()
+  s.exits[0]!()
+  expect(releases).toBe(1)
+  const renders = s.renders()
+  notify?.()
+  data.source.subscribe?.(() => {
+    throw new Error("Stale notification")
+  })()
+  expect(data.source.snapshot().phases).toEqual([])
+  expect(data.source.details("checkout.i2.spec.r3")).toBeUndefined()
+  expect(await data.source.act!("checkout.i2.spec.r3", "stop")).toContain("no longer available")
+  expect(() => s.service.register(source("project.replacement"))).toThrow("closed")
+  remove()
+  s.close()
+  await s.command.run("agents", s.ctx)
+  expect(s.opened).toHaveLength(1)
+  expect(subscriptions).toBe(1)
+  expect(s.renders()).toBe(renders)
+  expect(fixture.act).not.toHaveBeenCalled()
+})
+
+test("unload drains visible live subscriptions and prevents a pending trace open", async () => {
+  const s = setup()
+  await s.command.run("agents", s.ctx)
+  expect(s.listeners()).toBeGreaterThan(0)
+  let finish!: (records: []) => void
+  const pending = s.command.run("trace", {
+    ...s.ctx,
+    session: {
+      ...s.ctx.session,
+      trace: () =>
+        new Promise<[]>((resolve) => {
+          finish = resolve
+        }),
+    },
+  })
+  s.unloads[0]!()
+  expect(s.listeners()).toBe(0)
+  finish([])
+  await pending
+  expect(s.opened).toHaveLength(1)
+  s.exits[0]!()
+  expect(s.listeners()).toBe(0)
 })

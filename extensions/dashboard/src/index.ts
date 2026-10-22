@@ -1,6 +1,6 @@
 import { defineExtension } from "@amira/api"
 import { createLiveSource } from "./live.ts"
-import type { DashboardSource, DashboardSources } from "./source.ts"
+import { agentsOf, type DashboardSource, type DashboardSources } from "./source.ts"
 import { createTraceSource } from "./trace.ts"
 import { type DashboardViewData, dashboardView, VIEW_KIND } from "./view.ts"
 
@@ -12,8 +12,11 @@ export function sourceRegistry(changed: () => void) {
   const disposers = new Map<string, () => void>()
   const registrations = new Map<string, symbol>()
   const subscriptions = new Map<string, Set<() => void>>()
+  let closed = false
   const service: DashboardSources = {
+    capabilities: { cards: true },
     register(source) {
+      if (closed) throw new Error("Dashboard source registry is closed.")
       if (!/^[a-z][\w.-]*$/i.test(source.id) || ["agents", "trace"].includes(source.id)) {
         throw new Error(`Invalid or reserved dashboard source ID: ${source.id}`)
       }
@@ -26,9 +29,21 @@ export function sourceRegistry(changed: () => void) {
         registrations.delete(source.id)
         sources.delete(source.id)
         disposers.delete(source.id)
-        for (const unsubscribe of [...(subscriptions.get(source.id) ?? [])]) unsubscribe()
+        const errors: unknown[] = []
+        for (const unsubscribe of [...(subscriptions.get(source.id) ?? [])]) {
+          try {
+            unsubscribe()
+          } catch (error) {
+            errors.push(error)
+          }
+        }
         subscriptions.delete(source.id)
-        changed()
+        try {
+          changed()
+        } catch (error) {
+          errors.push(error)
+        }
+        if (errors.length) throw new AggregateError(errors, "Dashboard source unsubscribe failed.")
       }
       disposers.set(source.id, dispose)
       changed()
@@ -40,13 +55,12 @@ export function sourceRegistry(changed: () => void) {
     registrations,
     service,
     subscribe(id: string, changed: () => void) {
+      if (closed || !registrations.has(id)) return () => {}
       const source = sources.get(id)
       const registration = registrations.get(id)
       const listeners = subscriptions.get(id) ?? new Set<() => void>()
       let active = true
-      const unsubscribe = source?.subscribe?.(() => {
-        if (active && registrations.get(id) === registration) changed()
-      })
+      let unsubscribe: (() => void) | undefined
       const release = () => {
         if (!active) return
         active = false
@@ -55,10 +69,33 @@ export function sourceRegistry(changed: () => void) {
       }
       listeners.add(release)
       subscriptions.set(id, listeners)
+      try {
+        const dispose = source?.subscribe?.(() => {
+          if (active && !closed && registrations.get(id) === registration) changed()
+        })
+        // A synchronous provider callback may close or unregister during subscription.
+        if (active) unsubscribe = dispose
+        else dispose?.()
+        if (closed || registrations.get(id) !== registration) release()
+      } catch (error) {
+        release()
+        throw error
+      }
       return release
     },
     dispose: () => {
-      for (const dispose of [...disposers.values()]) dispose()
+      if (closed) return
+      closed = true
+      const errors: unknown[] = []
+      for (const dispose of [...disposers.values()]) {
+        try {
+          dispose()
+        } catch (error) {
+          errors.push(error)
+        }
+      }
+      if (errors.length)
+        throw new AggregateError(errors, "Dashboard source unsubscribe failed during disposal.")
     },
   }
 }
@@ -67,6 +104,7 @@ export default defineExtension((api) => {
   let active: DashboardViewData | undefined
   let unsubscribe: (() => void) | undefined
   let generation = 0
+  let closed = false
   const liveSources = new WeakMap<DashboardSource, { sessionId: string; dispose: () => void }>()
   const registry = sourceRegistry(() => {
     if (active) api.requestRender()
@@ -76,10 +114,14 @@ export default defineExtension((api) => {
     active = undefined
     const release = unsubscribe
     unsubscribe = undefined
-    release?.()
-    if (previous) liveSources.get(previous.source)?.dispose()
+    try {
+      release?.()
+    } finally {
+      if (previous) liveSources.get(previous.source)?.dispose()
+    }
   }
   const open = (data: DashboardViewData) => {
+    if (closed) return
     if (active?.source === data.source) {
       // Replacing view data must not interrupt the live source's event cache.
       active = data
@@ -91,14 +133,23 @@ export default defineExtension((api) => {
       if (active?.source === data.source) api.requestRender()
     })
   }
-  api.onExit(() => {
-    close()
-    registry.dispose()
-  })
+  const dispose = () => {
+    if (closed) return
+    closed = true
+    generation++
+    try {
+      close()
+    } finally {
+      registry.dispose()
+    }
+  }
+  api.onExit(dispose)
+  api.onUnload?.(dispose)
   api.provideService("dashboard.sources", registry.service)
   api.registerView({
     ...dashboardView,
     onOpen(data, view) {
+      if (closed) return
       open(data)
       dashboardView.onOpen?.(data, view)
     },
@@ -120,7 +171,7 @@ export default defineExtension((api) => {
     },
     async run(args, ctx) {
       const request = ++generation
-      if (ctx.signal.aborted) return
+      if (closed || ctx.signal.aborted) return
       if (!ctx.openView) {
         ctx.print("The dashboard needs a frontend with full-screen views.", "warning")
         return
@@ -138,7 +189,7 @@ export default defineExtension((api) => {
           : id === "trace"
             ? await createTraceSource(ctx.session, ctx.signal)
             : registry.sources.get(id)
-      if (ctx.signal.aborted || request !== generation) {
+      if (closed || ctx.signal.aborted || request !== generation) {
         live?.dispose()
         return
       }
@@ -148,7 +199,7 @@ export default defineExtension((api) => {
       }
       // A removed provider must not remain actionable in a view that outlives its registration.
       const registration = registry.registrations.get(id)
-      const registered = () => registry.registrations.get(id) === registration
+      const registered = () => !closed && registry.registrations.get(id) === registration
       const guarded: DashboardSource = registration
         ? {
             id: source.id,
@@ -163,10 +214,12 @@ export default defineExtension((api) => {
                   },
             details: (agentId, opts) => (registered() ? source.details(agentId, opts) : undefined),
             subscribe: (changed) => (registered() ? registry.subscribe(id, changed) : () => {}),
-            act: (agentId, action, text) =>
-              registered() && source.act
-                ? source.act(agentId, action, text)
-                : "This dashboard source is no longer available.",
+            act: (agentId, action, text) => {
+              if (!registered() || !source.act) return "This dashboard source is no longer available."
+              if (agentsOf(source.snapshot()).find((agent) => agent.id === agentId)?.card?.kind === "stage")
+                return "This stage is read-only. Use the source's commands to continue."
+              return source.act(agentId, action, text)
+            },
           }
         : source
       const data: DashboardViewData = { source: guarded, session: ctx.session }

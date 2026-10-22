@@ -7,6 +7,7 @@ import { AGENT_STATUS_BADGES, type AgentStatusState, type SessionControl, type T
 import { agentsOf } from "../src/source.ts"
 import { createTraceSource } from "../src/trace.ts"
 import { dashboardView } from "../src/view.ts"
+import { projectFixture } from "./project-fixture.ts"
 import { viewFixture } from "./view-fixture.ts"
 
 // Module names in variables keep the type checker out of the host's sources.
@@ -320,7 +321,7 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
     const rows = render().join("\n")
     expect(rows).toContain("A durable agent note")
     expect(rows).toContain("Some older files may be omitted.")
-    expect(rows).toContain("0.1250")
+    expect(rows).toContain("$0.125")
     viewer.dispose()
   })
 
@@ -526,4 +527,105 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
     expect(fixture.act).toHaveBeenLastCalledWith("receipts", "resume", undefined)
     viewer.dispose()
   })
+})
+
+describe.skipIf(!available)("project stage cards in the real TUI viewer", () => {
+  for (const [width, height] of [
+    [120, 36],
+    [80, 24],
+  ] as const) {
+    test(`${width}x${height}: stage outcome and reported rollup remain readable without placeholders`, () => {
+      const fixture = projectFixture()
+      const phase = fixture.snapshot.phases[0]!
+      phase.id = "65fcb0f0-fcb2-438f-8128-4d4867d0169e"
+      phase.status = "running"
+      phase.ref = phase.id.repeat(4)
+      const stage = agentsOf(fixture.snapshot)[1]!
+      stage.card = {
+        kind: "stage",
+        label: "Implement",
+        outcome: "budget stopped",
+        detail: "2 batches · 3 tasks · Read-only: use /project",
+        costText: "$1.20 reported",
+      }
+      fixture.data.selected = stage.id
+      const viewer = new tui.ExtensionViewer(dashboardView, fixture.data)
+      viewer.mount()
+      const render = (): string[] =>
+        viewer.render(width, { theme: kit.monoTheme, color: false, rows: height }).map(kit.stripAnsi)
+      try {
+        render()
+        viewer.handleInput(kit.key("down"))
+        const rows = render()
+        const output = rows.join("\n")
+        expect(output).not.toContain("--:--:--")
+        expect(output).not.toMatch(/─{6,}\s+—|65fcb0f0|\bunknown\s*▕/)
+        const header = rows.find((row) => row.includes("budget stopped"))
+        expect(header).toContain("Implement")
+        expect(header).toContain("$1.20 reported")
+        expect(header).toMatch(/^›.*Implement/)
+        expect(header).not.toContain("…")
+        expect(output).toContain("2 batches · 3 tasks")
+        // Host spinners use wall-clock cadence independently of the fixture's timestamps.
+        expect(rows.map((row) => row.trimEnd().replace(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/g, "⠋"))).toMatchSnapshot()
+        expect(output).not.toMatch(/^\s*[›>]\s*[│ ]*$/m)
+        viewer.handleInput(kit.key("up"))
+        render()
+        viewer.handleInput(kit.key("up"))
+        expect(render().find((row) => row.startsWith("›"))).toContain("Iteration 2")
+        viewer.handleInput(kit.key("down"))
+        render()
+        viewer.handleInput(kit.key("down"))
+        for (const costText of ["not reported yet", "$0.40 reported · incomplete/unpriced"]) {
+          stage.card.outcome = "awaiting review"
+          stage.card.costText = costText
+          const current = render().find((row) => row.startsWith("›") && row.includes("Implement"))
+          expect(current).toContain("awaiting review")
+          expect(current).toContain(costText)
+          expect(current).not.toContain("…")
+        }
+        stage.card.outcome = "budget stopped"
+        stage.card.costText = "$1.20 reported"
+        render()
+        viewer.handleInput(kit.key("enter"))
+        const page = render().join("\n")
+        expect(page).toContain("$1.20 reported")
+        expect(page).not.toContain("Cost     unknown")
+        expect(page).not.toContain("--:--:--")
+        for (const row of rows) expect(kit.visibleWidth(row)).toBeLessThanOrEqual(width)
+      } finally {
+        viewer.dispose()
+      }
+    })
+  }
+  for (const [width, height] of [
+    [180, 52],
+    [80, 24],
+  ] as const) {
+    test(`${width}x${height}: read-only content survives timeline/page navigation and clipping`, () => {
+      const fixture = projectFixture()
+      const viewer = new tui.ExtensionViewer(dashboardView, fixture.data)
+      viewer.mount()
+      const render = (): string[] =>
+        viewer.render(width, { theme: kit.monoTheme, color: false, rows: height }).map(kit.stripAnsi)
+      try {
+        for (const key of [undefined, "enter", "2", "3", "escape"]) {
+          if (key) viewer.handleInput(kit.key(key))
+          const rows = render()
+          const text = rows.join("\n")
+          expect(rows.length).toBeLessThanOrEqual(height)
+          for (const row of rows) expect(kit.visibleWidth(row)).toBeLessThanOrEqual(width)
+          if (key !== "2" && key !== "3") expect(text).toContain("Spec")
+          expect(text).not.toMatch(
+            /Stop agent|Open diff|o diff|pause\/resume|What this agent|Dashboard · Agent/,
+          )
+          if (key === "2") expect(text).toContain("Cached stage evidence")
+          if (key === "3") expect(text).toContain("ship-plan.md")
+        }
+        expect(fixture.act).not.toHaveBeenCalled()
+      } finally {
+        viewer.dispose()
+      }
+    })
+  }
 })

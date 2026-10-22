@@ -217,6 +217,7 @@ test("a normally pending priced completion is not cancelled by accounting refres
     ])
     f.receipt(key, 4, 2)
     return {
+      toolsKept: false,
       text: "priced",
       message: {
         role: "assistant",

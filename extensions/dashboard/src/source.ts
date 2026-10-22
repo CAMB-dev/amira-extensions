@@ -17,6 +17,17 @@ export interface DashboardAgent {
   /** Child session ID for host-authorized transcript and trace navigation. */
   sessionId?: string
   name: string
+  /** Optional read-only stage presentation; label replaces the agent name in visible chrome. */
+  card?: {
+    kind: "stage"
+    label: string
+    /** Human outcome, replacing the generic lifecycle label in stage chrome. */
+    outcome?: string
+    /** Remaining detail, without repeating the label, outcome or cost. */
+    detail?: string
+    /** Already formatted reported rollup; presentation only, never an own-cost total. */
+    costText?: string
+  }
   task: string
   status: DashboardStatus
   /** A defined early-end note (even empty) presents done as stopped. */
@@ -105,7 +116,20 @@ export interface DashboardSource {
 }
 
 export interface DashboardSources {
+  capabilities?: { cards?: true }
   register(source: DashboardSource): () => void
+}
+
+/** Presentation only: existing agent-shaped sources keep their names and fixed actions. */
+export const rowLabel = (agent: DashboardAgent): string => agent.card?.label ?? agent.name
+
+export function rowCount(agents: DashboardAgent[]): string {
+  const stages = agents.filter((agent) => agent.card?.kind === "stage").length
+  const workers = agents.length - stages
+  return [
+    ...(stages ? [`${stages} ${stages === 1 ? "stage" : "stages"}`] : []),
+    ...(workers || !stages ? [`${workers} ${workers === 1 ? "agent" : "agents"}`] : []),
+  ].join(" / ")
 }
 
 declare module "@amira/api" {
