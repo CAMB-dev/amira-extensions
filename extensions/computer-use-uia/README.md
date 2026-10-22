@@ -1,6 +1,6 @@
 # computer-use-uia
 
-> **Experimental 0.2.0 — Windows only, off by default.** This extension can read and control
+> **Experimental 0.2.1 — Windows only, off by default.** This extension can read and control
 > **any window**, including apps you already have open. It is not an application sandbox.
 > Interfaces and safety limits may change. Do not enable it unless you accept the risks below.
 
@@ -453,15 +453,17 @@ surviving descendants whose launcher has already exited. Failed producer retirem
 failure keeps custody alive with its native handles and retries; a bounded client cleanup timeout
 reports the failure without force-closing that owner. Replacement stays blocked until confirmed
 cleanup. The watchdog pins the current helper identity over its private
-client pipe, once per helper generation, checks the spawned child's PID and native creation time,
-and acknowledges that identity before the helper's first journal write. Cleanup retires that exact
+client pipe, once per helper generation, and checks the spawned child's PID and native creation time.
+Before the helper's first journal write, independent custody also acknowledges the exact journal
+path and pins that writer's process handle, even if no app is launched. Cleanup retires that exact
 helper before verifying the final snapshot. Missing, stale or untrusted journals **never prevent
 cleanup of jobs the watchdog itself retained**; journal-supplied identities grant no kill authority.
-A complete session cleanup removes the journal and `.tmp`; unverifiable/incomplete cleanup retains
-the journal and reports the failure. Existing windows are not closed during teardown.
-Rotated journals are deleted after the old generation's cleanup finishes or its watchdog is
-confirmed gone; cleanup authority remains in the independent owner's native duplicates, not
-those files. Journals are kept only while they can provide evidence for active cleanup. A missing journal before the first write,
+Custody removes all registered journals and their `.tmp` files only after every writer has exited
+and all retained jobs have drained. Unverifiable/incomplete cleanup retains the journals and reports
+the failure; deletion failures keep custody alive to retry. Existing windows are not closed during teardown.
+Rotated journals remain registered until complete session cleanup, even if their watchdog is killed;
+cleanup authority remains in the independent owner's native duplicates, not those files. No other
+client's journal is scanned or deleted. A missing journal before the first write,
 or a retired writer's snapshot before replacement writes, is not reported as incomplete when
 all retained jobs were drained. On a non-force emergency stop, windowed members deliberately
 preserved during a journal gap do not count as incomplete cleanup.

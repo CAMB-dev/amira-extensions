@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test"
 import { createHmac, randomBytes } from "node:crypto"
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
+import { dirname, join } from "node:path"
 import type { ExtensionAPI, OpenPipeOptions, SettingsLayer, ToolContext, ToolDefinition } from "@amira/api"
 import { formatTree, type TreeResult, UiaClient, validateKeys } from "../src/client.ts"
 import { setup } from "../src/extension.ts"
@@ -97,6 +98,7 @@ function fake(value: unknown = { enabled: true, treeDensityThreshold: 0 }, layer
     return false
   }
   const lifetimeSource = readFileSync(new URL("../helper/lifetime.ps1", import.meta.url), "utf8")
+  const custodySource = readFileSync(new URL("../helper/custody.ps1", import.meta.url), "utf8")
   const helperSource = readFileSync(new URL("../helper/uia.ps1", import.meta.url), "utf8")
   function stopOwnedJobs(watchdog: FakePipe, force: boolean) {
     // Source-driven native model, not Windows execution. Source contracts separately
@@ -345,6 +347,8 @@ function fake(value: unknown = { enabled: true, treeDensityThreshold: 0 }, layer
         custodies.push(pipe)
         let session: string | undefined
         const transfers = new Map<string, string>()
+        const journals = new Set<string>()
+        const writers = new Set<FakePipe>()
         queueMicrotask(() => pipe.options.onEvent({ type: "spawned", pid: pipe.pid }))
         return {
           write(line: string) {
@@ -357,6 +361,18 @@ function fake(value: unknown = { enabled: true, treeDensityThreshold: 0 }, layer
                 pipe.options.onEvent({
                   type: "stdout",
                   data: `${JSON.stringify({ event: "custody-ready", session, pid: pipe.pid, started: "5000" })}\n`,
+                }),
+              )
+            }
+            if (message.event === "journal" && message.session === session) {
+              const writer = pipes.findLast((candidate) => !candidate.exited && candidate.pid === message.pid)
+              if (!writer || message.started !== "1000") return
+              journals.add(message.path)
+              writers.add(writer)
+              ready("journal", () =>
+                pipe.options.onEvent({
+                  type: "stdout",
+                  data: `${JSON.stringify({ ...message, event: "journal-recorded" })}\n`,
                 }),
               )
             }
@@ -394,9 +410,21 @@ function fake(value: unknown = { enabled: true, treeDensityThreshold: 0 }, layer
             }
             if (message.event === "end" && message.session === session) {
               const cleanup = () => {
+                // Model custody's cached producer retirement, including zero-job writers.
+                for (const writer of writers) writer.options.onEvent({ type: "exit", code: 0 })
+                for (const { source, writer } of pipe.producers.values())
+                  for (const producer of [source, writer]) {
+                    const pinned = producer as FakePipe
+                    pinned.options.onEvent({ type: "exit", code: 0 })
+                  }
+                const incomplete = stopOwnedJobs(pipe, true)
+                // Source contracts below pin the production ordering and literal scope.
+                if (!incomplete && custodySource.includes("[IO.File]::Delete($path)"))
+                  for (const path of journals)
+                    for (const file of [path, `${path}.tmp`]) if (existsSync(file)) unlinkSync(file)
                 pipe.options.onEvent({
                   type: "stdout",
-                  data: `${JSON.stringify({ event: "custody-drained", session, incomplete: false })}\n`,
+                  data: `${JSON.stringify({ event: "custody-drained", session, incomplete })}\n`,
                 })
                 pipe.close(0)
               }
@@ -1915,6 +1943,76 @@ test("timeout and helper restart preserve the session owner; only explicit stop 
   expect(watchdog.closed).toEqual([15_000])
 })
 
+for (const method of ["launch", "windows"] as const)
+  test(`normal session end removes its journal and tmp after confirmed custody cleanup (${method})`, async () => {
+    const h = fake()
+    const c = new UiaClient(h.api, settings)
+    await c.call(method, method === "launch" ? { command: "fake.exe" } : {})
+    const helper = h.pipes[0]!
+    const path = helper.argv[helper.argv.indexOf("-StatePath") + 1]!
+    const foreign = join(dirname(path), `amira-uia-${crypto.randomUUID()}.json`)
+    for (const file of [path, `${path}.tmp`, foreign]) writeFileSync(file, "journal fixture")
+    try {
+      h.holdCustodyCleanup()
+      const stopping = c.stop()
+      await Bun.sleep(0)
+      expect(helper.exited).toBe(true)
+      expect(h.watchdogs[0]!.exited).toBe(true) // No watchdog finally is guaranteed after native termination.
+      expect(existsSync(path)).toBe(true)
+      expect(existsSync(`${path}.tmp`)).toBe(true)
+      h.releaseCustodyCleanup()
+      await stopping
+      expect(existsSync(path)).toBe(false)
+      expect(existsSync(`${path}.tmp`)).toBe(false)
+      expect(existsSync(foreign)).toBe(true)
+    } finally {
+      for (const file of [path, `${path}.tmp`, foreign]) if (existsSync(file)) unlinkSync(file)
+    }
+  })
+
+test("journal custody gates writer handoff and a late ack cannot authorize a replacement", async () => {
+  const h = fake({ enabled: true, overlay: false })
+  const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }))
+  h.pauseStage("journal")
+  await c.call("windows")
+  const old = h.pipes[0]!
+  expect(old.writes.some((message) => message.method === "writer_ack")).toBe(false)
+  expect(h.watchdogs[0]!.writes.some((message) => message.event === "writer")).toBe(false)
+  c.cancelRead()
+  await c.call("windows")
+  const replacement = h.pipes[1]!
+  expect(old.exited).toBe(true)
+  h.flushStage("journal")
+  await Bun.sleep(0)
+  expect(old.writes.some((message) => message.method === "writer_ack")).toBe(false)
+  expect(replacement.writes.filter((message) => message.method === "writer_ack")).toHaveLength(1)
+  expect(h.custodies[0]!.writes.filter((message) => message.event === "journal")).toHaveLength(2)
+  await c.stop()
+})
+
+test("unconfirmed session cleanup retains the journal pair until custody can finish", async () => {
+  const h = fake({ enabled: true, overlay: false })
+  const c = new UiaClient(h.api, readSettings({ enabled: true, overlay: false }), 50)
+  await c.call("windows")
+  const helper = h.pipes[0]!
+  const path = helper.argv[helper.argv.indexOf("-StatePath") + 1]!
+  writeFileSync(path, "evidence")
+  writeFileSync(`${path}.tmp`, "interrupted write")
+  try {
+    h.holdCustodyCleanup()
+    await expect(c.stop()).rejects.toThrow("retained owner is retrying")
+    expect(existsSync(path)).toBe(true)
+    expect(existsSync(`${path}.tmp`)).toBe(true)
+    expect(h.custodies[0]!.exited).toBe(false)
+    h.releaseCustodyCleanup()
+    await c.stop()
+    expect(existsSync(path)).toBe(false)
+    expect(existsSync(`${path}.tmp`)).toBe(false)
+  } finally {
+    for (const file of [path, `${path}.tmp`]) if (existsSync(file)) unlinkSync(file)
+  }
+})
+
 test("MAC replay is refused for adoption but untrusted journals cannot block fresh jobs", async () => {
   const h = fake()
   h.holdJobCreation() // Keep the standalone manual job-created reply under this test's control.
@@ -3048,8 +3146,8 @@ test("independent custody drains original and replacement trees after exact watc
   const watchdog = h.watchdogs[1]!
   const path = helper.argv[helper.argv.indexOf("-StatePath") + 1]!
   expect(path).not.toBe(oldPath)
-  expect(existsSync(oldPath)).toBe(false)
-  expect(existsSync(`${oldPath}.tmp`)).toBe(false)
+  expect(existsSync(oldPath)).toBe(true) // Custody retains earlier evidence until the session drains.
+  expect(existsSync(`${oldPath}.tmp`)).toBe(true)
   expect(helper.writes[0]!.key).not.toBe(oldSecret.key)
   expect(helper.writes[0]!.nonce).not.toBe(oldSecret.nonce)
   expect(watchdog.argv[watchdog.argv.indexOf("-StatePath") + 1]).toBe(path)
@@ -3078,6 +3176,8 @@ test("independent custody drains original and replacement trees after exact watc
   expect(app.descendants.every((child) => child.exited)).toBe(true)
   expect(oldApp.exited).toBe(true)
   expect(oldApp.descendants.every((child) => child.exited)).toBe(true)
+  expect(existsSync(oldPath)).toBe(false)
+  expect(existsSync(`${oldPath}.tmp`)).toBe(false)
 })
 
 for (const journal of ["missing", "corrupt", "stale"] as const) {
@@ -3253,12 +3353,14 @@ test("failed stop teardown refuses restart until exact old-helper exit, then rec
   const helper = h.pipes[0]!
   h.failRetirement()
   h.failReaper()
+  h.holdCustodyCleanup() // The independent writer pin cannot confirm retirement either.
   await expect(c.stop()).rejects.toThrow("retirement failed")
   expect(helper.exited).toBe(false)
   expect(helper.closed).toEqual([])
   await expect(c.call("windows")).rejects.toThrow("old helper exit is unconfirmed")
   expect(h.pipes).toHaveLength(1)
   helper.options.onEvent({ type: "exit", code: 0 })
+  h.releaseCustodyCleanup()
   await Bun.sleep(0)
   c.resume()
   await c.call("windows")

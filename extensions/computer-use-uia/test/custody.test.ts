@@ -274,6 +274,102 @@ test("custody emergency stop uses native per-member checks with retained root/gr
   expect(guard).toContain("rootStarted < 30000000L")
 })
 
+test("journal registration acknowledges the exact path, writer and request before permitting writes", async () => {
+  const h = fixture()
+  await h.owner.start(42, "1234")
+  const path = `C:\\Temp\\amira-uia-${crypto.randomUUID()}.json`
+  let accepted = false
+  const registration = h.owner.rememberJournal(path, 70, "1000").then(() => {
+    accepted = true
+  })
+  const message = h.writes.at(-1)!
+  expect(message).toMatchObject({
+    event: "journal",
+    path,
+    pid: 70,
+    started: "1000",
+    session: h.owner.session,
+  })
+  for (const wrong of [
+    { path: `${path}.foreign` },
+    { pid: 71 },
+    { started: "1001" },
+    { request: crypto.randomUUID() },
+    { session: "foreign" },
+  ]) {
+    h.emit({ ...message, ...wrong, event: "journal-recorded" })
+    await Bun.sleep(0)
+    expect(accepted).toBe(false)
+  }
+  h.emit({ ...message, event: "journal-recorded" })
+  await registration
+  expect(accepted).toBe(true)
+  await h.owner.stop()
+})
+
+test("missing journal acknowledgement fails closed; a late acknowledgement cannot reopen the gate", async () => {
+  const h = fixture()
+  await h.owner.start(42, "1234")
+  const registration = h.owner.rememberJournal("C:\\Temp\\journal.json", 70, "1000")
+  const message = h.writes.at(-1)!
+  await expect(registration).rejects.toThrow("journal acknowledgement timed out")
+  h.emit({ ...message, event: "journal-recorded" })
+  await h.owner.stop()
+})
+
+test("custody alone deletes registered journal pairs after all writers exit and jobs drain", () => {
+  const owner = readFileSync(new URL("../helper/custody.ps1", import.meta.url), "utf8")
+  const lifetime = readFileSync(new URL("../helper/lifetime.ps1", import.meta.url), "utf8")
+  const client = readFileSync(new URL("../src/client.ts", import.meta.url), "utf8")
+  const registration = owner.slice(
+    owner.indexOf("$message.event -ceq 'journal'"),
+    owner.indexOf("$message.event -cin @('root', 'stop')"),
+  )
+  for (const text of [
+    "$writers.ContainsKey($key)",
+    "::CreationTime($writer.Handle)",
+    "$writers[$key] = $writer",
+    "$journals[$message.path] = $true",
+    "$message.event = 'journal-recorded'",
+  ])
+    expect(registration).toContain(text)
+  expect(registration.indexOf("$writers[$key] = $writer")).toBeLessThan(
+    registration.indexOf("'journal-recorded'"),
+  )
+  const cleanup = owner.slice(owner.indexOf("} finally {\n    # All authenticated"))
+  let previous = -1
+  for (const text of [
+    "foreach ($writer in @($writers.Values))",
+    "$writer.Kill()",
+    "$writer.WaitForExit(1000)",
+    "$job.RetireProducers()",
+    "$job.Terminate()",
+    "$job.Members().Length",
+    "if (-not $failed -and -not $remaining -and -not $incomplete)",
+    "foreach ($path in @($journals.Keys))",
+    "[IO.File]::Delete($path)",
+    "[IO.File]::Delete($path + '.tmp')",
+    "if (-not $failed -and -not $remaining) { break }",
+    "$job.Dispose()",
+    "event = 'custody-drained'",
+  ]) {
+    const index = cleanup.indexOf(text)
+    expect(index, text).toBeGreaterThan(previous)
+    previous = index
+  }
+  expect(cleanup).toContain("} catch { $failed = $true }") // Deletion failure retries with authority retained.
+  expect(owner).toContain("$null -eq $line") // EOF, explicit end and sentinel death share cleanup.
+  expect(owner).toContain("$message.event -ceq 'end'")
+  expect(lifetime).not.toContain("Remove-Item")
+  expect(client).not.toContain("rmSync")
+  expect(client.match(/this\.statePath = join\(/g)).toHaveLength(2)
+  for (const source of [owner, client]) {
+    expect(source).not.toContain("Get-ChildItem")
+    expect(source).not.toContain("[IO.Directory]::GetFiles")
+    expect(source).not.toContain("readdir")
+  }
+})
+
 test("custody source contracts pin local pull-duplication and explicit session-end cleanup", () => {
   const owner = readFileSync(new URL("../helper/custody.ps1", import.meta.url), "utf8")
   const guard = readFileSync(new URL("../helper/launch.ps1", import.meta.url), "utf8")
