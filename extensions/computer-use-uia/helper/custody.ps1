@@ -12,6 +12,9 @@ $reader = New-Object IO.StreamReader([Console]::OpenStandardInput(), $utf8, $fal
 $sentinel = $null
 $jobs = @{}
 $offers = @{}
+# Private registrations, independent of jobs: even a read-only session writes a journal.
+$journals = @{}
+$writers = @{}
 $session = $null
 $incomplete = $false
 try {
@@ -43,6 +46,30 @@ try {
                     $message = $line | ConvertFrom-Json
                     if ($message.event -ceq 'end' -and $session -ceq [string]$message.session) {
                         if ($null -eq $endingSince) { $endingSince = [DateTime]::UtcNow }
+                        $inputLine = $reader.ReadLineAsync()
+                        continue
+                    }
+                    if ($null -eq $endingSince -and $session -ceq [string]$message.session -and
+                        $message.event -ceq 'journal' -and
+                        [string]$message.request -cmatch '^[0-9a-f-]{36}$') {
+                        if ($message.path -isnot [string] -or -not [IO.Path]::IsPathRooted($message.path) -or
+                            [IO.Path]::GetFileName($message.path) -cnotmatch '^amira-uia-[0-9a-f-]{36}\.json$' -or
+                            [int]$message.pid -le 0 -or [long]$message.started -le 0) { throw 'Invalid journal writer.' }
+                        $key = '{0}:{1}' -f $message.pid, $message.started
+                        if (-not $writers.ContainsKey($key)) {
+                            $writer = [Diagnostics.Process]::GetProcessById([int]$message.pid)
+                            try {
+                                # Cache the exact handle before acknowledging ANY journal write.
+                                if ($writer.HasExited -or
+                                    [OwnedUia.LaunchGuard]::CreationTime($writer.Handle).ToString() -cne [string]$message.started) {
+                                    throw 'Journal writer identity changed.'
+                                }
+                                $writers[$key] = $writer
+                            } catch { $writer.Dispose(); throw }
+                        }
+                        $journals[$message.path] = $true
+                        $message.event = 'journal-recorded'
+                        [Console]::WriteLine(($message | ConvertTo-Json -Compress))
                         $inputLine = $reader.ReadLineAsync()
                         continue
                     }
@@ -117,6 +144,12 @@ try {
     $reported = $false
     while ($true) {
         $failed = $false
+        foreach ($writer in @($writers.Values)) {
+            try {
+                if (-not $writer.HasExited) { $writer.Kill() }
+                if (-not $writer.WaitForExit(1000)) { $failed = $true }
+            } catch { $failed = $true }
+        }
         foreach ($job in @($jobs.Values)) {
             try { $job.RetireProducers() }
             catch { $failed = $true }
@@ -135,8 +168,19 @@ try {
             if (-not $remaining) { break }
             Start-Sleep -Milliseconds 25
         } while ($clock.ElapsedMilliseconds -lt 2000)
+        if (-not $failed -and -not $remaining -and -not $incomplete) {
+            try {
+                # Last writers are confirmed exited and ALL retained jobs are empty.
+                # Literal paths came only from this session's private pipe, never a scan
+                # or a path/identity read from the journal. Missing files are already clean.
+                foreach ($path in @($journals.Keys)) {
+                    [IO.File]::Delete($path)
+                    [IO.File]::Delete($path + '.tmp')
+                }
+            } catch { $failed = $true }
+        }
         if (-not $failed -and -not $remaining) { break }
-        # Never abandon the last duplicates on an unconfirmed producer/drain.
+        # Never abandon the last duplicates on an unconfirmed producer/drain or deletion.
         # The client may time out, but keeps this private owner alive to retry.
         if (-not $reported) {
             [Console]::Error.WriteLine('UIA custody cleanup incomplete; retained authority is retrying.')
@@ -145,6 +189,7 @@ try {
         Start-Sleep -Milliseconds 250
     }
     foreach ($job in @($jobs.Values)) { $job.Dispose() }
+    foreach ($writer in @($writers.Values)) { $writer.Dispose() }
     if ($null -ne $sentinel) { $sentinel.Dispose() }
     if ($null -ne $session) {
         [Console]::WriteLine((@{ event = 'custody-drained'; session = $session; incomplete = $incomplete } | ConvertTo-Json -Compress))

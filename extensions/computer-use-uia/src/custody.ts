@@ -35,7 +35,7 @@ export class SessionCustody {
     string,
     {
       identity: Record<string, unknown>
-      reply: "root-recorded" | "stopped"
+      reply: "root-recorded" | "stopped" | "journal-recorded"
       resolve(reply: Record<string, unknown>): void
       reject(error: Error): void
       timer?: ReturnType<typeof setTimeout>
@@ -126,7 +126,9 @@ export class SessionCustody {
                       this.retained.set(pending.offer.job, pending.offer)
                       pending.resolve()
                     } else pending.reject(new Error("UIA custody transfer was rejected; launch refused"))
-                  } else if (["root-recorded", "stopped", "command-error"].includes(reply.event)) {
+                  } else if (
+                    ["root-recorded", "stopped", "journal-recorded", "command-error"].includes(reply.event)
+                  ) {
                     const pending = this.commands.get(reply.request)
                     if (
                       !pending ||
@@ -225,6 +227,11 @@ export class SessionCustody {
     return retained.promise
   }
 
+  /** Bind the exact journal and writer over the private pipe before its first write. */
+  async rememberJournal(path: string, pid: number, started: string): Promise<void> {
+    await this.command("journal", { path, pid, started })
+  }
+
   /** Record the verified suspended root before the watchdog is allowed to resume it. */
   async rememberRoot(job: string, pid: number, started: string): Promise<void> {
     const offer = this.retained.get(job)
@@ -246,24 +253,33 @@ export class SessionCustody {
     return result.incomplete as boolean
   }
 
-  private command(event: "root" | "stop", fields: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private command(
+    event: "root" | "stop" | "journal",
+    fields: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
     if (this.state !== "running" || this.failure)
       return Promise.reject(new Error("UIA custody owner is unavailable"))
     const request = crypto.randomUUID()
     const identity = { ...fields, request, session: this.session }
     const pending = Promise.withResolvers<Record<string, unknown>>()
     // Stop completion is gated by the client's bounded wait, retaining late acknowledgements
-    // so a slow cleanup can recover. Root timeout must never allow the root to resume.
+    // so a slow cleanup can recover. Startup timeouts must never allow writes/launches.
     const timer =
-      event === "root"
+      event !== "stop"
         ? setTimeout(() => {
             this.commands.delete(request)
-            pending.reject(new Error("UIA custody root acknowledgement timed out; launch refused"))
+            pending.reject(
+              new Error(
+                event === "root"
+                  ? "UIA custody root acknowledgement timed out; launch refused"
+                  : "UIA custody journal acknowledgement timed out; startup refused",
+              ),
+            )
           }, this.timeoutMs)
         : undefined
     this.commands.set(request, {
       identity,
-      reply: event === "root" ? "root-recorded" : "stopped",
+      reply: event === "stop" ? "stopped" : event === "root" ? "root-recorded" : "journal-recorded",
       ...pending,
       timer,
     })

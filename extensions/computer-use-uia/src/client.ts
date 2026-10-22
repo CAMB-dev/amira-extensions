@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto"
-import { rmSync } from "node:fs"
+import { join } from "node:path"
 import type { ExtensionAPI, PipeEvent, PipeProcess } from "@amira/api"
 import { type CustodyOffer, SessionCustody } from "./custody.ts"
 import {
@@ -108,7 +108,10 @@ export class UiaClient {
     private readonly onStopped: () => void = () => {},
     private readonly waitClock: WaitClock = { now: () => performance.now(), sleep: waitDelay },
   ) {
-    this.statePath = `${process.env.TEMP ?? process.env.TMP ?? host.cwd}/amira-uia-${crypto.randomUUID()}.json`
+    this.statePath = join(
+      process.env.TEMP ?? process.env.TMP ?? host.cwd,
+      `amira-uia-${crypto.randomUUID()}.json`,
+    )
   }
 
   /** Serialize even direct callers: snapshots, focus and cleanup must not race. */
@@ -438,16 +441,12 @@ export class UiaClient {
   }
 
   private rotateJournal(): void {
-    // Called only after the previous watchdog exited. Independent custody still
-    // retains the original kernel jobs; this journal is never recovery authority.
-    for (const path of [this.statePath, `${this.statePath}.tmp`]) {
-      try {
-        rmSync(path, { force: true })
-      } catch {
-        this.host.reportError("computer-use-uia: could not remove retired launch journal")
-      }
-    }
-    this.statePath = `${process.env.TEMP ?? process.env.TMP ?? this.host.cwd}/amira-uia-${crypto.randomUUID()}.json`
+    // Custody retains earlier paths and writers until complete session cleanup.
+    // Rotation must not discard a journal while older jobs still need cleanup.
+    this.statePath = join(
+      process.env.TEMP ?? process.env.TMP ?? this.host.cwd,
+      `amira-uia-${crypto.randomUUID()}.json`,
+    )
     this.journalKey = randomBytes(32)
     this.journalNonce = crypto.randomUUID()
   }
@@ -1005,6 +1004,25 @@ export class UiaClient {
     }
   }
 
+  private async acceptWriter(): Promise<void> {
+    const pipe = this.pipe
+    const watchdog = this.watchdog
+    const custody = this.custody
+    const identity = this.helperIdentity
+    const generation = this.generation
+    if (!pipe || !watchdog || !custody || !identity) return
+    try {
+      // No writer_ack (and thus no journal write) until the independent owner
+      // has pinned this exact writer, even when the session never launches an app.
+      await custody.rememberJournal(this.statePath, identity.pid, identity.started)
+      if (this.pipe !== pipe || this.watchdog !== watchdog || this.generation !== generation || this.stopping)
+        return
+      watchdog.write(`${JSON.stringify({ ...identity, event: "writer", generation })}\n`)
+    } catch {
+      if (this.pipe === pipe) this.breakPipe("UIA journal custody failed; helper startup refused")
+    }
+  }
+
   private async acceptCustody(
     watchdog: PipeProcess,
     pid: number | undefined,
@@ -1187,9 +1205,7 @@ export class UiaClient {
             return
           }
           this.helperIdentity = { event: "owner", pid: response.pid, started: response.started }
-          this.watchdog?.write(
-            `${JSON.stringify({ event: "writer", pid: response.pid, started: response.started, generation: this.generation })}\n`,
-          )
+          void this.acceptWriter()
           this.overlay?.write(`${JSON.stringify(this.helperIdentity)}\n`)
           continue
         }

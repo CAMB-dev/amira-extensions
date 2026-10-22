@@ -325,10 +325,9 @@ try {
     $sentinelProcess.Dispose()
     # Unnamed handles originate here, not from files. Closing has NO implicit kill.
     foreach ($job in @($jobs.Values)) { $job.Dispose() }
-    if ($null -ne $endingSince -and -not $cleanupIncomplete) {
-        Remove-Item -LiteralPath $StatePath -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath ($StatePath + '.tmp') -Force -ErrorAction SilentlyContinue
-    } elseif ($cleanupIncomplete) {
+    # Custody can terminate this watchdog before finally runs. Only that independent
+    # owner removes registered journals, after every writer exits and all jobs drain.
+    if ($cleanupIncomplete) {
         [Console]::Error.WriteLine('UIA cleanup incomplete; launch journal retained.')
     }
 }
