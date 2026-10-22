@@ -19,11 +19,21 @@ for (const key of Object.keys(process.env)) {
   if (
     key.startsWith("AMIRA_LIVE_") ||
     /(?:API_KEY|TOKEN|PROXY|CREDENTIALS|SSH_AUTH_SOCK|SSH_AGENT_PID)$/i.test(key) ||
-    key.startsWith("GIT_CONFIG_")
+    key.startsWith("GIT_")
   )
     delete process.env[key]
 }
-for (const key of ["HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"]) process.env[key] = root
+for (const key of [
+  "HOME",
+  "USERPROFILE",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "XDG_CONFIG_HOME",
+  "XDG_CACHE_HOME",
+  "XDG_DATA_HOME",
+  "XDG_STATE_HOME",
+])
+  process.env[key] = root
 process.env.AMIRA_HOME = path.join(root, "amira-home")
 mkdirSync(process.env.AMIRA_HOME, { recursive: true })
 const gitConfig = path.join(root, "empty-git-config")

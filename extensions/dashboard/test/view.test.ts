@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import type { UiEvent, UiNode, UiTreeItem, ViewLine } from "@amira/api"
 import { agentsOf } from "../src/source.ts"
 import { dashboardView, performAction } from "../src/view.ts"
+import { projectFixture } from "./project-fixture.ts"
 import { viewFixture } from "./view-fixture.ts"
 
 type Fixture = ReturnType<typeof viewFixture>
@@ -66,6 +67,17 @@ function freeze(value: unknown): void {
 }
 
 describe("public semantic rendering (not terminal raster snapshots)", () => {
+  test("empty project source shows load warnings instead of delegation guidance", () => {
+    const f = viewFixture()
+    const snapshot = f.data.source.snapshot()
+    snapshot.phases = []
+    snapshot.note = "Read-only project source. Use /project status to inspect saved history."
+    snapshot.warning = "Project history unavailable: corrupt evidence. Use /project status."
+    const visible = JSON.stringify(render(f))
+    expect(visible).toContain("corrupt evidence")
+    expect(visible).toContain("/project status")
+    expect(visible).not.toContain("ask Amira to delegate")
+  })
   // Semantic snapshots complement the real host's wrapping/clipping tests.
   for (const viewport of [
     { columns: 180, rows: 52 },
@@ -635,4 +647,191 @@ test("supplied stats retain time attribution, per-tool outcomes, failures and ow
   expect(stats).toContain("Payment validation: $0.125")
   expect(stats).toContain("Receipt templates: cost unknown")
   expect(stats).toContain("Refund audit: $0.040")
+})
+
+describe("read-only project stage cards", () => {
+  for (const costText of ["$1.20 reported", "not reported yet", "$0.40 reported · incomplete/unpriced"]) {
+    test(`stage metadata appears once per card and summary, without own-cost substitution: ${costText}`, () => {
+      const fixture = projectFixture()
+      const stage = agentsOf(fixture.snapshot)[1]!
+      stage.card = {
+        kind: "stage",
+        label: "Implement",
+        outcome: "budget stopped",
+        detail: "2 batches · 3 tasks · Read-only: use /project",
+        costText,
+      }
+      stage.task = "Implement failed: duplicate legacy task with stale cost $9.999"
+      fixture.details[stage.id]!.summary = [{ kind: "text", text: stage.task }]
+      fixture.data.selected = stage.id
+      fixture.state.selected.timeline = `agent:${stage.id}`
+      const before = structuredClone(fixture.snapshot)
+      for (const width of [120, 80]) {
+        const rendered = render(fixture, width)
+        const tree = nodes(rendered).find((node) => node.type === "tree")
+        if (tree?.type !== "tree") throw new Error("Missing stage timeline")
+        const item = tree.items.find((item) => item.key === `agent:${stage.id}`)!
+        const header = item.row!.map((part) => part.text).join("")
+        expect(header).toContain(`Implement · budget stopped · ${costText}`)
+        expect(header).not.toContain("failed")
+        const card = JSON.stringify(item)
+        expect(card.split("2 batches").length - 1).toBe(1)
+        expect(card.split("Implement").length - 1).toBe(1)
+        expect(card).not.toContain("duplicate legacy task")
+        const body = nodes(rendered).find((node) => node.type === "text" && node.id === "summary")!
+        const summary = JSON.stringify(body)
+        expect(summary).toContain(costText)
+        expect(summary.split("budget stopped").length - 1).toBe(1)
+        expect(summary.split("2 batches").length - 1).toBe(1)
+        expect(summary).not.toMatch(/unknown|--:--:--|Runtime|duplicate legacy task|Cost /)
+      }
+      // The formatted aggregate never becomes own usage, including in the header total or Stats.
+      expect(stage.cost).toBeUndefined()
+      for (const agent of agentsOf(fixture.snapshot)) agent.cost = 0
+      fixture.details[stage.id]!.stats = fixture.stats
+      fixture.state.activeTabs.detail = "stats"
+      expect(words(fixture, "stats").join("\n")).toContain(`Implement reported rollup: ${costText}`)
+      expect(JSON.stringify(render(fixture))).toContain("cost: $0.000")
+      delete stage.cost
+      expect(words(fixture, "stats").join("\n")).not.toContain("Implement: cost unknown")
+      expect(before.phases[0]!.groups[0]!.agents[1]!.card).toEqual(stage.card)
+    })
+  }
+
+  for (const width of [180, 80]) {
+    test(`${width} columns: stage labels, content tabs and unknown costs without agent controls`, () => {
+      const fixture = projectFixture()
+      const before = structuredClone(fixture.snapshot)
+      for (const page of [false, true]) {
+        if (page) send(fixture, { type: "activate", id: "timeline", key: "agent:checkout.i2.spec.r3" })
+        const tree = render(fixture, width)
+        const rendered = JSON.stringify(tree)
+        expect(rendered).toContain("Spec")
+        expect(rendered).toContain("Read-only stage")
+        expect(rendered).toContain("cost: unknown")
+        expect(rendered).toContain("Budget stop")
+        for (const misleading of [
+          "Stop agent",
+          "Open diff",
+          "o diff",
+          "pause/resume",
+          "What this agent",
+          '"Task"',
+          '"Agent"',
+          "legacy spec row",
+        ])
+          expect(rendered).not.toContain(misleading)
+        if (!page) expect(rendered).toContain("3 stages")
+        else expect(dashboardView.title(fixture.data, fixture.context(width))).toContain("Spec")
+        const tabs = nodes(tree).find((node) => node.type === "tabs")
+        expect(tabs?.type === "tabs" && tabs.tabs.map((tab) => tab.key)).toEqual([
+          "summary",
+          "logs",
+          "documents",
+        ])
+        send(fixture, { type: "tab", id: "detail", key: "documents" })
+        expect(JSON.stringify(render(fixture, width))).toContain("ship-plan.md")
+        send(fixture, { type: "tab", id: "detail", key: "summary" })
+      }
+      expect(fixture.snapshot).toEqual(before)
+      expect(fixture.act).not.toHaveBeenCalled()
+    })
+  }
+
+  test("stage shortcuts and retained action rows never prompt, confirm or dispatch fixed actions", async () => {
+    const fixture = projectFixture()
+    const stage = agentsOf(fixture.snapshot)[0]!
+    // Even an adapter accidentally advertising old capabilities cannot make a stage actionable.
+    stage.actions = ["pause", "resume", "stop", "request-changes"]
+    for (const action of [
+      "pause",
+      "resume",
+      "stop",
+      "request-changes",
+      "open-diff",
+      "open-trace",
+      "open-transcript",
+      "ship",
+    ])
+      await performAction(fixture.data, fixture.control, action, stage.id)
+    for (const page of [false, true]) {
+      if (page) send(fixture, { type: "activate", id: "timeline", key: `agent:${stage.id}` })
+      for (const shortcut of ["o", "p", "r", "x", "a"]) key(fixture, shortcut)
+      send(fixture, { type: "activate", id: "actions", key: JSON.stringify([stage.id, "stop"]) })
+    }
+    expect(fixture.data.flash).toContain("read-only")
+    expect(fixture.act).not.toHaveBeenCalled()
+    expect(fixture.control.confirm).not.toHaveBeenCalled()
+    expect(fixture.control.prompt).not.toHaveBeenCalled()
+  })
+
+  test("rendering project content uses cached synchronous reads, without session I/O or actions", () => {
+    const fixture = projectFixture()
+    let ioAttempts = 0
+    const forbidden = () => {
+      ioAttempts++
+      throw new Error("Rendering must not perform I/O")
+    }
+    fixture.data.session = new Proxy({}, { get: forbidden }) as NonNullable<typeof fixture.data.session>
+    const source = fixture.data.source
+    // All host-like operations, including accidental subscription, are forbidden during render.
+    source.subscribe = forbidden
+    source.act = forbidden
+    for (const agent of agentsOf(fixture.snapshot)) agent.sessionId = "owned-not-navigable"
+    freeze(fixture.snapshot)
+    freeze(fixture.details)
+    freeze(fixture.data)
+    for (const width of [180, 80]) {
+      for (const page of [undefined, "checkout.i2.spec.r3"]) {
+        const id = page ? JSON.stringify(["agent-page", page, "detail"]) : "detail"
+        for (const tab of ["summary", "logs", "documents"]) {
+          fixture.state.activeTabs[id] = tab
+          const context = {
+            ...fixture.context(width),
+            ...(page ? { page: { depth: 1, data: page } } : {}),
+          }
+          const before = structuredClone(fixture.state)
+          expect(dashboardView.ui!(fixture.data, context)).toEqual(dashboardView.ui!(fixture.data, context))
+          expect(dashboardView.title(fixture.data, context)).toBeTruthy()
+          expect(fixture.state).toEqual(before)
+        }
+      }
+    }
+    expect(fixture.control.setState).not.toHaveBeenCalled()
+    expect(fixture.control.requestRender).not.toHaveBeenCalled()
+    expect(ioAttempts).toBe(0)
+  })
+
+  test("stage stats and header keep unknown own costs distinct from cached iteration rollups", () => {
+    const fixture = projectFixture()
+    const first = agentsOf(fixture.snapshot)[0]!
+    fixture.details[first.id]!.stats = fixture.stats
+    fixture.state.activeTabs.detail = "stats"
+    const unknown = JSON.stringify(render(fixture))
+    expect(unknown).toContain("cost: unknown")
+    expect(unknown).toContain("Cost per row")
+    expect(unknown).toContain("Implement: cost unknown")
+    expect(unknown).toContain("no recursive totals")
+    for (const agent of agentsOf(fixture.snapshot).slice(1)) agent.cost = 0
+    fixture.state.activeTabs.detail = "summary"
+    const known = JSON.stringify(render(fixture))
+    expect(known).toContain("cost: $0.125")
+    expect(known).toContain("Iteration known subtotal: $0.125; incomplete pricing.")
+    expect(known).not.toContain("cost: $0.250")
+  })
+
+  test("mixed completed phases count stages separately while old rows retain fixed action chrome", () => {
+    const fixture = viewFixture()
+    const first = agentsOf(fixture.snapshot)[0]!
+    first.card = { kind: "stage", label: "Implement" }
+    first.status = "done"
+    agentsOf(fixture.snapshot)[1]!.status = "done"
+    fixture.state.selected.timeline = "agent:receipts"
+    const rendered = JSON.stringify(render(fixture))
+    expect(rendered).toContain("1 stage / 1 agent")
+    expect(rendered).toContain("Implement")
+    expect(rendered).toContain("Open diff")
+    send(fixture, { type: "tab", id: "detail", key: "actions" })
+    expect(JSON.stringify(render(fixture))).toContain("Stop agent")
+  })
 })

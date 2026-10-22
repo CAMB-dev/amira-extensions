@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import type {
   CommandContext,
+  CompleteResult,
   ConversationRuntime,
   ConversationSpec,
   ExtensionAPI,
@@ -122,14 +123,17 @@ async function fixture(apiVersion: string | undefined = "0.1.53") {
   })
   const stop = mock(async () => {})
   let modelText = JSON.stringify(proposals)
-  const complete = mock(async (_request: unknown) => ({
-    text: modelText,
-    message: {
-      role: "assistant" as const,
-      model: { provider: "mock", model: "fixture" },
-      content: [{ type: "text" as const, text: modelText }],
-    },
-  }))
+  const complete = mock(
+    async (_request: unknown): Promise<CompleteResult> => ({
+      toolsKept: false,
+      text: modelText,
+      message: {
+        role: "assistant" as const,
+        model: { provider: "mock", model: "fixture" },
+        content: [{ type: "text" as const, text: modelText }],
+      },
+    }),
+  )
   const openOrCreate = mock(async (spec: ConversationSpec, runtime: ConversationRuntime) => {
     specs.push(spec)
     runtimes.push(runtime)

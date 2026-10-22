@@ -13,8 +13,9 @@ import type {
 } from "@amira/api"
 import { summarizeTrace } from "@amira/api"
 import { chrome, repeatCells } from "./chrome.ts"
+import { formatCost } from "./format.ts"
 import { clock, phaseInfo, summary, timeline } from "./layout.ts"
-import { agentsOf, type DashboardAgent, type DashboardSource, type DashboardTab } from "./source.ts"
+import { agentsOf, type DashboardAgent, type DashboardSource, type DashboardTab, rowLabel } from "./source.ts"
 import { displayState } from "./status.ts"
 import { ownCost, traceLogLines } from "./trace.ts"
 
@@ -23,7 +24,7 @@ const TABS = ["summary", "diff", "logs", "actions", "stats"]
 const part = (text: string, kind: ViewSegment["kind"] = "text"): ViewSegment => ({ text, kind })
 const text = (lines: ViewLine[], id?: string): UiNode => ({ type: "text", id, lines })
 const line = (value: string): ViewLine => ({ kind: "text", text: value })
-const money = (cost?: number) => (cost === undefined ? "cost unknown" : `$${cost.toFixed(3)}`)
+const money = (cost?: number) => (cost === undefined ? "cost unknown" : formatCost(cost))
 const seconds = (ms: number) => `${(ms / 1000).toFixed(2)}s`
 const agentKey = (id: string) => `agent:${id}`
 
@@ -82,9 +83,18 @@ function statsPanel(
         }))
       : [line("No recorded failures.")]),
     line(""),
-    line(c`Cost per agent · own usage only, no recursive totals`),
+    line(
+      agents.some((agent) => agent.card)
+        ? c`Cost per row · own usage only, no recursive totals`
+        : c`Cost per agent · own usage only, no recursive totals`,
+    ),
     { kind: "muted", text: c`ⓘ Missing reported costs are unknown, not zero.` },
-    ...agents.map((item) => line(`${item.name}: ${money(item.cost)}`)),
+    ...agents
+      .filter((item) => item.card?.costText === undefined || item.cost !== undefined)
+      .map((item) => line(`${rowLabel(item)}: ${money(item.cost)}`)),
+    ...agents
+      .filter((item) => item.card?.costText !== undefined)
+      .map((item) => line(`${rowLabel(item)} reported rollup: ${item.card!.costText}`)),
     ...(note ? [{ kind: "muted" as const, text: c`ⓘ ${note}` }] : []),
   ]
   return text(lines, "stats")
@@ -95,11 +105,18 @@ function details(data: DashboardViewData, ctx: UiContext, agent?: DashboardAgent
   if (!agent && !agentsOf(data.source.snapshot()).length) return text([])
   if (!agent)
     return text(
-      [line("Select an agent in the timeline, then press Enter to open its page.")],
+      [
+        line(
+          agentsOf(data.source.snapshot()).some((agent) => agent.card)
+            ? "Select a row in the timeline, then press Enter to open its page."
+            : "Select an agent in the timeline, then press Enter to open its page.",
+        ),
+      ],
       "selection-hint",
     )
   const id = typeof ctx.page?.data === "string" ? pageWidget(ctx.page.data, "detail") : "detail"
   const detail = data.source.details(agent.id, ctx.state.activeTabs[id] === "logs" ? ctx : undefined)
+  const stage = agent.card?.kind === "stage"
   const diff: ViewLine[] = agent.files.length
     ? agent.files.flatMap((file) => [
         { kind: "accent" as const, text: file.path },
@@ -119,22 +136,24 @@ function details(data: DashboardViewData, ctx: UiContext, agent?: DashboardAgent
         ? "resume"
         : "pause"
       : data.pendingAction
-  const labels = [
-    ["open-diff", "Open diff", "o"],
-    ...(agent.sessionId && readable(data.session, agent.sessionId)
-      ? [
-          ["open-transcript", "Open transcript", ""],
-          ["open-trace", "Open trace", ""],
-        ]
-      : []),
-    [
-      displayState(agent) === "paused" ? "resume" : "pause",
-      displayState(agent) === "paused" ? "Resume" : "Pause",
-      "p",
-    ],
-    ["request-changes", "Request changes", "r"],
-    ["stop", "Stop agent", "x"],
-  ].filter(([key]) => !requested || requested === key)
+  const labels = stage
+    ? []
+    : [
+        ["open-diff", "Open diff", "o"],
+        ...(agent.sessionId && readable(data.session, agent.sessionId)
+          ? [
+              ["open-transcript", "Open transcript", ""],
+              ["open-trace", "Open trace", ""],
+            ]
+          : []),
+        [
+          displayState(agent) === "paused" ? "resume" : "pause",
+          displayState(agent) === "paused" ? "Resume" : "Pause",
+          "p",
+        ],
+        ["request-changes", "Request changes", "r"],
+        ["stop", "Stop agent", "x"],
+      ].filter(([key]) => !requested || requested === key)
   const tabs = [
     {
       key: "summary",
@@ -180,7 +199,7 @@ function details(data: DashboardViewData, ctx: UiContext, agent?: DashboardAgent
         })),
       },
     },
-  ]
+  ].filter(({ key }) => !stage || (key !== "diff" && key !== "actions"))
   if (detail?.stats)
     tabs.push({
       key: "stats",
@@ -218,21 +237,21 @@ function details(data: DashboardViewData, ctx: UiContext, agent?: DashboardAgent
           type: "row",
           children: [
             {
-              size: ctx.width < 110 ? "fill" : 72,
+              size: ctx.width < 110 || stage ? "fill" : 72,
               node: {
                 type: "tabs",
                 id: "detail",
                 tabs: tabs.map((tab) => ({ ...tab, body: { type: "spacer" } })),
               },
             },
-            ...(ctx.width < 110
+            ...(ctx.width < 110 || stage
               ? []
               : [
                   {
                     node: {
                       type: "bar" as const,
                       left: [],
-                      right: [part(c`${agent.name}  ${agent.task}   ✕ `, "muted")],
+                      right: [part(c`${rowLabel(agent)}  ${agent.task}   ✕ `, "muted")],
                     },
                   },
                 ]),
@@ -461,6 +480,11 @@ export async function performAction(
     view.requestRender()
     return
   }
+  if (agent.card?.kind === "stage") {
+    data.flash = "This stage is read-only. Use the source's commands to continue."
+    view.requestRender()
+    return
+  }
   if (action === "open-diff") {
     setTab(data, view, "diff")
     view.focus("detail")
@@ -549,12 +573,19 @@ function onEvent(event: UiEvent, data: DashboardViewData, host: UiControl) {
   }
   if (event.type !== "key") return
   const agent = selectedAgent(data, target.agentId ? agentKey(target.agentId) : undefined)
+  const stage = agent?.card?.kind === "stage"
+  if (stage && ["o", "p", "r", "x", "a"].includes(event.key)) {
+    data.flash = "This stage is read-only. Use the source's commands to continue."
+    view.requestRender()
+    return
+  }
   if (event.key === "e") {
     // Remove the explicit key list: the host's expanded="all" mode includes future rows.
     view.setState({ expanded: {} })
   } else if (event.key === "?") {
-    data.flash =
-      "e expand all / o diff / p pause/resume / r request changes / a actions / x stop / 1-4 tabs / 5 stats / Tab widgets / F6 input"
+    data.flash = stage
+      ? "e expand all / 1 summary / 2 logs / arrows tabs / Tab widgets / F6 input / Read-only stage"
+      : "e expand all / o diff / p pause/resume / r request changes / a actions / x stop / 1-4 tabs / 5 stats / Tab widgets / F6 input"
   } else if (event.key === "a") {
     data.pendingAction = undefined
     setTab(data, view, "actions")
@@ -562,7 +593,9 @@ function onEvent(event: UiEvent, data: DashboardViewData, host: UiControl) {
   } else if (["1", "2", "3", "4", "5", "left", "right"].includes(event.key)) {
     const detail = data.source.details(agent?.id ?? "")
     const tabs = [
-      ...(detail?.stats ? TABS : TABS.slice(0, 4)),
+      ...(detail?.stats ? TABS : TABS.slice(0, 4)).filter(
+        (tab) => !stage || (tab !== "diff" && tab !== "actions"),
+      ),
       ...sourceTabs(detail?.tabs).map((tab) => tab.key),
     ]
     let focusedTab = target.id
@@ -583,7 +616,7 @@ function onEvent(event: UiEvent, data: DashboardViewData, host: UiControl) {
         : event.key === "right"
           ? tabs[(index + 1) % tabs.length]
           : // Let the host reconcile missing tabs; event selection may lag its retained state.
-            TABS[Number(event.key) - 1]
+            (stage ? tabs : TABS)[Number(event.key) - 1]
     if (tab) setTab(data, view, tab)
   } else {
     const actions: Record<string, string> = {
@@ -625,8 +658,13 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
       focused: "timeline",
     })
   },
-  title: (data, ctx) =>
-    ctx.page ? chrome(ctx)`Dashboard · Agent` : chrome(ctx)`Dashboard · ${data.source.label}`,
+  title: (data, ctx) => {
+    const agent =
+      typeof ctx.page?.data === "string" ? selectedAgent(data, agentKey(ctx.page.data)) : undefined
+    return ctx.page
+      ? chrome(ctx)`Dashboard · ${agent?.card ? rowLabel(agent) : "Agent"}`
+      : chrome(ctx)`Dashboard · ${data.source.label}`
+  },
   keys: [
     { key: "e", label: "" },
     { key: "o", label: "" },
@@ -664,7 +702,8 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
         item.groups.some((group) => group.agents.some((item) => displayState(item) === "working")),
       ) ?? snapshot.phases[0]
     const narrow = ctx.width < 110
-    const totals = c`phase: ${phase?.name ?? "Agents"}  │  running: ${agents.filter((item) => displayState(item) === "working").length}/${agents.length}  │  cost: ${cost === undefined ? "unknown" : `$${cost.toFixed(4)}`}`
+    const stage = agent?.card?.kind === "stage"
+    const totals = c`phase: ${phase?.name ?? "Agents"}  │  running: ${agents.filter((item) => displayState(item) === "working").length}/${agents.length}  │  cost: ${cost === undefined ? "unknown" : formatCost(cost)}`
     const top: UiNode = {
       type: "bar",
       left: [
@@ -697,18 +736,27 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
           ? [
               {
                 size: 1,
-                node: narrow
-                  ? text([{ kind: "muted" as const, text: c` 1–4 tabs · o diff · a actions · ? shortcuts` }])
-                  : {
-                      type: "bar" as const,
-                      left: [
-                        part(
-                          " o open diff   p pause/resume   r request changes   a actions   x stop",
-                          "muted",
-                        ),
-                      ],
-                      right: [part(c`1–4 tabs · 5 stats (when available) `, "muted")],
-                    },
+                node: stage
+                  ? text([
+                      {
+                        kind: "muted" as const,
+                        text: c` 1 summary · 2 logs · arrows tabs · Read-only stage`,
+                      },
+                    ])
+                  : narrow
+                    ? text([
+                        { kind: "muted" as const, text: c` 1–4 tabs · o diff · a actions · ? shortcuts` },
+                      ])
+                    : {
+                        type: "bar" as const,
+                        left: [
+                          part(
+                            " o open diff   p pause/resume   r request changes   a actions   x stop",
+                            "muted",
+                          ),
+                        ],
+                        right: [part(c`1–4 tabs · 5 stats (when available) `, "muted")],
+                      },
               },
             ]
           : []),

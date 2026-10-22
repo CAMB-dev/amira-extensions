@@ -172,6 +172,7 @@ The exported contract is in [`src/source.ts`](src/source.ts) (also the package's
 
 ```ts
 interface DashboardSources {
+  capabilities?: { cards?: true }
   register(source: DashboardSource): () => void
 }
 
@@ -189,23 +190,52 @@ interface DashboardSource {
 }
 ```
 
+### Optional stage cards (0.5.0)
+
+Capability-detect cards without importing another provider. Older dashboard services have no `capabilities`; keep the independent panel/commands available and either omit registration or use an old-compatible read-only source with command guidance. Never reinterpret a fixed action such as `resume` as a stage transition.
+
+```ts
+if (service?.capabilities?.cards) {
+  // Each iteration can be a phase; stage IDs should remain stable and source-wide unique.
+  const stage = {
+    id: "checkout.i2.ship.r1",
+    name: "Ship",
+    card: {
+      kind: "stage" as const,
+      label: "Ship",
+      outcome: "awaiting review",
+      detail: "2 batches · Read-only: use /project to continue.",
+      costText: "$1.20 reported",
+    },
+    task: "Awaiting approval. Use /project to continue.",
+    status: "queued" as const,
+    files: [],
+    actions: [],
+  }
+  // Include stage in source.snapshot().phases[].groups[].agents, then register(source).
+}
+```
+
+The source contract stays structural and API-only. `snapshot()`, `details()` and custom-tab `render()` must only read coherent caches: no filesystem reads/repair, shell probes, model/tool calls, actions or subscription setup during rendering. Rendered document tabs are content, not a second action-dispatch mechanism. Archived, skipped, blocked and unknown-cost stages should retain their source-authored status/evidence and command guidance; dashboard does not infer progression or grant mutation authority.
+
 ### Data contract
 
-- `DashboardSnapshot`: `{ workspace, phases, note?, warning? }`. Usage caveats (`note`) stay in Stats; an empty source uses its note as an explanation. Operational warnings (`warning`) appear in Summary’s Notes, including at narrow widths.
-- A phase: `{ id, name, groups }`. A group: `{ id, name, agents }`. Both may report `ref`, `status`, `startedAt`, `durationMs`, `description`, and `stepCount`. The timeline flattens a phase’s groups into one card box. Missing phase metadata falls back to reported group/agent data; unknown start times remain `--:--:--`, and step counts are never inferred from tool calls.
-- An agent: `{ id, name, task, status, files, actions, note?, paused?, sessionId?, startedAt?, durationMs?, cost?, language?, progress? }`.
+- `DashboardSnapshot`: `{ workspace, phases, note?, warning? }`. Usage caveats (`note`) stay in Stats; an empty source uses its note as an explanation. Operational warnings (`warning`) appear in Summary’s Notes, including at narrow widths, and remain visible when the source has no rows. Supply an empty-source `note` with source-specific recovery guidance instead of the default agent-delegation hint.
+- A phase: `{ id, name, groups }`. A group: `{ id, name, agents }`. Both may report `ref`, `status`, `startedAt`, `durationMs`, `description`, and `stepCount`. The timeline flattens a phase’s groups into one card box. Missing phase metadata falls back to reported group/agent data; worker phases retain `--:--:--` for unknown start times, while stage-only phases omit unknown timing/progress placeholders and internal references. Step counts are never inferred from tool calls.
+- An agent: `{ id, name, task, status, files, actions, card?, note?, paused?, sessionId?, startedAt?, durationMs?, cost?, language?, progress? }`.
+- `card?: { kind: "stage"; label: string; outcome?: string; detail?: string; costText?: string }` opts into a **read-only stage card**. Its first line shows the label, outcome (or lifecycle status) and reported cost; the next line shows the remaining detail once. Supply `detail` without repeating the stage name, status/outcome or cost; without it, `task` remains the description. `costText` is already host-style formatted display text, such as `$1.20 reported`, `not reported yet` or `$0.40 reported · incomplete/unpriced`; it appears consistently in the card and Summary, never in own-cost totals. Stage Summary uses the full available width instead of narrow worker metadata columns, preserving additional source-authored approval/history evidence without repeating the heading. Phase counts distinguish stages from agents, and stage pages omit Diff/Actions, agent controls and child-session navigation. Summary, Logs, optional Stats and source content tabs remain available. Stage shortcuts are **1 Summary / 2 Logs**, then optional Stats and source tabs in order; arrows traverse all visible tabs. Agent shortcuts and fixed actions are unchanged. Stage rows never dispatch `act`, even if `actions` is accidentally nonempty; use `actions: []` and guide the reader to the source's commands in notes or warnings. There is no custom-action contract.
 - `sessionId?: string` is the actual child session ID, not the dashboard agent ID. When supplied, **Actions → Open transcript / Open trace** opens a host-owned page using `SessionControl.subagentMessages(sessionId)` or `SessionControl.trace(sessionId)`. Transcript shows recorded messages; trace opens the same **Stats** view used by replay, plus recorded logs. These reads remain host-authorized; missing or unrelated sessions show unavailable data. Esc returns to the agent page with its state intact. Sources without `sessionId` keep their existing actions.
 - Status: `queued | running | idle | paused | done | failed | stopped`. `running` displays as working; `paused?: boolean` preserves an active pause, and `done` with a defined `note` displays as stopped.
 - A file: `{ path, diff?: ViewLine[], added?: number, removed?: number }`; a path alone must not imply diff content or line counts.
 - `details` optionally receives the host’s `statusBadge` helper and `glyphs` metadata when Logs is visible, so status-bearing log rows and authored separators can use the current theme. Sources that ignore them are unchanged. Historical trace statuses stay static.
 - Details: `{ summary: ViewLine[], logs: ViewLine[], stats?: TraceSummary, tabs?: DashboardTab[], notes?: ViewLine[], steps?: { text: string; status: "done" | "running" | "queued" }[] }`. Steps and notes are source-reported, not synthesized.
 - A custom tab: `{ key: string; label: string; render(): UiNode | ViewLine[] }`. Tabs append after the built-ins; use the focused tab bar's arrows (or arrows from its text body) to reach them. Keys must be nonempty, stable and unique. `summary`, `diff`, `logs`, `actions` and `stats` are reserved; duplicate/reserved keys are ignored. `render()` follows the same synchronous, side-effect-free rules as other source reads. Line arrays become scrollable text; widget trees retain host-owned focus, selection and scroll. IDs must be unique within each tab; the dashboard namespaces them across tabs and agent pages. The contract supplies content only, not custom event handlers. Omitting `tabs` preserves the original page.
-- Cost is USD for that agent's **own** usage, not its descendants. Omit unknown cost.
+- Cost is USD for that row's **own** usage, not its descendants. Omit unknown cost; a missing row cost keeps the header total unknown. This rule also applies to stage cards: do not put a stage aggregate alongside its worker rows and count it twice. Put explicitly labelled project/iteration rollups and incomplete known subtotals in cached details or source tabs; a stage's display-only rollup can use `card.costText`. This text is never parsed or added to `cost`. Money uses the host's magnitude-based precision; negative corrections retain their sign. No numeric aggregate-cost field or provider-specific accounting is added.
 - Progress is a known 0–1 fraction; omit it when unknown. Do not estimate completion from a count of tools.
 - Agent IDs are unique across a source; phase IDs across the snapshot; group IDs within their phase. Keep them stable across redraws. Sources `agents` and `trace` are reserved. Custom IDs start with a letter and contain letters, numbers, underscores, dots or hyphens. Duplicate registration throws.
 - Reads are synchronous, side-effect-free and fast: cache asynchronous work outside rendering. Keep the snapshot and its details coherent. Bound live logs. Publish changes through `subscribe`; the dashboard requests a host redraw. No subscriptions are created by `ui()`.
 - The `actions` list advertises actual capabilities; `act` must check the target still exists and is authorized at invocation time. Return a short English result, or throw an error the view can show. Never perform work during `snapshot()` or `details()`.
-- Registration keeps a source discoverable without subscribing while the dashboard is closed. Opening a source subscribes to its updates; closing or switching sources releases that subscription. The registration disposer is idempotent and releases active subscriptions; an old disposer cannot remove a replacement. A view for an unregistered source becomes unavailable instead of retaining its actions. Adapters own and must release their other resources, including on reload. Re-register against a newly loaded dashboard service after dashboard reload.
+- Registration keeps a source discoverable without subscribing while the dashboard is closed. Opening a source subscribes to its updates; closing or switching sources releases that subscription. The registration disposer is idempotent and releases active subscriptions; an old disposer cannot remove a replacement. A view for an unregistered source becomes unavailable instead of retaining its actions. Dashboard exit/unload cleanup is idempotent and terminal: retained service objects reject new registration, retained views cannot subscribe or dispatch actions, and late callbacks/pending opens cannot revive the dashboard. Cleanup attempts every registration before surfacing an unsubscribe failure. Adapters own and must release their other resources, including on reload. Rediscover and re-register against a newly loaded dashboard service object after dashboard reload.
 - This experimental service name is a contract: compatible additions are optional; a breaking shape change should use a new service name rather than silently changing this one.
 
 ## Development
@@ -221,6 +251,8 @@ bun run lint
 ```
 
 The helper links `@amira/api` and its transitive `@amira/ai` dependency, plus `@amira/tui` and `@amira/tui-kit` for the render test when the checkout has them. Extension runtime imports remain API-only; the linking script uses Node filesystem utilities, and tests use `bun:test`. Tests use fake sessions and event buses, no models, network requests, process killing or changes to core. Snapshot updates: `bun test --update-snapshots` after inspecting intentional widget changes. Regenerate the README's first-frame captures with `UPDATE_DASHBOARD_README=1 bun test test/tui-render.test.ts` (PowerShell: set `$env:UPDATE_DASHBOARD_README = "1"` before running the test).
+
+Project-shaped fixtures in `test/project-fixture.ts` exercise read-only stage labels, unknown own costs versus labelled rollups, content tabs, page navigation, and synchronous no-I/O rendering at wide/narrow sizes. The extension tests cover terminal unload, stale service/view callbacks and synchronous unregistration during subscription. For isolated offline checks, use already installed local dependencies, redirect `HOME`, `USERPROFILE`, `AMIRA_HOME`, `APPDATA`, `LOCALAPPDATA`, `XDG_CONFIG_HOME` and `XDG_CACHE_HOME` to temporary directories, and unset `UPDATE_DASHBOARD_README` / `DASHBOARD_COMPARE` so test capture helpers cannot write artifacts.
 
 The frozen workflow in `test/prototype-fixture.ts` maps User request / Plan / Code Agent ×3 / Integrate / Check / Complete onto the public source contract. `test/prototype-render.test.ts` compares the 180×52 timeline against the approved variant D **line by line**, with full rendered snapshots at both sizes. It uses the prototype’s collapsed-phase state for the wide comparison. Set `DASHBOARD_COMPARE=path/to/comparison.txt` when running that test to write numbered dashboard/target lines side by side. The checked-in target is copied from the approved plain-text artifact; native widget selection markers/chips and unknown timestamps intentionally differ.
 

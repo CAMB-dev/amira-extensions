@@ -1,6 +1,14 @@
 import type { UiContext, UiNode, UiTreeItem, ViewLine, ViewSegment } from "@amira/api"
 import { chrome, repeatCells } from "./chrome.ts"
-import type { DashboardAgent, DashboardFile, DashboardPhase, DashboardSource } from "./source.ts"
+import { formatCost } from "./format.ts"
+import {
+  type DashboardAgent,
+  type DashboardFile,
+  type DashboardPhase,
+  type DashboardSource,
+  rowCount,
+  rowLabel,
+} from "./source.ts"
 import { dashboardStatus, displayState, statusBadge, statusMark, statusTone } from "./status.ts"
 
 const part = (text: string, kind: ViewSegment["kind"] = "text"): ViewSegment => ({ text, kind })
@@ -64,19 +72,30 @@ export function phaseInfo(phase: DashboardPhase, now: number, opts: Pick<UiConte
     (phase.groups.every((group) => group.stepCount !== undefined) && phase.groups.length
       ? phase.groups.reduce((sum, group) => sum + group.stepCount!, 0)
       : undefined)
+  const stageOnly = agents.length > 0 && agents.every((agent) => agent.card?.kind === "stage")
   const description =
     phase.description ??
     group?.description ??
-    (status === "done"
-      ? [
-          ...(steps === undefined ? [] : [`${steps} steps`]),
-          `${agents.length} ${agents.length === 1 ? "agent" : "agents"}`,
-          ...(durationMs === undefined ? [] : [duration(durationMs, opts)]),
-        ].join(c` · `)
-      : status === "queued"
-        ? "queued"
-        : (agents.find((agent) => dashboardStatus(agent) === status)?.task ?? status))
-  return { agents, status, startedAt, durationMs, description, ref: phase.ref ?? group?.ref ?? phase.id }
+    (stageOnly
+      ? rowCount(agents)
+      : status === "done"
+        ? [
+            ...(steps === undefined ? [] : [`${steps} steps`]),
+            rowCount(agents),
+            ...(durationMs === undefined ? [] : [duration(durationMs, opts)]),
+          ].join(c` · `)
+        : status === "queued"
+          ? "queued"
+          : (agents.find((agent) => dashboardStatus(agent) === status)?.task ?? status))
+  return {
+    agents,
+    status,
+    startedAt,
+    durationMs,
+    description,
+    stageOnly,
+    ref: stageOnly ? undefined : (phase.ref ?? group?.ref ?? phase.id),
+  }
 }
 
 function fileParts(file: DashboardFile, width: number, ctx: UiContext): ViewSegment[] {
@@ -92,16 +111,34 @@ function fileParts(file: DashboardFile, width: number, ctx: UiContext): ViewSegm
   ]
 }
 
+/** Stage rollups are display text, never an agent's own usage. */
+function stageHeading(agent: DashboardAgent, ctx: UiContext): ViewSegment[] {
+  const c = chrome(ctx)
+  const cost = agent.card?.costText ?? (agent.cost === undefined ? undefined : formatCost(agent.cost))
+  return [
+    ...statusMark(agent, ctx),
+    part(` ${rowLabel(agent)}`, "accent"),
+    part(c` · ${agent.card?.outcome || displayState(agent)}`, statusTone(agent)),
+    ...(cost ? [part(c` · ${cost}`, "muted")] : []),
+  ]
+}
+
+function stageDetail(agent: DashboardAgent): string {
+  return agent.card?.detail ?? agent.task
+}
+
 /** A shared frame composed from selectable card heads and display-only semantic bodies. */
 export function timeline(source: DashboardSource, ctx: UiContext, selected?: string): UiNode {
   const c = chrome(ctx)
-  const phases = source.snapshot().phases
+  const snapshot = source.snapshot()
+  const phases = snapshot.phases
   if (!phases.length)
     return text(
       [
+        ...(snapshot.warning ? [{ kind: "warning" as const, text: snapshot.warning }] : []),
         {
-          kind: "text",
-          text: source.snapshot().note ?? "No agents yet. Close this view and ask Amira to delegate a task.",
+          kind: "text" as const,
+          text: snapshot.note ?? "No agents yet. Close this view and ask Amira to delegate a task.",
         },
       ],
       "empty",
@@ -117,8 +154,12 @@ export function timeline(source: DashboardSource, ctx: UiContext, selected?: str
     phases[0]
   const expanded = ctx.state.expanded.timeline
   const open = (key: string) => expanded === undefined || expanded.includes(key)
-  // The host reserves two cells for selection and twelve for time/status. The box starts at 17.
-  const innerWidth = Math.max(1, ctx.width - 22)
+  // The host shares the widest lead across the tree. Stage-only history needs no unknown clock slot.
+  const compactLead = phases.every((phase) => {
+    const info = phaseInfo(phase, ctx.now, ctx)
+    return info.stageOnly && info.startedAt === undefined
+  })
+  const innerWidth = Math.max(1, ctx.width - (compactLead ? 10 : 22))
   const frame = (left: string, right: string): UiNode =>
     text([segments([part(` ${left}${repeatCells(c`─`, innerWidth + 2)}${right}`, "muted")])])
   const bodyLine = (node: UiNode): UiNode => ({
@@ -144,16 +185,40 @@ export function timeline(source: DashboardSource, ctx: UiContext, selected?: str
     const name = `${phase.name}${info.agents.length > 1 && !phase.name.includes("×") ? c` ×${info.agents.length}` : ""}`
     items.push({
       key,
-      lead: [part(`${clock(info.startedAt)}  `, "muted"), ...statusMark(info, ctx)],
+      ...(compactLead
+        ? {}
+        : {
+            lead: [
+              part(
+                info.stageOnly && info.startedAt === undefined ? "          " : `${clock(info.startedAt)}  `,
+                "muted",
+              ),
+              ...statusMark(info, ctx),
+            ],
+          }),
       node: statusMark(info, ctx),
       row: [
-        part(`${field(name, narrow ? 14 : 15, ctx)} `, info.status === "running" ? "accent" : "text"),
+        part(
+          info.stageOnly ? `${name}  ` : `${field(name, narrow ? 14 : 15, ctx)} `,
+          info.status === "running" ? "accent" : "text",
+        ),
         part(info.description, "muted"),
-        ...(info.status === "running"
-          ? [part(c`   ▏`), ...statusBadge(info, ctx), part(c` ${duration(info.durationMs, ctx)}▕`, "accent")]
-          : []),
+        ...(info.stageOnly
+          ? [
+              part(c` · ${displayState(info)}`, statusTone(info)),
+              ...(info.durationMs === undefined
+                ? []
+                : [part(c` · ${duration(info.durationMs, ctx)}`, "muted")]),
+            ]
+          : info.status === "running"
+            ? [
+                part(c`   ▏`),
+                ...statusBadge(info, ctx),
+                part(c` ${duration(info.durationMs, ctx)}▕`, "accent"),
+              ]
+            : []),
       ],
-      aside: [part(`${narrow ? "" : `${info.ref}  `}${showCards ? c`▾` : c`▸`}`, "muted")],
+      aside: [part(`${narrow || !info.ref ? "" : `${info.ref}  `}${showCards ? c`▾` : c`▸`}`, "muted")],
       rail: true,
       expandable: info.agents.length > 0,
       underline: !showCards,
@@ -163,7 +228,31 @@ export function timeline(source: DashboardSource, ctx: UiContext, selected?: str
     for (const [index, agent] of info.agents.entries()) {
       const last = index === info.agents.length - 1
       const foldedFooter = last && !open(`agent:${agent.id}`)
-      const count = c`${info.agents.length} ${info.agents.length === 1 ? "agent" : "agents"} · ${info.agents.filter((agent) => displayState(agent) === "working").length} running`
+      const stage = agent.card?.kind === "stage"
+      const count = c`${rowCount(info.agents)} · ${info.agents.filter((agent) => displayState(agent) === "working").length} running`
+      if (stage) {
+        const detail = stageDetail(agent)
+        const children: { size: number; node: UiNode }[] = []
+        if (detail) children.push({ size: 1, node: bodyLine(text([{ kind: "muted", text: `  ${detail}` }])) })
+        if (last) {
+          children.push({
+            size: 1,
+            node: bodyLine(text([{ kind: "muted", text: c`${count} · e expand all · Read-only stage` }])),
+          })
+          children.push({ size: 1, node: frame(c`╰`, c`╯`) })
+        } else children.push({ size: 1, node: bodyLine({ type: "rule" }) })
+        items.push({
+          key: `agent:${agent.id}`,
+          node: [part(last && phaseIndex === phases.length - 1 ? c`└─` : c`├─`, "muted")],
+          row: [part(foldedFooter ? c`─╰ ` : c`─▶ `, "muted"), ...stageHeading(agent, ctx)],
+          // Host sides() prioritizes aside; never put stage content there at the expense of its label.
+          aside: [part(foldedFooter ? c` ╯ ` : c` │ `, "muted")],
+          rail: true,
+          detail: { type: "column", children },
+          underline: last,
+        })
+        continue
+      }
       const detail = source.details(agent.id)
       const progress =
         agent.progress === undefined || !Number.isFinite(agent.progress)
@@ -242,7 +331,7 @@ export function timeline(source: DashboardSource, ctx: UiContext, selected?: str
           part(foldedFooter ? c`─╰ ` : c`─▶ `, "muted"),
           ...statusBadge(agent, ctx),
           part(" "),
-          part(field(agent.name, narrow ? 10 : 12, ctx), "accent"),
+          part(field(rowLabel(agent), narrow ? 10 : 12, ctx), "accent"),
           ...(!narrow
             ? [
                 part(`  ${field(agent.task, 22, ctx)}  `),
@@ -297,7 +386,7 @@ export function timeline(source: DashboardSource, ctx: UiContext, selected?: str
           {
             node: text(
               Array.from({ length: ctx.height - height }, () =>
-                segments([part(c`              │`, "muted")]),
+                segments([part(`${" ".repeat(compactLead ? 2 : 14)}${c`│`}`, "muted")]),
               ),
             ),
           },
@@ -317,8 +406,49 @@ export function summary(source: DashboardSource, agent: DashboardAgent, ctx: UiC
       : undefined)
   if (agent.durationMs === undefined && runtime !== undefined && displayState(agent) === "working")
     ctx.requestRefresh?.(1000)
+  const stage = agent.card?.kind === "stage"
+  if (stage) {
+    const remaining = stageDetail(agent)
+    const notes = [
+      ...(detail?.notes ?? []),
+      ...(source.snapshot().warning ? [{ kind: "warning" as const, text: source.snapshot().warning! }] : []),
+    ]
+    return text(
+      [
+        segments(stageHeading(agent, ctx)),
+        ...(remaining ? [{ kind: "text" as const, text: remaining }] : []),
+        ...(detail?.summary ?? []).filter((line) => {
+          const value = line.kind === "segments" ? line.parts.map((part) => part.text).join("") : line.text
+          return ![
+            remaining,
+            agent.task,
+            agent.card?.label,
+            agent.card?.outcome,
+            agent.card?.costText,
+          ].includes(value)
+        }),
+        ...(runtime === undefined
+          ? []
+          : [{ kind: "muted" as const, text: `Runtime  ${duration(runtime, ctx)}` }]),
+        ...(agent.startedAt === undefined
+          ? []
+          : [{ kind: "muted" as const, text: `Started  ${clock(agent.startedAt)}` }]),
+        ...(detail?.steps?.length
+          ? detail.steps.map((step) => segments([...statusBadge(step, ctx), part(` ${step.text}`)]))
+          : []),
+        ...(agent.files.length
+          ? [
+              segments([part("Reported files", "accent")]),
+              ...agent.files.map((file) => segments(fileParts(file, Math.max(1, ctx.width - 2), ctx))),
+            ]
+          : []),
+        ...(notes.length ? [{ kind: "text" as const, text: "" }, ...notes] : []),
+      ],
+      "summary",
+    )
+  }
   const values = [
-    ["Agent", agent.name],
+    ["Agent", rowLabel(agent)],
     ["Task", agent.task],
     ["Kind", agent.language ?? c`—`],
     ["Status", ""],
@@ -326,7 +456,7 @@ export function summary(source: DashboardSource, agent: DashboardAgent, ctx: UiC
     ["Started", clock(agent.startedAt)],
     [
       tokens === undefined ? "Cost" : "Tokens",
-      `${tokens === undefined ? "" : `${(tokens / 1000).toFixed(1)}k${c` · `}`}${agent.cost === undefined ? "unknown" : `$${agent.cost.toFixed(4)}`}`,
+      `${tokens === undefined ? "" : `${(tokens / 1000).toFixed(1)}k${c` · `}`}${agent.cost === undefined ? "unknown" : formatCost(agent.cost)}`,
     ],
   ]
   const doing: ViewLine[] = [
@@ -359,7 +489,7 @@ export function summary(source: DashboardSource, agent: DashboardAgent, ctx: UiC
     return text(
       [
         segments([
-          part(c`${agent.name} · `, "accent"),
+          part(c`${rowLabel(agent)} · `, "accent"),
           ...statusBadge(agent, ctx),
           part(c` · ${duration(runtime, ctx)}`, "accent"),
         ]),

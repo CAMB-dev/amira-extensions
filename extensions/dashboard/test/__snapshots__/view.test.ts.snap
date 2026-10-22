@@ -1608,7 +1608,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 timeli
                                 "parts": [
                                   {
                                     "kind": "text",
-                                    "text": "Tokens   0.0k · $0.1250",
+                                    "text": "Tokens   0.0k · $0.125",
                                   },
                                 ],
                               },
@@ -1950,7 +1950,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 agent 
                                 "parts": [
                                   {
                                     "kind": "text",
-                                    "text": "Tokens   0.0k · $0.1250",
+                                    "text": "Tokens   0.0k · $0.125",
                                   },
                                 ],
                               },
@@ -3376,7 +3376,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 timelin
                           "parts": [
                             {
                               "kind": "text",
-                              "text": "Tokens   0.0k · $0.1250",
+                              "text": "Tokens   0.0k · $0.125",
                             },
                           ],
                         },
@@ -3679,7 +3679,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 agent w
                           "parts": [
                             {
                               "kind": "text",
-                              "text": "Tokens   0.0k · $0.1250",
+                              "text": "Tokens   0.0k · $0.125",
                             },
                           ],
                         },

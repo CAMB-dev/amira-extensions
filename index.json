@@ -14,9 +14,8 @@
     {
       "name": "project",
       "description": "Experimental project discovery, guided design conversations, durable human decisions, a confirmed stage engine, confined prototypes, spec-driven implementation, acceptance and workflow/swarm execution modes: /project",
-      "version": "0.7.0",
-      "status": "wip",
-      "statusMessage": "Batch 3 in progress: spend caps, ship and archive are in; the dashboard view is not done yet.",
+      "version": "0.8.0",
+      "status": "experimental",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/project" },
       "engines": { "amira": "^0.1.64" },
       "tags": ["experimental", "project", "design", "decisions"],
@@ -35,7 +34,7 @@
     {
       "name": "dashboard",
       "description": "Experimental default dashboard: live sub-agent timeline, agent detail pages and trace replay statistics: /dashboard",
-      "version": "0.4.1",
+      "version": "0.5.0",
       "status": "experimental",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/dashboard" },
       "engines": { "amira": "^0.1.49" },

@@ -63,6 +63,31 @@ test("empty source explains unregistration instead of suggesting a new task", ()
   expect(rendered).not.toContain("No agents yet")
 })
 
+test("stage Summary preserves detailed approval and historical evidence without repeating its heading", () => {
+  const fixture = viewFixture()
+  const agent = fixture.snapshot.phases[0]!.groups[0]!.agents[0]!
+  agent.card = {
+    kind: "stage",
+    label: "Acceptance",
+    outcome: "awaiting review",
+    detail: "Batch B2",
+    costText: "$1.20 reported",
+  }
+  agent.task = "awaiting review"
+  fixture.details.payments!.summary = [
+    { kind: "text", text: "awaiting review" },
+    { kind: "text", text: "Approved batch B2 [plan current-plan]" },
+    { kind: "text", text: "Historical B1 accepted; B2 is not reviewed" },
+  ]
+  for (const width of [80, 120]) {
+    const rendered = JSON.stringify(summary(fixture.data.source, agent, fixture.context(width)))
+    expect(rendered).toContain("Approved batch B2 [plan current-plan]")
+    expect(rendered).toContain("Historical B1 accepted; B2 is not reviewed")
+    expect(rendered.match(/awaiting review/g)).toHaveLength(1)
+    expect(rendered.match(/\$1\.20 reported/g)).toHaveLength(1)
+  }
+})
+
 test("narrow Summary keeps all metadata, notes and warnings reachable by scrolling", () => {
   const fixture = viewFixture()
   const agent = fixture.snapshot.phases[0]!.groups[0]!.agents[0]!
@@ -74,7 +99,7 @@ test("narrow Summary keeps all metadata, notes and warnings reachable by scrolli
     "Earlier files may be missing.",
     "TypeScript",
     "09:00:30",
-    "0.1250",
+    "$0.125",
     "src/payments.ts",
   ])
     expect(rendered).toContain(value)

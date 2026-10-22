@@ -2,6 +2,7 @@ import { expect, mock, test } from "bun:test"
 import type { AgentStatusState, Message, SessionControl, TraceRecord, UiNode, ViewSegment } from "@amira/api"
 import { agentsOf } from "../src/source.ts"
 import { dashboardView, performAction } from "../src/view.ts"
+import { projectFixture } from "./project-fixture.ts"
 import { viewFixture } from "./view-fixture.ts"
 
 function setup() {
@@ -261,4 +262,31 @@ test("trace-page historical working badges stay static in Logs and Stats", async
   ctx.state.activeTabs["session-page:trace"] = "stats"
   dashboardView.ui!(s.data, ctx)
   expect(helper).not.toHaveBeenCalled()
+})
+
+test("project stage pages preserve host page state and use content-only tab navigation", () => {
+  const fixture = projectFixture()
+  const before = structuredClone(fixture.state)
+  dashboardView.onEvent!(
+    { type: "activate", id: "timeline", key: "agent:checkout.i2.spec.r3" },
+    fixture.data,
+    fixture.control,
+  )
+  const focused = fixture.widgetId("detail")
+  const press = (key: string) =>
+    dashboardView.onEvent!({ type: "key", key, focused }, fixture.data, fixture.control)
+  press("2")
+  expect(fixture.state.activeTabs[focused]).toBe("logs")
+  expect(JSON.stringify(dashboardView.ui!(fixture.data, fixture.context()))).toContain(
+    "Cached stage evidence",
+  )
+  press("3")
+  expect(fixture.state.activeTabs[focused]).toBe("documents")
+  expect(JSON.stringify(dashboardView.ui!(fixture.data, fixture.context()))).toContain("ship-plan.md")
+  press("?")
+  expect(fixture.data.flash).toContain("Read-only stage")
+  expect(fixture.data.flash).not.toContain("stop")
+  fixture.control.popPage()
+  expect(fixture.state).toEqual(before)
+  expect(fixture.act).not.toHaveBeenCalled()
 })

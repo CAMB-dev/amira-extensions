@@ -3,7 +3,7 @@
 exports[`approved prototype fidelity 80x24: selected phase only, compact details, and bounded lines 1`] = `
 [
   " amira  │  workspace: ~/work/amira                               ? help · q quit",
-  "phase: Code Agent ×3  │  running: 2/6  │  cost: $0.0106",
+  "phase: Code Agent ×3  │  running: 2/6  │  cost: $0.011",
   "────────────────────────────────────────────────────────────────────────────────",
   "› 10:12:31  ✓ ✓ User request   Add refresh token rotation and invalidate on l… ▸",
   "              │ ────────────────────────────────────────────────────────────────",
@@ -31,7 +31,7 @@ exports[`approved prototype fidelity 80x24: selected phase only, compact details
 
 exports[`approved prototype fidelity 180x52: equivalent scenario matches the target's timeline line by line 1`] = `
 [
-  " amira  │  workspace: ~/work/amira  │  phase: Code Agent ×3  │  running: 2/6  │  cost: $0.0106                                                               ? shortcuts  │  q quit",
+  " amira  │  workspace: ~/work/amira  │  phase: Code Agent ×3  │  running: 2/6  │  cost: $0.011                                                                ? shortcuts  │  q quit",
   "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
   "› 10:12:31  ✓ ✓ User request    Add refresh token rotation and invalidate on logout                                                                                      req-7f3a  ▸",
   "              │ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",

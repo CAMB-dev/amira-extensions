@@ -101,6 +101,7 @@ async function fixture(carryForward = false) {
   const complete = mock(async (_request: Omit<CompleteRequest, "model">) => {
     const text = JSON.stringify(drafts.shift())
     return {
+      toolsKept: false,
       text,
       message: {
         role: "assistant" as const,
