@@ -28,7 +28,7 @@ Phases and cards start expanded, with the first active phase’s agent selected.
 <!-- render:180x52 -->
 
 ```text
- amira  │  workspace: acme/checkout  │  phase: Implementation  │  running: 1/3  │  cost: unknown                                                             ? shortcuts  │  q quit
+ amira · workspace: acme/checkout · phase: Implementation · running: 1/3 · cost: unknown                                                                       ? shortcuts · q quit
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 › 09:00:30  ⠋ ⠋ Implementation… Validate payment amounts and add regression coverage for partial refunds.   ▏⠋ working 90s▕                                           checkout-v2  ▾
               │  ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
@@ -61,6 +61,9 @@ Phases and cards start expanded, with the first active phase’s agent selected.
               │
               │
               │
+              │
+              │
+              │
 ──────────────────────────────────────────────────────────────────────────────────────── ≡ ─────────────────────────────────────────────────────────────────────────────────────────
   [Summary]  Diff  Logs  Actions  Stats                                           Payment validation  Validate payment amounts and add regression coverage for partial refunds.   ✕
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -70,15 +73,12 @@ Phases and cards start expanded, with the first active phase’s agent selected.
   Status   ⠋ working             │                                                                                               │
   Runtime  90s                   │                                                                                               │
   Started  09:00:30              │                                                                                               │
-  Tokens   0.0k · $0.1250        │                                                                                               │
+  Tokens   0.0k · $0.125         │                                                                                               │
                                  │                                                                                               │
                                  │                                                                                               │
                                  │                                                                                               │
                                  │                                                                                               │
- o open diff   p pause/resume   r request changes   a actions   x stop                                                                          1–4 tabs · 5 stats (when available)
-╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│ > Press F6 to ask Amira or enter a command                                                                                                               Hint only · F6 to input │
-╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+  o open diff   p pause/resume   r request changes   a actions   x stop                                                                         1–4 tabs · 5 stats (when available)
   tab focus · arrows navigate · enter open/send · pgup pgdn scroll · esc close
 ```
 
@@ -91,8 +91,8 @@ At 80×24 only the selected phase’s box is shown, with shorter card fields and
 <!-- render:80x24 -->
 
 ```text
- amira  │  workspace: acme/checkout                              ? help · q quit
-phase: Implementation  │  running: 1/3  │  cost: unknown
+ amira · workspace: acme/checkout                                ? help · q quit
+phase: Implementation · running: 1/3 · cost: unknown
 ────────────────────────────────────────────────────────────────────────────────
 › 09:00:30  ⠋ ⠋ Implementatio… Validate payment amounts and add regression co… ▾
               │  ╭────────────────────────────────────────────────────────────╮
@@ -105,15 +105,15 @@ phase: Implementation  │  running: 1/3  │  cost: unknown
               ├──▶ ‖ paused  Receipt t… ──────  —                      o diff │
               │  │   Waiting for approval.                                    │
               │  │   Changed files                                            │
+              │  │   templates/receipt.html                                   │
+              │  │ 2 agents · 1 running                                       │
+              │  ╰────────────────────────────────────────────────────────────╯
 ────────────────────────────────────── ≡ ───────────────────────────────────────
   [Summary]  Diff  Logs  Actions  Stats
 ────────────────────────────────────────────────────────────────────────────────
   Payment validation · ⠋ working · 90s
   Validate payment amounts and add regression coverage for partial refunds.
- 1–4 tabs · o diff · a actions · ? shortcuts
-╭──────────────────────────────────────────────────────────────────────────────╮
-│ > Press F6 to ask Amira                                                      │
-╰──────────────────────────────────────────────────────────────────────────────╯
+  1–4 tabs · o diff · a actions · ? shortcuts
   tab focus · arrows navigate · enter open/send · pgup pgdn scroll · esc close
 ```
 

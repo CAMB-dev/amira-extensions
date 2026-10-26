@@ -113,7 +113,8 @@ describe.skipIf(!available)("dashboard in the real TUI viewer", () => {
       viewer.handleInput(kit.key("tab", { shift: true }))
       render()
       expect(focused).toBe(before)
-      expect(viewer.focusHint(kit.monoTheme, 180)).toContain("f6 → input")
+      // The host bolds hint keys even in the mono theme.
+      expect(kit.stripAnsi(viewer.focusHint(kit.monoTheme, 180))).toContain("f6 → input")
     } finally {
       viewer.dispose()
     }

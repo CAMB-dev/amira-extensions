@@ -21,6 +21,8 @@ export function chrome(opts: Pick<ViewRenderOptions, "glyphs"> = {}) {
     "…": glyphs?.more ?? "…",
     ...(ascii
       ? {
+          // The host's view ellipsis: the ASCII theme's one-cell `more` reads as a period.
+          "…": "...",
           "╭": "+",
           "╮": "+",
           "╰": "+",

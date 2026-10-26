@@ -162,7 +162,7 @@ export function agentDetails(
     ...(agent.note !== undefined ? fold("Note", agent.note || "Stopped before completion", expanded) : []),
     text(""),
     text(
-      `Events / result${sep}${expanded ? "expanded" : "folded"} (Enter to ${expanded ? "fold" : "expand"})`,
+      `Events / result${sep}${expanded ? "expanded" : "folded"} (enter to ${expanded ? "fold" : "expand"})`,
       "muted",
     ),
     ...(agent.events ?? []).flatMap((event) =>

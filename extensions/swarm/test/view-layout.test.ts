@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import type { AgentStatusState, UiContext, UiControl, UiNode, UiState, ViewLine } from "@amira/api"
-import { memberBadge, memberState } from "../src/status.ts"
+import { memberBadge, memberState, stateBadge } from "../src/status.ts"
 import { type MemberView, type SwarmSnapshot, swarmsFromRecords } from "../src/swarm.ts"
 import { READONLY_VIEW_KIND, readonlySwarmView, type SwarmViewData, swarmView } from "../src/view.ts"
 
@@ -87,6 +87,8 @@ test("host member selection changes the right pane, with a missing selection fal
   state.focused = "details:reviewer"
   const node = render(snapshot(), context({ state }))
   expect(text(node)).toContain("reviewer · reviewer role")
+  // The detail heading is prose: an unpadded badge.
+  expect(text(node)).toMatch(/reviewer role · o idle · /)
   expect(tree(node, "details:reviewer").items).toHaveLength(1)
   state.selected.members = "removed"
   expect(text(render(snapshot(), context({ state })))).toContain("writer · writer role")
@@ -99,6 +101,14 @@ test("one top line contains state, elapsed, known zero cost and per-state counts
   if (bar.type !== "bar") return
   expect(bar.left.map((p) => p.text).join("")).toBe("Swarm sw1 · * working · 10s · $0.00")
   expect(bar.right!.map((p) => p.text).join("")).toBe("working 1 · idle 1")
+  const ended = nodes(
+    render(
+      snapshot({ state: "ended", endedAt: 9000, endReason: "every member is idle" }),
+      context({ width: 120 }),
+    ),
+  ).find((n) => n.type === "bar")!
+  // Prose headers take the unpadded badge: no gap before the separator.
+  if (ended.type === "bar") expect(ended.left.map((p) => p.text).join("")).toContain("v done · ")
   expect(text(render(snapshot({ members: [member("a", { cost: undefined })] })))).not.toContain(
     "cost unknown",
   )
@@ -199,6 +209,8 @@ const states: [Partial<MemberView>, AgentStatusState][] = [
   [{ status: "ended", outcome: "done", note: "" }, "stopped"],
   [{ status: "ended", outcome: "done", note: "limit reached" }, "stopped"],
   [{ status: "ended", outcome: "done", stopReason: "" }, "stopped"],
+  [{ status: "ended", outcome: "done", note: "every member is idle", woundDown: true }, "done"],
+  [{ status: "ended", outcome: "done", woundDown: true, stopReason: "stopped by the user" }, "stopped"],
   [{ status: "ended", outcome: "error", note: "" }, "failed"],
   [{ status: "ended", outcome: "aborted" }, "stopped"],
 ]
@@ -269,6 +281,7 @@ test("host badge receives padded state and ASCII fallback retains semantic style
     ),
   ).toBe(parts)
   expect(calls).toEqual([["working", { pad: true }]])
+  expect(stateBadge("done", context(), false)).toEqual([{ kind: "success", text: "v done" }])
   expect(memberBadge(member("writer", { status: "paused" }), context())).toEqual([
     { kind: "warning", text: "| paused " },
   ])

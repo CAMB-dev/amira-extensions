@@ -107,6 +107,8 @@ export interface MemberView extends MemberMetrics {
   result?: string
   /** Why it ended, once it did. */
   note?: string
+  /** It finished and the swarm wound it down normally once every member was idle. */
+  woundDown?: boolean
 }
 
 export type SwarmState = "running" | "paused" | "ending" | "ended"
@@ -140,6 +142,7 @@ export interface MemberReport extends MemberMetrics {
   turns: number
   messagesSent?: number
   note?: string
+  woundDown?: boolean
 }
 
 /** How a swarm ended, for its commander. */
@@ -210,6 +213,8 @@ interface Member {
   /** Asked to stop (by the user, or as the swarm ends): it takes no more messages. */
   stopping?: boolean
   stopReason?: string
+  /** Stopped by the swarm's normal idle wind-down, not by the user, a limit or an error. */
+  woundDown?: boolean
   result?: string
   ended?: SubagentResult
   startedAt?: number
@@ -879,12 +884,13 @@ export class Swarm {
         const quiet = all.every(
           (m) => (m.child.state === "idle" || m.child.state === "ended") && !this.#inFlight(m),
         )
-        if (quiet) void this.#end("every member is idle and no message is on its way", false)
+        if (quiet) void this.#end("every member is idle and no message is on its way", false, true)
       }, 0)
     }
   }
 
-  async #end(reason: string, now: boolean) {
+  /** `windDown`: the normal idle end, whose members finished rather than being stopped. */
+  async #end(reason: string, now: boolean, windDown = false) {
     if (!this.live) return
     this.#state = "ending"
     this.#endReason = reason
@@ -893,6 +899,7 @@ export class Swarm {
     this.#log({ kind: "note", text: `ending: ${reason}` })
     let undelivered = this.#dropped
     for (const m of this.#members.values()) {
+      if (windDown && !m.stopping && m.child.state !== "ended") m.woundDown = true
       m.stopping = true
       undelivered += m.held.splice(0).length
       if (now) m.child.abort(reason)
@@ -902,6 +909,8 @@ export class Swarm {
     const results = await Promise.all([...this.#members.values()].map((m) => m.child.result()))
     this.#group.end(reason)
     const info = await this.#group.ended()
+    // A tree limit that ended the group outranks the idle wind-down.
+    if (info.exceeded) for (const m of this.#members.values()) m.woundDown = undefined
     this.#state = "ended"
     this.#endedAt = Date.now()
     const members = [...this.#members.values()]
@@ -926,6 +935,7 @@ export class Swarm {
           turns: r.turns ?? m.child.turns,
           ...(r.error !== undefined ? { error: r.error } : {}),
           ...(r.note !== undefined ? { note: r.note } : {}),
+          ...(m.woundDown && r.status === "done" && r.error === undefined ? { woundDown: true } : {}),
         }
       }),
       board: this.board.entries(),
@@ -1002,6 +1012,9 @@ export class Swarm {
       messagesSent: m.sent,
       ...(m.result !== undefined ? { result: m.result } : {}),
       ...(note !== undefined ? { note } : {}),
+      ...(m.woundDown && m.ended?.status === "done" && m.ended.error === undefined
+        ? { woundDown: true }
+        : {}),
     }
   }
 

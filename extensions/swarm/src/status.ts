@@ -23,7 +23,8 @@ export function memberState(
       member.status === "ended"
         ? (member.outcome ?? (member.error !== undefined ? "error" : "aborted"))
         : member.status,
-    note: member.stopReason ?? member.note,
+    // A normal wind-down ends finished work: its note explains, it does not mean stopped.
+    note: member.stopReason ?? (member.woundDown ? undefined : member.note),
     paused: member.status === "paused",
   }
   if (typeof api.agentStatusState === "function") {
@@ -40,15 +41,16 @@ export function memberState(
   return source.status
 }
 
-export function stateBadge(state: AgentStatusState, opts: ViewRenderOptions): ViewSegment[] {
+/** Padded for aligned rows; headers and prose pass `pad: false`. */
+export function stateBadge(state: AgentStatusState, opts: ViewRenderOptions, pad = true): ViewSegment[] {
   const badge = amira.AGENT_STATUS_BADGES?.[state] ?? FALLBACK[state]
   return (
-    opts.statusBadge?.(state, { pad: true }) ?? [
-      { kind: badge.role, text: `${badge.ascii} ${badge.label.padEnd(7)}` },
+    opts.statusBadge?.(state, { pad }) ?? [
+      { kind: badge.role, text: `${badge.ascii} ${pad ? badge.label.padEnd(7) : badge.label}` },
     ]
   )
 }
 
-export function memberBadge(member: MemberView, opts: ViewRenderOptions): ViewSegment[] {
-  return stateBadge(memberState(member), opts)
+export function memberBadge(member: MemberView, opts: ViewRenderOptions, pad = true): ViewSegment[] {
+  return stateBadge(memberState(member), opts, pad)
 }

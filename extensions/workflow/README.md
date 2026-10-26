@@ -58,7 +58,7 @@ clutter. Below 80 columns, the agent list stacks above the selected agent's deta
   Look                     │ check · reviewer · ⠋ working · 3s · $0.02
     ✓ done    api          │ Current tool: read
     ✓ done    core         │
-  Verify                   │ Events / result · folded (Enter to expand)
+  Verify                   │ Events / result · folded (enter to expand)
   > ⠋ working check        │ 0s: Started agent
                            │ 1s: Started read
 

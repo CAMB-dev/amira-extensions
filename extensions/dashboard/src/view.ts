@@ -703,14 +703,14 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
       ) ?? snapshot.phases[0]
     const narrow = ctx.width < 110
     const stage = agent?.card?.kind === "stage"
-    const totals = c`phase: ${phase?.name ?? "Agents"}  │  running: ${agents.filter((item) => displayState(item) === "working").length}/${agents.length}  │  cost: ${cost === undefined ? "unknown" : formatCost(cost)}`
+    const totals = c`phase: ${phase?.name ?? "Agents"} · running: ${agents.filter((item) => displayState(item) === "working").length}/${agents.length} · cost: ${cost === undefined ? "unknown" : formatCost(cost)}`
     const top: UiNode = {
       type: "bar",
       left: [
         part(" amira", "accent"),
-        part(c`  │  workspace: ${snapshot.workspace}${narrow ? "" : c`  │  ${totals}`}`),
+        part(c` · workspace: ${snapshot.workspace}${narrow ? "" : c` · ${totals}`}`),
       ],
-      right: [part(narrow ? c`? help · q quit` : c`? shortcuts  │  q quit `, "muted")],
+      right: [part(narrow ? c`? help · q quit` : c`? shortcuts · q quit `, "muted")],
     }
     const detailHeight = agent ? (narrow ? 6 : Math.min(15, Math.max(9, Math.round(ctx.height * 0.3)))) : 2
     const flashHeight = data.flash ? (narrow ? 2 : 1) : 0
@@ -740,18 +740,18 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
                   ? text([
                       {
                         kind: "muted" as const,
-                        text: c` 1 summary · 2 logs · arrows tabs · Read-only stage`,
+                        text: c`  1 summary · 2 logs · arrows tabs · Read-only stage`,
                       },
                     ])
                   : narrow
                     ? text([
-                        { kind: "muted" as const, text: c` 1–4 tabs · o diff · a actions · ? shortcuts` },
+                        { kind: "muted" as const, text: c`  1–4 tabs · o diff · a actions · ? shortcuts` },
                       ])
                     : {
                         type: "bar" as const,
                         left: [
                           part(
-                            " o open diff   p pause/resume   r request changes   a actions   x stop",
+                            "  o open diff   p pause/resume   r request changes   a actions   x stop",
                             "muted",
                           ),
                         ],
@@ -775,7 +775,7 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
                   data.source,
                   {
                     ...ctx,
-                    height: Math.max(0, ctx.height - (narrow ? 3 : 2) - detailHeight - 3 - flashHeight),
+                    height: Math.max(0, ctx.height - (narrow ? 3 : 2) - detailHeight - flashHeight),
                   },
                   agent?.id,
                 ),
@@ -783,25 +783,10 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
             ]
           : []),
         { ...(page ? {} : { size: detailHeight }), node: panel },
+        // The host composer below the view takes input (its hint names the key); no second box.
         ...(data.flash
           ? [{ size: flashHeight, node: text([{ kind: "accent" as const, text: data.flash }]) }]
           : []),
-        {
-          size: 3,
-          node: {
-            type: "box",
-            child: {
-              type: "bar",
-              left: [
-                part(
-                  narrow ? " > Press F6 to ask Amira" : " > Press F6 to ask Amira or enter a command",
-                  "muted",
-                ),
-              ],
-              right: narrow ? [] : [part(c`Hint only · F6 to input `, "muted")],
-            },
-          },
-        },
       ],
     }
   },

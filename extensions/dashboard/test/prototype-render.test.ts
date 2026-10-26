@@ -80,13 +80,15 @@ describe.skipIf(!tui || !kit)("approved prototype fidelity", () => {
         /worker-1.*task-auth-middleware.*TypeScript.*70%.*3 files changed.*Open diff.*Pause.*Request changes/,
       )
       expect(rows.slice(0, 33).filter((row) => row.includes("worker-1"))).toHaveLength(1)
-      expect(rows[33]).toContain("≡")
-      expect(rows[34]).toMatch(/Summary.*Diff.*Logs.*Actions/)
-      expect(rows[34]).toContain("worker-1  task-auth-middleware")
-      expect(rows[36]).toContain("What this agent is doing")
-      expect(rows[36]).toContain("Changed files")
-      expect(rows[48]).toContain("╭")
-      expect(rows[50]).toContain("╰")
+      // The prototype's own input box is gone (D139): the host composer takes input, and the
+      // timeline gets its three rows.
+      expect(rows[36]).toContain("≡")
+      expect(rows[37]).toMatch(/Summary.*Diff.*Logs.*Actions/)
+      expect(rows[37]).toContain("worker-1  task-auth-middleware")
+      expect(rows[39]).toContain("What this agent is doing")
+      expect(rows[39]).toContain("Changed files")
+      expect(rows.join("\n")).not.toContain("Press F6")
+      expect(rows[0]).not.toContain("│")
       expect(rows[51]).toMatch(/esc close/i)
       for (const row of rows) expect(kit.visibleWidth(row)).toBeLessThanOrEqual(180)
     } finally {

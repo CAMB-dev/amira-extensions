@@ -19,7 +19,15 @@ import { compileScript } from "./compile.ts"
 import { bindWorkflowSource, createWorkflowSource } from "./dashboard.ts"
 import { type JournalEntry, listRuns, readJournal, readRun, successful } from "./journal.ts"
 import { estimate, readMeta, sizeLine, type WorkflowMeta, workspaceLine } from "./meta.ts"
-import { countsLine, formatDuration, formatTokens, runStateText, totals, treeLines } from "./progress.ts"
+import {
+  countsLine,
+  formatDuration,
+  formatTokens,
+  groupStatusLine,
+  runStateText,
+  totals,
+  treeLines,
+} from "./progress.ts"
 import { loadRoles } from "./roles.ts"
 import { type ScriptWorker, WorkflowRun } from "./run.ts"
 import { type RunSnapshot, runnerResult, runSnapshot, type WorkflowRunner } from "./runner.ts"
@@ -480,11 +488,12 @@ export function createWorkflowExtension(opts: WorkflowExtensionOptions = {}) {
       return run
     }
 
-    /** The group's one-line status in the transcript: phase and counts. */
+    /** The group's one-line status in the transcript: run, owner and phase; the host adds counts. */
     const setStatus = (run: WorkflowRun) => {
-      const phase = run.flow.current ? `${run.flow.current} · ` : ""
       const owner = run.record.startedBy
-      run.group.setStatus(`${run.id} · ${owner ? `${owner.label} · ` : ""}${phase}${countsLine(run.flow)}`)
+      run.group.setStatus(
+        [run.id, owner?.label, run.flow.current, groupStatusLine(run.flow)].filter(Boolean).join(" · "),
+      )
     }
 
     /** A run to resume: its stored script and journal. */

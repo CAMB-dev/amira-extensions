@@ -352,6 +352,8 @@ The dashboard itself requires its newer Amira API; this adapter uses the optiona
 - Changes appear while the swarm runs. Ended swarms reconstruct from the session records
   after resume or extension reload; an interrupted swarm or old member without a recorded
   outcome is shown as stopped, not assumed successful.
+- A member the swarm winds down normally, once every member is idle with no message on its
+  way, shows done (since 0.3.2). Stopped means the user, a limit or an error ended it.
 
 Since 0.1.6, the adapter supplies dedicated Board and Messages tabs and each member's
 recorded child session ID. With a dashboard that supports these optional fields, its session

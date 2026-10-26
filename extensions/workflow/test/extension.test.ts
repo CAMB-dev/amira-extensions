@@ -970,14 +970,15 @@ test("tool controls are main-only and scoped to this session", async () => {
   expect(t.groups).toHaveLength(1)
 })
 
-test("progress: the group's status follows phases and counts, and the view lists agents without metrics", async () => {
+test("progress: the group's status follows phases, and the view lists agents without metrics", async () => {
   const t = setup({ settings: { enabled: "always" } })
   const r = await t.call({ script: SCRIPT })
   const id = /run (wf_\w+)/.exec(t.text(r))![1]!
   await until(() => t.notices.length === 1)
   const statuses = t.groups[0]!.statuses
-  expect(statuses.some((s) => s.startsWith(`${id} · Explore · `))).toBe(true)
-  expect(statuses.at(-1)).toMatch(new RegExp(`^${id} · Verify · 4/4 agents · 400 tok$`))
+  expect(statuses).toContain(`${id} · Explore`)
+  // Counts and tokens are the host row's; the status repeats neither.
+  expect(statuses.at(-1)).toBe(`${id} · Verify`)
   const renderOptions = { now: Date.now(), width: 80 }
   const lines = t.view.render!({ id }, renderOptions).map((line) =>
     line.kind === "segments" ? line.parts.map((part) => part.text).join("") : line.text,

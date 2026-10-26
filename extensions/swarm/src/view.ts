@@ -121,7 +121,7 @@ function summary(s: SwarmSnapshot, opts: ViewRenderOptions): ViewSegment[] {
   const { separator } = chrome(opts)
   return [
     { kind: "accent", text: `Swarm ${s.id}${separator}` },
-    ...stateBadge(state, opts),
+    ...stateBadge(state, opts, false),
     { kind: "muted", text: `${separator}${parts.join(separator)}` },
   ]
 }
@@ -174,7 +174,7 @@ function folded(
 function details(s: SwarmSnapshot, m: MemberView, opts: ViewRenderOptions): UiTreeItem[] {
   const items: UiTreeItem[] = []
   if (m.brief !== undefined) items.push(folded("brief", "Brief", m.brief))
-  if (m.note !== undefined) items.push(folded("note", "Note", m.note, "warning"))
+  if (m.note !== undefined) items.push(folded("note", "Note", m.note, m.woundDown ? "muted" : "warning"))
   if (m.lastMessage !== undefined) items.push(folded("reply", "Last reply", m.lastMessage))
   if (m.result !== undefined) items.push(folded("result", "Result", m.result))
   for (const entry of s.board.filter((e) => e.by === m.name))
@@ -392,7 +392,7 @@ function innerScreen(data: SwarmViewData, s: SwarmSnapshot, ctx: UiContext, read
                   parts: [
                     { kind: "accent", text: `${selected.name}${separator}` },
                     { kind: "text", text: `${selected.role}${separator}` },
-                    ...memberBadge(selected, ctx),
+                    ...memberBadge(selected, ctx, false),
                     {
                       kind: "muted",
                       text: `${separator}${known(duration) ? elapsed(duration) : "elapsed unknown"}${known(selected.cost) ? `${separator}${cost(selected.cost)}` : ""}`,
