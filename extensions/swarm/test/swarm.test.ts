@@ -1140,11 +1140,17 @@ test("explicitly stopping a queued member stays stopped live and after reconstru
   expect(report.members[1]).toMatchObject({ status: "done", turns: 0, stopReason: "stopped by the user" })
   const restored = swarmsFromRecords(JSON.parse(JSON.stringify(records)))
   const historical = createSwarmSource("workspace", () => restored).source
-  // The idle member also has the host's defined early-end note when the group closes.
+  // The idle member finished; the swarm's normal wind-down note does not make it stopped.
   expect(historical.snapshot().phases[0]!.groups[0]!.agents.map((agent) => agent.status)).toEqual([
-    "stopped",
+    "done",
     "stopped",
   ])
+  expect(source.snapshot().phases[0]!.groups[0]!.agents.map((agent) => agent.status)).toEqual([
+    "done",
+    "stopped",
+  ])
+  expect(report.members[0]).toMatchObject({ status: "done", woundDown: true })
+  expect(report.members[1]!.woundDown).toBeUndefined()
   expect(swarm.member("a")!.stopReason).toBeUndefined()
 })
 

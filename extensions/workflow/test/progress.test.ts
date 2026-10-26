@@ -3,6 +3,7 @@ import {
   type AgentNode,
   type FlowNode,
   formatDuration,
+  groupStatusLine,
   runStateText,
   totals,
   treeLines,
@@ -89,4 +90,24 @@ test("run and agent states are worded as every screen words them", () => {
   expect(runStateText("error")).toBe("failed")
   expect(runStateText("aborted")).toBe("stopped")
   expect(runStateText("done")).toBe("done")
+})
+
+test("the group status adds only what the host's group row does not show", () => {
+  const flow = (items: AgentNode[]): FlowNode => ({
+    kind: "workflow",
+    name: "review",
+    state: "running",
+    phases: [{ title: "Read", items }],
+  })
+  expect(groupStatusLine(flow([agent(1, "queued"), agent(2, "done")]))).toBe("")
+  expect(groupStatusLine(flow([agent(1, "cached"), agent(2, "working")]))).toBe("1 from the journal")
+  expect(groupStatusLine(flow([{ ...agent(1, "done"), cost: 0.5 }]))).toBe("$0.50")
+  expect(
+    groupStatusLine(
+      flow([
+        { ...agent(1, "cached"), cost: 0 },
+        { ...agent(2, "done"), cost: 0.5 },
+      ]),
+    ),
+  ).toBe("1 from the journal · $0.50")
 })

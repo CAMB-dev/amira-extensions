@@ -2,7 +2,7 @@
 
 exports[`project stage cards in the real TUI viewer 120x36: stage outcome and reported rollup remain readable without placeholders 1`] = `
 [
-  " amira  │  workspace: acme/checkout  │  phase: Iteration 2  │  running: 0/3  │  cost: unknown    ? shortcuts  │  q quit",
+  " amira · workspace: acme/checkout · phase: Iteration 2 · running: 0/3 · cost: unknown              ? shortcuts · q quit",
   "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
   "› ⠋ Iteration 2 ×3  3 stages · working                                                                                 ▾",
   "  │  ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
@@ -23,6 +23,9 @@ exports[`project stage cards in the real TUI viewer 120x36: stage outcome and re
   "  │",
   "  │",
   "  │",
+  "  │",
+  "  │",
+  "  │",
   "────────────────────────────────────────────────────────── ≡ ───────────────────────────────────────────────────────────",
   "  [Summary]  Logs  Documents",
   "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
@@ -33,18 +36,15 @@ exports[`project stage cards in the real TUI viewer 120x36: stage outcome and re
   "  Budget stop: implementation needs approval. Use /project to continue.",
   "",
   "",
-  " 1 summary · 2 logs · arrows tabs · Read-only stage",
-  "╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
-  "│ > Press F6 to ask Amira or enter a command                                                   Hint only · F6 to input │",
-  "╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
+  "  1 summary · 2 logs · arrows tabs · Read-only stage",
   "  tab focus · arrows navigate · enter open/send · pgup pgdn scroll · esc close",
 ]
 `;
 
 exports[`project stage cards in the real TUI viewer 80x24: stage outcome and reported rollup remain readable without placeholders 1`] = `
 [
-  " amira  │  workspace: acme/checkout                              ? help · q quit",
-  "phase: Iteration 2  │  running: 0/3  │  cost: unknown",
+  " amira · workspace: acme/checkout                                ? help · q quit",
+  "phase: Iteration 2 · running: 0/3 · cost: unknown",
   "────────────────────────────────────────────────────────────────────────────────",
   "› ⠋ Iteration 2 ×3  3 stages · working                                         ▾",
   "  │  ╭────────────────────────────────────────────────────────────────────────╮",
@@ -57,15 +57,15 @@ exports[`project stage cards in the real TUI viewer 80x24: stage outcome and rep
   "  └──▶ · Ship · queued                                                        │",
   "  │  │   Awaiting human approval                                              │",
   "  │  │ 3 stages · 0 running · e expand all · Read-only stage                  │",
+  "  │  ╰────────────────────────────────────────────────────────────────────────╯",
+  "  │ ────────────────────────────────────────────────────────────────────────────",
+  "  │",
   "────────────────────────────────────── ≡ ───────────────────────────────────────",
   "  [Summary]  Logs  Documents",
   "────────────────────────────────────────────────────────────────────────────────",
   "  ✗ Implement · budget stopped · $1.20 reported",
   "  2 batches · 3 tasks · Read-only: use /project",
-  " 1 summary · 2 logs · arrows tabs · Read-only stage",
-  "╭──────────────────────────────────────────────────────────────────────────────╮",
-  "│ > Press F6 to ask Amira                                                      │",
-  "╰──────────────────────────────────────────────────────────────────────────────╯",
+  "  1 summary · 2 logs · arrows tabs · Read-only stage",
   "  tab focus · arrows navigate · enter open/send · pgup pgdn scroll · esc close",
 ]
 `;

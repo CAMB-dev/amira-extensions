@@ -42,7 +42,7 @@ for (const [width, height] of [
 
 test("ASCII chrome never rewrites interpolated content or source-provided lines", () => {
   const content = "用户 · ╭─▶ résumé…"
-  expect(chrome({ glyphs })`╭─ ${content} · …`).toBe(`+- ${content} . .`)
+  expect(chrome({ glyphs })`╭─ ${content} · …`).toBe(`+- ${content} . ...`)
   const fixture = viewFixture()
   fixture.details.payments!.summary = [{ kind: "text", text: content }]
   fixture.details.payments!.logs = [{ kind: "text", text: content }]
@@ -73,6 +73,20 @@ test("multi-cell host rules fit frame, progress and panel cell budgets", () => {
 })
 
 test("host glyph overrides are used for authored separators, rails, rules and truncation", () => {
-  const custom = { ...glyphs, rule: "~", treePipe: "!", separator: "/", more: ":" }
-  expect(chrome({ glyphs: custom })`─│·…`).toBe("~!/:")
+  const custom = { ...glyphs, rule: "≈", treePipe: "¦", separator: "/", more: ":" }
+  expect(chrome({ glyphs: custom })`─│·…`).toBe("≈¦/:")
+  // ASCII mode cuts text like the host's views: three periods, not the theme's one-cell ".".
+  expect(chrome({ glyphs: { ...glyphs, rule: "~", treePipe: "!", separator: "/", more: ":" } })`─│·…`).toBe(
+    "~!/...",
+  )
+})
+
+test("ASCII truncation ends cut fields with the host's view ellipsis", () => {
+  const fixture = viewFixture()
+  fixture.data.source.snapshot().phases[0]!.name = "An extremely long phase name"
+  const ctx = { ...fixture.context(180, 60), glyphs, statusBadge }
+  const tree = timeline(fixture.data.source, { ...ctx, height: 0 })
+  if (tree.type !== "tree") throw new Error("Expected timeline tree")
+  expect(JSON.stringify(tree)).toMatch(/\.\.\./)
+  expect(JSON.stringify(tree)).not.toMatch(/[^\p{ASCII}]/u)
 })

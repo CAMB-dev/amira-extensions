@@ -1,6 +1,12 @@
 import { expect, test } from "bun:test"
-import { phaseInfo, summary, timeline } from "../src/layout.ts"
+import { clock, phaseInfo, summary, timeline } from "../src/layout.ts"
 import { viewFixture } from "./view-fixture.ts"
+
+test("the timeline clock shows local wall-clock time in a fixed slot", () => {
+  expect(clock(new Date(2026, 9, 26, 14, 38, 4).getTime())).toBe("14:38:04")
+  expect(clock(new Date(2026, 9, 26, 9, 5, 0).getTime())).toBe("09:05:00")
+  expect(clock()).toBe("--:--:--")
+})
 
 test("a truncated phase name keeps a gap before its description", () => {
   const fixture = viewFixture()

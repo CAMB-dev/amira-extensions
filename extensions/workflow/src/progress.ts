@@ -169,6 +169,16 @@ export function countsLine(flow: FlowNode): string {
 }
 
 /**
+ * The agent group's status beside its tree row. The host row already shows the members' badge,
+ * their state counts (done as a fraction) and tokens, so only journal replays, which are not
+ * members, and cost are added here; often nothing.
+ */
+export function groupStatusLine(flow: FlowNode): string {
+  const t = totals(flow)
+  return `${t.cached ? `${t.cached} from the journal` : ""}${cost(t.cost)}`.replace(/^ · /, "")
+}
+
+/**
  * How a phase stands: not reached yet, going on, or over, and then whether all its agents did
  * their work: one that failed makes it failed, one stopped (and none failed) stopped.
  */
