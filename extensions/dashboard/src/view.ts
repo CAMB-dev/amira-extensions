@@ -643,6 +643,8 @@ function onEvent(event: UiEvent, data: DashboardViewData, host: UiControl) {
 export const dashboardView: ViewDefinition<DashboardViewData> = {
   kind: VIEW_KIND,
   needsTab: true,
+  // Every page draws its own key hints (header, detail footer, session pages). Since API 0.1.25.
+  hostKeys: "none",
   onOpen(data, view) {
     const phases = data.source.snapshot().phases
     const active =
@@ -680,14 +682,23 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
     const c = chrome(ctx)
     const sessionPage = ctx.page?.data as SessionPage | undefined
     if (sessionPage?.kind === "session") {
-      return sessionPage.source === data.source && sessionPage.rootId === data.session?.info().id
-        ? typeof sessionPage.body === "function"
-          ? sessionPage.body(ctx)
-          : sessionPage.body
-        : text(
-            [line("Dashboard source or session changed. Press Esc to return.")],
-            "session-page:unavailable",
-          )
+      const body =
+        sessionPage.source === data.source && sessionPage.rootId === data.session?.info().id
+          ? typeof sessionPage.body === "function"
+            ? sessionPage.body({ ...ctx, height: Math.max(0, ctx.height - 1) })
+            : sessionPage.body
+          : text(
+              [line("Dashboard source or session changed. Press Esc to return.")],
+              "session-page:unavailable",
+            )
+      // The host key bar is hidden (hostKeys "none"), so session pages draw their way back.
+      return {
+        type: "column",
+        children: [
+          { node: body },
+          { size: 1, node: text([{ kind: "muted", text: c`  esc back · q quit` }]) },
+        ],
+      }
     }
     const snapshot = data.source.snapshot()
     const agents = agentsOf(snapshot)
@@ -710,7 +721,13 @@ export const dashboardView: ViewDefinition<DashboardViewData> = {
         part(" amira", "accent"),
         part(c` · workspace: ${snapshot.workspace}${narrow ? "" : c` · ${totals}`}`),
       ],
-      right: [part(narrow ? c`? help · q quit` : c`? shortcuts · q quit `, "muted")],
+      // With the host key bar hidden, a pushed page names its own way back.
+      right: [
+        part(
+          `${narrow ? c`? help` : c`? shortcuts`}${page ? c` · esc back` : ""}${c` · q quit`}${narrow ? "" : " "}`,
+          "muted",
+        ),
+      ],
     }
     const detailHeight = agent ? (narrow ? 6 : Math.min(15, Math.max(9, Math.round(ctx.height * 0.3)))) : 2
     const flashHeight = data.flash ? (narrow ? 2 : 1) : 0

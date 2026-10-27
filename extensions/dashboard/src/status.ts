@@ -64,25 +64,28 @@ export function statusTone(source: amira.AgentStatusSource): amira.ViewSegment["
   return (amira.AGENT_STATUS_BADGES?.[state] ?? fallback[state]).role
 }
 
+/** Padded for aligned columns; headings and prose pass `pad: false`. */
 export function statusBadge(
   source: amira.AgentStatusSource,
   opts: Pick<amira.ViewRenderOptions, "statusBadge"> = {},
   api: StatusApi = amira,
+  pad = true,
 ): amira.ViewSegment[] {
   const state = displayState(source, api)
-  if (typeof opts.statusBadge === "function") return opts.statusBadge(state, { pad: true })
-  return staticStatusBadge(state, api)
+  if (typeof opts.statusBadge === "function") return opts.statusBadge(state, { pad })
+  return staticStatusBadge(state, api, pad)
 }
 
 /** Historical events must not acquire the live helper's spinner metadata or cadence. */
 export function staticStatusBadge(
   source: amira.AgentStatusSource,
   api: StatusApi = amira,
+  pad = true,
 ): amira.ViewSegment[] {
   const state = displayState(source, api)
   const badge = api.AGENT_STATUS_BADGES?.[state] ?? fallback[state]
   // Render options expose no static theme glyph: ASCII is safe for every theme.
-  return [{ kind: badge.role, text: `${badge.ascii} ${badge.label.padEnd(7)}` }]
+  return [{ kind: badge.role, text: `${badge.ascii} ${pad ? badge.label.padEnd(7) : badge.label}` }]
 }
 
 /** Compact slots keep the timeline rail fixed, using the host badge's symbol and style. */

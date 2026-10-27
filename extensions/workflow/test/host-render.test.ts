@@ -347,21 +347,29 @@ for (const [width, detailsKey, listKey] of [
   })
 }
 
-test("default-theme animated badge keeps the entire selected badge/name inverse", () => {
+test("default-theme selected row keeps its badge colour under the accent cursor", () => {
+  const run = fixture()
   const viewer = new tui.ExtensionViewer(
     createWorkflowView(
-      () => fixture(),
+      () => run,
       async () => false,
     ),
     {},
     { now: () => 10000 },
   )
   viewer.mount()
-  const rows: string[] = viewer.render(120, { theme: kit.defaultTheme, color: true, rows: 32 })
-  const selected = rows.find((row) => row.includes("\u001b[7m") && row.includes("grid"))!
-  expect(selected).toBeDefined()
-  expect(selected.slice(0, selected.indexOf("grid") + 4)).not.toContain("\u001b[0m")
+  const theme = kit.defaultTheme
+  const [accent] = theme.accent("\0").split("\0")
+  const [success] = theme.success("\0").split("\0")
+  const render = (): string[] => viewer.render(120, { theme, color: true, rows: 32 })
+  render()
   expect(viewer.animating).toBe(true)
+  viewer.handleInput(kit.key("down"))
+  const selected = render().find((row) => kit.stripAnsi(row).includes(`${hostGlyphs.glyphs.pointer} ✓ done`))!
+  expect(selected).toBeDefined()
+  expect(selected).toContain(`${success}✓`)
+  expect(selected).toContain(`${success}done`)
+  expect(selected).toContain(`${accent} motion`)
   viewer.dispose()
 })
 
@@ -461,19 +469,21 @@ test("only active native pane highlights selection and pointer touches the badge
     { now: () => 10000 },
   )
   viewer.mount()
-  const theme = { ...kit.monoTheme, selection: (s: string) => `\u001b[7m${s}\u001b[27m` }
+  // A distinct accent marks the host's bold accent selection apart from mono's bold text.
+  const theme = { ...kit.monoTheme, accent: (s: string) => `\u001b[35m${s}\u001b[39m` }
+  const mark = "\u001b[1m\u001b[35m"
   const render = (): string[] => viewer.render(120, { theme, color: true, rows: 30 })
   const rows = render()
-  const selected = rows.find((row) => row.includes("\u001b[7m"))!
+  const selected = rows.find((row) => row.includes(mark))!
   expect(kit.stripAnsi(selected)).toMatch(/^ {2}› \S working grid/)
-  expect(rows.filter((row) => row.includes("\u001b[7m"))).toHaveLength(1)
+  expect(rows.filter((row) => row.includes(mark))).toHaveLength(1)
   expect(rows.some((row) => kit.stripAnsi(row).includes("│"))).toBe(true)
   viewer.handleInput(kit.key("]"))
   const detailRows = render()
   const listRow = detailRows.find((row) => kit.stripAnsi(row).includes("working grid"))!
-  expect(listRow).not.toContain("\u001b[7m")
-  expect(detailRows.filter((row) => row.includes("\u001b[7m"))).toHaveLength(1)
-  expect(detailRows.find((row) => row.includes("\u001b[7m"))).toContain("Events / result")
+  expect(listRow).not.toContain(mark)
+  expect(detailRows.filter((row) => row.includes(mark))).toHaveLength(1)
+  expect(detailRows.find((row) => row.includes(mark))).toContain("Events / result")
   viewer.dispose()
 })
 

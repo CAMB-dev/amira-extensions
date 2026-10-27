@@ -26,6 +26,7 @@ exports[`project stage cards in the real TUI viewer 120x36: stage outcome and re
   "  │",
   "  │",
   "  │",
+  "  │",
   "────────────────────────────────────────────────────────── ≡ ───────────────────────────────────────────────────────────",
   "  [Summary]  Logs  Documents",
   "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
@@ -37,7 +38,6 @@ exports[`project stage cards in the real TUI viewer 120x36: stage outcome and re
   "",
   "",
   "  1 summary · 2 logs · arrows tabs · Read-only stage",
-  "  tab focus · arrows navigate · enter open/send · pgup pgdn scroll · esc close",
 ]
 `;
 
@@ -60,12 +60,12 @@ exports[`project stage cards in the real TUI viewer 80x24: stage outcome and rep
   "  │  ╰────────────────────────────────────────────────────────────────────────╯",
   "  │ ────────────────────────────────────────────────────────────────────────────",
   "  │",
+  "  │",
   "────────────────────────────────────── ≡ ───────────────────────────────────────",
   "  [Summary]  Logs  Documents",
   "────────────────────────────────────────────────────────────────────────────────",
   "  ✗ Implement · budget stopped · $1.20 reported",
   "  2 batches · 3 tasks · Read-only: use /project",
   "  1 summary · 2 logs · arrows tabs · Read-only stage",
-  "  tab focus · arrows navigate · enter open/send · pgup pgdn scroll · esc close",
 ]
 `;

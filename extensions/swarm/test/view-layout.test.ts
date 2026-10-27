@@ -293,7 +293,15 @@ test("host badge receives padded state and ASCII fallback retains semantic style
 test("input-focused selection is dim but its member and detail stay selected", () => {
   const active = tree(render(), "members").items[0]!
   const inactive = tree(render(snapshot(), context({ focused: false })), "members").items[0]!
-  expect([...(active.node ?? []), ...active.row].every((p) => p.kind === "text")).toBe(true)
+  // The host accents the selected name; the badge keeps its own colour.
+  expect([...(active.node ?? []), ...active.row].map((p) => p.kind)).toEqual(["accent", "accent", "text"])
+  const done = snapshot({ members: [member("writer", { status: "ended", outcome: "done" })] })
+  const selectedDone = tree(render(done), "members").items[0]!
+  expect([...(selectedDone.node ?? []), ...selectedDone.row].map((p) => p.kind)).toEqual([
+    "success",
+    "success",
+    "text",
+  ])
   expect([...(inactive.node ?? []), ...inactive.row].every((p) => p.kind === "dim")).toBe(true)
   expect(tree(render(), "members").items[1]!.node![0]!.kind).toBe("muted")
   expect(active.gap).toBe(0)

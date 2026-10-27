@@ -109,7 +109,7 @@ export function traceLogLines(record: TraceRecord, opts: Pick<ViewRenderOptions,
           kind: "segments",
           parts: [
             { kind: "text", text: c`Turn ${record.turnId} · ` },
-            ...staticStatusBadge({ status: record.reason }),
+            ...staticStatusBadge({ status: record.reason }, undefined, false),
           ],
         },
         ...(record.failure ? [{ kind: "text" as const, text: record.failure.message }] : []),
@@ -118,7 +118,7 @@ export function traceLogLines(record: TraceRecord, opts: Pick<ViewRenderOptions,
       return [
         {
           kind: "segments",
-          parts: [...staticStatusBadge({ ...record, status: statusOf(record) })],
+          parts: [...staticStatusBadge({ ...record, status: statusOf(record) }, undefined, false)],
         },
         ...(record.reason ? [{ kind: "muted" as const, text: record.reason }] : []),
       ]
@@ -128,7 +128,7 @@ export function traceLogLines(record: TraceRecord, opts: Pick<ViewRenderOptions,
           kind: "segments",
           parts: [
             { kind: "text", text: c`${record.title ?? record.childSessionId} · ` },
-            ...staticStatusBadge({ ...record, status: statusOf(record) }),
+            ...staticStatusBadge({ ...record, status: statusOf(record) }, undefined, false),
           ],
         },
         ...(record.error ? [{ kind: "text" as const, text: record.error }] : []),

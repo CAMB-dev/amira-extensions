@@ -104,7 +104,10 @@ test("trace page reuses Stats with own-session cost, timing and read-only logs",
   const s = setup()
   await performAction(s.data, s.control, "open-trace", "payments")
   expect(s.session.trace).toHaveBeenCalledWith("child-session")
-  const tree = s.render()
+  const page = s.render()
+  // Session pages draw their own way back below the body; the host key bar is hidden.
+  expect(page.type === "column" && JSON.stringify(page.children[1]?.node)).toContain("esc back · q quit")
+  const tree = page.type === "column" ? page.children[0]!.node : page
   expect(tree.type === "tabs" && tree.tabs.map((tab) => tab.key)).toEqual(["stats", "logs"])
   const body = JSON.stringify(tree)
   expect(body).toContain("First token wait")

@@ -119,14 +119,21 @@ test("narrow host keeps all six member-state counts visible before identity or m
   viewer.dispose()
 })
 
-test("default-theme animated badge keeps the entire selected badge/name inverse", () => {
+test("default-theme selected row keeps its badge colour under the accent cursor", () => {
   const viewer = new tui.ExtensionViewer(readonlySwarmView, fixture(), { now: () => 10000 })
   viewer.mount()
-  const rows: string[] = viewer.render(120, { theme: kit.defaultTheme, color: true, rows: 32 })
-  const selected = rows.find((row) => row.includes("\u001b[7m") && row.includes("grid"))!
-  expect(selected).toBeDefined()
-  expect(selected.slice(0, selected.indexOf("grid") + 4)).not.toContain("\u001b[0m")
+  const theme = kit.defaultTheme
+  const [accent] = theme.accent("\0").split("\0")
+  const [success] = theme.success("\0").split("\0")
+  const render = (): string[] => viewer.render(120, { theme, color: true, rows: 32 })
+  render()
   expect(viewer.animating).toBe(true)
+  viewer.handleInput(kit.key("down"))
+  const selected = render().find((row) => strip(row).includes(`${glyphs.pointer} ✓ done`))!
+  expect(selected).toBeDefined()
+  expect(selected).toContain(`${success}✓`)
+  expect(selected).toContain(`${success}done`)
+  expect(selected).toContain(`${accent} motion`)
   viewer.dispose()
 })
 
@@ -191,9 +198,10 @@ for (const [width, height] of [
   test(`host ${width}x${height}: only the active pane has a selection bar and expansions survive navigation`, () => {
     const viewer = new tui.ExtensionViewer(readonlySwarmView, fixture(), { now: () => 10000 })
     viewer.mount()
-    const theme = { ...kit.monoTheme, selection: kit.inverse }
+    // A distinct accent marks the host's bold accent selection apart from mono's bold text.
+    const theme = { ...kit.monoTheme, accent: (text: string) => `\u001b[35m${text}\u001b[39m` }
     const render = (): string[] => viewer.render(width, { theme, color: true, rows: height })
-    const selectedRows = (rows: string[]) => rows.filter((row) => row.includes("\u001b[7m"))
+    const selectedRows = (rows: string[]) => rows.filter((row) => row.includes("\u001b[1m\u001b[35m"))
     expect(selectedRows(render())).toHaveLength(1)
     viewer.handleInput(kit.key("down"))
     expect(selectedRows(render()).map(strip).join("\n")).toContain("motion")

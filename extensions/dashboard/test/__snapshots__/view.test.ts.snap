@@ -1779,7 +1779,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 agent 
           "right": [
             {
               "kind": "muted",
-              "text": "? shortcuts · q quit ",
+              "text": "? shortcuts · esc back · q quit ",
             },
           ],
           "type": "bar",
@@ -2099,7 +2099,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 180x52 stats 
           "right": [
             {
               "kind": "muted",
-              "text": "? shortcuts · q quit ",
+              "text": "? shortcuts · esc back · q quit ",
             },
           ],
           "type": "bar",
@@ -3442,7 +3442,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 agent w
           "right": [
             {
               "kind": "muted",
-              "text": "? help · q quit",
+              "text": "? help · esc back · q quit",
             },
           ],
           "type": "bar",
@@ -3728,7 +3728,7 @@ exports[`public semantic rendering (not terminal raster snapshots) 80x24 stats w
           "right": [
             {
               "kind": "muted",
-              "text": "? help · q quit",
+              "text": "? help · esc back · q quit",
             },
           ],
           "type": "bar",

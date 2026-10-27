@@ -835,3 +835,7 @@ describe("read-only project stage cards", () => {
     expect(JSON.stringify(render(fixture))).toContain("Stop agent")
   })
 })
+
+test("the view draws its own key hints, so the host key bar is hidden", () => {
+  expect(dashboardView.hostKeys).toBe("none")
+})

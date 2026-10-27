@@ -9,7 +9,7 @@ import type {
   ViewRenderOptions,
   ViewSegment,
 } from "@amira/api"
-import { textCells } from "@amira/api"
+import { API_VERSION, textCells } from "@amira/api"
 import type { JournalEntry, RunRecord } from "./journal.ts"
 import {
   type AgentNode,
@@ -203,6 +203,14 @@ function listLines(
   })
 }
 
+/** API 0.1.70 hosts accent a selected row and keep its coloured segments; older ones inverse it. */
+const ACCENT_SELECTION = (() => {
+  const match = API_VERSION.match(/^(\d+)\.(\d+)\.(\d+)$/)
+  if (!match) return false
+  const [major, minor, patch] = match.slice(1).map(Number) as [number, number, number]
+  return major > 0 || minor > 1 || (minor === 1 && patch >= 70)
+})()
+
 /**
  * Only agents become host tree items. Headings are display-only detail after the preceding
  * agent (or leading text), so Up/Down indexes agents while groups remain visible. The tree
@@ -229,16 +237,19 @@ function agentTree(
       const badge = statusBadge(row.agent, opts)
       const first = badge[0]
       const split = first?.text.indexOf(" ") ?? -1
-      const kind: "dim" | "text" = opts.focused === false ? "dim" : "text"
+      const focused = opts.focused !== false
+      const kind: "dim" | "text" = focused ? "text" : "dim"
+      // The badge keeps its own colour under an accent selection; inverse and dim rows stay one style.
+      const plain = row.agent === selected && !(focused && ACCENT_SELECTION)
       const selectedParts = (parts: ViewSegment[]) =>
-        row.agent === selected ? parts.map((part) => ({ ...part, kind })) : parts
+        plain ? parts.map((part) => ({ ...part, kind })) : parts
       // The native two-cell node slot holds the symbol; the row starts at the state word.
       items.push({
         key: String(row.agent.call),
         // The fitted symbol must not carry animation provenance that resets inverse mid-row.
         // The word/name row retains the host's redraw demand and the shared symbol itself.
         node:
-          row.agent === selected && opts.focused !== false
+          plain && focused
             ? first && split >= 0
               ? [{ kind: "text", text: first.text.slice(0, split + 1) }]
               : []

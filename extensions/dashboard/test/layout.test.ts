@@ -111,3 +111,13 @@ test("narrow Summary keeps all metadata, notes and warnings reachable by scrolli
     expect(rendered).toContain(value)
   expect(rendered).not.toContain("Own reported usage")
 })
+
+test("the narrow Summary heading uses the unpadded badge in prose", () => {
+  const fixture = viewFixture()
+  const agent = fixture.snapshot.phases[1]!.groups[0]!.agents[0]!
+  const node = summary(fixture.data.source, agent, fixture.context(80))
+  const heading = node.type === "text" ? node.lines[0] : undefined
+  const text = heading?.kind === "segments" ? heading.parts.map((part) => part.text).join("") : ""
+  expect(text).toMatch(/done · /)
+  expect(text).not.toMatch(/done {2,}/)
+})

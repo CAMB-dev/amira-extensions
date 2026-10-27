@@ -81,15 +81,17 @@ describe.skipIf(!tui || !kit)("approved prototype fidelity", () => {
       )
       expect(rows.slice(0, 33).filter((row) => row.includes("worker-1"))).toHaveLength(1)
       // The prototype's own input box is gone (D139): the host composer takes input, and the
-      // timeline gets its three rows.
-      expect(rows[36]).toContain("≡")
-      expect(rows[37]).toMatch(/Summary.*Diff.*Logs.*Actions/)
-      expect(rows[37]).toContain("worker-1  task-auth-middleware")
-      expect(rows[39]).toContain("What this agent is doing")
-      expect(rows[39]).toContain("Changed files")
+      // timeline gets its three rows, plus the hidden host key bar's row (hostKeys "none").
+      expect(rows[37]).toContain("≡")
+      expect(rows[38]).toMatch(/Summary.*Diff.*Logs.*Actions/)
+      expect(rows[38]).toContain("worker-1  task-auth-middleware")
+      expect(rows[40]).toContain("What this agent is doing")
+      expect(rows[40]).toContain("Changed files")
       expect(rows.join("\n")).not.toContain("Press F6")
       expect(rows[0]).not.toContain("│")
-      expect(rows[51]).toMatch(/esc close/i)
+      // hostKeys "none": the header names the keys, no host key bar repeats them below.
+      expect(rows[0]).toContain("? shortcuts · q quit")
+      expect(rows.join("\n")).not.toMatch(/esc close/i)
       for (const row of rows) expect(kit.visibleWidth(row)).toBeLessThanOrEqual(180)
     } finally {
       viewer.dispose()

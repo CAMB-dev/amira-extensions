@@ -79,7 +79,6 @@ Phases and cards start expanded, with the first active phase’s agent selected.
                                  │                                                                                               │
                                  │                                                                                               │
   o open diff   p pause/resume   r request changes   a actions   x stop                                                                         1–4 tabs · 5 stats (when available)
-  tab focus · arrows navigate · enter open/send · pgup pgdn scroll · esc close
 ```
 
 <!-- /render:180x52 -->
@@ -114,7 +113,6 @@ phase: Implementation · running: 1/3 · cost: unknown
   Payment validation · ⠋ working · 90s
   Validate payment amounts and add regression coverage for partial refunds.
   1–4 tabs · o diff · a actions · ? shortcuts
-  tab focus · arrows navigate · enter open/send · pgup pgdn scroll · esc close
 ```
 
 <!-- /render:80x24 -->
@@ -142,7 +140,7 @@ Replay adds a **Stats** tab: first-token wait, streaming, unclassified model tim
 | Esc | Cancel a prompt first; otherwise return from an agent page, or close at the timeline |
 | q / Ctrl+C | Close the whole dashboard; q types text inside a prompt, Ctrl+C always closes |
 
-The framed bottom bar is a **hint, not an input**: press **F6** to ask Amira or enter a command in the host's main input without closing the dashboard. A focused input would consume navigation shortcuts, and the source contract has no general chat submission action. The host’s own navigation key bar remains the only in-view list of arrows/Tab/Enter/Esc.
+The framed bottom bar is a **hint, not an input**: press **F6** to ask Amira or enter a command in the host's main input without closing the dashboard. A focused input would consume navigation shortcuts, and the source contract has no general chat submission action. The dashboard draws its own key hints, so it hides the host key bar (`hostKeys: "none"`, since API 0.1.25; the host still shows its F6 route to the input): the header names `? shortcuts` and `q quit`, adds `esc back` on agent pages, the detail footer lists the actions, and transcript and trace pages end with `esc back · q quit`. Headings use the unpadded status badge (`✓ done · 8s`); only aligned columns pad it.
 
 Card action labels are keyboard hints, not pretend clickable buttons: tree detail widgets are display-only in this API. From the timeline, **p/r/x focus a single named action; press Enter to continue**. On an agent page they act directly on that page's fixed target. The Actions table provides an Enter-activated path for every action. Its row keys include the target agent, so host selection repair or same-kind view replacement cannot redirect an action to an old selection. `UiControl` has no state getter; the handler deliberately does not guess the host's current selection. Status always includes a word or mark, not color alone.
 
