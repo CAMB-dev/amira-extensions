@@ -114,9 +114,9 @@ test("only visible elapsed content requests a one-second refresh; badges own spi
   expect(refresh).not.toHaveBeenCalled()
 })
 
-test("trace status and subagent rows use shared static badges, including early-end notes", () => {
+test("trace status and subagent rows use shared unpadded static badges, including early-end notes", () => {
   expect(traceLogLines({ type: "status", at: 0, status: "blocked" })).toEqual([
-    { kind: "segments", parts: staticStatusBadge("paused") },
+    { kind: "segments", parts: staticStatusBadge("paused", undefined, false) },
   ])
   const record = {
     type: "subagent" as const,
@@ -130,11 +130,14 @@ test("trace status and subagent rows use shared static badges, including early-e
   expect(JSON.stringify(traceLogLines(record))).toContain("| stopped")
   expect(traceLogLines(record)[0]).toMatchObject({
     kind: "segments",
-    parts: expect.arrayContaining(staticStatusBadge("stopped")),
+    parts: expect.arrayContaining(staticStatusBadge("stopped", undefined, false)),
   })
   expect(
     traceLogLines({ type: "turn", turnId: "turn", start: 0, end: 10, reason: "error", steps: 1 })[0],
-  ).toMatchObject({ kind: "segments", parts: expect.arrayContaining(staticStatusBadge("failed")) })
+  ).toMatchObject({
+    kind: "segments",
+    parts: expect.arrayContaining(staticStatusBadge("failed", undefined, false)),
+  })
 })
 
 test("compatible mappers receive the complete original agent, not only its status string", () => {

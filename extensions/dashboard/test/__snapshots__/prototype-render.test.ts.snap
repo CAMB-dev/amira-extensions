@@ -19,13 +19,13 @@ exports[`approved prototype fidelity 80x24: selected phase only, compact details
   "              │  │ ────────────────────────────────────────────────────────── │",
   "              ├──▶ ✓ done    worker-2   ━━━━━━  100%                   o diff │",
   "              │  │   Add jti column and index for refresh_tokens.             │",
+  "              │  │   Changed files                                            │",
   "────────────────────────────────────── ≡ ───────────────────────────────────────",
   "  [Summary]  Diff  Logs  Actions  Stats",
   "────────────────────────────────────────────────────────────────────────────────",
   "  worker-1 · ⠋ working · 38s",
   "  task-auth-middleware",
   "  1–4 tabs · o diff · a actions · ? shortcuts",
-  "  tab focus · arrows navigate · enter open/send · pgup pgdn scroll · esc close",
 ]
 `;
 
@@ -67,6 +67,7 @@ exports[`approved prototype fidelity 180x52: equivalent scenario matches the tar
   "  --:--:--  · · Complete        waiting                                                                                                                                  cmp-b8c3  ▸",
   "              │ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
   "              │",
+  "              │",
   "──────────────────────────────────────────────────────────────────────────────────────── ≡ ─────────────────────────────────────────────────────────────────────────────────────────",
   "  [Summary]  Diff  Logs  Actions  Stats                                                                                                          worker-1  task-auth-middleware   ✕",
   "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
@@ -82,6 +83,5 @@ exports[`approved prototype fidelity 180x52: equivalent scenario matches the tar
   "                                 │                                                                                               │",
   "                                 │                                                                                               │",
   "  o open diff   p pause/resume   r request changes   a actions   x stop                                                                         1–4 tabs · 5 stats (when available)",
-  "  tab focus · arrows navigate · enter open/send · pgup pgdn scroll · esc close",
 ]
 `;

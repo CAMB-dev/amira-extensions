@@ -412,16 +412,17 @@ test("counts use shared outcomes and informational worktree notes do not mean st
 
 test("host input focus dims selection, but keeps the selection marker and state meaning", () => {
   const f = fixture()
-  for (const [focused, kind] of [
-    [true, "text"],
-    [false, "dim"],
+  // Focused, the host accents the name and the badge keeps its colour; unfocused, all dims.
+  for (const [focused, kind, badge] of [
+    [true, "text", "success"],
+    [false, "dim", "dim"],
   ] as const) {
     const row = left(f.view.ui!(f.data, context(100, focused))).find((line) =>
       lineText(line).includes("v done    agent 1"),
     )!
     if (row.kind !== "segments") throw new Error("Expected semantic selected row")
     expect(row.parts.at(-1)?.kind).toBe(kind)
-    expect(row.parts.every((part) => part.kind === kind)).toBe(true)
+    expect(row.parts.slice(0, -1).every((part) => part.kind === badge)).toBe(true)
   }
   expect(f.view.needsTab).toBeUndefined()
   expect(f.view.keys!.map((key) => key.key)).not.toContain("tab")

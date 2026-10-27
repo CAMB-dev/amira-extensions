@@ -169,8 +169,11 @@ focus toggles remain host-owned. Render the inactive pane as nonfocusable static
 text: native trees highlight selected rows even when unfocused. `UiControl.focus(id)` stores
 focus for the next frame, so choose the active native widget from `ctx.state.focused`
 (default members); keep selection and expansion host-owned. Put the shared badge symbol
-in the tree's two-cell `node` slot with `gap: 0`; selected symbol, state word and name all
-use the same text/dim semantic style, while unselected badges retain their theme roles.
+in the tree's two-cell `node` slot with `gap: 0`. On API 0.1.70+ hosts, which accent the
+selected row and keep coloured segments, the selected badge keeps its theme role (`✓ done`
+stays green) and only the name takes the accent (since 0.3.3); older hosts inverse the row,
+so there the selected symbol, state word and name share one text style. A dimmed selection
+(input focused, or the inactive pane) uses dim throughout.
 Use `ctx.glyphs.separator` and `ctx.glyphs.more` for separators and truncation, measuring
 these strings rather than assuming single-cell symbols. API 0.1.49 exposes only a subset
 of host glyphs; infer ASCII arrows and static disclosure markers from a printable-ASCII

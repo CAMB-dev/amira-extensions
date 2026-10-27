@@ -10,6 +10,7 @@ import type {
   ViewRenderOptions,
   ViewSegment,
 } from "@amira/api"
+import * as amira from "@amira/api"
 import { memberBadge, memberState, stateBadge } from "./status.ts"
 import type { MemberView, SwarmSnapshot, TimelineEntry } from "./swarm.ts"
 
@@ -246,10 +247,21 @@ function wrappedGroups(groups: string[], opts: ViewRenderOptions): ViewLine[] {
   return rows.map((text) => ({ kind: "segments", parts: [{ kind: "muted", text }] }))
 }
 
+/** API 0.1.70 hosts accent a selected row and keep its coloured segments; older ones inverse it. */
+const ACCENT_SELECTION = (() => {
+  const match = amira.API_VERSION?.match(/^(\d+)\.(\d+)\.(\d+)$/)
+  if (!match) return false
+  const [major, minor, patch] = match.slice(1).map(Number) as [number, number, number]
+  return major > 0 || minor > 1 || (minor === 1 && patch >= 70)
+})()
+
 /** Native trees reserve two disclosure cells; put the shared badge symbol there, not a blank. */
 function memberItem(m: MemberView, ctx: UiContext, selected: boolean, active: boolean): UiTreeItem {
+  const focused = active && ctx.focused !== false
+  // The badge keeps its own colour under an accent selection; inverse and dim rows stay one style.
+  const plain = selected && !(focused && ACCENT_SELECTION)
   const parts = [...memberBadge(m, ctx), { kind: "text" as const, text: ` ${m.name}` }].map((p) =>
-    selected ? { ...p, kind: active && ctx.focused !== false ? ("text" as const) : ("dim" as const) } : p,
+    plain ? { ...p, kind: focused ? ("text" as const) : ("dim" as const) } : p,
   )
   const node: ViewSegment[] = []
   const row: ViewSegment[] = []
@@ -267,10 +279,7 @@ function memberItem(m: MemberView, ctx: UiContext, selected: boolean, active: bo
   }
   // Fitting animated node fragments closes styles mid-row. Keep provenance in the row,
   // while the selected symbol slot is a plain semantic fragment under one inverse style.
-  const symbol =
-    selected && active && ctx.focused !== false
-      ? node.map((part) => ({ kind: "text" as const, text: part.text }))
-      : node
+  const symbol = plain && focused ? node.map((part) => ({ kind: "text" as const, text: part.text })) : node
   return { key: m.name, node: symbol, row, gap: 0 }
 }
 

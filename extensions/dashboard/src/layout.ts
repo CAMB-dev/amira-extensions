@@ -491,7 +491,7 @@ export function summary(source: DashboardSource, agent: DashboardAgent, ctx: UiC
       [
         segments([
           part(c`${rowLabel(agent)} · `, "accent"),
-          ...statusBadge(agent, ctx),
+          ...statusBadge(agent, ctx, undefined, false),
           part(c` · ${duration(runtime, ctx)}`, "accent"),
         ]),
         { kind: "text", text: agent.task },
