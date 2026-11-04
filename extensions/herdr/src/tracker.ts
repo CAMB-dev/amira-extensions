@@ -94,6 +94,8 @@ export class Tracker {
         this.#resume = e.data.resume ? [...e.data.resume] : undefined
         // A new, cleared, forked or resumed conversation waits for input.
         this.#status = "idle"
+        // Dialogs of the session before end with it; one never resolved must not block forever.
+        this.#dialogs.clear()
         this.#reason = undefined
         if (this.#resume) this.#tellSession()
         this.#update(true)
@@ -114,7 +116,7 @@ export class Tracker {
         this.#update()
         return
       case "ui.request":
-        if (!this.#fromSubagent(e)) return
+        if (!this.#countsDialog(e)) return
         // The same request again (a live list that changed) keeps its place.
         this.#dialogs.set(e.data.requestId, "title" in e.data ? e.data.title : undefined)
         this.#update()
@@ -133,13 +135,20 @@ export class Tracker {
   }
 
   /**
-   * Whether a dialog belongs to a session other than the root: a sub-agent's carries that
-   * sub-agent's id (the approval's request.sessionId). Commands' and extensions' own dialogs
-   * carry "host", and the root's own carry the root's id.
+   * Whether a dialog counts: it is neither the user's own (host) nor the root's. The host's
+   * carry "host" (pickers the user opens, such as /model); the root's carry the root's id
+   * and show through its status. What is left needs the user without the root saying so: a
+   * sub-agent's (its approval carries the sub-agent's id) or an extension's own parentless
+   * conversation's.
    */
-  #fromSubagent(e: AnyEvent): boolean {
+  #countsDialog(e: AnyEvent): boolean {
     if (e.parentSessionId !== undefined) return true
     return e.sessionId !== "host" && e.sessionId !== this.#root
+  }
+
+  /** Sends the current state again with the next event (the last report failed). */
+  forget(): void {
+    this.#last = undefined
   }
 
   #tellSession() {

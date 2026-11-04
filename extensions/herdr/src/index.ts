@@ -80,8 +80,13 @@ export function createHerdrExtension(deps: HerdrDeps = {}): Extension {
       })
       return r.exitCode === 0 && !r.timedOut && !r.aborted
     }
-    const reporter = new Reporter({ ...found, run, ...(deps.now ? { now: deps.now } : {}) })
-    const tracker = new Tracker({
+    const reporter = new Reporter({
+      ...found,
+      run,
+      onFailed: () => tracker.forget(),
+      ...(deps.now ? { now: deps.now } : {}),
+    })
+    const tracker: Tracker = new Tracker({
       report: (r) => reporter.report(r),
       setSession: (s) => reporter.setSession(s),
       release: () => void reporter.release(),

@@ -24,6 +24,11 @@ export interface ReporterOptions {
   pane: string
   run: RunHerdr
   now?: () => number
+  /**
+   * A state report failed and nothing newer waits: herdr may still show an older state, so
+   * the caller should send the current one again with its next event.
+   */
+  onFailed?: () => void
 }
 
 /** Identifies this integration to herdr (never starting with "herdr:"), and the name users see. */
@@ -108,6 +113,7 @@ export class Reporter {
       this.#inFlight = undefined
       const next = this.#pending
       this.#pending = undefined
+      if (!ok && !next) this.#opts.onFailed?.()
       if (next && !this.#released && !this.#disposed) this.#launch(next)
     })
   }

@@ -43,7 +43,9 @@ a background sub-agent). The extension therefore also follows `ui.request` and
 is open: a sub-agent's approval carries that sub-agent's session id. Dialogs you open
 yourself (the `/model` picker, other commands' and extensions' pickers) belong to the host,
 and the main session's own approvals already show through its status, so neither of them
-counts.
+counts. Every other dialog does: a sub-agent's, and one from an extension's own background
+conversation (a parentless session of its own), which needs you just the same. A new main
+session (startup, `/clear`, `/resume`, a fork) forgets the dialogs of the one before.
 
 ## Resume after a herdr restart
 
@@ -76,7 +78,7 @@ background, one at a time, each killed after 2 s. While one runs only the newest
 waits; older ones are dropped. `--seq` is the time in microseconds, kept strictly
 increasing, so it also grows across restarts. A failed report is ignored silently (herdr
 then falls back to reading the screen); a session that did not get through goes with the
-next report.
+next report, and a state that did not get through is sent again with the next event.
 
 ## Development
 

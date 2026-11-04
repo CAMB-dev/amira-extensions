@@ -291,6 +291,88 @@ describe("coalescing and seq", () => {
   })
 })
 
+describe("failures and argv", () => {
+  test("a final report that fails is sent again with the next event", async () => {
+    const s = setup({ auto: false })
+    await s.emit("session.start", startData())
+    s.calls[0]!.finish()
+    await s.emit("status.changed", { status: "working" })
+    s.calls[1]!.finish()
+    await s.emit("status.changed", { status: "idle" })
+    s.calls[2]!.finish(1)
+    await settle()
+    // The same state again: herdr may still show working, so it goes out once more.
+    await s.emit("status.changed", { status: "idle" })
+    expect(s.calls.length).toBe(4)
+    expect(s.brief()[3]).toEqual(["report-agent", "--state", "idle"])
+    s.calls[3]!.finish()
+    await s.emit("status.changed", { status: "idle" })
+    expect(s.calls.length).toBe(4)
+  })
+
+  test("a failure with a newer report waiting does not repeat the old one", async () => {
+    const s = setup({ auto: false })
+    await s.emit("session.start", startData())
+    await s.emit("status.changed", { status: "working" })
+    s.calls[0]!.finish(1)
+    await settle()
+    s.calls[1]!.finish()
+    await s.emit("status.changed", { status: "working" })
+    expect(s.brief().map((b) => b[2])).toEqual(["idle", "working"])
+  })
+
+  test("a binary path with spaces is one argv element", async () => {
+    const bin = "C:Program Filesherdrherdr.exe"
+    const s = setup({ env: herdrEnv({ HERDR_BIN_PATH: bin }) })
+    await s.emit("session.start", startData())
+    await s.emit("session.end", { reason: "exit" })
+    for (const c of s.calls) expect(c.argv[0]).toBe(bin)
+    expect(s.calls.length).toBe(2)
+  })
+
+  test("a session id or message starting with - stays one element after its flag", async () => {
+    const s = setup()
+    const id = "-s_odd id"
+    await s.emit("session.start", startData({ resume: ["amira", "--resume", id] }), { sessionId: id })
+    await s.emit("status.changed", { status: "blocked", reason: "-x --y" }, { sessionId: id })
+    const first = s.calls[0]!.argv
+    expect(first[first.indexOf("--agent-session-id") + 1]).toBe(id)
+    expect(first.slice(first.indexOf("--") + 1)).toEqual([
+      "amira",
+      "--resume",
+      id,
+      "--model",
+      "deepseek/deepseek-chat",
+    ])
+    const second = s.calls[1]!.argv
+    expect(second[second.indexOf("--message") + 1]).toBe("x --y")
+  })
+})
+
+describe("dialogs across sessions", () => {
+  test("a new root session forgets the dialogs of the one before", async () => {
+    const s = setup()
+    await s.emit("session.start", startData())
+    await s.emit("ui.request", { kind: "confirm", title: "Allow?", requestId: "z" } as never, {
+      sessionId: "s_child",
+    })
+    await s.emit("session.end", { reason: "switch" })
+    await s.emit("session.start", startData({ reason: "clear", resume: ["amira", "--resume", "s_new"] }), {
+      sessionId: "s_new",
+    })
+    expect(s.brief().map((b) => b[2])).toEqual(["idle", "blocked", "idle"])
+  })
+
+  test("an extension's own conversation's dialog counts", async () => {
+    const s = setup()
+    await s.emit("session.start", startData())
+    await s.emit("ui.request", { kind: "input", title: "Token?", requestId: "o" } as never, {
+      sessionId: "s_owned",
+    })
+    expect(s.brief()[1]).toEqual(["report-agent", "--state", "blocked", "--message", "Token?"])
+  })
+})
+
 describe("sessions", () => {
   test("every new session (clear, resume, fork) reports its resume command", async () => {
     const s = setup()
