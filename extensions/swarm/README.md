@@ -212,7 +212,7 @@ conversation that started it is closed).
   work (e.g. a sub-agent it started in the background);
 - you or the main session stop it;
 - a limit is hit: the swarm's message limit, the members' turn limits (each member ends
-  after its last turn), or the budget;
+  after its last turn), or the budget, when the settings set them (none do by default);
 - it made no progress: after `noProgressRounds` rounds with messages but no blackboard
   change and no finished part, it pauses and asks you whether to go on (with nobody to ask,
   as in print mode, it stops). It waits for your answer.
@@ -224,8 +224,8 @@ stopped takes no more messages; sending it one is refused, not dropped.
 
 A swarm has no budget of its own unless the settings give one (since 0.1.7; before, it stopped
 at 3,000,000 tokens). Without one, the session's budget (`budget` in settings), if set, still
-applies to the whole agent tree, and the message, turn, no-progress and pair-exchange limits
-above still stop a swarm that runs away. A `budget` covers the members and their own
+applies to the whole agent tree, and the no-progress and pair-exchange checks above (plus
+any message or turn limits the settings set) still stop a swarm that runs away. A `budget` covers the members and their own
 sub-agents; the main session's turns answering them are its own.
 
 The blackboard, the messages and the results are kept in the session file, so `/swarm view`
@@ -381,16 +381,16 @@ In `settings.json`, under `extensions.swarm`:
   "extensions": {
     "swarm": {
       "enabled": "mode",           // default: follow the session's permission mode (see below)
-      "maxMembers": 6,
+      "maxMembers": 6,             // default: no limit
       "memberWorkflows": {
         "enabled": true,          // needs the workflow.runner service
         "maxRunning": 3,          // across this swarm, including pending starts
         "maxPerMember": 1
       },
       "limits": {
-        "maxMessagesPerMember": 30,
-        "maxMessages": 150,
-        "maxTurnsPerMember": 20,
+        "maxMessagesPerMember": 30, // default: no limit
+        "maxMessages": 150,         // default: no limit
+        "maxTurnsPerMember": 20,    // default: no limit
         "noProgressRounds": 3,
         "maxPairExchanges": 8,
         "maxConcurrent": 3,        // members working at once (the agent tree's limit applies too)
@@ -409,8 +409,9 @@ In `settings.json`, under `extensions.swarm`:
 - `"always"`: starts without asking in any permission mode.
 - `"never"`: disables swarms.
 
-A start may lower the message and turn limits (`limits` of the `swarm` tool), never raise
-them.
+Since 0.4.0 the member, message and turn limits are off unless the settings set them; the
+two stall checks (`noProgressRounds`, `maxPairExchanges`) stay on by default. A start may
+set or lower the message and turn limits (`limits` of the `swarm` tool), never raise them.
 
 Older settings still work: `"enabled": "explicit"` reads as `"ask"`. Without `enabled`,
 `"confirm": false` reads as `"always"` and `"confirm": true` as `"ask"`. As before,

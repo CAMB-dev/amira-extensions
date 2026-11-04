@@ -15,7 +15,7 @@ import type {
 } from "@amira/api"
 import { textResult } from "@amira/api"
 import { connectDashboardSource, createSwarmSource } from "./dashboard.ts"
-import { readSettings, type SwarmSettings, withOverrides } from "./limits.ts"
+import { readSettings, type SwarmLimits, type SwarmSettings, withOverrides } from "./limits.ts"
 import { createSwarmRunner, type RunnerOwner } from "./runner.ts"
 import {
   checkRoster,
@@ -222,7 +222,7 @@ export function createSwarmExtension(): Extension {
                 "",
                 roster,
                 "",
-                `Agents: ${members.length}${limits.maxConcurrent ? `, ${limits.maxConcurrent} at a time` : ", all at once"}; each works up to ${limits.maxTurnsPerMember} turns and sends up to ${limits.maxMessagesPerMember} messages (${limits.maxMessages} in all).`,
+                `Agents: ${members.length}${limits.maxConcurrent ? `, ${limits.maxConcurrent} at a time` : ", all at once"}; ${countLimits(limits)}.`,
                 `Cost: ${budget.length ? `stops at ${budget.join(" or ")}` : "no cost cap"}.`,
                 "Files: the members work in your working tree and can change your files.",
               ].join("\n"),
@@ -259,7 +259,7 @@ export function createSwarmExtension(): Extension {
             name: `swarm: ${clip(goal, 40)}`,
             ...(limits.maxConcurrent ? { maxConcurrent: limits.maxConcurrent } : {}),
             ...(limits.budget ? { budget: limits.budget } : {}),
-            maxTurnsPerAgent: limits.maxTurnsPerMember,
+            ...(limits.maxTurnsPerMember ? { maxTurnsPerAgent: limits.maxTurnsPerMember } : {}),
             maxAgents: members.length * 4,
           })
         } catch (err) {
@@ -776,3 +776,14 @@ export function createSwarmExtension(): Extension {
 }
 
 export default createSwarmExtension()
+
+/** The count limits for the start confirmation: "no turn or message limits" when none are set. */
+function countLimits(limits: SwarmLimits): string {
+  const each = [
+    limits.maxTurnsPerMember !== undefined ? `up to ${limits.maxTurnsPerMember} turns` : "",
+    limits.maxMessagesPerMember !== undefined ? `up to ${limits.maxMessagesPerMember} messages` : "",
+  ].filter(Boolean)
+  const all = limits.maxMessages !== undefined ? `${limits.maxMessages} messages in all` : ""
+  if (!each.length && !all) return "no turn or message limits"
+  return [each.length ? `each works ${each.join(" and sends ")}` : "", all].filter(Boolean).join("; ")
+}

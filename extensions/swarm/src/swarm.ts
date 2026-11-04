@@ -237,9 +237,10 @@ const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…`
 const oneLine = (s: string) => s.replace(/\s+/g, " ").trim()
 
 /** The problem with a roster, or undefined when it can start. */
-export function checkRoster(members: MemberSpec[], maxMembers: number): string | undefined {
+export function checkRoster(members: MemberSpec[], maxMembers?: number): string | undefined {
   if (!Array.isArray(members) || members.length < 2) return "A swarm needs at least 2 members."
-  if (members.length > maxMembers) return `A swarm may have at most ${maxMembers} members.`
+  if (maxMembers !== undefined && members.length > maxMembers)
+    return `A swarm may have at most ${maxMembers} members.`
   const seen = new Set<string>()
   for (const m of members) {
     if (!m || typeof m.name !== "string" || !MEMBER_NAME.test(m.name)) {
@@ -333,7 +334,7 @@ export class Swarm {
         prompt: memberPrompt(spec),
         systemPrompt: memberSystemPrompt(spec, this.goal, roster, this.limits),
         persistent: true,
-        maxTurns: this.limits.maxTurnsPerMember,
+        ...(this.limits.maxTurnsPerMember ? { maxTurns: this.limits.maxTurnsPerMember } : {}),
         ...(spec.model ? { model: spec.model } : {}),
         extraTools: [...this.#tools(spec.name), ...(this.#workflows?.tools(spec.name) ?? [])],
       })
@@ -403,7 +404,7 @@ export class Swarm {
     const body = oneLine(text) ? text.trim() : ""
     if (!body) return "The message is empty."
     if (from === "commander") {
-      if (this.#messages >= this.limits.maxMessages)
+      if (this.limits.maxMessages !== undefined && this.#messages >= this.limits.maxMessages)
         return `The swarm has sent all ${this.limits.maxMessages} messages it may send; stop it, or let it end.`
       const pair = pairKey("commander", m.spec.name)
       const count = this.#pairs.get(pair) ?? 0
@@ -431,7 +432,7 @@ export class Swarm {
     const to = [...this.#members.values()].filter((m) => m.child.state !== "ended" && !m.stopping)
     if (!to.length) return "No member can get messages any more: every one has ended or is stopping."
     if (from === "commander") {
-      if (this.#messages + to.length > this.limits.maxMessages)
+      if (this.limits.maxMessages !== undefined && this.#messages + to.length > this.limits.maxMessages)
         return `The swarm has too few messages left to reach all ${to.length} members; stop it, or let it end.`
       for (const m of to) {
         const count = this.#pairs.get(pairKey("commander", m.spec.name)) ?? 0
@@ -619,7 +620,7 @@ export class Swarm {
     if (m === sender) return "That is you."
     if (m?.child.state === "ended") return `${m.spec.name} has ended; it cannot get messages any more.`
     if (m?.stopping) return `${m.spec.name} is stopping; it cannot get messages any more.`
-    if (sender.sent >= this.limits.maxMessagesPerMember) {
+    if (this.limits.maxMessagesPerMember !== undefined && sender.sent >= this.limits.maxMessagesPerMember) {
       return `You have sent all ${this.limits.maxMessagesPerMember} messages a member may send. Put what is left on the blackboard, or call finish.`
     }
     const pair = pairKey(sender.spec.name, m ? m.spec.name : "commander")
@@ -627,7 +628,7 @@ export class Swarm {
     if (count >= this.limits.maxPairExchanges) {
       return `You and ${m ? m.spec.name : "the commander"} have exchanged ${count} messages while ${m ? "neither" : "you"} wrote to the blackboard. Write your findings or decision to the blackboard (or call finish) instead of messaging further.`
     }
-    if (this.#messages >= this.limits.maxMessages) {
+    if (this.limits.maxMessages !== undefined && this.#messages >= this.limits.maxMessages) {
       void this.#end(`the members sent the ${this.limits.maxMessages} messages a swarm may send`, false)
       return "The swarm has reached its message limit and is ending. End your turn."
     }
@@ -747,7 +748,7 @@ export class Swarm {
       ...lines,
       '- commander: started the swarm; reach it with send_message(to: "commander")',
       "",
-      `Messages you may still send: ${Math.max(0, this.limits.maxMessagesPerMember - me.sent)} (the swarm: ${Math.max(0, this.limits.maxMessages - this.#messages)}).`,
+      ...messagesLeft(this.limits, me.sent, this.#messages),
     ].join("\n")
   }
 
@@ -1059,7 +1060,7 @@ function memberSystemPrompt(
       '- send_message(to, text) reaches one member, or "commander" (who started the swarm) for questions only it can answer. Keep messages short and actionable; never send thanks, greetings or acknowledgements.',
       '- After each turn you go idle; a message wakes you. Messages reach you as "[message from <name>] ...". Never wait for others inside a turn (no sleep commands, no re-reading the blackboard in a loop): when you need the work of someone else, end your turn; their message wakes you.',
       "- When your part is done, call finish(result) with a short summary, then end your turn.",
-      `- The swarm ends once every member is idle and no message is on its way. Limits: ${limits.maxMessagesPerMember} messages per member, ${limits.maxTurnsPerMember} turns per member.`,
+      `- The swarm ends once every member is idle and no message is on its way.${limitText(limits)}`,
     ].join("\n"),
   ].join("\n\n")
 }
@@ -1190,4 +1191,25 @@ export function swarmsFromRecords(records: readonly unknown[]): SwarmSnapshot[] 
       ...(s.endReason === undefined ? { endReason: "the session ended before the swarm did" } : {}),
     }
   })
+}
+
+/** The member's remaining message allowance, when the swarm has one. */
+function messagesLeft(limits: SwarmLimits, sent: number, total: number): string[] {
+  const own =
+    limits.maxMessagesPerMember !== undefined ? Math.max(0, limits.maxMessagesPerMember - sent) : undefined
+  const all = limits.maxMessages !== undefined ? Math.max(0, limits.maxMessages - total) : undefined
+  if (own === undefined && all === undefined) return []
+  if (all === undefined) return [`Messages you may still send: ${own}.`]
+  if (own === undefined) return [`Messages the swarm may still send: ${all}.`]
+  return [`Messages you may still send: ${own} (the swarm: ${all}).`]
+}
+
+/** The count limits a member works under, as a sentence for its system prompt (empty when none). */
+function limitText(limits: SwarmLimits): string {
+  const parts = [
+    limits.maxMessagesPerMember !== undefined ? `${limits.maxMessagesPerMember} messages per member` : "",
+    limits.maxTurnsPerMember !== undefined ? `${limits.maxTurnsPerMember} turns per member` : "",
+    limits.maxMessages !== undefined ? `${limits.maxMessages} messages in all` : "",
+  ].filter(Boolean)
+  return parts.length ? ` Limits: ${parts.join(", ")}.` : ""
 }

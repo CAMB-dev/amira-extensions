@@ -19,7 +19,8 @@ import {
   readSettings,
   type SwarmLimits,
 } from "../src/index.ts"
-import { type MemberSpec, Swarm, type SwarmRecord, swarmsFromRecords } from "../src/swarm.ts"
+import { withOverrides } from "../src/limits.ts"
+import { checkRoster, type MemberSpec, Swarm, type SwarmRecord, swarmsFromRecords } from "../src/swarm.ts"
 import { timelineLine } from "../src/view.ts"
 
 setDefaultTimeout(30_000)
@@ -497,9 +498,7 @@ test("the model may propose a swarm: the confirmation, marked as its proposal, i
   expect(lines[1]).toBe("Goal: Check the sky")
   expect(seen[0]!.message).toContain("  a (one): talk to b")
   expect(seen[0]!.message).toContain("  b (two): answer a")
-  expect(seen[0]!.message).toContain(
-    "Agents: 2, all at once; each works up to 20 turns and sends up to 30 messages (150 in all).",
-  )
+  expect(seen[0]!.message).toContain("Agents: 2, all at once; no turn or message limits.")
   expect(seen[0]!.message).toContain("Cost: no cost cap.")
   expect(seen[0]!.message).toContain(
     "Files: the members work in your working tree and can change your files.",
@@ -691,13 +690,32 @@ test("settings: bad values are reported and ignored; a start can only lower the 
   )
   // An unknown value is reported; the older confirm: false still skips the confirmation.
   expect(s.enabled).toBe("always")
-  expect(s.maxMembers).toBe(6)
+  // A bad value leaves the default: no member limit.
+  expect(s.maxMembers).toBeUndefined()
   expect(s.limits.maxMessages).toBe(10)
   expect(s.limits.noProgressRounds).toBe(DEFAULT_LIMITS.noProgressRounds)
   expect(s.limits.budget).toEqual({ tokens: 5000 })
   expect(problems.length).toBe(3)
   // Without settings a swarm has no budget of its own; the session's budget, if any, applies.
   expect(readSettings(undefined).limits.budget).toBeUndefined()
+  // No count limits by default; the stall checks stay on.
+  const plain = readSettings(undefined)
+  expect(plain.maxMembers).toBeUndefined()
+  expect(plain.limits.maxMessages).toBeUndefined()
+  expect(plain.limits.maxMessagesPerMember).toBeUndefined()
+  expect(plain.limits.maxTurnsPerMember).toBeUndefined()
+  expect(plain.limits.noProgressRounds).toBe(3)
+  expect(plain.limits.maxPairExchanges).toBe(8)
+  expect(
+    checkRoster(
+      Array.from({ length: 12 }, (_, i) => ({ name: `m${i}`, role: "r", brief: "b" }) as MemberSpec),
+    ),
+  ).toBeUndefined()
+  // A start may still set a limit where the settings have none, and only lower one that is set.
+  const asked = withOverrides(plain.limits, { max_messages: 40, max_turns_per_member: 5 })
+  expect(asked.maxMessages).toBe(40)
+  expect(asked.maxTurnsPerMember).toBe(5)
+  expect(withOverrides(s.limits, { max_messages: 99 }).maxMessages).toBe(10)
   expect(readSettings(undefined).enabled).toBe("mode")
   // The older values: "explicit" is "ask"; confirm: false never overrides "never".
   const quiet: string[] = []
