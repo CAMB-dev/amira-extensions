@@ -1,14 +1,14 @@
 import type { Budget } from "@amira/api"
 import type { MemberWorkflowSettings } from "./workflows.ts"
 
-/** The guardrails of one swarm. */
+/** The guardrails of one swarm. A count limit left out means no limit. */
 export interface SwarmLimits {
   /** Messages one member may send in all. */
-  maxMessagesPerMember: number
+  maxMessagesPerMember?: number
   /** Messages the members may send in all (the user's and the commander's do not count). */
-  maxMessages: number
+  maxMessages?: number
   /** Turns each member runs at most; it ends after its last one. */
-  maxTurnsPerMember: number
+  maxTurnsPerMember?: number
   /**
    * Rounds (every live member ending a turn once, on average) with messages but without any
    * blackboard change or finished part, after which the swarm pauses and asks the user.
@@ -25,10 +25,8 @@ export interface SwarmLimits {
   budget?: Budget
 }
 
+/** No count limits by default; the stall checks still pause or redirect a swarm going nowhere. */
 export const DEFAULT_LIMITS: SwarmLimits = {
-  maxMessagesPerMember: 30,
-  maxMessages: 150,
-  maxTurnsPerMember: 20,
   noProgressRounds: 3,
   maxPairExchanges: 8,
 }
@@ -41,8 +39,8 @@ export interface SwarmSettings {
    * Older settings read as: "explicit" is "ask", and `confirm: false` turns "ask" into "always".
    */
   enabled: "mode" | "ask" | "always" | "never"
-  /** Most members a swarm may have. */
-  maxMembers: number
+  /** Most members a swarm may have; no limit when left out. */
+  maxMembers?: number
   limits: SwarmLimits
   /** Optional workflow.runner integration; pending starts count against both limits. */
   memberWorkflows: MemberWorkflowSettings
@@ -56,7 +54,6 @@ export function readSettings(raw: unknown, report: (problem: string) => void = (
   const s = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {}
   const out: SwarmSettings = {
     enabled: s.confirm === false ? "always" : s.confirm === true ? "ask" : "mode",
-    maxMembers: 6,
     limits: { ...DEFAULT_LIMITS },
     memberWorkflows: { enabled: true, maxRunning: 3, maxPerMember: 1 },
   }
@@ -133,7 +130,7 @@ export function withOverrides(base: SwarmLimits, asked: Record<string, unknown> 
   } as const
   for (const [param, key] of Object.entries(map)) {
     const n = positive(asked[param])
-    if (n) out[key] = Math.min(out[key], n)
+    if (n) out[key] = Math.min(out[key] ?? n, n)
   }
   return out
 }
