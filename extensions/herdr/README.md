@@ -28,19 +28,22 @@ starts, and an Amira that finds its own pane id there stays silent.
 
 Reports are for the main session only; sub-agents never report on their own.
 
-| Amira | herdr |
-|---|---|
-| A turn runs | `working` |
-| A question or approval waits for you, from the main session or any sub-agent | `blocked`, with the question (one line, at most 80 characters) |
-| Waiting for your input | `idle` |
-| A turn failed | `idle`: Amira waits for input, and `blocked` would read "needs a decision" until the next turn |
+| Amira                                                                        | herdr                                                                                          |
+| ---------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| A turn runs                                                                  | `working`                                                                                      |
+| A question or approval waits for you, from the main session or any sub-agent | `blocked`, with the question (one line, at most 80 characters)                                 |
+| Waiting for your input                                                       | `idle`                                                                                         |
+| A turn failed                                                                | `idle`: Amira waits for input, and `blocked` would read "needs a decision" until the next turn |
 
-Why dialogs anywhere count: when a sub-agent needs a permission, only that sub-agent's
+Why sub-agents' dialogs count: when a sub-agent needs a permission, only that sub-agent's
 session goes `blocked`. Its approval goes straight to the user (the approver handed down
 from the main session), so the main session's own status stays `working` (or `idle`, for
 a background sub-agent). The extension therefore also follows `ui.request` and
-`ui.resolved` and shows `blocked` while any dialog is open. That includes dialogs you open
-yourself (a `/model` picker, say) for as long as they are open.
+`ui.resolved`, and shows `blocked` while a dialog of any session other than the main one
+is open: a sub-agent's approval carries that sub-agent's session id. Dialogs you open
+yourself (the `/model` picker, other commands' and extensions' pickers) belong to the host,
+and the main session's own approvals already show through its status, so neither of them
+counts.
 
 ## Resume after a herdr restart
 

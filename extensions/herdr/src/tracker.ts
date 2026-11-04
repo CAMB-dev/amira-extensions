@@ -41,7 +41,9 @@ export interface TrackerOptions {
  * Follows the root session's events and tells the reporter what herdr should show. The root is
  * the session the user talks to: sub-agents (events with parentSessionId) never count, and
  * neither do other parentless sessions (extensions' own conversations) once the root is known.
- * A dialog open anywhere (a sub-agent's permission question included) shows as blocked.
+ * A sub-agent's dialog (its permission question, say) shows as blocked too: it never blocks
+ * the root's own status. The root's own approvals and questions already set its status, and
+ * dialogs of the host (pickers the user opens, such as /model) do not count.
  */
 export class Tracker {
   #opts: TrackerOptions
@@ -112,6 +114,7 @@ export class Tracker {
         this.#update()
         return
       case "ui.request":
+        if (!this.#fromSubagent(e)) return
         // The same request again (a live list that changed) keeps its place.
         this.#dialogs.set(e.data.requestId, "title" in e.data ? e.data.title : undefined)
         this.#update()
@@ -127,6 +130,16 @@ export class Tracker {
         this.#opts.release()
         return
     }
+  }
+
+  /**
+   * Whether a dialog belongs to a session other than the root: a sub-agent's carries that
+   * sub-agent's id (the approval's request.sessionId). Commands' and extensions' own dialogs
+   * carry "host", and the root's own carry the root's id.
+   */
+  #fromSubagent(e: AnyEvent): boolean {
+    if (e.parentSessionId !== undefined) return true
+    return e.sessionId !== "host" && e.sessionId !== this.#root
   }
 
   #tellSession() {

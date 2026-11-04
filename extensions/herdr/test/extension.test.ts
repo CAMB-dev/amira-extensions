@@ -184,17 +184,37 @@ describe("dialogs", () => {
   test("several dialogs: blocked until the last one closes", async () => {
     const s = setup()
     await s.emit("session.start", startData())
-    await s.emit("ui.request", { kind: "confirm", title: "first", requestId: "a" } as never)
-    await s.emit("ui.request", { kind: "confirm", title: "second", requestId: "b" } as never)
-    await s.emit("ui.resolved", { requestId: "b", cancelled: true })
-    await s.emit("ui.resolved", { requestId: "a", cancelled: true })
-    await s.emit("ui.resolved", { requestId: "unknown", cancelled: true })
+    const child = { sessionId: "s_child" }
+    await s.emit("ui.request", { kind: "confirm", title: "first", requestId: "a" } as never, child)
+    await s.emit("ui.request", { kind: "confirm", title: "second", requestId: "b" } as never, child)
+    await s.emit("ui.resolved", { requestId: "b", cancelled: true }, child)
+    await s.emit("ui.resolved", { requestId: "a", cancelled: true }, child)
+    await s.emit("ui.resolved", { requestId: "unknown", cancelled: true }, child)
     await settle()
     expect(s.brief().slice(1)).toEqual([
       ["report-agent", "--state", "blocked", "--message", "first"],
       ["report-agent", "--state", "blocked", "--message", "second"],
       ["report-agent", "--state", "blocked", "--message", "first"],
       ["report-agent", "--state", "idle"],
+    ])
+  })
+
+  test("the user's own pickers and the root's dialogs do not count", async () => {
+    const s = setup()
+    await s.emit("session.start", startData())
+    // /model and other commands ask through the host's dialogs.
+    await s.emit("ui.request", { kind: "select", title: "Model", options: ["a"], requestId: "m" } as never, {
+      sessionId: "host",
+    })
+    // The root's approval: its status says blocked, the dialog adds nothing.
+    await s.emit("status.changed", { status: "blocked", reason: "approval for bash" })
+    await s.emit("ui.request", { kind: "confirm", title: "Allow bash?", requestId: "r" } as never)
+    await s.emit("ui.resolved", { requestId: "r", cancelled: false, value: true })
+    await s.emit("status.changed", { status: "working" })
+    await s.emit("ui.resolved", { requestId: "m", cancelled: true }, { sessionId: "host" })
+    expect(s.brief().slice(1)).toEqual([
+      ["report-agent", "--state", "blocked", "--message", "approval for bash"],
+      ["report-agent", "--state", "working"],
     ])
   })
 })
