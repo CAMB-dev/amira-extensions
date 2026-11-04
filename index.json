@@ -4,7 +4,7 @@
     {
       "name": "herdr",
       "description": "Amira's state (working, idle, blocked) and resume command reported to herdr when it runs in a herdr pane, so herdr agent wait and restores work",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/herdr" },
       "engines": { "amira": "^0.1.2" },
       "tags": ["herdr", "terminal", "workspace", "integration", "status"],

@@ -37,16 +37,22 @@ export interface HerdrPane {
   bin: string
 }
 
-/** The pane to report to, or why not: outside herdr, turned off, or nested in another Amira. */
+/**
+ * The pane to report to, or why not: outside herdr, turned off, nested in another Amira, or
+ * not the interactive UI (print, rpc, a daemon: herdr shows the agent a person runs in the
+ * pane). `frontend` is ExtensionAPI.frontend; Amira before API 0.1.72 has none and reports.
+ */
 export function detect(
   env: Env,
   settings: Record<string, unknown> | undefined,
   owner: Record<symbol, unknown> = globalThis as never,
-): HerdrPane | { inactive: "not in herdr" | "disabled" | "nested" } {
+  frontend?: string,
+): HerdrPane | { inactive: "not in herdr" | "disabled" | "nested" | "headless" } {
   if (settings?.enabled === false) return { inactive: "disabled" }
   const pane = env.HERDR_PANE_ID?.trim()
   const bin = env.HERDR_BIN_PATH?.trim()
   if (env.HERDR_ENV !== "1" || !pane || !bin) return { inactive: "not in herdr" }
+  if (frontend !== undefined && frontend !== "tui") return { inactive: "headless" }
   // The variable came from a parent Amira that reports for this pane already.
   if (env[NESTED_VAR] === pane && owner[OWNER] !== pane) return { inactive: "nested" }
   return { pane, bin }
@@ -65,7 +71,7 @@ export function createHerdrExtension(deps: HerdrDeps = {}): Extension {
   return (api: ExtensionAPI) => {
     const env = deps.env ?? process.env
     const owner = deps.process ?? (globalThis as never)
-    const found = detect(env, api.settings.extensions?.herdr, owner)
+    const found = detect(env, api.settings.extensions?.herdr, owner, (api as { frontend?: string }).frontend)
     if ("inactive" in found) return
     env[NESTED_VAR] = found.pane
     owner[OWNER] = found.pane

@@ -20,6 +20,10 @@ Only inside a herdr pane: `HERDR_ENV=1` and non-empty `HERDR_PANE_ID` and `HERDR
 Anywhere else it does nothing at all. `"extensions": { "herdr": { "enabled": false } }` in
 settings.json turns it off.
 
+Only the interactive UI reports. `amira -p`, `--rpc` and workspace daemons stay silent (Amira
+0.1.72 and later tell extensions how they run): herdr shows the agent a person runs in the pane,
+and an `amira -p` that another agent starts in its own pane must not take that pane over.
+
 An Amira started from inside another one (from the bash tool, say) runs in the same pane and
 would fight over it: the outer one sets `AMIRA_HERDR_PANE` to the pane id for everything it
 starts, and an Amira that finds its own pane id there stays silent.

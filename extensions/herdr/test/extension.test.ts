@@ -54,6 +54,10 @@ describe("activation", () => {
     expect(detect(herdrEnv(), { enabled: false }, {})).toEqual({ inactive: "disabled" })
     expect(detect(herdrEnv({ [NESTED_VAR]: PANE }), undefined, {})).toEqual({ inactive: "nested" })
     expect(detect(herdrEnv(), {}, {})).toEqual({ pane: PANE, bin: BIN })
+    // Only the interactive UI reports; an Amira without api.frontend (before 0.1.72) does too.
+    expect(detect(herdrEnv(), {}, {}, "tui")).toEqual({ pane: PANE, bin: BIN })
+    for (const frontend of ["print", "rpc", "server", "embedded"])
+      expect(detect(herdrEnv(), {}, {}, frontend)).toEqual({ inactive: "headless" })
   })
 })
 
