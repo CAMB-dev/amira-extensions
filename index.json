@@ -2,6 +2,26 @@
   "schemaVersion": 1,
   "extensions": [
     {
+      "name": "goal",
+      "description": "Goal-driven completion loop: keep pushing until verification passes (shell commands, completion tool, LLM/verifier judge), with stuck recovery, budget caps, and fresh-context Ralph mode: /goal",
+      "version": "0.1.0",
+      "status": "experimental",
+      "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/goal" },
+      "engines": { "amira": "^0.1.72" },
+      "tags": ["experimental", "goal", "loop", "verification", "automation"],
+      "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/goal"
+    },
+    {
+      "name": "pair",
+      "description": "Decentralized E2EE multi-peer collaboration and Agent-to-Agent grilling & handoff over WebSocket (zero-knowledge relay or LAN P2P) with btw-style Live Fork context and non-intrusive Decision Cards: /pair",
+      "version": "0.1.0",
+      "status": "experimental",
+      "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/pair" },
+      "engines": { "amira": "^0.1.72" },
+      "tags": ["experimental", "pair", "collaboration", "a2a", "handoff", "e2ee"],
+      "homepage": "https://github.com/CAMB-dev/amira-extensions/tree/main/extensions/pair"
+    },
+    {
       "name": "herdr",
       "description": "Amira's state (working, idle, blocked) and resume command reported to herdr when it runs in a herdr pane, so herdr agent wait and restores work",
       "version": "0.1.1",
