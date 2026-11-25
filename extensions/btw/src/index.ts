@@ -1,5 +1,4 @@
 import type {
-  AgentStatusState,
   AnyEvent,
   ChildSession,
   CommandContext,
@@ -142,23 +141,6 @@ function recover(value: unknown): Pending[] {
         (typeof item.retryId === "string" && LEGACY_RETRY_ID.test(item.retryId)))
     )
   })
-}
-
-function badgeStateOf(status: string): AgentStatusState {
-  switch (status) {
-    case "working":
-      return "working"
-    case "waiting":
-      return "queued"
-    case "ready":
-      return "idle"
-    case "paused":
-      return "paused"
-    case "failed":
-      return "failed"
-    default:
-      return "stopped"
-  }
 }
 
 function turnCount(side: Side): number {
@@ -446,35 +428,34 @@ const extension: Extension = (api) => {
       const queuedCount = side.pending.filter((item) => item.state === "queued").length
       const topic = latestQuestion(side).replace(/\s+/g, " ").trim()
       const shortTopic = topic.length > 42 ? `${topic.slice(0, 41)}…` : topic
-      const left: ViewSegment[] = [
+      const titleParts: ViewSegment[] = [
         { kind: "chip", text: "btw", tone: "accent" },
         { kind: "text", text: ` ${shortTopic}` },
         ...(turns > 1 ? [{ kind: "dim" as const, text: ` ${sep} ${turns} turns` }] : []),
         ...(queuedCount > 0
-          ? [{ kind: "chip" as const, text: `${queuedCount} queued`, tone: "info" as const }]
-          : []),
-      ]
-      const right: ViewSegment[] = [
-        { kind: "badge", state: badgeStateOf(side.status), label: side.status },
-        ...(side.status === "working" && side.startedAt !== undefined
           ? [
-              { kind: "dim" as const, text: ` ${sep} ` },
-              { kind: "elapsed" as const, since: side.startedAt, tone: "dim" as const },
+              { kind: "text" as const, text: " " },
+              { kind: "chip" as const, text: `${queuedCount} queued`, tone: "info" as const },
             ]
           : []),
       ]
       const firstRetry = side.retries.keys().next().value as string | undefined
       const actionChildren: { node: UiNode; size?: number | "fill"; min?: number }[] = [
         {
+          size: 11,
+          node: { type: "bar", left: [{ kind: "chip", text: "btw reply", tone: "accent" }] },
+        },
+        {
           size: "fill",
-          min: 18,
+          min: 14,
           node: {
             type: "input",
             id: "followup",
             placeholder:
               side.status === "working" || side.status === "waiting"
-                ? "Queue a follow-up… (Enter sends · Tab main)"
-                : "Follow up in btw… (Enter sends · Tab main)",
+                ? "Queue a btw follow-up… (Tab / click)"
+                : "Ask btw a follow-up… (Tab / click)",
+            hint: "Enter",
           },
         },
         ...(firstRetry
@@ -500,23 +481,26 @@ const extension: Extension = (api) => {
           node: { type: "button", id: "clear", label: "Clear", tone: "normal" },
         },
       ]
-      const showRules = ctx.height >= 7
+      const showRule = ctx.height >= 7
       const children: { node: UiNode; size?: number | "fill" }[] = [
-        { size: 1, node: { type: "bar", left, right } },
-        ...(showRules ? [{ size: 1, node: { type: "rule" as const } }] : []),
         {
           size: "fill",
           node: {
             type: "text",
-            id: "transcript",
             follow: true,
             lines: buildUiLines(side, ctx),
           },
         },
-        ...(showRules ? [{ size: 1, node: { type: "rule" as const } }] : []),
+        ...(showRule ? [{ size: 1, node: { type: "rule" as const } }] : []),
         { size: 1, node: { type: "row", gap: 1, children: actionChildren } },
       ]
-      return { type: "column", children }
+      return {
+        type: "box",
+        tone: "focus",
+        title: { kind: "segments", parts: titleParts },
+        aside: side.status,
+        child: { type: "column", children },
+      }
     },
     onEvent(event, side, control) {
       if (event.type === "submit" && event.id === "followup") {

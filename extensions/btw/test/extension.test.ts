@@ -1671,9 +1671,13 @@ test("declarative ui submits inline follow-ups, hides without killing the child,
   await child.answer("First answer")
   expect(s.statusItems[0]?.text()).toBeUndefined()
 
-  // Inline follow-up input inside the dock sends directly to the same child and clears input state.
+  // Inline follow-up input inside the focus-bordered dock is the first focusable widget so Tab lands directly in it.
   const ui = c.shown().ui
-  expect(ui?.type).toBe("column")
+  expect(ui?.type).toBe("box")
+  if (ui?.type === "box" && ui.child.type === "column") {
+    const transcript = ui.child.children.find((entry) => entry.node.type === "text")?.node
+    expect(transcript?.type === "text" && transcript.id).toBeUndefined()
+  }
   c.sendUiEvent({ type: "submit", id: "followup", value: "  Second question  " })
   expect(c.statePatches.at(-1)).toEqual({ inputValues: { followup: "" } })
   expect(child.sent).toEqual(["Second question"])
