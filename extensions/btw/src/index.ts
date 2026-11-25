@@ -1,6 +1,7 @@
 import type {
   AnyEvent,
   ChildSession,
+  CommandCandidate,
   CommandContext,
   Extension,
   SessionControl,
@@ -69,6 +70,7 @@ type Entry = TextEntry | ToolEntry
 
 interface Side {
   sessionId: string
+  localId: string
   threadId?: string
   question: string
   entries: Entry[]
@@ -84,6 +86,7 @@ interface Side {
   child?: ChildSession
   group?: SpawnGroup
   control?: UiControl
+  openView?: CommandContext["openView"]
   print: CommandContext["print"]
   status: string
   startedAt?: number
@@ -317,12 +320,76 @@ function renderEntryLines(entry: Entry, opts: ViewRenderOptions): ViewLine[] {
 const extension: Extension = (api) => {
   const viewKind = `btw:${crypto.randomUUID()}`
   const sides = new Map<string, Side>()
+  const stashed = new Map<string, Map<string, Side>>()
   const counters = new Map<string, number>()
   const memoryHistory = new Map<string, HistoryThread[]>()
   // The host closes views BEFORE onUnload, without a close reason. Keep their recovery
   // candidates until the synchronous unload hook has had a chance to claim them.
   const closing = new Set<Side>()
+  let localSeq = 0
   let unloaded = false
+
+  const nextLocalId = () => `t${++localSeq}`
+  const tabKeyOf = (side: Pick<Side, "threadId" | "localId">) => side.threadId ?? side.localId
+  const sessionStash = (sessionId: string) => {
+    let bucket = stashed.get(sessionId)
+    if (!bucket) {
+      bucket = new Map()
+      stashed.set(sessionId, bucket)
+    }
+    return bucket
+  }
+  const removeFromStash = (side: Side) => {
+    const bucket = stashed.get(side.sessionId)
+    if (!bucket) return
+    for (const [key, value] of bucket) {
+      if (value === side || key === side.localId || (side.threadId && key === side.threadId)) {
+        bucket.delete(key)
+      }
+    }
+    if (!bucket.size) stashed.delete(side.sessionId)
+  }
+  const stashSide = (side: Side) => {
+    if (side.closed) return
+    if (side.entries.length) saveHistory(side)
+    side.control = undefined
+    if (!side.entries.length && !side.child) return
+    removeFromStash(side)
+    sessionStash(side.sessionId).set(tabKeyOf(side), side)
+  }
+  const createBlankSide = (
+    sessionId: string,
+    opts: {
+      data?: SessionData
+      print: CommandContext["print"]
+      openView?: CommandContext["openView"]
+      placement?: "dock" | "fullscreen"
+      question?: string
+      status?: string
+      mode?: "chat" | "history"
+      saved?: boolean
+    },
+  ): Side => ({
+    sessionId,
+    localId: nextLocalId(),
+    question: opts.question ?? "New btw",
+    entries: [],
+    pending: [],
+    retries: new Map(),
+    completed: new Set(),
+    mode: opts.mode ?? "chat",
+    data: opts.data,
+    openView: opts.openView,
+    print: opts.print,
+    status: opts.status ?? "ready",
+    placement: opts.placement ?? "dock",
+    hidden: false,
+    hiding: false,
+    repositioning: false,
+    closed: false,
+    opened: false,
+    saved: opts.saved ?? true,
+  })
 
   function readHistory(sessionId: string, data?: SessionData): HistoryThread[] {
     if (data) return parseHistory(data.read(HISTORY_KEY).at(-1))
@@ -500,6 +567,7 @@ const extension: Extension = (api) => {
     saveHistory(side)
     side.closed = true
     side.hidden = false
+    removeFromStash(side)
     if (sides.get(side.sessionId) === side) sides.delete(side.sessionId)
     if (side.child && side.child.state !== "ended" && side.child.state !== "idle") {
       side.entries.push({ kind: "note", text: "Stopped before the answer finished." })
@@ -511,14 +579,75 @@ const extension: Extension = (api) => {
     api.requestRender()
   }
 
+  function closeStashedForSession(sessionId: string, persist = true, reason = "btw dock closed") {
+    const bucket = stashed.get(sessionId)
+    if (!bucket) return
+    stashed.delete(sessionId)
+    for (const item of new Set(bucket.values())) {
+      finish(item, persist, reason)
+    }
+  }
+
   function close(side: Side) {
     side.hiding = false
     side.repositioning = false
     side.control?.close()
     // Explicit user/session closes are not reload recovery candidates.
     closing.delete(side)
+    closeStashedForSession(side.sessionId)
     finish(side)
     saveDisplay(side)
+  }
+
+  function switchToSide(current: Side, target: Side) {
+    if (current === target) return
+    const placement = current.placement
+    const openView = current.openView ?? target.openView
+    const control = current.control
+    stashSide(current)
+    removeFromStash(target)
+    target.placement = placement
+    target.openView = openView
+    target.opened = true
+    target.hidden = false
+    target.mode = "chat"
+    sides.set(current.sessionId, target)
+    const nextState = { activeTabs: { threads: tabKeyOf(target) }, focused: "followup" }
+    if (openView) {
+      target.control = control
+      openView({ kind: viewKind, data: target, placement, state: nextState })
+    } else {
+      target.control = control
+    }
+    target.control?.setState({ activeTabs: { threads: tabKeyOf(target) } })
+    target.control?.focus("followup")
+    api.requestRender()
+  }
+
+  function togglePlacement(side: Side, requested?: "dock" | "fullscreen"): boolean {
+    const nextPlacement = requested ?? (side.placement === "dock" ? "fullscreen" : "dock")
+    if (side.placement === nextPlacement || !side.openView) return false
+    side.repositioning = true
+    side.control?.close()
+    const ok = side.openView({
+      kind: viewKind,
+      data: side,
+      placement: nextPlacement,
+      state:
+        side.mode === "history"
+          ? {
+              ...(side.selectedHistoryId ? { selected: { "history-list": side.selectedHistoryId } } : {}),
+              focused: "history-list",
+            }
+          : { activeTabs: { threads: tabKeyOf(side) }, focused: "followup" },
+    })
+    side.repositioning = false
+    if (!ok) return false
+    side.placement = nextPlacement
+    side.opened = true
+    side.hidden = false
+    api.requestRender()
+    return true
   }
 
   function hide(side: Side) {
@@ -557,6 +686,12 @@ const extension: Extension = (api) => {
 
   function buildUiLines(side: Side, opts: ViewRenderOptions): ViewLine[] {
     const lines = side.entries.flatMap((entry) => renderEntryLines(entry, opts))
+    if (!lines.length && side.status === "ready") {
+      lines.push({
+        kind: "muted",
+        text: "Ask a side question below (Enter to send · Tab switches main/btw · + New starts another thread).",
+      })
+    }
     if (side.status === "waiting") {
       lines.push({
         kind: "segments",
@@ -596,6 +731,7 @@ const extension: Extension = (api) => {
       question = retryItem.question
     }
     if (!question) return
+    if (!side.entries.length) side.question = question
     side.mode = "chat"
     side.saved = false
     if (side.closed || side.child?.state === "ended" || (!side.child && side.failure)) {
@@ -633,6 +769,14 @@ const extension: Extension = (api) => {
     api.requestRender()
   }
 
+  function tabLabelFor(label: string, idPrefix?: string, busy = false): string {
+    const flat = label.replace(/\s+/g, " ").trim()
+    const base = flat && flat !== "New btw" ? flat : "New"
+    const clipped = base.length > 16 ? `${base.slice(0, 15)}…` : base
+    const tag = idPrefix ? `${idPrefix} ${clipped}` : clipped
+    return busy ? `${WORKING_SYMBOL} ${tag}` : tag
+  }
+
   const view: ViewDefinition<Side> = {
     kind: viewKind,
     title: (side) => `btw: ${side.question}`,
@@ -644,7 +788,17 @@ const extension: Extension = (api) => {
       side.hidden = false
       side.hiding = false
       side.repositioning = false
-      if (side.closed) control.close()
+      if (side.closed) {
+        control.close()
+        return
+      }
+      if (side.mode === "history") {
+        if (side.selectedHistoryId) control.setState({ selected: { "history-list": side.selectedHistoryId } })
+        control.focus("history-list")
+      } else {
+        control.setState({ activeTabs: { threads: tabKeyOf(side) } })
+        control.focus("followup")
+      }
     },
     onClose(side) {
       if (side.closed) return
@@ -655,7 +809,10 @@ const extension: Extension = (api) => {
         api.requestRender()
         return
       }
+      // If another thread became active via switchToSide, do not close the newly active thread.
+      if (sides.get(side.sessionId) !== side) return
       closing.add(side)
+      closeStashedForSession(side.sessionId, false)
       finish(side, false)
       queueMicrotask(() => {
         if (closing.delete(side) && !unloaded) saveDisplay(side)
@@ -745,6 +902,19 @@ const extension: Extension = (api) => {
               ]
             : []),
           { size: "fill", node: { type: "spacer" } },
+          ...(side.openView
+            ? [
+                {
+                  size: 8,
+                  node: {
+                    type: "button" as const,
+                    id: "placement",
+                    label: side.placement === "dock" ? "Full" : "Dock",
+                    tone: "normal" as const,
+                  },
+                },
+              ]
+            : []),
           {
             size: 8,
             node: { type: "button", id: "history-back", label: "Back", tone: "normal" },
@@ -822,6 +992,19 @@ const extension: Extension = (api) => {
               },
             ]
           : []),
+        ...(side.openView
+          ? [
+              {
+                size: 8,
+                node: {
+                  type: "button" as const,
+                  id: "placement",
+                  label: side.placement === "dock" ? "Full" : "Dock",
+                  tone: "normal" as const,
+                },
+              },
+            ]
+          : []),
         ...(history.length > 0
           ? [
               {
@@ -840,27 +1023,115 @@ const extension: Extension = (api) => {
         },
       ]
       const showRule = ctx.height >= 7
-      const children: { node: UiNode; size?: number | "fill" }[] = [
-        {
-          size: "fill",
-          node: {
-            type: "text",
-            follow: true,
-            lines: buildUiLines(side, ctx),
+      const chatColumn: UiNode = {
+        type: "column",
+        children: [
+          {
+            size: "fill",
+            node: {
+              type: "text",
+              follow: true,
+              lines: buildUiLines(side, ctx),
+            },
           },
+          ...(showRule ? [{ size: 1, node: { type: "rule" as const } }] : []),
+          { size: 1, node: { type: "row", gap: 1, children: actionChildren } },
+        ],
+      }
+      const activeKey = tabKeyOf(side)
+      const seenKeys = new Set<string>([activeKey])
+      const liveStash = [...(stashed.get(side.sessionId)?.values() ?? [])]
+      const threadTabs: { key: string; label: string; body: UiNode }[] = [
+        {
+          key: activeKey,
+          label: tabLabelFor(
+            side.question,
+            side.threadId,
+            side.status === "working" || side.status === "waiting",
+          ),
+          body: chatColumn,
         },
-        ...(showRule ? [{ size: 1, node: { type: "rule" as const } }] : []),
-        { size: 1, node: { type: "row", gap: 1, children: actionChildren } },
       ]
+      for (const other of liveStash) {
+        const key = tabKeyOf(other)
+        if (seenKeys.has(key)) continue
+        seenKeys.add(key)
+        threadTabs.push({
+          key,
+          label: tabLabelFor(
+            other.question,
+            other.threadId,
+            other.status === "working" || other.status === "waiting",
+          ),
+          body: chatColumn,
+        })
+      }
+      for (const thread of history) {
+        if (threadTabs.length >= 5) break
+        if (seenKeys.has(thread.id)) continue
+        seenKeys.add(thread.id)
+        threadTabs.push({
+          key: thread.id,
+          label: tabLabelFor(thread.title, thread.id, false),
+          body: chatColumn,
+        })
+      }
+      threadTabs.push({ key: "__new__", label: "+ New", body: chatColumn })
+      const content: UiNode =
+        ctx.height >= 7
+          ? {
+              type: "tabs",
+              id: "threads",
+              style: "divided",
+              tabs: threadTabs,
+            }
+          : chatColumn
       return {
         type: "box",
         tone: "focus",
         title: { kind: "segments", parts: titleParts },
         aside: side.status,
-        child: { type: "column", children },
+        child: content,
       }
     },
     onEvent(event, side, control) {
+      if (event.type === "tab" && event.id === "threads") {
+        if (event.key === tabKeyOf(side)) {
+          control.focus("followup")
+          return
+        }
+        if (event.key === "__new__") {
+          const fresh = createBlankSide(side.sessionId, {
+            data: side.data,
+            print: side.print,
+            openView: side.openView,
+            placement: side.placement,
+          })
+          switchToSide(side, fresh)
+          return
+        }
+        const liveTarget = [...(stashed.get(side.sessionId)?.values() ?? [])].find(
+          (item) => tabKeyOf(item) === event.key,
+        )
+        if (liveTarget) {
+          switchToSide(side, liveTarget)
+          return
+        }
+        const historyTarget = readHistory(side.sessionId, side.data).find((thread) => thread.id === event.key)
+        if (historyTarget) {
+          const restored = createBlankSide(side.sessionId, {
+            data: side.data,
+            print: side.print,
+            openView: side.openView,
+            placement: side.placement,
+            question: historyTarget.title,
+            status: "history",
+          })
+          applyHistoryThread(restored, historyTarget)
+          switchToSide(side, restored)
+        }
+        return
+      }
       if (event.type === "select" && event.id === "history-list") {
         side.selectedHistoryId = event.key
         return
@@ -873,10 +1144,15 @@ const extension: Extension = (api) => {
         return
       }
       if (event.type === "activate") {
+        if (event.id === "placement") {
+          togglePlacement(side)
+          return
+        }
         if (event.id === "history-list") {
           const target = readHistory(side.sessionId, side.data).find((thread) => thread.id === event.key)
           if (target) {
             applyHistoryThread(side, target)
+            control.setState({ activeTabs: { threads: tabKeyOf(side) } })
             control.focus("followup")
           }
           return
@@ -898,6 +1174,7 @@ const extension: Extension = (api) => {
           const target = history.find((thread) => thread.id === side.selectedHistoryId) ?? history[0]
           if (target) {
             applyHistoryThread(side, target)
+            control.setState({ activeTabs: { threads: tabKeyOf(side) } })
             control.focus("followup")
           }
           return
@@ -920,6 +1197,7 @@ const extension: Extension = (api) => {
         if (event.id === "history-back") {
           if (side.entries.length) {
             side.mode = "chat"
+            control.setState({ activeTabs: { threads: tabKeyOf(side) } })
             control.focus("followup")
             api.requestRender()
           } else {
@@ -1150,12 +1428,16 @@ const extension: Extension = (api) => {
   }
 
   function open(side: Side, ctx: CommandContext, placement = side.placement) {
+    if (ctx.openView) side.openView = ctx.openView
     const changingPlacement = side.opened && !side.hidden && side.placement !== placement
     if (side.opened && !side.hidden && !changingPlacement) return
     if (!ctx.openView || !ctx.session.createGroup) {
       throw new Error("Side questions need a TUI dock and an agent tree.")
     }
-    if (changingPlacement) side.repositioning = true
+    if (changingPlacement) {
+      side.repositioning = true
+      side.control?.close()
+    }
     const opened = ctx.openView({ kind: viewKind, data: side, placement })
     if (!opened) {
       side.repositioning = false
@@ -1191,16 +1473,74 @@ const extension: Extension = (api) => {
 
   api.registerCommand({
     name: "btw",
-    description: "Ask a side question without interrupting the main agent",
-    args: { hint: "<question> | resume [id] | history | hide | full | dock | clear | retry <id>" },
+    description: "Open the btw panel or ask a side question without interrupting the main agent",
+    args: {
+      hint: "[question] | new | resume [id] | history | full | dock | hide | clear",
+      complete(prefix, ctx): CommandCandidate[] {
+        const trimmed = prefix.trimStart()
+        const lower = trimmed.toLowerCase()
+        // Never hijack multi-word free-text questions except after explicit `resume ` or `retry `.
+        if (/\s/.test(trimmed) && !lower.startsWith("resume ") && !lower.startsWith("retry ")) {
+          return []
+        }
+        const id = ctx.session.info().id
+        const side = sides.get(id)
+        const history = readHistory(id, ctx.session.data)
+        const candidates: CommandCandidate[] = [
+          { value: "new", description: "Start a new btw conversation thread" },
+        ]
+        if (history.length) {
+          const latest = history[0]!
+          const preview = latest.title.replace(/\s+/g, " ").trim()
+          candidates.push({
+            value: "resume",
+            description: `Restore latest (${latest.id}: ${preview.length > 36 ? `${preview.slice(0, 35)}…` : preview})`,
+          })
+          for (const thread of history.slice(0, 8)) {
+            const topic = thread.title.replace(/\s+/g, " ").trim()
+            candidates.push({
+              value: `resume ${thread.id}`,
+              description: `${thread.turns.length} turn${thread.turns.length === 1 ? "" : "s"} · ${topic.length > 36 ? `${topic.slice(0, 35)}…` : topic}`,
+            })
+          }
+        }
+        candidates.push({
+          value: "history",
+          description: history.length
+            ? `Browse, switch, or delete saved btw threads (${history.length})`
+            : "Browse saved btw threads",
+        })
+        if (side && !side.closed) {
+          if (side.placement === "dock") {
+            candidates.push({ value: "full", description: "Expand btw panel to fullscreen" })
+          } else {
+            candidates.push({ value: "dock", description: "Dock btw panel above the composer" })
+          }
+          if (!side.hidden) {
+            candidates.push({ value: "hide", description: "Minimize btw panel while keeping it alive" })
+          }
+          candidates.push({ value: "clear", description: "Archive and close the btw panel" })
+          for (const [retryId, item] of side.retries) {
+            const preview = item.question.replace(/\s+/g, " ").trim()
+            candidates.push({
+              value: `retry ${retryId}`,
+              description: `Retry: ${preview.length > 40 ? `${preview.slice(0, 39)}…` : preview}`,
+            })
+          }
+        }
+        return candidates
+      },
+    },
     echo: false,
     run(args, ctx) {
       ctx.signal.throwIfAborted()
       let question = args.trim()
       const id = ctx.session.info().id
       let side = sides.get(id)
+      if (side && ctx.openView) side.openView = ctx.openView
       if (question === "clear") {
         if (side) close(side)
+        else closeStashedForSession(id)
         sides.delete(id)
         return
       }
@@ -1216,6 +1556,46 @@ const extension: Extension = (api) => {
         }
         open(side, ctx, question === "full" ? "fullscreen" : "dock")
         api.requestRender()
+        return
+      }
+      if (question === "new") {
+        if (side && !side.closed) {
+          const fresh = createBlankSide(id, {
+            data: ctx.session.data,
+            print: ctx.print,
+            openView: ctx.openView,
+            placement: side.placement,
+            question: "New btw",
+            status: "ready",
+            saved: true,
+          })
+          if (side.opened && !side.hidden) {
+            switchToSide(side, fresh)
+          } else {
+            stashSide(side)
+            sides.set(id, fresh)
+            open(fresh, ctx)
+          }
+          return
+        }
+        if (!ctx.openView || !ctx.session.createGroup) {
+          throw new Error("Side questions need a TUI dock and an agent tree.")
+        }
+        const fresh = createBlankSide(id, {
+          data: ctx.session.data,
+          print: ctx.print,
+          openView: ctx.openView,
+          question: "New btw",
+          status: "ready",
+          saved: true,
+        })
+        sides.set(id, fresh)
+        try {
+          open(fresh, ctx)
+        } catch (error) {
+          finish(fresh, false)
+          throw error
+        }
         return
       }
       if (question === "history") {
@@ -1239,26 +1619,16 @@ const extension: Extension = (api) => {
         if (!ctx.openView || !ctx.session.createGroup) {
           throw new Error("Side questions need a TUI dock and an agent tree.")
         }
-        const browser: Side = {
-          sessionId: id,
-          question: "History",
-          entries: [],
-          pending: [],
-          retries: new Map(),
-          completed: new Set(),
-          selectedHistoryId: history[0]?.id,
-          mode: "history",
+        const browser = createBlankSide(id, {
           data: ctx.session.data,
           print: ctx.print,
+          openView: ctx.openView,
+          question: "History",
           status: "history",
-          placement: "dock",
-          hidden: false,
-          hiding: false,
-          repositioning: false,
-          closed: false,
-          opened: false,
+          mode: "history",
           saved: true,
-        }
+        })
+        browser.selectedHistoryId = history[0]?.id
         sides.set(id, browser)
         try {
           open(browser, ctx)
@@ -1287,9 +1657,16 @@ const extension: Extension = (api) => {
           )
           return
         }
+        const liveTarget = [...(stashed.get(id)?.values() ?? [])].find((item) => item.threadId === thread.id)
         if (side && !side.closed) {
+          if (liveTarget) {
+            switchToSide(side, liveTarget)
+            open(liveTarget, ctx)
+            return
+          }
           applyHistoryThread(side, thread)
           open(side, ctx)
+          side.control?.setState({ activeTabs: { threads: tabKeyOf(side) } })
           side.control?.focus("followup")
           api.requestRender()
           return
@@ -1297,26 +1674,18 @@ const extension: Extension = (api) => {
         if (!ctx.openView || !ctx.session.createGroup) {
           throw new Error("Side questions need a TUI dock and an agent tree.")
         }
-        const restored: Side = {
-          sessionId: id,
-          question: thread.title,
-          entries: [],
-          pending: [],
-          retries: new Map(),
-          completed: new Set(),
-          mode: "chat",
-          data: ctx.session.data,
-          print: ctx.print,
-          status: "history",
-          placement: "dock",
-          hidden: false,
-          hiding: false,
-          repositioning: false,
-          closed: false,
-          opened: false,
-          saved: true,
-        }
-        applyHistoryThread(restored, thread)
+        const restored =
+          liveTarget ??
+          createBlankSide(id, {
+            data: ctx.session.data,
+            print: ctx.print,
+            openView: ctx.openView,
+            question: thread.title,
+            status: "history",
+            saved: true,
+          })
+        if (!liveTarget) applyHistoryThread(restored, thread)
+        else removeFromStash(restored)
         sides.set(id, restored)
         try {
           open(restored, ctx)
@@ -1324,6 +1693,7 @@ const extension: Extension = (api) => {
           finish(restored, false)
           throw error
         }
+        restored.control?.setState({ activeTabs: { threads: tabKeyOf(restored) } })
         restored.control?.focus("followup")
         api.requestRender()
         return
@@ -1344,19 +1714,47 @@ const extension: Extension = (api) => {
         question = retryItem.question
       }
       if (!question) {
-        if (side && (!side.opened || side.hidden)) {
-          open(side, ctx)
-          if (!side.child && !side.failure) requeue(side, ctx.session)
+        if (side && !side.closed) {
+          if (side.mode === "history") side.mode = "chat"
+          if (!side.opened || side.hidden) {
+            open(side, ctx)
+            if (!side.child && !side.failure) requeue(side, ctx.session)
+          }
+          side.control?.setState({ activeTabs: { threads: tabKeyOf(side) } })
+          side.control?.focus("followup")
           api.requestRender()
-        } else {
-          const historyCount = readHistory(id, ctx.session.data).length
-          const historyHint = historyCount
-            ? ` /btw resume restores the latest (${historyCount} saved in /btw history);`
-            : ""
-          ctx.print(
-            `Use /btw <question> to ask or follow up (or Tab into the dock);${historyHint} /btw hide minimizes, Esc or /btw clear closes.`,
-          )
+          return
         }
+        const history = readHistory(id, ctx.session.data)
+        if (ctx.openView && ctx.session.createGroup) {
+          const latest = history[0]
+          const panel = createBlankSide(id, {
+            data: ctx.session.data,
+            print: ctx.print,
+            openView: ctx.openView,
+            question: latest?.title ?? "New btw",
+            status: latest ? "history" : "ready",
+            saved: true,
+          })
+          if (latest) applyHistoryThread(panel, latest)
+          sides.set(id, panel)
+          try {
+            open(panel, ctx)
+          } catch (error) {
+            finish(panel, false)
+            throw error
+          }
+          panel.control?.setState({ activeTabs: { threads: tabKeyOf(panel) } })
+          panel.control?.focus("followup")
+          api.requestRender()
+          return
+        }
+        const historyHint = history.length
+          ? ` /btw resume restores the latest (${history.length} saved in /btw history);`
+          : ""
+        ctx.print(
+          `Use /btw <question> to ask or follow up (or Tab into the dock);${historyHint} /btw hide minimizes, Esc or /btw clear closes.`,
+        )
         return
       }
       if (side && (side.closed || side.child?.state === "ended" || (!side.child && side.failure))) {
@@ -1383,6 +1781,7 @@ const extension: Extension = (api) => {
       }
       const pending: Pending = { question, answer: "", timestamp: Date.now(), state: "queued" }
       if (side) {
+        if (!side.entries.length) side.question = question
         side.mode = "chat"
         side.saved = false
         open(side, ctx)
@@ -1400,26 +1799,17 @@ const extension: Extension = (api) => {
       if (!ctx.openView || !ctx.session.createGroup) {
         throw new Error("Side questions need a TUI dock and an agent tree.")
       }
-      const next: Side = {
-        sessionId: id,
-        question,
-        entries: [{ kind: "question", text: question, pending: [pending] }],
-        pending: [pending],
-        retries: new Map(),
-        completed: new Set(),
-        mode: "chat",
+      const next = createBlankSide(id, {
         data: ctx.session.data,
         print: ctx.print,
+        openView: ctx.openView,
+        question,
         status: "working",
-        startedAt: Date.now(),
-        placement: "dock",
-        hidden: false,
-        hiding: false,
-        repositioning: false,
-        closed: false,
-        opened: false,
         saved: false,
-      }
+      })
+      next.entries = [{ kind: "question", text: question, pending: [pending] }]
+      next.pending = [pending]
+      next.startedAt = Date.now()
       sides.set(id, next)
       try {
         open(next, ctx)
@@ -1443,25 +1833,14 @@ const extension: Extension = (api) => {
       if (raw !== undefined && (!Array.isArray(raw) || raw.length)) data?.append(DATA_KEY, [])
       return
     }
-    const side: Side = {
-      sessionId: id,
-      question: pending[0]!.question,
-      entries: [],
-      pending,
-      retries: new Map(),
-      completed: new Set(),
-      mode: "chat",
+    const side = createBlankSide(id, {
       data,
       print: (...args) => api.notify(...args),
+      question: pending[0]!.question,
       status: "interrupted",
-      placement: "dock",
-      hidden: false,
-      hiding: false,
-      repositioning: false,
-      closed: false,
-      opened: false,
       saved: false,
-    }
+    })
+    side.pending = pending
     sides.set(id, side)
     for (const item of pending) {
       side.entries.push({ kind: "question", text: item.question, pending: [item] })
@@ -1488,7 +1867,9 @@ const extension: Extension = (api) => {
 
   api.onUnload(() => {
     unloaded = true
-    for (const side of new Set([...sides.values(), ...closing])) {
+    const allStashed = [...stashed.values()].flatMap((bucket) => [...bucket.values()])
+    stashed.clear()
+    for (const side of new Set([...sides.values(), ...allStashed, ...closing])) {
       if (side.pending.length) {
         side.data?.append(
           DATA_KEY,
@@ -1514,6 +1895,7 @@ const extension: Extension = (api) => {
   api.on("session.end", (event) => {
     const side = sides.get(event.sessionId)
     if (side) close(side)
+    else closeStashedForSession(event.sessionId)
   })
   api.on("session.start", restore)
   restore()

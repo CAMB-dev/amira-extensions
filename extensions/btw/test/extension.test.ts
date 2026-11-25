@@ -1641,11 +1641,16 @@ test("session end closes only its side and prints into its originating session e
   expect(b.printed[0]?.[2]?.details).toContain("B answer")
 })
 
-test("empty args explain the dock commands and show is an ordinary question", async () => {
+test("empty args open the panel directly (or print help without a dock) and show is an ordinary question", async () => {
   const s = await setup()
+  const noDock = s.context({ dock: "missing" })
+  s.run("", noDock)
+  expect(noDock.printed[0]?.[0]).toContain("Use /btw <question> to ask or follow up")
+  expect(s.children).toEqual([])
+
   const c = s.context()
   s.run("", c)
-  expect(c.printed[0]?.[0]).toContain("Use /btw <question> to ask or follow up")
+  expect(c.opened).toHaveLength(1)
   expect(s.children).toEqual([])
   s.run("show", c)
   expect(s.children[0]!.options.prompt).toBe("show")
@@ -1693,6 +1698,14 @@ test("declarative ui submits inline follow-ups, hides without killing the child,
   s.run("", c)
   expect(c.opened.at(-1)).toMatchObject({ placement: "dock" })
   expect(s.statusItems[0]?.text()).toBeUndefined()
+
+  // Clicking [ Full ] / [ Dock ] switches placement right from the panel without killing the child.
+  c.sendUiEvent({ type: "activate", id: "placement", key: "placement" })
+  expect(c.opened.at(-1)).toMatchObject({ placement: "fullscreen" })
+  expect(child.aborts).toEqual([])
+  c.sendUiEvent({ type: "activate", id: "placement", key: "placement" })
+  expect(c.opened.at(-1)).toMatchObject({ placement: "dock" })
+  expect(child.aborts).toEqual([])
 
   // /btw full switches to fullscreen without killing the child; /btw dock returns to dock.
   s.run("full", c)
@@ -1868,4 +1881,76 @@ test("/btw history opens the interactive history table and supports restore, del
 
   c2.sendUiEvent({ type: "activate", id: "history-clear", key: "history-clear" })
   expect(s.records.get("session-a:btw.history")?.at(-1)).toEqual([])
+})
+
+test("bare /btw auto-resumes the latest saved btw conversation when history exists", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.run("First thread", c)
+  await s.children[0]!.answer("First reply")
+  c.hostClose()
+  await flush()
+  await s.reload()
+
+  const c2 = s.context()
+  s.run("", c2)
+  expect(c2.shown().status).toBe("history")
+  expect(c2.shown().lines).toContainEqual({ kind: "user-message", text: "First thread" })
+  expect(s.children).toHaveLength(1)
+})
+
+test("multi-thread tabs and /btw new switch between live concurrent btw conversations without aborting", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.run("Auth thread", c)
+  const authChild = s.children[0]!
+  await authChild.answer("Auth uses JWT.")
+
+  // Click + New tab to start a second concurrent thread without aborting the first.
+  c.sendUiEvent({ type: "tab", id: "threads", key: "__new__" })
+  expect(authChild.aborts).toEqual([])
+  c.sendUiEvent({ type: "submit", id: "followup", value: "Schema thread" })
+  expect(s.children).toHaveLength(2)
+  const schemaChild = s.children[1]!
+  await schemaChild.answer("Schema uses SQLite.")
+
+  // Switch back to h1 (Auth thread) via tab click: reuses the still-living authChild!
+  c.sendUiEvent({ type: "tab", id: "threads", key: "h1" })
+  expect(authChild.aborts).toEqual([])
+  expect(schemaChild.aborts).toEqual([])
+  expect(c.shown().lines).toContainEqual({ kind: "user-message", text: "Auth thread" })
+  c.sendUiEvent({ type: "submit", id: "followup", value: "Auth follow-up" })
+  expect(authChild.sent).toEqual(["Auth follow-up"])
+  await authChild.answer("Auth follow-up answer.")
+
+  // /btw new starts a 3rd blank thread tab cleanly without killing previous threads.
+  s.run("new", c)
+  s.run("Third topic", c)
+  expect(s.children).toHaveLength(3)
+  expect(s.children[2]!.options.prompt).toBe("Third topic")
+})
+
+test("btw command provides highlighted argument completions and stays out of the way for free-text questions", async () => {
+  const s = await setup()
+  const c = s.context()
+  const complete = s.commands[0]!.args?.complete
+  expect(typeof complete).toBe("function")
+
+  const initial = await complete!("", { cwd: "/work", session: c.ctx.session })
+  expect(initial.map((item) => item.value)).toEqual(["new", "history"])
+
+  s.run("Topic one", c)
+  await s.children[0]!.answer("Answer one")
+
+  const active = await complete!("", { cwd: "/work", session: c.ctx.session })
+  expect(active.map((item) => item.value)).toContain("new")
+  expect(active.map((item) => item.value)).toContain("resume")
+  expect(active.map((item) => item.value)).toContain("resume h1")
+  expect(active.map((item) => item.value)).toContain("full")
+  expect(active.map((item) => item.value)).toContain("hide")
+  expect(active.map((item) => item.value)).toContain("clear")
+
+  // Free-text multi-word question returns no subcommand candidates so Enter sends it verbatim.
+  const freeText = await complete!("how does auth work", { cwd: "/work", session: c.ctx.session })
+  expect(freeText).toEqual([])
 })

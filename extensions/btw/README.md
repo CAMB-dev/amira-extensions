@@ -7,37 +7,38 @@ keeps working. The side conversation never enters the main model's context.
 amira ext install btw
 ```
 
-Version **0.5.0** requires Amira extension API **0.1.49 or later within 0.1.x**, a
+Version **0.6.0** requires Amira extension API **0.1.49 or later within 0.1.x**, a
 terminal UI with interactive dock support, and an agent tree. Print/RPC frontends without docks
 are not supported. New questions start no child when a dock is unavailable;
 reload recovery can restart queued work before the dock reopens (see below).
 
 ## Commands
 
-| Command                   | What it does                                                                                                 |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `/btw <question>`         | Fork the main session's current context into a private side agent and open the interactive dock.             |
-| `/btw <follow-up>`        | While the side conversation is active (open or hidden), send a follow-up to the same side agent.             |
-| `/btw resume [id]`        | Restore the latest (or specific `hN`) multi-turn `btw` conversation from this session's history.             |
-| `/btw history`            | Open the interactive history table inside the dock to browse, restore, or delete saved `btw` threads.        |
-| `/btw hide`               | Hide the dock while keeping the side agent alive; the status bar shows `btw · hidden` and `/btw` reopens it. |
-| `/btw full` / `/btw dock` | Switch the live side conversation between fullscreen view and dock view without losing context.              |
-| `/btw clear`              | Archive completed turns to history, close the dock, stop the side agent, and save one folded display block.  |
-| `/btw`                    | Reopen a hidden or restored dock, or show command help.                                                      |
-| `/btw retry <id>`         | Ask an interrupted question again using its short, stable ID, such as `r1`.                                  |
+| Command                   | What it does                                                                                                                      |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `/btw`                    | Open the `btw` panel directly: reopens a hidden/active panel, auto-resumes the latest saved thread, or opens a fresh blank panel. |
+| `/btw <question>`         | Ask a side question or follow up in the active `btw` thread without touching main conversation context.                           |
+| `/btw new`                | Start a new concurrent `btw` thread tab while keeping earlier threads alive/archived.                                             |
+| `/btw resume [id]`        | Restore the latest (or specific `hN`) multi-turn `btw` conversation from this session's history.                                  |
+| `/btw history`            | Open the interactive history table inside the panel to browse, restore, or delete saved `btw` threads.                            |
+| `/btw hide`               | Hide the panel while keeping the side agent alive; the status bar shows `btw · hidden` and `/btw` reopens it.                     |
+| `/btw full` / `/btw dock` | Switch the live side conversation between fullscreen view and dock view without losing context.                                   |
+| `/btw clear`              | Archive completed turns to history, close the panel, stop side agents, and save one folded display block.                         |
+| `/btw retry <id>`         | Ask an interrupted question again using its short, stable ID, such as `r1`.                                                       |
 
-`clear`, `hide`, `full`, `dock`, `history`, `resume [id]`, and `retry <id>` are reserved when they are the entire argument. To ask
-about those words, use `/btw What does history mean here?` or a similar full question.
+Typing `/btw ` in the composer shows live highlighted subcommand and history/retry completion candidates.
+`clear`, `hide`, `full`, `dock`, `history`, `new`, `resume [id]`, and `retry <id>` are reserved when they match the command syntax.
 
-## Interactive dock, multi-turn history, and saved answers
+## Interactive panel, multi-thread tabs, history, and saved answers
 
-The dock uses Amira's declarative UI wrapped in a focus-highlighted card (`box` with `tone: "focus"`):
+The panel uses Amira's declarative UI wrapped in a focus-highlighted card (`box` with `tone: "focus"`):
 
 - A **card header** showing the `btw` chip, latest topic, turn count, queued count, and live status.
+- A **multi-thread tab bar** (`h2 Topic │ h1 Topic │ + New`) for instant switching across live concurrent `btw` conversations and saved history threads without interrupting background side agents.
 - **Live tool progress** when the side agent runs read-only `read`, `grep`, or `glob` calls, alongside Markdown-streamed answers and animated shimmer.
 - A labeled **`btw reply` inline follow-up input**: press **Tab** (or click the input) to focus straight into it, type follow-ups and press **Enter** to send, and press **Tab** again (or click the main composer) to return to the main conversation.
-- **Clickable action buttons**: `[ Retry r1 ]` (when interrupted), `[ History ]` (when saved threads exist), `[ Hide ]` (keep alive in the background with a status bar indicator), and `[ Clear ]` (archive, close, and save).
-- **Session-scoped multi-turn history (`btw.history`)**: every `btw` thread with at least one completed turn is automatically archived in `SessionData` (survives closing the dock and reloading/resuming the session). Restoring a thread via `/btw resume`, `/btw history`, or `[ History ]` reloads all prior Q&A turns in the dock; sending a new follow-up forks the main session while prepending prior `btw` turns to the new user prompt (keeping `systemPrompt` and the forked prefix intact for prompt-cache efficiency).
+- **Clickable action buttons**: `[ Retry r1 ]` (when interrupted), `[ Full ]` / `[ Dock ]` (live fullscreen/dock switch), `[ History ]` (saved thread manager), `[ Hide ]` (keep alive in the background with a status bar indicator), and `[ Clear ]` (archive, close, and save).
+- **Session-scoped multi-turn history (`btw.history`)**: every `btw` thread with at least one completed turn is automatically archived in `SessionData` (survives closing the panel and reloading/resuming the session). Restoring a thread via `/btw`, `/btw resume`, `/btw history`, or clicking a tab reloads all prior Q&A turns; sending a new follow-up forks the main session while prepending prior `btw` turns to the new user prompt (keeping `systemPrompt` and the forked prefix intact for prompt-cache efficiency).
   Retry IDs are case-insensitive: `/btw retry R1` and `/btw retry r1` do the same thing.
   Keep the `r` prefix: bare numbers remain unavailable because they are ambiguous
   with old numbered actions.
