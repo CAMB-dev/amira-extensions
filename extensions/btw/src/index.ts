@@ -1,4 +1,5 @@
 import type {
+  AgentStatusState,
   AnyEvent,
   ChildSession,
   CommandContext,
@@ -7,9 +8,12 @@ import type {
   SessionData,
   SpawnGroup,
   UiControl,
+  UiNode,
   UserMessage,
   ViewDefinition,
   ViewLine,
+  ViewRenderOptions,
+  ViewSegment,
 } from "@amira/api"
 
 const SYSTEM =
@@ -19,6 +23,8 @@ const DATA_KEY = "btw.pending"
 const MAX_AGE = 24 * 60 * 60 * 1000
 const COUNTER_KEY = "btw.retry.counter"
 const LEGACY_RETRY_ID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
+const WORKING_SYMBOL = "●"
+const PRIMARY_TOOL_ARGS = ["path", "file_path", "filePath", "pattern", "query", "command", "name"]
 
 type Pending = {
   question: string
@@ -27,7 +33,21 @@ type Pending = {
   state: "queued" | "in-flight" | "interrupted"
   retryId?: string
 }
-type Entry = { kind: "question" | "reply" | "error" | "note"; text: string; pending?: Pending[] }
+
+type ToolEntry = {
+  kind: "tool"
+  id: string
+  name: string
+  args: Record<string, unknown>
+  startedAt: number
+  finished?: boolean
+  isError?: boolean
+  durationMs?: number
+}
+
+type TextEntry = { kind: "question" | "reply" | "error" | "note"; text: string; pending?: Pending[] }
+
+type Entry = TextEntry | ToolEntry
 
 interface Side {
   sessionId: string
@@ -43,15 +63,36 @@ interface Side {
   control?: UiControl
   print: CommandContext["print"]
   status: string
+  startedAt?: number
+  placement: "dock" | "fullscreen"
+  hidden: boolean
+  hiding: boolean
+  repositioning: boolean
   closed: boolean
   opened: boolean
   saved: boolean
   failure?: string
 }
 
+function summarizeToolArgs(args: Record<string, unknown>): string {
+  for (const key of PRIMARY_TOOL_ARGS) {
+    const val = args[key]
+    if (typeof val === "string" && val.trim()) {
+      const flat = val.replace(/\s+/g, " ").trim()
+      return flat.length > 48 ? `${flat.slice(0, 47)}…` : flat
+    }
+  }
+  return ""
+}
+
+function formatMs(ms: number | undefined): string {
+  if (ms === undefined || !Number.isFinite(ms) || ms < 0) return ""
+  return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`
+}
+
 function details(side: Pick<Side, "entries">): string {
   return side.entries
-    .filter((entry) => entry.text)
+    .filter((entry): entry is TextEntry => entry.kind !== "tool" && !!entry.text)
     .map((entry) => {
       const label = { question: "Question", reply: "Answer", error: "Error", note: "Status" }[entry.kind]
       return `**${label}**\n\n${entry.text}`
@@ -103,6 +144,66 @@ function recover(value: unknown): Pending[] {
   })
 }
 
+function badgeStateOf(status: string): AgentStatusState {
+  switch (status) {
+    case "working":
+      return "working"
+    case "waiting":
+      return "queued"
+    case "ready":
+      return "idle"
+    case "paused":
+      return "paused"
+    case "failed":
+      return "failed"
+    default:
+      return "stopped"
+  }
+}
+
+function turnCount(side: Side): number {
+  return side.entries.filter((entry) => entry.kind === "question").length
+}
+
+function latestQuestion(side: Side): string {
+  for (let i = side.entries.length - 1; i >= 0; i--) {
+    const entry = side.entries[i]!
+    if (entry.kind === "question") return entry.text
+  }
+  return side.question
+}
+
+function renderEntryLines(entry: Entry, opts: ViewRenderOptions): ViewLine[] {
+  if (entry.kind === "question") return [{ kind: "user-message", text: entry.text }]
+  if (entry.kind === "reply") {
+    return opts.renderReply?.(entry.text) ?? [{ kind: "text", text: entry.text }]
+  }
+  if (entry.kind === "tool") {
+    const summary = summarizeToolArgs(entry.args)
+    if (!entry.finished) {
+      if (opts.renderRunningTool) {
+        return opts.renderRunningTool(entry.name, { args: entry.args, startedAt: entry.startedAt })
+      }
+      const parts: ViewSegment[] = [
+        { kind: "spinner" },
+        { kind: "text", text: " " },
+        { kind: "accent", text: entry.name },
+        ...(summary ? [{ kind: "muted" as const, text: ` ${summary}` }] : []),
+      ]
+      return [{ kind: "segments", parts }]
+    }
+    const sep = opts.glyphs?.separator ?? "·"
+    const elapsed = formatMs(entry.durationMs)
+    const parts: ViewSegment[] = [
+      entry.isError ? { kind: "error", text: opts.glyphs?.error ?? "✗" } : { kind: "success", text: "✓" },
+      { kind: "muted", text: ` ${entry.name}${summary ? ` ${summary}` : ""}` },
+      ...(elapsed ? [{ kind: "dim" as const, text: ` ${sep} ${elapsed}` }] : []),
+    ]
+    return [{ kind: "segments", parts }]
+  }
+  return [{ kind: entry.kind === "error" ? "error" : "muted", text: entry.text }]
+}
+
 const extension: Extension = (api) => {
   const viewKind = `btw:${crypto.randomUUID()}`
   const sides = new Map<string, Side>()
@@ -112,10 +213,46 @@ const extension: Extension = (api) => {
   const closing = new Set<Side>()
   let unloaded = false
 
+  api.registerStatusItem({
+    id: "btw",
+    align: "left",
+    priority: 25,
+    tone() {
+      const id = api.session()?.info().id
+      const side = id ? sides.get(id) : undefined
+      if (!side || side.closed) return undefined
+      if (side.status === "failed" || side.retries.size > 0) return "warning"
+      if (side.status === "working" || side.status === "waiting") return "accent"
+      return "muted"
+    },
+    text() {
+      const id = api.session()?.info().id
+      const side = id ? sides.get(id) : undefined
+      if (!side || side.closed) return undefined
+      const turns = turnCount(side)
+      const count = turns > 1 ? ` (${turns})` : ""
+      if (side.status === "working") {
+        return `${WORKING_SYMBOL} btw${side.hidden ? " hidden" : ""}${count}`
+      }
+      if (side.status === "waiting") {
+        return `btw · waiting${count}`
+      }
+      if (side.retries.size > 0) {
+        const first = side.retries.keys().next().value as string
+        return `btw · retry ${first}`
+      }
+      if (side.hidden) {
+        return `btw · hidden${count}`
+      }
+      return undefined
+    },
+  })
+
   function saveDisplay(side: Side, entries = side.entries) {
     if (side.saved) return
     side.saved = true
-    const question = entries.find((entry) => entry.kind === "question")?.text ?? side.question
+    const firstQuestion = entries.find((entry): entry is TextEntry => entry.kind === "question")
+    const question = firstQuestion?.text ?? side.question
     side.print(`btw: ${question}`, "info", {
       details: details({ entries }),
       markdown: true,
@@ -137,6 +274,7 @@ const extension: Extension = (api) => {
   function finish(side: Side, persist = true, reason = "btw dock closed") {
     if (side.closed) return
     side.closed = true
+    side.hidden = false
     if (sides.get(side.sessionId) === side) sides.delete(side.sessionId)
     if (side.child && side.child.state !== "ended" && side.child.state !== "idle") {
       side.entries.push({ kind: "note", text: "Stopped before the answer finished." })
@@ -149,11 +287,32 @@ const extension: Extension = (api) => {
   }
 
   function close(side: Side) {
+    side.hiding = false
+    side.repositioning = false
     side.control?.close()
     // Explicit user/session closes are not reload recovery candidates.
     closing.delete(side)
     finish(side)
     saveDisplay(side)
+  }
+
+  function hide(side: Side) {
+    if (side.closed || side.hidden) return
+    side.hiding = true
+    side.hidden = true
+    side.control?.close()
+    side.control = undefined
+    side.hiding = false
+    api.requestRender()
+  }
+
+  function setStatus(side: Side, status: string) {
+    if (status === "working") {
+      if (side.status !== "working" || side.startedAt === undefined) side.startedAt = Date.now()
+    } else {
+      side.startedAt = undefined
+    }
+    side.status = status
   }
 
   function fail(side: Side, error: unknown) {
@@ -164,10 +323,82 @@ const extension: Extension = (api) => {
       side.entries.push({ kind: "error", text: `Could not answer: ${message}\n${RETRY}` })
       side.failure = message
     }
-    side.status = "failed"
+    setStatus(side, "failed")
     if (!side.opened && fresh) {
       side.print(`btw: ${side.question}`, "error", { details: details(side), markdown: true, persist: true })
     }
+    api.requestRender()
+  }
+
+  function buildUiLines(side: Side, opts: ViewRenderOptions): ViewLine[] {
+    const lines = side.entries.flatMap((entry) => renderEntryLines(entry, opts))
+    if (side.status === "waiting") {
+      lines.push({
+        kind: "segments",
+        parts: [{ kind: "badge", state: "queued", label: "Waiting for an agent slot…" }],
+      })
+    } else if (side.status === "working") {
+      const sep = opts.glyphs?.separator ?? "·"
+      lines.push({
+        kind: "segments",
+        parts: [
+          { kind: "spinner" },
+          { kind: "text", text: " " },
+          {
+            kind: "shimmer",
+            text: "Thinking…",
+            ...(side.startedAt !== undefined ? { startedAt: side.startedAt } : {}),
+          },
+          ...(side.startedAt !== undefined
+            ? [
+                { kind: "dim" as const, text: ` ${sep} ` },
+                { kind: "elapsed" as const, since: side.startedAt, tone: "dim" as const },
+              ]
+            : []),
+        ],
+      })
+    }
+    return lines
+  }
+
+  function sendFollowUpInView(side: Side, raw: string, retryKey?: string) {
+    const session = api.session()
+    let question = raw.trim()
+    let retryItem: Pending | undefined
+    if (retryKey) {
+      retryItem = side.retries.get(retryKey)
+      if (!retryItem) return
+      question = retryItem.question
+    }
+    if (!question) return
+    if (side.closed || side.child?.state === "ended" || (!side.child && side.failure)) {
+      if (!side.closed && side.pending.length) {
+        stopWatching(side)
+        side.group?.end("btw agent replaced")
+        for (const item of side.pending) {
+          if (item.state === "in-flight") interrupt(side, item, false)
+        }
+        side.child = undefined
+        side.group = undefined
+        side.failure = undefined
+      } else if (side.child?.state === "ended" || (!side.child && side.failure)) {
+        stopWatching(side)
+        side.group?.end("btw agent replaced")
+        side.child = undefined
+        side.group = undefined
+        side.failure = undefined
+      }
+    }
+    if (retryKey && retryItem) {
+      side.retries.delete(retryKey)
+      side.pending = side.pending.filter((item) => item !== retryItem)
+    }
+    const pending: Pending = { question, answer: "", timestamp: Date.now(), state: "queued" }
+    side.entries.push({ kind: "question", text: question, pending: [pending] })
+    side.pending.push(pending)
+    if (side.child) send(side, pending)
+    else if (session) requeue(side, session)
+    else setStatus(side, "waiting")
     api.requestRender()
   }
 
@@ -179,10 +410,20 @@ const extension: Extension = (api) => {
     hostKeys: "minimal",
     onOpen(side, control) {
       side.control = control
+      side.hidden = false
+      side.hiding = false
+      side.repositioning = false
       if (side.closed) control.close()
     },
     onClose(side) {
       if (side.closed) return
+      if (side.hiding || side.repositioning) {
+        side.control = undefined
+        side.hiding = false
+        side.repositioning = false
+        api.requestRender()
+        return
+      }
       closing.add(side)
       finish(side, false)
       queueMicrotask(() => {
@@ -190,13 +431,7 @@ const extension: Extension = (api) => {
       })
     },
     render: (side, opts) => {
-      const lines = side.entries.flatMap((entry): ViewLine[] => {
-        if (entry.kind === "question") return [{ kind: "user-message", text: entry.text }]
-        if (entry.kind === "reply") {
-          return opts.renderReply?.(entry.text) ?? [{ kind: "text", text: entry.text }]
-        }
-        return [{ kind: entry.kind === "error" ? "error" : "muted", text: entry.text }]
-      })
+      const lines = side.entries.flatMap((entry) => renderEntryLines(entry, opts))
       if (side.status === "waiting" || side.status === "working") {
         lines.push({
           kind: "muted",
@@ -204,6 +439,98 @@ const extension: Extension = (api) => {
         })
       }
       return lines
+    },
+    ui: (side, ctx): UiNode => {
+      const sep = ctx.glyphs?.separator ?? "·"
+      const turns = turnCount(side)
+      const queuedCount = side.pending.filter((item) => item.state === "queued").length
+      const topic = latestQuestion(side).replace(/\s+/g, " ").trim()
+      const shortTopic = topic.length > 42 ? `${topic.slice(0, 41)}…` : topic
+      const left: ViewSegment[] = [
+        { kind: "chip", text: "btw", tone: "accent" },
+        { kind: "text", text: ` ${shortTopic}` },
+        ...(turns > 1 ? [{ kind: "dim" as const, text: ` ${sep} ${turns} turns` }] : []),
+        ...(queuedCount > 0
+          ? [{ kind: "chip" as const, text: `${queuedCount} queued`, tone: "info" as const }]
+          : []),
+      ]
+      const right: ViewSegment[] = [
+        { kind: "badge", state: badgeStateOf(side.status), label: side.status },
+        ...(side.status === "working" && side.startedAt !== undefined
+          ? [
+              { kind: "dim" as const, text: ` ${sep} ` },
+              { kind: "elapsed" as const, since: side.startedAt, tone: "dim" as const },
+            ]
+          : []),
+      ]
+      const firstRetry = side.retries.keys().next().value as string | undefined
+      const actionChildren: { node: UiNode; size?: number | "fill"; min?: number }[] = [
+        {
+          size: "fill",
+          min: 18,
+          node: {
+            type: "input",
+            id: "followup",
+            placeholder:
+              side.status === "working" || side.status === "waiting"
+                ? "Queue a follow-up… (Enter sends · Tab main)"
+                : "Follow up in btw… (Enter sends · Tab main)",
+          },
+        },
+        ...(firstRetry
+          ? [
+              {
+                size: firstRetry.length + 10,
+                node: {
+                  type: "button" as const,
+                  id: "retry",
+                  key: firstRetry,
+                  label: `Retry ${firstRetry}`,
+                  tone: "accent" as const,
+                },
+              },
+            ]
+          : []),
+        {
+          size: 8,
+          node: { type: "button", id: "hide", label: "Hide", tone: "normal" },
+        },
+        {
+          size: 9,
+          node: { type: "button", id: "clear", label: "Clear", tone: "normal" },
+        },
+      ]
+      const showRules = ctx.height >= 7
+      const children: { node: UiNode; size?: number | "fill" }[] = [
+        { size: 1, node: { type: "bar", left, right } },
+        ...(showRules ? [{ size: 1, node: { type: "rule" as const } }] : []),
+        {
+          size: "fill",
+          node: {
+            type: "text",
+            id: "transcript",
+            follow: true,
+            lines: buildUiLines(side, ctx),
+          },
+        },
+        ...(showRules ? [{ size: 1, node: { type: "rule" as const } }] : []),
+        { size: 1, node: { type: "row", gap: 1, children: actionChildren } },
+      ]
+      return { type: "column", children }
+    },
+    onEvent(event, side, control) {
+      if (event.type === "submit" && event.id === "followup") {
+        const value = event.value.trim()
+        if (!value) return
+        control.setState({ inputValues: { followup: "" } })
+        sendFollowUpInView(side, value)
+        return
+      }
+      if (event.type === "activate") {
+        if (event.id === "hide") hide(side)
+        else if (event.id === "clear") close(side)
+        else if (event.id === "retry") sendFollowUpInView(side, "", event.key)
+      }
     },
   }
   api.registerView(view)
@@ -248,7 +575,7 @@ const extension: Extension = (api) => {
   }
 
   async function watch(side: Side, child: ChildSession) {
-    let reply: Entry | undefined
+    let reply: TextEntry | undefined
     const group = side.group
     const events = child.events[Symbol.asyncIterator]()
     side.events = events
@@ -257,14 +584,35 @@ const extension: Extension = (api) => {
         if (side.closed || side.child !== child) return
         if (event.type === "subagent.state" && event.data.childSessionId === child.id) {
           if (child.state !== "ended" && !side.failure) {
-            side.status = { queued: "waiting", working: "working", idle: "ready", paused: "paused" }[
-              event.data.state
-            ]
+            setStatus(
+              side,
+              { queued: "waiting", working: "working", idle: "ready", paused: "paused" }[event.data.state],
+            )
           }
         } else if (event.sessionId === child.id) {
           if (event.type === "turn.start") activate(side, event.data.prompt)
           if (event.type === "turn.steer" && event.data.state === "injected") {
             activate(side, event.data.message, true)
+          }
+          if (event.type === "tool.execute.start") {
+            reply = undefined
+            side.entries.push({
+              kind: "tool",
+              id: event.data.toolCallId,
+              name: event.data.name,
+              args: event.data.args,
+              startedAt: event.ts || Date.now(),
+            })
+          }
+          if (event.type === "tool.execute.end") {
+            const tool = side.entries.find(
+              (entry): entry is ToolEntry => entry.kind === "tool" && entry.id === event.data.toolCallId,
+            )
+            if (tool) {
+              tool.finished = true
+              tool.isError = event.data.result.isError
+              tool.durationMs = event.data.durationMs
+            }
           }
           if (event.type === "message.start") reply = undefined
           if (
@@ -292,7 +640,9 @@ const extension: Extension = (api) => {
             }
             for (const pending of reply.pending ?? []) {
               pending.answer = side.entries
-                .filter((entry) => entry.kind === "reply" && entry.pending?.includes(pending))
+                .filter(
+                  (entry): entry is TextEntry => entry.kind === "reply" && !!entry.pending?.includes(pending),
+                )
                 .map((entry) => entry.text)
                 .filter(Boolean)
                 .join("\n\n")
@@ -325,7 +675,7 @@ const extension: Extension = (api) => {
       if (side.closed || side.child !== child) return
       if (result.status === "error") fail(side, result.error ?? "The side agent failed.")
       else if (!side.failure) {
-        side.status = "ended"
+        setStatus(side, "ended")
         side.entries.push({ kind: "note", text: `Side agent ended. ${RETRY}` })
       }
       if (result.undelivered?.length) {
@@ -359,7 +709,7 @@ const extension: Extension = (api) => {
         systemPrompt: SYSTEM,
       })
       pending.state = side.child.state === "queued" ? "queued" : "in-flight"
-      side.status = side.child.state === "queued" ? "waiting" : "working"
+      setStatus(side, side.child.state === "queued" ? "waiting" : "working")
       void watch(side, side.child)
       void ended(side, side.child)
     } catch (error) {
@@ -376,7 +726,7 @@ const extension: Extension = (api) => {
       } else {
         // Acceptance is not delivery, even from idle: admission may still be queued.
         pending.state = "queued"
-        side.status = side.child.state === "queued" ? "waiting" : "working"
+        setStatus(side, side.child.state === "queued" ? "waiting" : "working")
       }
     } catch (error) {
       fail(side, error)
@@ -388,23 +738,30 @@ const extension: Extension = (api) => {
     const queued = side.pending.filter((item) => item.state === "queued")
     if (!queued.length) return
     if (!session.createGroup) {
-      side.status = "waiting"
+      setStatus(side, "waiting")
       return
     }
     start(side, session, queued[0]!)
     if (side.child) for (const item of queued.slice(1)) send(side, item)
   }
 
-  function open(side: Side, ctx: CommandContext) {
-    if (side.opened) return
+  function open(side: Side, ctx: CommandContext, placement = side.placement) {
+    const changingPlacement = side.opened && !side.hidden && side.placement !== placement
+    if (side.opened && !side.hidden && !changingPlacement) return
     if (!ctx.openView || !ctx.session.createGroup) {
       throw new Error("Side questions need a TUI dock and an agent tree.")
     }
-    if (!ctx.openView({ kind: viewKind, data: side, placement: "dock" })) {
+    if (changingPlacement) side.repositioning = true
+    const opened = ctx.openView({ kind: viewKind, data: side, placement })
+    if (!opened) {
+      side.repositioning = false
       throw new Error("The btw dock cannot open now. Close the active form or view and try again.")
     }
+    const wasOpened = side.opened
+    side.placement = placement
     side.opened = true
-    side.print = ctx.print
+    side.hidden = false
+    if (!wasOpened) side.print = ctx.print
   }
 
   function interrupt(side: Side, item: Pending, reloaded = true) {
@@ -431,7 +788,7 @@ const extension: Extension = (api) => {
   api.registerCommand({
     name: "btw",
     description: "Ask a side question without interrupting the main agent",
-    args: { hint: "<question> | clear | retry <id>" },
+    args: { hint: "<question> | hide | full | dock | clear | retry <id>" },
     echo: false,
     run(args, ctx) {
       ctx.signal.throwIfAborted()
@@ -441,6 +798,20 @@ const extension: Extension = (api) => {
       if (question === "clear") {
         if (side) close(side)
         sides.delete(id)
+        return
+      }
+      if (question === "hide") {
+        if (side && !side.closed) hide(side)
+        else ctx.print("No open btw conversation to hide.")
+        return
+      }
+      if (question === "full" || question === "dock") {
+        if (!side || side.closed) {
+          ctx.print("No active btw conversation. Ask a question with /btw <question> first.")
+          return
+        }
+        open(side, ctx, question === "full" ? "fullscreen" : "dock")
+        api.requestRender()
         return
       }
       const retry = /^retry (r\d+|[0-9a-f-]+)$/i.exec(question)
@@ -459,10 +830,15 @@ const extension: Extension = (api) => {
         question = retryItem.question
       }
       if (!question) {
-        if (side && !side.opened) {
+        if (side && (!side.opened || side.hidden)) {
           open(side, ctx)
           if (!side.child && !side.failure) requeue(side, ctx.session)
-        } else ctx.print("Use /btw <question> to ask or follow up; Esc or /btw clear closes the dock.")
+          api.requestRender()
+        } else {
+          ctx.print(
+            "Use /btw <question> to ask or follow up (or Tab into the dock); /btw hide minimizes, Esc or /btw clear closes.",
+          )
+        }
         return
       }
       if (side && (side.closed || side.child?.state === "ended" || (!side.child && side.failure))) {
@@ -510,6 +886,11 @@ const extension: Extension = (api) => {
         data: ctx.session.data,
         print: ctx.print,
         status: "working",
+        startedAt: Date.now(),
+        placement: "dock",
+        hidden: false,
+        hiding: false,
+        repositioning: false,
         closed: false,
         opened: false,
         saved: false,
@@ -547,6 +928,10 @@ const extension: Extension = (api) => {
       data,
       print: (...args) => api.notify(...args),
       status: "interrupted",
+      placement: "dock",
+      hidden: false,
+      hiding: false,
+      repositioning: false,
       closed: false,
       opened: false,
       saved: false,
@@ -590,8 +975,8 @@ const extension: Extension = (api) => {
           })),
         )
         if (side.opened) {
-          const completed = side.entries.filter((entry) =>
-            entry.pending?.some((item) => side.completed.has(item)),
+          const completed = side.entries.filter(
+            (entry) => entry.kind !== "tool" && entry.pending?.some((item) => side.completed.has(item)),
           )
           if (completed.length) saveDisplay(side, completed)
         }

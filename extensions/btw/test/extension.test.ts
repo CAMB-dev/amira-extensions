@@ -14,8 +14,11 @@ import type {
   Settings,
   SpawnGroup,
   SpawnOptions,
+  StatusItem,
   SubagentResult,
+  UiContext,
   UiControl,
+  UiEvent,
   ViewDefinition,
   ViewLine,
 } from "@amira/api"
@@ -125,6 +128,7 @@ async function setup(settings: Settings = {}) {
   let currentSession: SessionControl | undefined
   const commands: CommandDefinition[] = []
   const views: ViewDefinition[] = []
+  const statusItems: StatusItem[] = []
   const listeners = new Map<keyof EventMap, (event: EventEnvelope) => void>()
   let renders = 0
   let seq = 0
@@ -233,6 +237,10 @@ async function setup(settings: Settings = {}) {
       views.push(view)
       return () => {}
     },
+    registerStatusItem(item) {
+      statusItems.push(item)
+      return () => {}
+    },
     on(type, handler) {
       listeners.set(type, (event) => handler(event as never))
       return () => {
@@ -313,7 +321,14 @@ async function setup(settings: Settings = {}) {
       mounted = undefined
     }
     hostClosers.push(hostClose)
-    const control = strict<UiControl>("control", { close: hostClose })
+    const statePatches: Parameters<UiControl["setState"]>[0][] = []
+    const control = strict<UiControl>("control", {
+      close: hostClose,
+      setState: (patch) => {
+        statePatches.push(patch)
+      },
+      focus: () => {},
+    })
     const ctx = strict<CommandContext>("ctx", {
       session,
       frontend: options.frontend ?? "tui",
@@ -361,10 +376,32 @@ async function setup(settings: Settings = {}) {
         title: views[0]!.title(view.data, opts),
         status: views[0]!.titleAside?.(view.data),
         lines: views[0]!.render!(view.data, opts),
+        ui: views[0]!.ui?.(view.data, {
+          width: 100,
+          now: 0,
+          height: 12,
+          state: { selected: {}, expanded: {}, activeTabs: {}, scroll: {}, inputValues: {} },
+        } as UiContext),
         replies,
       }
     }
-    return { ctx, controller, printed, opened, hostClose, shown, mainHistory, closes: () => closes }
+    function sendUiEvent(event: UiEvent) {
+      const view = opened.at(-1)
+      if (!view || !("data" in view)) throw new Error("Expected a dock")
+      views[0]!.onEvent?.(event, view.data, control)
+    }
+    return {
+      ctx,
+      controller,
+      printed,
+      opened,
+      hostClose,
+      shown,
+      sendUiEvent,
+      statePatches,
+      mainHistory,
+      closes: () => closes,
+    }
   }
   function run(text: string, c: ReturnType<typeof context>) {
     return commands[0]!.run(text, c.ctx)
@@ -396,6 +433,7 @@ async function setup(settings: Settings = {}) {
     groups,
     commands,
     views,
+    statusItems,
     spawnFails: (error: unknown) => {
       spawnError = error
     },
@@ -407,6 +445,7 @@ async function setup(settings: Settings = {}) {
       this.unload()
       commands.length = 0
       views.length = 0
+      statusItems.length = 0
       listeners.clear()
       await extension(api)
     },
@@ -1606,7 +1645,7 @@ test("empty args explain the dock commands and show/history are ordinary questio
   const s = await setup()
   const c = s.context()
   s.run("", c)
-  expect(c.printed).toEqual([["Use /btw <question> to ask or follow up; Esc or /btw clear closes the dock."]])
+  expect(c.printed[0]?.[0]).toContain("Use /btw <question> to ask or follow up")
   expect(s.children).toEqual([])
   s.run("show", c)
   s.run("history", c)
@@ -1621,4 +1660,107 @@ test("an already-aborted command starts no dock or child", async () => {
   expect(() => s.run("Question", c)).toThrow()
   expect(s.children).toEqual([])
   expect(c.opened).toEqual([])
+})
+
+test("declarative ui submits inline follow-ups, hides without killing the child, and switches full/dock", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.run("First question", c)
+  const child = s.children[0]!
+  expect(s.statusItems[0]?.text()).toBe("● btw")
+  await child.answer("First answer")
+  expect(s.statusItems[0]?.text()).toBeUndefined()
+
+  // Inline follow-up input inside the dock sends directly to the same child and clears input state.
+  const ui = c.shown().ui
+  expect(ui?.type).toBe("column")
+  c.sendUiEvent({ type: "submit", id: "followup", value: "  Second question  " })
+  expect(c.statePatches.at(-1)).toEqual({ inputValues: { followup: "" } })
+  expect(child.sent).toEqual(["Second question"])
+  expect(s.children).toHaveLength(1)
+  await child.answer("Second answer")
+
+  // Clicking [ Hide ] closes the dock WITHOUT aborting the child or printing early, and shows status pill.
+  c.sendUiEvent({ type: "activate", id: "hide", key: "hide" })
+  await flush()
+  expect(child.aborts).toEqual([])
+  expect(c.printed).toEqual([])
+  expect(s.statusItems[0]?.text()).toBe("btw · hidden (2)")
+
+  // Running /btw reopens the same living side conversation.
+  s.run("", c)
+  expect(c.opened.at(-1)).toMatchObject({ placement: "dock" })
+  expect(s.statusItems[0]?.text()).toBeUndefined()
+
+  // /btw full switches to fullscreen without killing the child; /btw dock returns to dock.
+  s.run("full", c)
+  expect(c.opened.at(-1)).toMatchObject({ placement: "fullscreen" })
+  expect(child.aborts).toEqual([])
+  s.run("dock", c)
+  expect(c.opened.at(-1)).toMatchObject({ placement: "dock" })
+  expect(child.aborts).toEqual([])
+
+  // Clicking [ Clear ] closes cleanly and persists all Q&A once.
+  c.sendUiEvent({ type: "activate", id: "clear", key: "clear" })
+  await flush()
+  expect(child.aborts).toHaveLength(1)
+  expect(c.printed).toHaveLength(1)
+  expect(c.printed[0]?.[2]?.details).toContain("First answer")
+  expect(c.printed[0]?.[2]?.details).toContain("Second answer")
+})
+
+test("live tool calls render in the dock without polluting saved display details", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.run("Inspect file", c)
+  const child = s.children[0]!
+  await child.emit("tool.execute.start", {
+    toolCallId: "t1",
+    name: "read",
+    args: { path: "src/index.ts" },
+  })
+  expect(
+    c
+      .shown()
+      .lines.some(
+        (line) =>
+          line.kind === "segments" &&
+          line.parts.some((p) => "text" in p && p.text.includes("read")) &&
+          line.parts.some((p) => "text" in p && p.text.includes("src/index.ts")),
+      ),
+  ).toBe(true)
+  await child.emit("tool.execute.end", {
+    toolCallId: "t1",
+    name: "read",
+    durationMs: 42,
+    result: { content: [{ type: "text", text: "ok" }], isError: false },
+  })
+  expect(
+    c
+      .shown()
+      .lines.some(
+        (line) =>
+          line.kind === "segments" &&
+          line.parts.some((p) => "text" in p && p.text === "✓") &&
+          line.parts.some((p) => "text" in p && p.text.includes("42ms")),
+      ),
+  ).toBe(true)
+  await child.answer("Found it")
+  c.hostClose()
+  await flush()
+  expect(c.printed[0]?.[2]?.details).toBe("**Question**\n\nInspect file\n\n**Answer**\n\nFound it")
+})
+
+test("clicking [ Retry r1 ] in the dock retries an interrupted question directly", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.records.set("session-a:btw.pending", [
+    [{ question: "Interrupted Q", answer: "Partial", timestamp: Date.now(), state: "in-flight" }],
+  ])
+  await s.reload()
+  expect(s.statusItems[0]?.text()).toBe("btw · retry r1")
+  s.run("", c)
+  c.sendUiEvent({ type: "activate", id: "retry", key: "r1" })
+  expect(s.children).toHaveLength(1)
+  expect(s.children[0]!.options.prompt).toBe("Interrupted Q")
 })
