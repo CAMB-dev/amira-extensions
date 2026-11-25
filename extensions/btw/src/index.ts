@@ -635,6 +635,43 @@ const extension: Extension = (api) => {
     saveDisplay(side)
   }
 
+  function clearSide(side: Side) {
+    if (side.closed) return
+    const oldKey = tabKeyOf(side)
+    const hadThreadId = side.threadId
+    stopWatching(side)
+    side.child?.abort("btw cleared")
+    side.group?.end("btw cleared")
+    side.child = undefined
+    side.group = undefined
+    side.failure = undefined
+    side.pending = []
+    side.retries.clear()
+    side.completed.clear()
+    side.historyContext = undefined
+    if (hadThreadId) deleteHistoryThread(side, hadThreadId)
+    else dropTabOrder(side.sessionId, oldKey)
+    side.threadId = undefined
+    side.lastSavedHistorySig = undefined
+    side.entries = []
+    side.question = "New btw"
+    side.mode = "chat"
+    side.saved = true
+    setStatus(side, "ready")
+    // When not currently shown in a mounted panel, finish cleanup instead of leaving an empty hidden stub.
+    if (!side.opened || side.hidden || !side.control) {
+      side.closed = true
+      if (sides.get(side.sessionId) === side) sides.delete(side.sessionId)
+      closing.delete(side)
+      api.requestRender()
+      return
+    }
+    side.localId = nextLocalId()
+    side.control.setState({ activeTabs: { threads: tabKeyOf(side) }, inputValues: { followup: "" } })
+    side.control.focus("followup")
+    api.requestRender()
+  }
+
   function switchToSide(current: Side, target: Side) {
     if (current === target) return
     const placement = current.placement
@@ -996,10 +1033,14 @@ const extension: Extension = (api) => {
           : []),
       ]
       const firstRetry = side.retries.keys().next().value as string | undefined
+      const compactChip = ctx.width < 94
       const actionChildren: { node: UiNode; size?: number | "fill"; min?: number }[] = [
         {
-          size: 11,
-          node: { type: "bar", left: [{ kind: "chip", text: "btw reply", tone: "accent" }] },
+          size: compactChip ? 5 : 11,
+          node: {
+            type: "bar",
+            left: [{ kind: "chip", text: compactChip ? "btw" : "btw reply", tone: "accent" }],
+          },
         },
         {
           size: "fill",
@@ -1056,6 +1097,10 @@ const extension: Extension = (api) => {
         {
           size: 9,
           node: { type: "button", id: "clear", label: "Clear", tone: "normal" },
+        },
+        {
+          size: 9,
+          node: { type: "button", id: "close", label: "Close", tone: "normal" },
         },
       ]
       const showRule = ctx.height >= 7
@@ -1243,7 +1288,8 @@ const extension: Extension = (api) => {
           return
         }
         if (event.id === "hide") hide(side)
-        else if (event.id === "clear") close(side)
+        else if (event.id === "clear") clearSide(side)
+        else if (event.id === "close") close(side)
         else if (event.id === "retry") sendFollowUpInView(side, "", event.key)
       }
     },
@@ -1512,7 +1558,7 @@ const extension: Extension = (api) => {
     name: "btw",
     description: "Open the btw panel or ask a side question without interrupting the main agent",
     args: {
-      hint: "[question] | new | resume [id] | history | full | dock | hide | clear",
+      hint: "[question] | new | resume [id] | history | full | dock | hide | clear | close",
       complete(prefix, ctx): CommandCandidate[] {
         const trimmed = prefix.trimStart()
         const lower = trimmed.toLowerCase()
@@ -1556,7 +1602,8 @@ const extension: Extension = (api) => {
           if (!side.hidden) {
             candidates.push({ value: "hide", description: "Minimize btw panel while keeping it alive" })
           }
-          candidates.push({ value: "clear", description: "Archive and close the btw panel" })
+          candidates.push({ value: "clear", description: "Clear the current btw conversation" })
+          candidates.push({ value: "close", description: "Archive and close the btw panel" })
           for (const [retryId, item] of side.retries) {
             const preview = item.question.replace(/\s+/g, " ").trim()
             candidates.push({
@@ -1575,10 +1622,14 @@ const extension: Extension = (api) => {
       const id = ctx.session.info().id
       let side = sides.get(id)
       if (side && ctx.openView) side.openView = ctx.openView
-      if (question === "clear") {
+      if (question === "close") {
         if (side) close(side)
         else closeStashedForSession(id)
         sides.delete(id)
+        return
+      }
+      if (question === "clear") {
+        if (side) clearSide(side)
         return
       }
       if (question === "hide") {

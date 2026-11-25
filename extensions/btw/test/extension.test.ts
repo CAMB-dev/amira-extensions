@@ -678,17 +678,23 @@ test("explicit close and clear do not become reload recovery candidates", async 
   const s = await setup()
   const c = s.context()
   s.run("A", c)
-  s.run("clear", c)
+  s.run("close", c)
   await s.reload()
   expect(s.recoveryWrites).toEqual([])
   expect(s.children).toHaveLength(1)
   expect(c.printed).toHaveLength(1)
   s.run("B", c)
+  s.run("clear", c)
+  await s.reload()
+  expect(s.recoveryWrites).toEqual([])
+  expect(s.children).toHaveLength(2)
+  expect(c.printed).toHaveLength(1)
+  s.run("C", c)
   c.hostClose()
   await flush()
   await s.reload()
   expect(s.recoveryWrites).toEqual([])
-  expect(s.children).toHaveLength(2)
+  expect(s.children).toHaveLength(3)
   expect(c.printed).toHaveLength(2)
 })
 
@@ -1397,25 +1403,32 @@ test("host Esc/onClose aborts unfinished work and persists exactly one display-o
   expect(c.printed[0]?.[2]?.details).not.toContain("Too late")
 })
 
-test("clear closes the mounted dock and idle child once, then a new question forks afresh", async () => {
+test("close closes the mounted dock and idle child once, while clear resets in place without closing", async () => {
   const s = await setup()
   const c = s.context()
   s.run("First", c)
   await s.children[0]!.answer("Done")
   s.run("clear", c)
-  expect(c.closes()).toBe(1)
+  expect(c.closes()).toBe(0)
   expect(s.children[0]!.aborts).toHaveLength(1)
-  expect(c.printed[0]?.[2]?.details).not.toContain("Stopped before")
+  expect(s.records.get("session-a:btw.history")?.at(-1)).toEqual([])
+  expect(c.shown().status).toBe("ready")
   s.run("New", c)
   expect(s.children).toHaveLength(2)
   expect(s.children[1]!.options.prompt).toBe("New")
+  await s.children[1]!.answer("Fresh answer")
+  s.run("close", c)
+  expect(c.closes()).toBe(1)
+  expect(s.children[1]!.aborts).toHaveLength(1)
+  expect(c.printed[0]?.[2]?.details).not.toContain("Stopped before")
+  expect((s.records.get("session-a:btw.history")?.at(-1) as { title: string }[])?.[0]?.title).toBe("New")
 })
 
-test("clear before onOpen still cleans up and late mounting immediately closes", async () => {
+test("close before onOpen still cleans up and late mounting immediately closes", async () => {
   const s = await setup()
   const c = s.context({ dock: "deferred" })
   s.run("Question", c)
-  s.run("clear", c)
+  s.run("close", c)
   expect(s.children[0]!.aborts).toHaveLength(1)
   const opened = c.opened[0]!
   if ("data" in opened) s.views[0]!.onOpen?.(opened.data, { close: c.hostClose } as UiControl)
@@ -1715,8 +1728,8 @@ test("declarative ui submits inline follow-ups, hides without killing the child,
   expect(c.opened.at(-1)).toMatchObject({ placement: "dock" })
   expect(child.aborts).toEqual([])
 
-  // Clicking [ Clear ] closes cleanly and persists all Q&A once.
-  c.sendUiEvent({ type: "activate", id: "clear", key: "clear" })
+  // Clicking [ Close ] closes cleanly, archives history, and persists all Q&A once.
+  c.sendUiEvent({ type: "activate", id: "close", key: "close" })
   await flush()
   expect(child.aborts).toHaveLength(1)
   expect(c.printed).toHaveLength(1)
@@ -1845,13 +1858,13 @@ test("/btw history opens the interactive history table and supports restore, del
   s.run("history", c)
   expect(c.printed[0]?.[0]).toContain("No saved btw history")
 
-  // Create two separate threads.
+  // Create two separate threads (using close to archive each thread).
   s.run("Topic A", c)
   await s.children[0]!.answer("Answer A")
-  s.run("clear", c)
+  s.run("close", c)
   s.run("Topic B", c)
   await s.children[1]!.answer("Answer B")
-  s.run("clear", c)
+  s.run("close", c)
 
   // Open /btw history and verify table lists newest first (h2 then h1).
   const c2 = s.context()
@@ -1956,8 +1969,27 @@ test("btw command provides highlighted argument completions and stays out of the
   expect(active.map((item) => item.value)).toContain("full")
   expect(active.map((item) => item.value)).toContain("hide")
   expect(active.map((item) => item.value)).toContain("clear")
+  expect(active.map((item) => item.value)).toContain("close")
 
   // Free-text multi-word question returns no subcommand candidates so Enter sends it verbatim.
   const freeText = await complete!("how does auth work", { cwd: "/work", session: c.ctx.session })
   expect(freeText).toEqual([])
+})
+
+test("clicking [ Clear ] clears only the active thread in place without closing the panel or wiping other threads", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.run("Keep me", c)
+  await s.children[0]!.answer("Kept answer")
+  c.sendUiEvent({ type: "tab", id: "threads", key: "__new__" })
+  c.sendUiEvent({ type: "submit", id: "followup", value: "Discard me" })
+  await s.children[1]!.answer("Discarded answer")
+
+  c.sendUiEvent({ type: "activate", id: "clear", key: "clear" })
+  expect(c.closes()).toBe(0)
+  expect(s.children[1]!.aborts).toHaveLength(1)
+  expect(s.children[0]!.aborts).toEqual([])
+  expect(c.shown().status).toBe("ready")
+  const remaining = (s.records.get("session-a:btw.history")?.at(-1) as { title: string }[] | undefined) ?? []
+  expect(remaining.map((t) => t.title)).toEqual(["Keep me"])
 })
