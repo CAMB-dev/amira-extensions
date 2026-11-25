@@ -128,7 +128,7 @@
     {
       "name": "btw",
       "description": "Interactive side-question panel with multi-thread tabs, instant /btw resume, Full/Dock toggle, command completions, inline follow-ups, and live tool progress: /btw [question]",
-      "version": "0.6.0",
+      "version": "0.6.1",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/btw" },
       "engines": { "amira": "^0.1.49" },
       "tags": ["question", "side-call", "dock"],

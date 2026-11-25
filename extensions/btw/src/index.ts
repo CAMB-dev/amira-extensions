@@ -321,6 +321,7 @@ const extension: Extension = (api) => {
   const viewKind = `btw:${crypto.randomUUID()}`
   const sides = new Map<string, Side>()
   const stashed = new Map<string, Map<string, Side>>()
+  const tabOrder = new Map<string, string[]>()
   const counters = new Map<string, number>()
   const memoryHistory = new Map<string, HistoryThread[]>()
   // The host closes views BEFORE onUnload, without a close reason. Keep their recovery
@@ -331,6 +332,32 @@ const extension: Extension = (api) => {
 
   const nextLocalId = () => `t${++localSeq}`
   const tabKeyOf = (side: Pick<Side, "threadId" | "localId">) => side.threadId ?? side.localId
+  const ensureTabOrder = (sessionId: string, keys: string[]) => {
+    let order = tabOrder.get(sessionId)
+    if (!order) {
+      order = []
+      tabOrder.set(sessionId, order)
+    }
+    for (const key of keys) {
+      if (!order.includes(key)) order.push(key)
+    }
+    return order
+  }
+  const renameTabOrder = (sessionId: string, oldKey: string, newKey: string) => {
+    if (oldKey === newKey) return
+    const order = tabOrder.get(sessionId)
+    if (!order) return
+    const at = order.indexOf(oldKey)
+    if (at === -1) return
+    if (order.includes(newKey)) order.splice(at, 1)
+    else order[at] = newKey
+  }
+  const dropTabOrder = (sessionId: string, key: string) => {
+    const order = tabOrder.get(sessionId)
+    if (!order) return
+    const at = order.indexOf(key)
+    if (at !== -1) order.splice(at, 1)
+  }
   const sessionStash = (sessionId: string) => {
     let bucket = stashed.get(sessionId)
     if (!bucket) {
@@ -436,8 +463,15 @@ const extension: Extension = (api) => {
     const now = Date.now()
     const match = side.threadId ? existing.find((thread) => thread.id === side.threadId) : undefined
     const id = match?.id ?? side.threadId ?? nextHistoryId(side.sessionId, side.data, existing)
+    const prevKey = tabKeyOf(side)
     side.threadId = id
     side.lastSavedHistorySig = sig
+    if (prevKey !== id) {
+      renameTabOrder(side.sessionId, prevKey, id)
+      if (sides.get(side.sessionId) === side) {
+        side.control?.setState({ activeTabs: { threads: id } })
+      }
+    }
     const updated: HistoryThread = {
       id,
       title: match?.title ?? turns[0]!.question,
@@ -490,6 +524,7 @@ const extension: Extension = (api) => {
       side.threadId = undefined
       side.lastSavedHistorySig = undefined
     }
+    dropTabOrder(side.sessionId, threadId)
     side.selectedHistoryId = next[0]?.id
     api.requestRender()
   }
@@ -498,6 +533,7 @@ const extension: Extension = (api) => {
     const existing = readHistory(side.sessionId, side.data)
     if (!existing.length) return
     writeHistory(side.sessionId, side.data, [])
+    for (const thread of existing) dropTabOrder(side.sessionId, thread.id)
     side.threadId = undefined
     side.lastSavedHistorySig = undefined
     side.selectedHistoryId = undefined
@@ -1039,24 +1075,20 @@ const extension: Extension = (api) => {
         ],
       }
       const activeKey = tabKeyOf(side)
-      const seenKeys = new Set<string>([activeKey])
-      const liveStash = [...(stashed.get(side.sessionId)?.values() ?? [])]
-      const threadTabs: { key: string; label: string; body: UiNode }[] = [
-        {
-          key: activeKey,
-          label: tabLabelFor(
-            side.question,
-            side.threadId,
-            side.status === "working" || side.status === "waiting",
-          ),
+      const tabByKey = new Map<string, { key: string; label: string; body: UiNode }>()
+      const recentHistory = history
+        .slice(0, 5)
+        .sort((a, b) => a.createdAt - b.createdAt || (historyNumber(a.id) ?? 0) - (historyNumber(b.id) ?? 0))
+      for (const thread of recentHistory) {
+        tabByKey.set(thread.id, {
+          key: thread.id,
+          label: tabLabelFor(thread.title, thread.id, false),
           body: chatColumn,
-        },
-      ]
-      for (const other of liveStash) {
+        })
+      }
+      for (const other of stashed.get(side.sessionId)?.values() ?? []) {
         const key = tabKeyOf(other)
-        if (seenKeys.has(key)) continue
-        seenKeys.add(key)
-        threadTabs.push({
+        tabByKey.set(key, {
           key,
           label: tabLabelFor(
             other.question,
@@ -1066,15 +1098,20 @@ const extension: Extension = (api) => {
           body: chatColumn,
         })
       }
-      for (const thread of history) {
-        if (threadTabs.length >= 5) break
-        if (seenKeys.has(thread.id)) continue
-        seenKeys.add(thread.id)
-        threadTabs.push({
-          key: thread.id,
-          label: tabLabelFor(thread.title, thread.id, false),
-          body: chatColumn,
-        })
+      tabByKey.set(activeKey, {
+        key: activeKey,
+        label: tabLabelFor(
+          side.question,
+          side.threadId,
+          side.status === "working" || side.status === "waiting",
+        ),
+        body: chatColumn,
+      })
+      const order = ensureTabOrder(side.sessionId, [...tabByKey.keys()])
+      const threadTabs: { key: string; label: string; body: UiNode }[] = []
+      for (const key of order) {
+        const tab = tabByKey.get(key)
+        if (tab) threadTabs.push(tab)
       }
       threadTabs.push({ key: "__new__", label: "+ New", body: chatColumn })
       const content: UiNode =

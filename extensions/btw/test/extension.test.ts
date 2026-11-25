@@ -1914,14 +1914,21 @@ test("multi-thread tabs and /btw new switch between live concurrent btw conversa
   const schemaChild = s.children[1]!
   await schemaChild.answer("Schema uses SQLite.")
 
-  // Switch back to h1 (Auth thread) via tab click: reuses the still-living authChild!
+  // Switch back to h1 (Auth thread) via tab click: reuses the still-living authChild and keeps tab order stable!
+  const tabKeys = () => {
+    const ui = c.shown().ui
+    return ui?.type === "box" && ui.child.type === "tabs" ? ui.child.tabs.map((tab) => tab.key) : []
+  }
+  expect(tabKeys()).toEqual(["h1", "h2", "__new__"])
   c.sendUiEvent({ type: "tab", id: "threads", key: "h1" })
+  expect(tabKeys()).toEqual(["h1", "h2", "__new__"])
   expect(authChild.aborts).toEqual([])
   expect(schemaChild.aborts).toEqual([])
   expect(c.shown().lines).toContainEqual({ kind: "user-message", text: "Auth thread" })
   c.sendUiEvent({ type: "submit", id: "followup", value: "Auth follow-up" })
   expect(authChild.sent).toEqual(["Auth follow-up"])
   await authChild.answer("Auth follow-up answer.")
+  expect(tabKeys()).toEqual(["h1", "h2", "__new__"])
 
   // /btw new starts a 3rd blank thread tab cleanly without killing previous threads.
   s.run("new", c)
