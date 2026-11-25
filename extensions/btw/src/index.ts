@@ -19,7 +19,12 @@ const SYSTEM =
   "Answer this side question briefly using the forked conversation. You may read files, but must not change files or the main conversation."
 const RETRY = "Close the dock with Esc or /btw clear, then ask again."
 const DATA_KEY = "btw.pending"
+const HISTORY_KEY = "btw.history"
 const MAX_AGE = 24 * 60 * 60 * 1000
+const MAX_HISTORY_THREADS = 20
+const MAX_HISTORY_TURNS = 30
+const MAX_HISTORY_CHARS = 12_000
+const MAX_HISTORY_CONTEXT_CHARS = 24_000
 const COUNTER_KEY = "btw.retry.counter"
 const LEGACY_RETRY_ID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
 const WORKING_SYMBOL = "●"
@@ -31,6 +36,20 @@ type Pending = {
   timestamp: number
   state: "queued" | "in-flight" | "interrupted"
   retryId?: string
+  deliveredPrompt?: string
+}
+
+type HistoryTurn = {
+  question: string
+  answer: string
+}
+
+type HistoryThread = {
+  id: string
+  title: string
+  turns: HistoryTurn[]
+  createdAt: number
+  updatedAt: number
 }
 
 type ToolEntry = {
@@ -50,11 +69,16 @@ type Entry = TextEntry | ToolEntry
 
 interface Side {
   sessionId: string
+  threadId?: string
   question: string
   entries: Entry[]
   pending: Pending[]
   retries: Map<string, Pending>
   completed: Set<Pending>
+  historyContext?: HistoryTurn[]
+  lastSavedHistorySig?: string
+  selectedHistoryId?: string
+  mode: "chat" | "history"
   events?: AsyncIterator<AnyEvent>
   data?: SessionData
   child?: ChildSession
@@ -71,6 +95,110 @@ interface Side {
   opened: boolean
   saved: boolean
   failure?: string
+}
+
+function trimHistoryText(text: string): string {
+  const trimmed = text.trim()
+  if (trimmed.length <= MAX_HISTORY_CHARS) return trimmed
+  return `${trimmed.slice(0, MAX_HISTORY_CHARS - 1)}…`
+}
+
+function historyNumber(value: unknown): number | undefined {
+  if (typeof value !== "string" || !/^h[1-9]\d*$/i.test(value)) return
+  const num = Number(value.slice(1))
+  return Number.isSafeInteger(num) ? num : undefined
+}
+
+function parseHistory(value: unknown): HistoryThread[] {
+  if (!Array.isArray(value)) return []
+  const out: HistoryThread[] = []
+  const seen = new Set<string>()
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue
+    const raw = item as Record<string, unknown>
+    if (typeof raw.id !== "string" || !raw.id.trim() || seen.has(raw.id)) continue
+    if (!Array.isArray(raw.turns)) continue
+    const turns: HistoryTurn[] = []
+    for (const turn of raw.turns) {
+      if (!turn || typeof turn !== "object") continue
+      const t = turn as Record<string, unknown>
+      if (
+        typeof t.question === "string" &&
+        t.question.trim() &&
+        typeof t.answer === "string" &&
+        t.answer.trim()
+      ) {
+        turns.push({ question: trimHistoryText(t.question), answer: trimHistoryText(t.answer) })
+      }
+    }
+    if (!turns.length) continue
+    const createdAt = typeof raw.createdAt === "number" && Number.isFinite(raw.createdAt) ? raw.createdAt : 0
+    const updatedAt =
+      typeof raw.updatedAt === "number" && Number.isFinite(raw.updatedAt) ? raw.updatedAt : createdAt
+    const title = typeof raw.title === "string" && raw.title.trim() ? raw.title.trim() : turns[0]!.question
+    seen.add(raw.id)
+    out.push({ id: raw.id, title, turns: turns.slice(-MAX_HISTORY_TURNS), createdAt, updatedAt })
+  }
+  return out.slice(0, MAX_HISTORY_THREADS)
+}
+
+function extractCompletedTurns(side: Pick<Side, "entries" | "completed">): HistoryTurn[] {
+  const turns: HistoryTurn[] = []
+  let currentQuestion: string | undefined
+  let replies: string[] = []
+  const isCompleted = (entry: TextEntry) =>
+    !entry.pending?.length || entry.pending.every((item) => side.completed.has(item))
+  const flush = () => {
+    const answer = replies.join("\n\n").trim()
+    if (currentQuestion && answer) {
+      turns.push({ question: trimHistoryText(currentQuestion), answer: trimHistoryText(answer) })
+    }
+    currentQuestion = undefined
+    replies = []
+  }
+  for (const entry of side.entries) {
+    if (entry.kind === "question") {
+      flush()
+      if (!isCompleted(entry)) continue
+      const q = entry.text.trim()
+      if (q) currentQuestion = q
+    } else if (entry.kind === "reply" && currentQuestion && isCompleted(entry)) {
+      const a = entry.text.trim()
+      if (a) replies.push(a)
+    }
+  }
+  flush()
+  return turns.slice(-MAX_HISTORY_TURNS)
+}
+
+function historySignature(turns: HistoryTurn[]): string {
+  return turns
+    .map((turn) => `${turn.question.length}:${turn.question}\0${turn.answer.length}:${turn.answer}`)
+    .join("\x1e")
+}
+
+function buildPromptWithHistory(question: string, history?: HistoryTurn[]): string {
+  if (!history?.length) return question
+  const selected: string[] = []
+  let used = 0
+  for (let i = history.length - 1; i >= 0; i--) {
+    const turn = history[i]!
+    const block = `User: ${turn.question}\nAssistant: ${turn.answer}`
+    if (selected.length > 0 && used + block.length > MAX_HISTORY_CONTEXT_CHARS) break
+    selected.unshift(block)
+    used += block.length + 2
+  }
+  if (!selected.length) return question
+  return `Continuing a previous side (btw) conversation from this session. Prior btw turns:\n\n${selected.join("\n\n")}\n\nNew follow-up question:\n${question}`
+}
+
+function formatRelativeTime(timestamp: number, now = Date.now()): string {
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return ""
+  const diff = Math.max(0, now - timestamp)
+  if (diff < 60_000) return "just now"
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`
+  return `${Math.floor(diff / 86_400_000)}d ago`
 }
 
 function summarizeToolArgs(args: Record<string, unknown>): string {
@@ -190,10 +318,124 @@ const extension: Extension = (api) => {
   const viewKind = `btw:${crypto.randomUUID()}`
   const sides = new Map<string, Side>()
   const counters = new Map<string, number>()
+  const memoryHistory = new Map<string, HistoryThread[]>()
   // The host closes views BEFORE onUnload, without a close reason. Keep their recovery
   // candidates until the synchronous unload hook has had a chance to claim them.
   const closing = new Set<Side>()
   let unloaded = false
+
+  function readHistory(sessionId: string, data?: SessionData): HistoryThread[] {
+    if (data) return parseHistory(data.read(HISTORY_KEY).at(-1))
+    return (memoryHistory.get(sessionId) ?? []).map((thread) => ({
+      ...thread,
+      turns: thread.turns.map((turn) => ({ ...turn })),
+    }))
+  }
+
+  function writeHistory(sessionId: string, data: SessionData | undefined, threads: HistoryThread[]) {
+    const capped = threads.slice(0, MAX_HISTORY_THREADS).map((thread) => ({
+      ...thread,
+      turns: thread.turns.slice(-MAX_HISTORY_TURNS).map((turn) => ({
+        question: trimHistoryText(turn.question),
+        answer: trimHistoryText(turn.answer),
+      })),
+    }))
+    if (data) data.append(HISTORY_KEY, capped)
+    else memoryHistory.set(sessionId, capped)
+  }
+
+  function nextHistoryId(sessionId: string, data?: SessionData, current?: HistoryThread[]): string {
+    let max = 0
+    for (const thread of current ?? readHistory(sessionId, data)) {
+      max = Math.max(max, historyNumber(thread.id) ?? 0)
+    }
+    for (const snapshot of data?.read(HISTORY_KEY) ?? []) {
+      if (!Array.isArray(snapshot)) continue
+      for (const item of snapshot) {
+        if (item && typeof item === "object") {
+          max = Math.max(max, historyNumber((item as Record<string, unknown>).id) ?? 0)
+        }
+      }
+    }
+    return `h${max + 1}`
+  }
+
+  function saveHistory(side: Side) {
+    const turns = extractCompletedTurns(side)
+    if (!turns.length) return
+    const sig = historySignature(turns)
+    if (side.lastSavedHistorySig === sig && side.threadId) return
+    const existing = readHistory(side.sessionId, side.data)
+    const now = Date.now()
+    const match = side.threadId ? existing.find((thread) => thread.id === side.threadId) : undefined
+    const id = match?.id ?? side.threadId ?? nextHistoryId(side.sessionId, side.data, existing)
+    side.threadId = id
+    side.lastSavedHistorySig = sig
+    const updated: HistoryThread = {
+      id,
+      title: match?.title ?? turns[0]!.question,
+      turns,
+      createdAt: match?.createdAt ?? now,
+      updatedAt: now,
+    }
+    const next = [updated, ...existing.filter((thread) => thread.id !== id)]
+    writeHistory(side.sessionId, side.data, next)
+  }
+
+  function applyHistoryThread(side: Side, thread: HistoryThread) {
+    if (side.entries.length) saveHistory(side)
+    stopWatching(side)
+    side.child?.abort("btw switched thread")
+    side.group?.end("btw switched thread")
+    side.child = undefined
+    side.group = undefined
+    side.failure = undefined
+    side.pending = []
+    side.retries.clear()
+    side.completed.clear()
+    side.threadId = thread.id
+    side.question = thread.title
+    side.entries = [
+      ...thread.turns.flatMap((turn): Entry[] => [
+        { kind: "question", text: turn.question },
+        { kind: "reply", text: turn.answer },
+      ]),
+      {
+        kind: "note",
+        text: `Restored ${thread.id} (${thread.turns.length} turn${thread.turns.length === 1 ? "" : "s"}). Ask a follow-up to continue.`,
+      },
+    ]
+    side.historyContext = thread.turns.map((turn) => ({ ...turn }))
+    side.lastSavedHistorySig = historySignature(thread.turns)
+    side.selectedHistoryId = thread.id
+    side.mode = "chat"
+    side.saved = true
+    setStatus(side, "history")
+    api.requestRender()
+  }
+
+  function deleteHistoryThread(side: Side, threadId: string) {
+    const existing = readHistory(side.sessionId, side.data)
+    const next = existing.filter((thread) => thread.id !== threadId)
+    if (next.length === existing.length) return
+    writeHistory(side.sessionId, side.data, next)
+    if (side.threadId === threadId) {
+      side.threadId = undefined
+      side.lastSavedHistorySig = undefined
+    }
+    side.selectedHistoryId = next[0]?.id
+    api.requestRender()
+  }
+
+  function clearAllHistory(side: Side) {
+    const existing = readHistory(side.sessionId, side.data)
+    if (!existing.length) return
+    writeHistory(side.sessionId, side.data, [])
+    side.threadId = undefined
+    side.lastSavedHistorySig = undefined
+    side.selectedHistoryId = undefined
+    api.requestRender()
+  }
 
   api.registerStatusItem({
     id: "btw",
@@ -231,7 +473,7 @@ const extension: Extension = (api) => {
   })
 
   function saveDisplay(side: Side, entries = side.entries) {
-    if (side.saved) return
+    if (side.saved || !entries.length) return
     side.saved = true
     const firstQuestion = entries.find((entry): entry is TextEntry => entry.kind === "question")
     const question = firstQuestion?.text ?? side.question
@@ -255,6 +497,7 @@ const extension: Extension = (api) => {
 
   function finish(side: Side, persist = true, reason = "btw dock closed") {
     if (side.closed) return
+    saveHistory(side)
     side.closed = true
     side.hidden = false
     if (sides.get(side.sessionId) === side) sides.delete(side.sessionId)
@@ -353,6 +596,8 @@ const extension: Extension = (api) => {
       question = retryItem.question
     }
     if (!question) return
+    side.mode = "chat"
+    side.saved = false
     if (side.closed || side.child?.state === "ended" || (!side.child && side.failure)) {
       if (!side.closed && side.pending.length) {
         stopWatching(side)
@@ -369,6 +614,10 @@ const extension: Extension = (api) => {
         side.child = undefined
         side.group = undefined
         side.failure = undefined
+      }
+      if (!side.historyContext?.length) {
+        const turns = extractCompletedTurns(side)
+        if (turns.length) side.historyContext = turns
       }
     }
     if (retryKey && retryItem) {
@@ -424,6 +673,107 @@ const extension: Extension = (api) => {
     },
     ui: (side, ctx): UiNode => {
       const sep = ctx.glyphs?.separator ?? "·"
+      const history = readHistory(side.sessionId, side.data)
+      if (side.mode === "history") {
+        const selectedKey =
+          (ctx.state.selected["history-list"] &&
+          history.some((thread) => thread.id === ctx.state.selected["history-list"])
+            ? ctx.state.selected["history-list"]
+            : undefined) ??
+          (side.selectedHistoryId && history.some((thread) => thread.id === side.selectedHistoryId)
+            ? side.selectedHistoryId
+            : undefined) ??
+          history[0]?.id
+        const body: UiNode = history.length
+          ? {
+              type: "table",
+              id: "history-list",
+              columns: [
+                { key: "id", label: "ID", size: 4 },
+                { key: "topic", label: "Topic", size: "fill" },
+                { key: "turns", label: "Turns", size: 8, align: "right" },
+                { key: "when", label: "Saved", size: 9, align: "right" },
+              ],
+              rows: history.map((thread) => {
+                const flat = thread.title.replace(/\s+/g, " ").trim()
+                const activeMark = thread.id === side.threadId ? " (active)" : ""
+                return {
+                  key: thread.id,
+                  cells: {
+                    id: [{ kind: "accent", text: thread.id }],
+                    topic: `${flat}${activeMark}`,
+                    turns: `${thread.turns.length} turn${thread.turns.length === 1 ? "" : "s"}`,
+                    when: formatRelativeTime(thread.updatedAt, ctx.now),
+                  },
+                }
+              }),
+            }
+          : {
+              type: "text",
+              lines: [{ kind: "muted", text: "No saved btw history in this session yet." }],
+            }
+        const actions: { node: UiNode; size?: number | "fill" }[] = [
+          ...(selectedKey
+            ? [
+                {
+                  size: 11,
+                  node: {
+                    type: "button" as const,
+                    id: "history-restore",
+                    label: "Restore",
+                    tone: "accent" as const,
+                  },
+                },
+                {
+                  size: 10,
+                  node: {
+                    type: "button" as const,
+                    id: "history-delete",
+                    label: "Delete",
+                    tone: "normal" as const,
+                  },
+                },
+                {
+                  size: 13,
+                  node: {
+                    type: "button" as const,
+                    id: "history-clear",
+                    label: "Clear All",
+                    tone: "normal" as const,
+                  },
+                },
+              ]
+            : []),
+          { size: "fill", node: { type: "spacer" } },
+          {
+            size: 8,
+            node: { type: "button", id: "history-back", label: "Back", tone: "normal" },
+          },
+        ]
+        const showRule = ctx.height >= 7
+        return {
+          type: "box",
+          tone: "focus",
+          title: {
+            kind: "segments",
+            parts: [
+              { kind: "chip", text: "btw", tone: "accent" },
+              { kind: "text", text: " History" },
+              { kind: "dim", text: ` ${sep} ${history.length} saved` },
+            ],
+          },
+          aside: "Enter to restore",
+          child: {
+            type: "column",
+            children: [
+              { size: "fill", node: body },
+              ...(showRule ? [{ size: 1, node: { type: "rule" as const } }] : []),
+              { size: 1, node: { type: "row", gap: 1, children: actions } },
+            ],
+          },
+        }
+      }
+
       const turns = turnCount(side)
       const queuedCount = side.pending.filter((item) => item.state === "queued").length
       const topic = latestQuestion(side).replace(/\s+/g, " ").trim()
@@ -472,6 +822,14 @@ const extension: Extension = (api) => {
               },
             ]
           : []),
+        ...(history.length > 0
+          ? [
+              {
+                size: 11,
+                node: { type: "button" as const, id: "history", label: "History", tone: "normal" as const },
+              },
+            ]
+          : []),
         {
           size: 8,
           node: { type: "button", id: "hide", label: "Hide", tone: "normal" },
@@ -503,6 +861,10 @@ const extension: Extension = (api) => {
       }
     },
     onEvent(event, side, control) {
+      if (event.type === "select" && event.id === "history-list") {
+        side.selectedHistoryId = event.key
+        return
+      }
       if (event.type === "submit" && event.id === "followup") {
         const value = event.value.trim()
         if (!value) return
@@ -511,6 +873,60 @@ const extension: Extension = (api) => {
         return
       }
       if (event.type === "activate") {
+        if (event.id === "history-list") {
+          const target = readHistory(side.sessionId, side.data).find((thread) => thread.id === event.key)
+          if (target) {
+            applyHistoryThread(side, target)
+            control.focus("followup")
+          }
+          return
+        }
+        if (event.id === "history") {
+          saveHistory(side)
+          const history = readHistory(side.sessionId, side.data)
+          side.mode = "history"
+          side.selectedHistoryId = side.threadId ?? history[0]?.id
+          if (side.selectedHistoryId) {
+            control.setState({ selected: { "history-list": side.selectedHistoryId } })
+            control.focus("history-list")
+          }
+          api.requestRender()
+          return
+        }
+        if (event.id === "history-restore") {
+          const history = readHistory(side.sessionId, side.data)
+          const target = history.find((thread) => thread.id === side.selectedHistoryId) ?? history[0]
+          if (target) {
+            applyHistoryThread(side, target)
+            control.focus("followup")
+          }
+          return
+        }
+        if (event.id === "history-delete") {
+          const history = readHistory(side.sessionId, side.data)
+          const target = history.find((thread) => thread.id === side.selectedHistoryId) ?? history[0]
+          if (target) {
+            deleteHistoryThread(side, target.id)
+            if (side.selectedHistoryId) {
+              control.setState({ selected: { "history-list": side.selectedHistoryId } })
+            }
+          }
+          return
+        }
+        if (event.id === "history-clear") {
+          clearAllHistory(side)
+          return
+        }
+        if (event.id === "history-back") {
+          if (side.entries.length) {
+            side.mode = "chat"
+            control.focus("followup")
+            api.requestRender()
+          } else {
+            close(side)
+          }
+          return
+        }
         if (event.id === "hide") hide(side)
         else if (event.id === "clear") close(side)
         else if (event.id === "retry") sendFollowUpInView(side, "", event.key)
@@ -528,7 +944,7 @@ const extension: Extension = (api) => {
       const pending = side.pending.find(
         (item) =>
           !matched.has(item) &&
-          item.question === part.text &&
+          (item.question === part.text || item.deliveredPrompt === part.text) &&
           (queuedOnly ? item.state === "queued" : item.state !== "interrupted"),
       )
       if (pending) {
@@ -542,6 +958,7 @@ const extension: Extension = (api) => {
     const answered = side.pending.filter((item) => item.state === "in-flight")
     for (const item of answered) side.completed.add(item)
     side.pending = side.pending.filter((item) => item.state !== "in-flight")
+    saveHistory(side)
     // There is no extension-level openView API. Automatically restarted work reports its
     // answers as display-only blocks until a command context can mount the dock again.
     if (!side.opened && answered.length) {
@@ -682,16 +1099,19 @@ const extension: Extension = (api) => {
     try {
       const setting = api.settings.extensions?.btw?.model
       const model = typeof setting === "string" ? setting.trim() : ""
+      const prompt = buildPromptWithHistory(pending.question, side.historyContext)
+      pending.deliveredPrompt = prompt
       side.group = session.createGroup!({ name: "btw" })
       side.child = side.group.spawn({
         title: "btw",
-        prompt: pending.question,
+        prompt,
         context: "fork",
         ephemeral: true,
         callableTools: ["read", "grep", "glob"],
         ...(model ? { model } : {}),
         systemPrompt: SYSTEM,
       })
+      side.historyContext = undefined
       pending.state = side.child.state === "queued" ? "queued" : "in-flight"
       setStatus(side, side.child.state === "queued" ? "waiting" : "working")
       void watch(side, side.child)
@@ -772,7 +1192,7 @@ const extension: Extension = (api) => {
   api.registerCommand({
     name: "btw",
     description: "Ask a side question without interrupting the main agent",
-    args: { hint: "<question> | hide | full | dock | clear | retry <id>" },
+    args: { hint: "<question> | resume [id] | history | hide | full | dock | clear | retry <id>" },
     echo: false,
     run(args, ctx) {
       ctx.signal.throwIfAborted()
@@ -798,6 +1218,116 @@ const extension: Extension = (api) => {
         api.requestRender()
         return
       }
+      if (question === "history") {
+        if (side && !side.closed) saveHistory(side)
+        const history = readHistory(id, ctx.session.data)
+        if (!history.length && (!side || side.closed)) {
+          ctx.print("No saved btw history in this session yet.")
+          return
+        }
+        if (side && !side.closed) {
+          side.mode = "history"
+          side.selectedHistoryId = side.threadId ?? history[0]?.id
+          open(side, ctx)
+          if (side.selectedHistoryId) {
+            side.control?.setState({ selected: { "history-list": side.selectedHistoryId } })
+            side.control?.focus("history-list")
+          }
+          api.requestRender()
+          return
+        }
+        if (!ctx.openView || !ctx.session.createGroup) {
+          throw new Error("Side questions need a TUI dock and an agent tree.")
+        }
+        const browser: Side = {
+          sessionId: id,
+          question: "History",
+          entries: [],
+          pending: [],
+          retries: new Map(),
+          completed: new Set(),
+          selectedHistoryId: history[0]?.id,
+          mode: "history",
+          data: ctx.session.data,
+          print: ctx.print,
+          status: "history",
+          placement: "dock",
+          hidden: false,
+          hiding: false,
+          repositioning: false,
+          closed: false,
+          opened: false,
+          saved: true,
+        }
+        sides.set(id, browser)
+        try {
+          open(browser, ctx)
+        } catch (error) {
+          finish(browser, false)
+          throw error
+        }
+        if (browser.selectedHistoryId) {
+          browser.control?.setState({ selected: { "history-list": browser.selectedHistoryId } })
+          browser.control?.focus("history-list")
+        }
+        api.requestRender()
+        return
+      }
+      const resumeMatch = /^resume(?:\s+(\S+))?$/i.exec(question)
+      if (resumeMatch) {
+        if (side && !side.closed) saveHistory(side)
+        const history = readHistory(id, ctx.session.data)
+        const targetId = resumeMatch[1]?.toLowerCase()
+        const thread = targetId ? history.find((item) => item.id.toLowerCase() === targetId) : history[0]
+        if (!thread) {
+          ctx.print(
+            targetId
+              ? `No saved btw conversation "${resumeMatch[1]}" found. Use /btw history to list saved conversations.`
+              : "No saved btw history to resume in this session.",
+          )
+          return
+        }
+        if (side && !side.closed) {
+          applyHistoryThread(side, thread)
+          open(side, ctx)
+          side.control?.focus("followup")
+          api.requestRender()
+          return
+        }
+        if (!ctx.openView || !ctx.session.createGroup) {
+          throw new Error("Side questions need a TUI dock and an agent tree.")
+        }
+        const restored: Side = {
+          sessionId: id,
+          question: thread.title,
+          entries: [],
+          pending: [],
+          retries: new Map(),
+          completed: new Set(),
+          mode: "chat",
+          data: ctx.session.data,
+          print: ctx.print,
+          status: "history",
+          placement: "dock",
+          hidden: false,
+          hiding: false,
+          repositioning: false,
+          closed: false,
+          opened: false,
+          saved: true,
+        }
+        applyHistoryThread(restored, thread)
+        sides.set(id, restored)
+        try {
+          open(restored, ctx)
+        } catch (error) {
+          finish(restored, false)
+          throw error
+        }
+        restored.control?.focus("followup")
+        api.requestRender()
+        return
+      }
       const retry = /^retry (r\d+|[0-9a-f-]+)$/i.exec(question)
       const retryId = retry?.[1]?.toLowerCase()
       // Bare numbers are ambiguous with old numbered actions; recognize them only
@@ -819,8 +1349,12 @@ const extension: Extension = (api) => {
           if (!side.child && !side.failure) requeue(side, ctx.session)
           api.requestRender()
         } else {
+          const historyCount = readHistory(id, ctx.session.data).length
+          const historyHint = historyCount
+            ? ` /btw resume restores the latest (${historyCount} saved in /btw history);`
+            : ""
           ctx.print(
-            "Use /btw <question> to ask or follow up (or Tab into the dock); /btw hide minimizes, Esc or /btw clear closes.",
+            `Use /btw <question> to ask or follow up (or Tab into the dock);${historyHint} /btw hide minimizes, Esc or /btw clear closes.`,
           )
         }
         return
@@ -837,6 +1371,10 @@ const extension: Extension = (api) => {
           side.child = undefined
           side.group = undefined
           side.failure = undefined
+          if (!side.historyContext?.length) {
+            const turns = extractCompletedTurns(side)
+            if (turns.length) side.historyContext = turns
+          }
         } else {
           close(side)
           sides.delete(id)
@@ -845,6 +1383,8 @@ const extension: Extension = (api) => {
       }
       const pending: Pending = { question, answer: "", timestamp: Date.now(), state: "queued" }
       if (side) {
+        side.mode = "chat"
+        side.saved = false
         open(side, ctx)
         // Consume only after opening succeeds. IDs stay stable for other displayed actions.
         if (isRetry && retryItem) {
@@ -867,6 +1407,7 @@ const extension: Extension = (api) => {
         pending: [pending],
         retries: new Map(),
         completed: new Set(),
+        mode: "chat",
         data: ctx.session.data,
         print: ctx.print,
         status: "working",
@@ -909,6 +1450,7 @@ const extension: Extension = (api) => {
       pending,
       retries: new Map(),
       completed: new Set(),
+      mode: "chat",
       data,
       print: (...args) => api.notify(...args),
       status: "interrupted",

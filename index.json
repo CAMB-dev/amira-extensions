@@ -127,8 +127,8 @@
     },
     {
       "name": "btw",
-      "description": "Ask side questions in an interactive dock (with inline follow-ups, hide/reopen, fullscreen toggle, and live tool progress) without changing the main conversation: /btw <question>",
-      "version": "0.4.1",
+      "description": "Ask side questions in an interactive dock (with inline follow-ups, multi-turn history restore, hide/reopen, fullscreen toggle, and live tool progress) without changing the main conversation: /btw <question>",
+      "version": "0.5.0",
       "source": { "git": "https://github.com/CAMB-dev/amira-extensions.git", "path": "extensions/btw" },
       "engines": { "amira": "^0.1.49" },
       "tags": ["question", "side-call", "dock"],

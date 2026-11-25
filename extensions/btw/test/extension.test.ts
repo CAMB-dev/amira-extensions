@@ -596,7 +596,7 @@ test("empty or fully answered sides write no recovery snapshot", async () => {
   s.run("Done?", c)
   await s.children[0]!.answer("Done")
   await s.reload()
-  expect(s.writes).toEqual([])
+  expect(s.writes.filter((write) => write.key !== "btw.history")).toEqual([])
   expect(s.recoveryWrites).toEqual([])
   expect(s.children).toHaveLength(1)
 })
@@ -1641,16 +1641,14 @@ test("session end closes only its side and prints into its originating session e
   expect(b.printed[0]?.[2]?.details).toContain("B answer")
 })
 
-test("empty args explain the dock commands and show/history are ordinary questions", async () => {
+test("empty args explain the dock commands and show is an ordinary question", async () => {
   const s = await setup()
   const c = s.context()
   s.run("", c)
   expect(c.printed[0]?.[0]).toContain("Use /btw <question> to ask or follow up")
   expect(s.children).toEqual([])
   s.run("show", c)
-  s.run("history", c)
   expect(s.children[0]!.options.prompt).toBe("show")
-  expect(s.children[0]!.sent).toEqual(["history"])
 })
 
 test("an already-aborted command starts no dock or child", async () => {
@@ -1767,4 +1765,107 @@ test("clicking [ Retry r1 ] in the dock retries an interrupted question directly
   c.sendUiEvent({ type: "activate", id: "retry", key: "r1" })
   expect(s.children).toHaveLength(1)
   expect(s.children[0]!.options.prompt).toBe("Interrupted Q")
+})
+
+test("multi-turn btw conversations are archived and can be resumed across close and reload with full context", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.run("How does auth work?", c)
+  await s.children[0]!.answer("It uses JWT cookies.")
+  s.run("Where is the secret loaded?", c)
+  await s.children[0]!.answer("From AUTH_SECRET in src/auth.ts.")
+
+  // Close the dock and reload the extension (simulating /resume or restart).
+  c.hostClose()
+  await flush()
+  expect(c.printed).toHaveLength(1)
+  await s.reload()
+
+  // /btw resume restores the full 2-turn conversation without spawning a child yet.
+  const c2 = s.context()
+  s.run("resume", c2)
+  expect(s.children).toHaveLength(1)
+  expect(c2.shown().status).toBe("history")
+  expect(c2.shown().lines).toContainEqual({ kind: "user-message", text: "How does auth work?" })
+  expect(c2.shown().lines).toContainEqual({ kind: "user-message", text: "Where is the secret loaded?" })
+
+  // Closing a read-only resumed thread does not duplicate the saved display block.
+  c2.hostClose()
+  await flush()
+  expect(c2.printed).toEqual([])
+
+  // Resume again and send a 3rd follow-up: new child forks with prior btw turns in the prompt (keeping systemPrompt unchanged).
+  const c3 = s.context()
+  s.run("resume h1", c3)
+  c3.sendUiEvent({ type: "submit", id: "followup", value: "Is token rotation implemented?" })
+  expect(s.children).toHaveLength(2)
+  const resumedChild = s.children[1]!
+  expect(resumedChild.options.context).toBe("fork")
+  expect(resumedChild.options.prompt).toContain("How does auth work?")
+  expect(resumedChild.options.prompt).toContain("It uses JWT cookies.")
+  expect(resumedChild.options.prompt).toContain("Where is the secret loaded?")
+  expect(resumedChild.options.prompt).toContain("From AUTH_SECRET in src/auth.ts.")
+  expect(resumedChild.options.prompt).toContain("Is token rotation implemented?")
+  await resumedChild.emit("turn.start", {
+    prompt: { role: "user", content: [{ type: "text", text: resumedChild.options.prompt }] },
+  })
+  await resumedChild.answer("Not yet, tokens expire after 24h.")
+
+  // Subsequent follow-up reuses the live child directly without re-wrapping history.
+  c3.sendUiEvent({ type: "submit", id: "followup", value: "Thanks!" })
+  expect(resumedChild.sent).toEqual(["Thanks!"])
+  await resumedChild.answer("You're welcome.")
+
+  // Closing saves the updated thread once and updates h1 in place with all 4 turns.
+  c3.hostClose()
+  await flush()
+  expect(c3.printed).toHaveLength(1)
+  const latest = s.records.get("session-a:btw.history")?.at(-1) as { id: string; turns: unknown[] }[]
+  expect(latest).toHaveLength(1)
+  expect(latest[0]?.id).toBe("h1")
+  expect(latest[0]?.turns).toHaveLength(4)
+})
+
+test("/btw history opens the interactive history table and supports restore, delete, and clear all", async () => {
+  const s = await setup()
+  const c = s.context()
+  s.run("history", c)
+  expect(c.printed[0]?.[0]).toContain("No saved btw history")
+
+  // Create two separate threads.
+  s.run("Topic A", c)
+  await s.children[0]!.answer("Answer A")
+  s.run("clear", c)
+  s.run("Topic B", c)
+  await s.children[1]!.answer("Answer B")
+  s.run("clear", c)
+
+  // Open /btw history and verify table lists newest first (h2 then h1).
+  const c2 = s.context()
+  s.run("history", c2)
+  const ui = c2.shown().ui
+  expect(ui?.type).toBe("box")
+  const table =
+    ui?.type === "box" && ui.child.type === "column"
+      ? ui.child.children.find((entry) => entry.node.type === "table")?.node
+      : undefined
+  expect(table?.type).toBe("table")
+  if (table?.type === "table") {
+    expect(table.rows.map((r) => r.key)).toEqual(["h2", "h1"])
+  }
+
+  // Selecting and activating h1 restores Topic A into the dock.
+  c2.sendUiEvent({ type: "select", id: "history-list", key: "h1" })
+  c2.sendUiEvent({ type: "activate", id: "history-list", key: "h1" })
+  expect(c2.shown().lines).toContainEqual({ kind: "user-message", text: "Topic A" })
+
+  // Clicking [History] inside chat returns to history table, then [Delete] removes h1 and [Clear All] empties it.
+  c2.sendUiEvent({ type: "activate", id: "history", key: "history" })
+  c2.sendUiEvent({ type: "select", id: "history-list", key: "h1" })
+  c2.sendUiEvent({ type: "activate", id: "history-delete", key: "history-delete" })
+  const remaining = (s.records.get("session-a:btw.history")?.at(-1) as { id: string }[] | undefined) ?? []
+  expect(remaining.map((t) => t.id)).toEqual(["h2"])
+
+  c2.sendUiEvent({ type: "activate", id: "history-clear", key: "history-clear" })
+  expect(s.records.get("session-a:btw.history")?.at(-1)).toEqual([])
 })
